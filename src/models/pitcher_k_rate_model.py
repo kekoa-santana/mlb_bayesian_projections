@@ -1,13 +1,13 @@
 """
-Layer 1: Hierarchical Bayesian K% projection model.
+Layer 1: Hierarchical Bayesian K% projection model for pitchers.
 
-Estimates true-talent strikeout rate for hitters using:
-- Hierarchical partial pooling across players (no hard PA cutoffs)
-- Multi-season data with year-to-year talent evolution
-- Statcast quality metrics as informative covariates on the prior
-- Binomial observation model
+Mirrors the hitter K% model (k_rate_model.py) with pitcher-specific
+covariates:
+- whiff_rate (arsenal-level whiff skill) → positive effect on K%
+- barrel_rate_against (contact suppression) → negative effect on K%
+- is_starter (role flag from IP/game) → population-level shift
 
-The model produces full posterior distributions, not point estimates.
+Uses batters_faced (bf) as the Binomial trial count, not PA.
 """
 from __future__ import annotations
 
@@ -27,25 +27,19 @@ logger = logging.getLogger(__name__)
 OUTPUTS_DIR = Path(__file__).resolve().parents[2] / "outputs"
 
 
-def prepare_model_data(
-    df: pd.DataFrame,
-    platoon: bool = False,
-) -> dict[str, Any]:
-    """Prepare raw multi-season data for the PyMC model.
+def prepare_pitcher_model_data(df: pd.DataFrame) -> dict[str, Any]:
+    """Prepare pitcher multi-season data for the PyMC model.
 
-    Encodes player IDs as integer indices, computes season offsets,
-    and extracts Statcast covariates.
+    Encodes pitcher IDs as integer indices, computes season offsets,
+    and z-scores arsenal covariates.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Output of ``build_multi_season_k_data`` (or
-        ``build_multi_season_k_data_platoon`` when ``platoon=True``).
-        Must contain: batter_id, season, pa, k, k_rate, barrel_pct,
-        hard_hit_pct.  When ``platoon=True``, must also contain
-        ``same_side``.
-    platoon : bool
-        If True, include same_side array for the platoon model.
+        Output of ``build_multi_season_pitcher_k_data``.
+        Must contain: pitcher_id, season, batters_faced, k, k_rate,
+        whiff_rate, barrel_rate_against.  Optionally ``is_starter``
+        (1=starter, 0=reliever); if present it is passed through as-is.
 
     Returns
     -------
@@ -55,77 +49,75 @@ def prepare_model_data(
     Raises
     ------
     ValueError
-        If ``platoon=True`` but ``same_side`` column is missing.
+        If ``whiff_rate`` or ``barrel_rate_against`` columns are missing.
     """
-    if platoon and "same_side" not in df.columns:
-        raise ValueError(
-            "platoon=True requires a 'same_side' column in the DataFrame. "
-            "Use build_multi_season_k_data_platoon() to produce the input."
-        )
+    for col in ["whiff_rate", "barrel_rate_against"]:
+        if col not in df.columns:
+            raise ValueError(
+                f"Missing required column '{col}'. "
+                "Use build_multi_season_pitcher_k_data() to produce the input."
+            )
 
     df = df.copy()
 
     # --- encode player IDs as contiguous ints ---
-    player_ids = df["batter_id"].unique()
+    player_ids = df["pitcher_id"].unique()
     player_map = {pid: idx for idx, pid in enumerate(player_ids)}
-    df["player_idx"] = df["batter_id"].map(player_map)
+    df["player_idx"] = df["pitcher_id"].map(player_map)
 
     # --- season offsets (0-based from earliest) ---
     min_season = df["season"].min()
     df["season_idx"] = df["season"] - min_season
 
-    # --- Statcast covariates (z-scored, NaN → 0 for missing) ---
-    for col in ["barrel_pct", "hard_hit_pct"]:
-        if col in df.columns:
-            mu = df[col].mean()
-            sd = df[col].std()
-            if pd.isna(sd) or np.isclose(sd, 0.0):
-                df[f"{col}_z"] = 0.0
-            else:
-                df[f"{col}_z"] = ((df[col] - mu) / sd).fillna(0.0)
-        else:
+    # --- Statcast covariates (z-scored, NaN → 0 for missing/constant) ---
+    for col in ["whiff_rate", "barrel_rate_against"]:
+        mu = df[col].mean()
+        sd = df[col].std()
+        if pd.isna(sd) or np.isclose(sd, 0.0):
             df[f"{col}_z"] = 0.0
+        else:
+            df[f"{col}_z"] = ((df[col] - mu) / sd).fillna(0.0)
 
     result = {
         "player_idx": df["player_idx"].values.astype(int),
         "season_idx": df["season_idx"].values.astype(int),
-        "pa": df["pa"].values.astype(int),
+        "bf": df["batters_faced"].values.astype(int),
         "k": df["k"].values.astype(int),
-        "barrel_z": df["barrel_pct_z"].values.astype(float),
-        "hard_hit_z": df["hard_hit_pct_z"].values.astype(float),
+        "whiff_z": df["whiff_rate_z"].values.astype(float),
+        "barrel_against_z": df["barrel_rate_against_z"].values.astype(float),
         "n_players": len(player_ids),
         "n_seasons": df["season_idx"].max() + 1,
         "player_map": player_map,
         "player_ids": player_ids,
         "min_season": min_season,
-        "platoon": platoon,
         "df": df,
     }
 
-    if platoon:
-        result["same_side"] = df["same_side"].values.astype(int)
+    if "is_starter" in df.columns:
+        result["is_starter"] = df["is_starter"].values.astype(int)
 
     return result
 
 
-def build_k_rate_model(
+def build_pitcher_k_rate_model(
     data: dict[str, Any],
     random_seed: int = 42,
 ) -> pm.Model:
-    """Build the hierarchical Bayesian K% model.
+    """Build the hierarchical Bayesian pitcher K% model.
 
     Model structure
     ---------------
-    - Population mean K% on logit scale ~ Normal(logit(0.22), 0.3)
-    - Player-level random intercepts ~ Normal(0, sigma_player)
-    - Season random walk: talent[t] = talent[t-1] + innovation
-    - Statcast covariates shift the player intercept
-    - Binomial likelihood: K ~ Binomial(PA, inv_logit(theta))
+    - Population mean K% on logit scale ~ Normal(logit(0.224), 0.3)
+    - Player-level random intercepts (non-centered)
+    - Season random walk for talent evolution
+    - Arsenal covariates: whiff_rate (+K%), barrel_rate_against
+    - Starter/reliever role flag (optional)
+    - Binomial likelihood: K ~ Binomial(BF, inv_logit(theta))
 
     Parameters
     ----------
     data : dict
-        Output of ``prepare_model_data``.
+        Output of ``prepare_pitcher_model_data``.
     random_seed : int
         For reproducibility.
 
@@ -137,13 +129,13 @@ def build_k_rate_model(
 
     player_idx = data["player_idx"]
     season_idx = data["season_idx"]
-    pa = data["pa"]
+    bf = data["bf"]
     k_obs = data["k"]
-    barrel_z = data["barrel_z"]
-    hard_hit_z = data["hard_hit_z"]
+    whiff_z = data["whiff_z"]
+    barrel_against_z = data["barrel_against_z"]
     n_players = data["n_players"]
     n_seasons = data["n_seasons"]
-    is_platoon = data.get("platoon", False)
+    has_role = "is_starter" in data
 
     # League-average K% on logit scale
     league_k_logit = np.log(
@@ -155,12 +147,13 @@ def build_k_rate_model(
         mu_pop = pm.Normal("mu_pop", mu=league_k_logit, sigma=0.3)
         sigma_player = pm.HalfNormal("sigma_player", sigma=0.5)
 
-        # --- Statcast covariate effects ---
-        # Higher barrel% and hard-hit% → lower K rate (better contact ability)
-        beta_barrel = pm.Normal("beta_barrel", mu=0, sigma=0.2)
-        beta_hard_hit = pm.Normal("beta_hard_hit", mu=0, sigma=0.2)
+        # --- Arsenal covariate effects ---
+        # Wider prior (0.3) than hitter model (0.2): whiff_rate is a more
+        # direct causal predictor of pitcher K%.
+        beta_whiff = pm.Normal("beta_whiff", mu=0, sigma=0.3)
+        beta_barrel_against = pm.Normal("beta_barrel_against", mu=0, sigma=0.3)
 
-        # --- Player-level intercepts ---
+        # --- Player-level intercepts (non-centered) ---
         alpha_raw = pm.Normal("alpha_raw", mu=0, sigma=1, shape=n_players)
         alpha = pm.Deterministic(
             "alpha", mu_pop + sigma_player * alpha_raw
@@ -170,12 +163,10 @@ def build_k_rate_model(
         sigma_season = pm.HalfNormal("sigma_season", sigma=0.15)
 
         if n_seasons > 1:
-            # Innovation for seasons 1..T-1
             innovation = pm.Normal(
                 "innovation", mu=0, sigma=1,
                 shape=(n_players, n_seasons - 1),
             )
-            # Build cumulative walk: season 0 = 0, season t = sum of innovations
             cum_innov = pt.concatenate(
                 [
                     pt.zeros((n_players, 1)),
@@ -187,37 +178,31 @@ def build_k_rate_model(
         else:
             season_effect = pt.zeros((n_players, 1))
 
+        # --- Starter/reliever role effect ---
+        if has_role:
+            is_starter = data["is_starter"]
+            beta_starter = pm.Normal("beta_starter", mu=0, sigma=0.2)
+
         # --- Linear predictor ---
         theta = (
             alpha[player_idx]
             + season_effect[player_idx, season_idx]
-            + beta_barrel * barrel_z
-            + beta_hard_hit * hard_hit_z
+            + beta_whiff * whiff_z
+            + beta_barrel_against * barrel_against_z
         )
-
-        # --- Platoon effect (same-side matchup shift) ---
-        if is_platoon:
-            same_side = data["same_side"]
-            # Population-level same-side effect (+0.05 logit ≈ +1.2 pp at 22%)
-            gamma_pop = pm.Normal("gamma_pop", mu=0.05, sigma=0.1)
-            sigma_gamma = pm.HalfNormal("sigma_gamma", sigma=0.15)
-            # Non-centered player-level platoon sensitivity
-            gamma_raw = pm.Normal("gamma_raw", mu=0, sigma=1, shape=n_players)
-            gamma = pm.Deterministic(
-                "gamma", gamma_pop + sigma_gamma * gamma_raw
-            )
-            theta = theta + gamma[player_idx] * same_side
+        if has_role:
+            theta = theta + beta_starter * is_starter
 
         # --- K rate on probability scale ---
         k_rate = pm.Deterministic("k_rate", pm.math.invlogit(theta))
 
         # --- Likelihood ---
-        pm.Binomial("k_obs", n=pa, p=k_rate, observed=k_obs)
+        pm.Binomial("k_obs", n=bf, p=k_rate, observed=k_obs)
 
     return model
 
 
-def fit_k_rate_model(
+def fit_pitcher_k_rate_model(
     data: dict[str, Any],
     draws: int = 2000,
     tune: int = 1000,
@@ -225,31 +210,28 @@ def fit_k_rate_model(
     target_accept: float = 0.95,
     random_seed: int = 42,
 ) -> tuple[pm.Model, az.InferenceData]:
-    """Build and sample the K% model.
+    """Build and sample the pitcher K% model.
 
     Parameters
     ----------
     data : dict
-        Output of ``prepare_model_data``.
+        Output of ``prepare_pitcher_model_data``.
     draws, tune, chains, target_accept, random_seed
         MCMC sampling parameters.
 
     Returns
     -------
     tuple[pm.Model, az.InferenceData]
-        The PyMC model and the ArviZ InferenceData with posterior + posterior_predictive.
     """
-    model = build_k_rate_model(data, random_seed=random_seed)
+    model = build_pitcher_k_rate_model(data, random_seed=random_seed)
 
     with model:
         logger.info(
-            "Sampling K-rate model: %d draws, %d tune, %d chains, "
+            "Sampling pitcher K-rate model: %d draws, %d tune, %d chains, "
             "%d players, %d seasons",
             draws, tune, chains, data["n_players"], data["n_seasons"],
         )
 
-        # Use nutpie (Rust-based sampler) if available — much faster
-        # on Windows where g++ is often unavailable for PyTensor C compilation
         try:
             import nutpie
             logger.info("Using nutpie sampler (Rust backend)")
@@ -273,53 +255,44 @@ def fit_k_rate_model(
                 return_inferencedata=True,
             )
 
-        # Posterior predictive for calibration checks
         pm.sample_posterior_predictive(trace, extend_inferencedata=True)
 
     return model, trace
 
 
-def extract_player_posteriors(
+def extract_pitcher_posteriors(
     trace: az.InferenceData,
     data: dict[str, Any],
 ) -> pd.DataFrame:
-    """Extract posterior K% summaries per player per season.
+    """Extract posterior K% summaries per pitcher per season.
 
     Parameters
     ----------
     trace : az.InferenceData
-        Fitted trace from ``fit_k_rate_model``.
+        Fitted trace from ``fit_pitcher_k_rate_model``.
     data : dict
-        Model data dict (for player_map, seasons, etc.).
+        Model data dict from ``prepare_pitcher_model_data``.
 
     Returns
     -------
     pd.DataFrame
-        Columns: batter_id, season, k_rate_mean, k_rate_sd,
-        k_rate_2_5, k_rate_25, k_rate_50, k_rate_75, k_rate_97_5,
-        observed_k_rate, pa.
+        Columns: pitcher_id, pitcher_name, pitch_hand, season,
+        batters_faced, is_starter, observed_k_rate, k_rate_mean, k_rate_sd,
+        k_rate_2_5, k_rate_25, k_rate_50, k_rate_75, k_rate_97_5.
     """
     df = data["df"]
-    is_platoon = data.get("platoon", False)
     k_rate_post = trace.posterior["k_rate"].values  # (chains, draws, obs)
-    # Flatten chains: (chains*draws, obs)
     k_rate_flat = k_rate_post.reshape(-1, k_rate_post.shape[-1])
-
-    # Platoon gamma posteriors (per player)
-    if is_platoon and "gamma" in trace.posterior:
-        gamma_post = trace.posterior["gamma"].values  # (chains, draws, n_players)
-        gamma_flat = gamma_post.reshape(-1, gamma_post.shape[-1])
-    else:
-        gamma_flat = None
 
     records = []
     for pos, (i, row) in enumerate(df.iterrows()):
         samples = k_rate_flat[:, pos]
         rec = {
-            "batter_id": row["batter_id"],
-            "batter_name": row.get("batter_name", ""),
+            "pitcher_id": row["pitcher_id"],
+            "pitcher_name": row.get("pitcher_name", ""),
+            "pitch_hand": row.get("pitch_hand", ""),
             "season": row["season"],
-            "pa": row["pa"],
+            "batters_faced": row["batters_faced"],
             "observed_k_rate": row["k_rate"],
             "k_rate_mean": np.mean(samples),
             "k_rate_sd": np.std(samples),
@@ -329,20 +302,15 @@ def extract_player_posteriors(
             "k_rate_75": np.percentile(samples, 75),
             "k_rate_97_5": np.percentile(samples, 97.5),
         }
-        if is_platoon:
-            rec["pitch_hand"] = row.get("pitch_hand", "")
-            rec["same_side"] = row.get("same_side", 0)
-            if gamma_flat is not None:
-                pidx = int(row["player_idx"])
-                rec["gamma_mean"] = float(np.mean(gamma_flat[:, pidx]))
-                rec["gamma_sd"] = float(np.std(gamma_flat[:, pidx]))
+        if "is_starter" in row.index:
+            rec["is_starter"] = int(row["is_starter"])
         records.append(rec)
 
     return pd.DataFrame(records)
 
 
-def check_convergence(trace: az.InferenceData) -> dict[str, Any]:
-    """Run standard convergence diagnostics on the trace.
+def check_pitcher_convergence(trace: az.InferenceData) -> dict[str, Any]:
+    """Run standard convergence diagnostics on the pitcher trace.
 
     Parameters
     ----------
@@ -353,12 +321,12 @@ def check_convergence(trace: az.InferenceData) -> dict[str, Any]:
     dict
         Summary with r_hat, ESS, and divergence counts.
     """
-    var_names = ["mu_pop", "sigma_player", "sigma_season",
-                  "beta_barrel", "beta_hard_hit"]
-    # Auto-detect platoon parameters
-    for v in ["gamma_pop", "sigma_gamma"]:
-        if v in trace.posterior:
-            var_names.append(v)
+    var_names = [
+        "mu_pop", "sigma_player", "sigma_season",
+        "beta_whiff", "beta_barrel_against",
+    ]
+    if "beta_starter" in trace.posterior:
+        var_names.append("beta_starter")
     summary = az.summary(trace, var_names=var_names)
     n_divergences = int(trace.sample_stats["diverging"].sum())
     max_rhat = float(summary["r_hat"].max())

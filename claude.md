@@ -176,9 +176,9 @@ Every model must be evaluated with:
 
 ### Phase 2: Layer 1 — Season Talent Models
 6. [x] Hitter K% hierarchical Bayesian model (PyMC, binomial, random walk, Statcast covariates)
-7. [ ] Add **platoon split** (batter_stand) as hierarchical factor to hitter K% model
-8. [ ] Pitcher K% model (mirror hitter model using `pitcher_season_totals`; separate whiff skill vs contact suppression as covariates)
-9. [ ] Add **starter/reliever role** flag to pitcher model (derive from IP/game in boxscores)
+7. [x] Add **platoon split** (batter_stand) as hierarchical factor to hitter K% model
+8. [x] Pitcher K% model (mirror hitter model using `pitcher_season_totals`; separate whiff skill vs contact suppression as covariates)
+9. [x] Add **starter/reliever role** flag to pitcher model (derive from IP/game in boxscores)
 10. [ ] Run walk-forward backtest, verify convergence, confirm beats Marcel
 
 ### Phase 3: Layer 2 — Matchup Model
