@@ -16,9 +16,8 @@ from src.viz.theme import (
     CREAM,
     DARK_BG,
     GOLD,
+    SAGE,
     SLATE,
-    TEAL,
-    WHITE,
     add_brand_footer,
     add_watermark,
     format_pct,
@@ -45,12 +44,12 @@ def _fmt_delta(value: float, is_pct: bool = True) -> str:
 
 
 def _delta_color(value: float, sign_good: int) -> str:
-    """Return TEAL if delta is good, _RED if bad, SLATE if neutral/NaN."""
+    """Return SAGE if delta is good, _RED if bad, SLATE if neutral/NaN."""
     if np.isnan(value):
         return _TEXT_SEC
     # sign_good: +1 means higher is better, -1 means lower is better
     if sign_good * value > 0.001:
-        return TEAL
+        return SAGE
     elif sign_good * value < -0.001:
         return _RED
     return _TEXT_SEC
@@ -110,7 +109,7 @@ def plot_hitter_composite(
     # Title
     if card_type == "breakout":
         title = f"HITTER BREAKOUT CANDIDATES — {season_label}"
-        accent = TEAL
+        accent = SAGE
         subtitle = "Projected to improve across K%, BB%, HR%, xwOBA"
     else:
         title = f"HITTER REGRESSION RISKS — {season_label}"
@@ -261,7 +260,7 @@ def plot_pitcher_composite(
 
     if card_type == "breakout":
         title = f"PITCHER BREAKOUT CANDIDATES — {season_label}"
-        accent = TEAL
+        accent = SAGE
         subtitle = "Projected to improve across K%, BB%, HR/BF"
     else:
         title = f"PITCHER REGRESSION RISKS — {season_label}"

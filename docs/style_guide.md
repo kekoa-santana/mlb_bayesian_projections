@@ -9,17 +9,25 @@ Reference for maintaining consistent branding across all Data Diamond projects a
 | Name | Hex | Usage |
 |------|-----|-------|
 | **Gold** | `#C8A96E` | Primary accent. Titles, projected values, CI bars, KDE fills, delta labels, footer brand name. |
-| **Teal** | `#4FC3C8` | Secondary accent. Positive/improvement bars, "increase" direction. |
+| **Ember** | `#D4562A` | Power/elite. Barrels, hard hits, 95+ mph velo, dominant K counts, HR events, hit results. |
+| **Sage** | `#6BA38E` | Positive/growth. Improvement trends, positive deltas, mid-tier highlights, strikes, walks. |
 | **Slate** | `#7B8FA6` | Neutral. Secondary text, observed values, axes, reference lines, footer subtitle, watermark, decline bars. |
 | **Cream** | `#F5F2EE` | Background. Figure, axes, and save facecolor. |
 | **Dark** | `#0F1117` | Primary text on cream background. Player names, bold labels, axis ticks. |
-| **White** | `#FFFFFF` | Rarely used. Available for contrast on dark elements. |
 
 ### When to use what
 - **Gold** = the thing you want people to look at (projections, headlines, brand name)
-- **Teal** = good/positive direction (K% increase for pitchers, K% decrease for hitters)
+- **Ember** = power, danger, elite performance (barrels, 95+ velo, HRs, dominant Ks)
+- **Sage** = good/positive direction (improvement trends, positive deltas, plate discipline)
 - **Slate** = context/secondary info (observed values, baselines, supporting text)
 - **Dark** = readable body text and bold labels
+
+### Three-tier EV bars
+| Tier | Threshold | Color |
+|------|-----------|-------|
+| Elite | 105+ mph | Gold |
+| Hard | 95–104 mph | Ember |
+| Below | <95 mph | Slate |
 
 ---
 
@@ -27,9 +35,10 @@ Reference for maintaining consistent branding across all Data Diamond projects a
 
 | Element | Font | Size | Weight | Color |
 |---------|------|------|--------|-------|
-| Chart title | sans-serif | 22pt | bold | Gold |
-| Chart subtitle | sans-serif | 13pt | normal | Slate |
-| Card title | sans-serif | 18pt | bold | Gold |
+| Chart title (16:9) | sans-serif | 22pt | bold | Gold |
+| Chart title (5:7, 1:1) | sans-serif | 18pt | bold | Gold |
+| Chart subtitle (16:9) | sans-serif | 13pt | normal | Slate |
+| Chart subtitle (5:7, 1:1) | sans-serif | 12pt | normal | Slate |
 | Player name (card) | sans-serif | 26pt | bold | Dark |
 | Team/hand label | sans-serif | 16pt | normal | Slate |
 | Big stat number | sans-serif | 32pt | bold | Dark (observed) / Gold (projected) |
@@ -50,19 +59,24 @@ Reference for maintaining consistent branding across all Data Diamond projects a
 
 ### 16:9 Landscape (Twitter/X feed cards)
 - **Size**: 16 x 9 inches
-- **Use for**: Mover charts, comparison tables, leaderboards
+- **Use for**: Mover charts, comparison tables, leaderboards, movement profiles
 - **Layout**: Typically 1x2 subplot grid (left/right panels)
 
-### 1:1 Square (Instagram, individual cards)
+### 5:7 Portrait (detail cards)
+- **Size**: 10 x 14 inches
+- **Use for**: Pitching line, at-bat breakdown, batter game cards
+- **Layout**: Vertical stack via GridSpec or figure text
+
+### 1:1 Square (single-stat features)
 - **Size**: 10 x 10 inches
-- **Use for**: Individual player cards, single-stat features
+- **Use for**: Individual HR cards, player projection cards
 - **Layout**: Vertical stack via GridSpec
 
 ### Output
 - **Format**: PNG
 - **DPI**: 300
 - **Padding**: 0.3 inches (`savefig.pad_inches`)
-- **Save directory**: `outputs/content/`
+- **Save directory**: `outputs/content/` (project-specific subdirectories)
 
 ---
 
@@ -77,7 +91,7 @@ Reference for maintaining consistent branding across all Data Diamond projects a
 ### Bars
 - **Height**: 0.55 units (horizontal bars)
 - **Alpha**: 0.85
-- **Color**: Teal for positive direction, Slate for negative direction
+- **Color**: Sage for positive direction, Slate for negative direction, Ember for elite
 - **X-axis range**: 0.05 to 0.45 for K% charts
 
 ### Reference Lines
@@ -126,68 +140,41 @@ The watermark should be invisible at a glance but detectable on close inspection
 Every chart gets a footer with three elements:
 
 ```
-[Logo]  TheDataDiamond                          Bayesian projection model
-^left                                                              right^
+[Logo]  TheDataDiamond                          Live Game Content
+^left                                                      right^
 ```
 
-| Element | Position | Details |
-|---------|----------|---------|
-| Logo icon | x=0.03, y=0.025 | `iconTransparent.png`, zoom=0.025, no frame |
-| Brand name | x=0.078, y=0.02 | "TheDataDiamond", 12pt bold Gold, left-aligned |
-| Subtitle | x=0.96, y=0.02 | Default "Bayesian projection model", 10pt Slate, right-aligned |
+### Footer positions by aspect ratio
 
-If the logo file is missing, the brand name shifts left to x=0.04.
+| Aspect | Logo pos | Logo zoom | Brand x | Subtitle x | Text y | Brand size | Sub size |
+|--------|----------|-----------|---------|------------|--------|------------|----------|
+| 16:9 | (0.03, 0.02) | 0.025 | 0.08 | 0.96 | 0.02 | 12pt | 10pt |
+| 5:7 | (0.03, 0.01) | 0.018 | 0.08 | 0.96 | 0.012 | 11pt | 9pt |
+| 1:1 | (0.03, 0.02) | 0.022 | 0.08 | 0.96 | 0.02 | 12pt | 10pt |
+
+### Footer subtitle presets
+
+| Key | Text |
+|-----|------|
+| `"live"` | Live Game Content |
+| `"postgame"` | Post-Game Recap |
+| `"highlight"` | Game Highlight |
+| `"projection"` | Bayesian Projection Model |
+
+Custom strings also accepted — presets are just shortcuts.
 
 ---
 
-## Layout Patterns
+## Header System
 
-### Two-Column Mover Chart (16:9)
-
-```
-+----------------------------------------------------------+
-|          PITCHER K% PROJECTIONS - 2026          (Gold 22pt bold)
-|     Bayesian model: 2025 observed vs 2026 projected (Slate 13pt)
-|                                                          |
-|  PROJECTED K% INCREASE    |    PROJECTED K% DECREASE     |
-|  (14pt bold Dark)         |    (14pt bold Dark)           |
-|                           |                               |
-|  Name (TEAM) HAND  XX.X%  +X.Xpp | Name (TEAM) HAND XX.X% -X.Xpp |
-|  2025: XX.X%       [===TEAL===]   | 2025: XX.X%    [===SLATE===]   |
-|  ...                      |    ...                        |
-|                                                          |
-|  [logo] TheDataDiamond              Bayesian projection model |
-+----------------------------------------------------------+
-```
-
-- Subplot spacing: top=0.80, bottom=0.10, left=0.04, right=0.96, wspace=0.15
-- Title at y=0.93, subtitle at y=0.885
-- Row spacing: 1.4 units between players
-
-### Individual Player Card (1:1)
+Uniform structure across all aspect ratios:
 
 ```
-+---------------------------+
-|   K% PROJECTION - 2026    |  (Gold 18pt bold, y=0.97)
-|                           |
-|       PLAYER NAME         |  (Dark 26pt bold)
-|       TEAM  |  HAND       |  (Slate 16pt)
-|                           |
-|  2025 K%    2026 PROJECTED|
-|   XX.X%       XX.X%       |  (Dark 32pt / Gold 32pt)
-|                           |
-|    [KDE density curve]    |  (Gold fill, Slate observed line)
-|          K%               |
-|                           |
-|   95% CREDIBLE INTERVAL   |  (Dark 13pt bold)
-|   lo% [====<>=====] hi%   |  (Gold bar, Dark diamond mean)
-|                           |
-| [logo] TheDataDiamond  Bayesian projection model |
-+---------------------------+
+         CARD TITLE              <- Gold, bold, centered
+    Subtitle / context line      <- Slate, normal, centered
 ```
 
-- GridSpec: 4 rows, height_ratios=[0.8, 0.8, 3, 1.2]
-- Spacing: top=0.92, bottom=0.08, left=0.1, right=0.9, hspace=0.35
+Font sizes scale by ratio (see Typography table above). The `add_header()` function handles positioning automatically.
 
 ---
 
@@ -211,18 +198,30 @@ On individual cards, the name is split:
 
 ## Implementation
 
-The canonical implementation lives in:
-- **`src/viz/theme.py`** — palette constants, `apply_theme()`, `add_watermark()`, `add_brand_footer()`, `save_card()`
-- **`src/viz/projections.py`** — chart-specific layouts (mover columns, player cards)
+The canonical theme lives in the shared **`tdd_theme`** package (`E:\data_analytics\tdd_theme\`):
 
-To use in a new project, copy `theme.py` and call:
+- **`tdd_theme/palette.py`** — GOLD, EMBER, SAGE, SLATE, CREAM, DARK
+- **`tdd_theme/theme.py`** — `apply_theme()` rcParams
+- **`tdd_theme/branding.py`** — `add_watermark()`, `add_header()`, `add_brand_footer()`
+- **`tdd_theme/layout.py`** — aspect sizes, footer/header configs per ratio
+- **`tdd_theme/save.py`** — `save_card()`, `format_pct()`
+
+Each project has a thin wrapper that re-exports from `tdd_theme` and adds project-specific paths:
+- **`gamefeed/scripts/theme.py`**
+- **`player_profiles/src/viz/theme.py`**
+
+To use in a new project:
+```bash
+pip install -e E:\data_analytics\tdd_theme
+```
 ```python
-from theme import apply_theme, add_watermark, add_brand_footer, save_card
+from tdd_theme import apply_theme, add_watermark, add_brand_footer, save_card
+from tdd_theme import GOLD, EMBER, SAGE, SLATE, CREAM, DARK
 
-apply_theme()           # set rcParams
+apply_theme()
 fig, ax = plt.subplots()
 # ... build your chart ...
 add_watermark(fig)
-add_brand_footer(fig)
+add_brand_footer(fig, subtitle="projection")
 save_card(fig, "my_chart", aspect="16:9")
 ```

@@ -19,9 +19,8 @@ from src.viz.theme import (
     CREAM,
     DARK_BG,
     GOLD,
+    SAGE,
     SLATE,
-    TEAL,
-    WHITE,
     add_brand_footer,
     add_watermark,
     format_pct,
@@ -356,7 +355,7 @@ def plot_pitcher_k_movers(
              "Bayesian model: 2025 observed vs 2026 projected",
              ha="center", va="center", fontsize=13, color=_TEXT_SEC)
 
-    _draw_mover_column(ax_l, improvers, TEAL,
+    _draw_mover_column(ax_l, improvers, SAGE,
                        "PROJECTED K% INCREASE",
                        name_col="pitcher_name", hand_col="pitch_hand")
     _draw_mover_column(ax_r, decliners, _TEXT_SEC,
@@ -400,7 +399,7 @@ def plot_hitter_k_movers(
              "Bayesian model: 2025 observed vs 2026 projected",
              ha="center", va="center", fontsize=13, color=_TEXT_SEC)
 
-    _draw_mover_column(ax_l, improvers, TEAL,
+    _draw_mover_column(ax_l, improvers, SAGE,
                        "WILL STRIKE OUT LESS",
                        name_col="batter_name", hand_col="batter_stand")
     _draw_mover_column(ax_r, decliners, _TEXT_SEC,
