@@ -19,5 +19,4 @@ __pycache__/
 .claude/
 .codex/
 
-*.png
 *.ipynb
