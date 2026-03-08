@@ -239,6 +239,33 @@ def load_bf_priors() -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+@st.cache_data
+def load_pitcher_arsenal() -> pd.DataFrame:
+    """Load pitcher arsenal profiles."""
+    path = DASHBOARD_DIR / "pitcher_arsenal.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data
+def load_hitter_vulnerability() -> pd.DataFrame:
+    """Load hitter vulnerability profiles."""
+    path = DASHBOARD_DIR / "hitter_vuln.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data
+def load_hitter_strength() -> pd.DataFrame:
+    """Load hitter strength profiles."""
+    path = DASHBOARD_DIR / "hitter_str.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
 def _check_data_exists() -> bool:
     """Check if pre-computed data exists."""
     required = [
@@ -599,6 +626,154 @@ def _create_game_k_fig(
 
 
 # ---------------------------------------------------------------------------
+# Pitch type display config
+# ---------------------------------------------------------------------------
+PITCH_DISPLAY: dict[str, str] = {
+    "FF": "4-Seam", "SI": "Sinker", "FC": "Cutter",
+    "SL": "Slider", "CU": "Curveball", "ST": "Sweeper",
+    "CH": "Changeup", "FS": "Splitter", "KC": "Knuckle-Curve",
+    "SV": "Slurve", "CS": "Slow Curve", "FO": "Forkball",
+    "EP": "Eephus", "KN": "Knuckleball",
+}
+PITCH_FAMILY_COLORS: dict[str, str] = {
+    "fastball": "#E8575A",   # warm red
+    "breaking": "#5B9BD5",   # cool blue
+    "offspeed": "#70AD47",   # green
+}
+PITCH_TYPE_TO_FAMILY: dict[str, str] = {
+    "FF": "fastball", "SI": "fastball", "FC": "fastball",
+    "SL": "breaking", "CU": "breaking", "ST": "breaking",
+    "KC": "breaking", "SV": "breaking", "CS": "breaking",
+    "CH": "offspeed", "FS": "offspeed", "FO": "offspeed",
+    "EP": "offspeed", "KN": "offspeed",
+}
+
+
+def _whiff_quality_color(whiff_rate: float) -> str:
+    """Color-code a whiff rate: green=elite, gold=avg, red=poor."""
+    if whiff_rate >= 0.35:
+        return SAGE
+    elif whiff_rate >= 0.25:
+        return GOLD
+    elif whiff_rate >= 0.15:
+        return SLATE
+    else:
+        return EMBER
+
+
+def _create_arsenal_fig(
+    arsenal_df: pd.DataFrame,
+    pitcher_name: str,
+) -> plt.Figure:
+    """Horizontal bar chart of a pitcher's arsenal, color-coded by whiff quality."""
+    df = arsenal_df.sort_values("usage_pct", ascending=True).copy()
+    df["label"] = df["pitch_type"].map(PITCH_DISPLAY).fillna(df["pitch_type"])
+
+    fig, ax = plt.subplots(figsize=(7, max(2.2, len(df) * 0.55)))
+    fig.patch.set_facecolor(DARK)
+    ax.set_facecolor(DARK)
+
+    colors = [_whiff_quality_color(w) if pd.notna(w) else SLATE for w in df["whiff_rate"]]
+    bars = ax.barh(df["label"], df["usage_pct"] * 100, color=colors, height=0.6, alpha=0.85)
+
+    for bar, (_, row) in zip(bars, df.iterrows()):
+        usage = row["usage_pct"] * 100
+        velo = row.get("avg_velo", np.nan)
+        whiff = row.get("whiff_rate", np.nan)
+        parts = []
+        if pd.notna(velo):
+            parts.append(f"{velo:.0f} mph")
+        if pd.notna(whiff):
+            parts.append(f"Whiff: {whiff*100:.0f}%")
+        annotation = "  " + " | ".join(parts) if parts else ""
+        ax.text(
+            usage + 0.8, bar.get_y() + bar.get_height() / 2,
+            annotation, color=CREAM, fontsize=9, va="center",
+        )
+
+    ax.set_xlabel("Usage %", color=SLATE, fontsize=10)
+    ax.set_title(
+        f"{pitcher_name} -- Pitch Arsenal (2025)",
+        color=CREAM, fontsize=12, fontweight="bold", pad=10,
+    )
+    ax.tick_params(colors=CREAM, labelsize=10)
+    ax.set_xlim(0, df["usage_pct"].max() * 100 + 18)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    add_watermark(fig)
+    fig.tight_layout()
+    return fig
+
+
+def _create_hitter_vuln_fig(
+    vuln_df: pd.DataFrame,
+    strength_df: pd.DataFrame,
+    hitter_name: str,
+) -> plt.Figure:
+    """Dual bar chart: vulnerabilities (whiff/chase) and strengths (barrel/hard-hit)."""
+    # Merge vuln + strength on pitch_type, keep only types with enough swings
+    vuln = vuln_df[vuln_df["swings"] >= 10].copy() if "swings" in vuln_df.columns else vuln_df.copy()
+    vuln["label"] = vuln["pitch_type"].map(PITCH_DISPLAY).fillna(vuln["pitch_type"])
+
+    if strength_df is not None and not strength_df.empty:
+        str_cols = ["pitch_type", "barrel_rate_contact", "hard_hit_rate", "xwoba_contact"]
+        str_cols = [c for c in str_cols if c in strength_df.columns]
+        merged = vuln.merge(strength_df[str_cols], on="pitch_type", how="left")
+    else:
+        merged = vuln.copy()
+
+    merged = merged.sort_values("whiff_rate", ascending=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(7, max(2.2, len(merged) * 0.5)))
+    fig.patch.set_facecolor(DARK)
+
+    # Left: Vulnerability (whiff rate)
+    ax1 = axes[0]
+    ax1.set_facecolor(DARK)
+    colors_vuln = [EMBER if w >= 0.30 else GOLD if w >= 0.20 else SAGE
+                   for w in merged["whiff_rate"].fillna(0)]
+    ax1.barh(merged["label"], merged["whiff_rate"].fillna(0) * 100,
+             color=colors_vuln, height=0.6, alpha=0.85)
+    ax1.set_xlabel("Whiff Rate %", color=SLATE, fontsize=9)
+    ax1.set_title("Vulnerability", color=EMBER, fontsize=11, fontweight="bold")
+    ax1.tick_params(colors=CREAM, labelsize=9)
+    for spine in ax1.spines.values():
+        spine.set_visible(False)
+
+    # Right: Strength (barrel rate on contact or hard-hit rate)
+    ax2 = axes[1]
+    ax2.set_facecolor(DARK)
+    if "barrel_rate_contact" in merged.columns:
+        vals = merged["barrel_rate_contact"].fillna(0) * 100
+        xlabel = "Barrel Rate %"
+    elif "hard_hit_rate" in merged.columns:
+        vals = merged["hard_hit_rate"].fillna(0) * 100
+        xlabel = "Hard-Hit Rate %"
+    else:
+        vals = pd.Series([0] * len(merged))
+        xlabel = "Contact Quality"
+
+    colors_str = [SAGE if v >= 10 else GOLD if v >= 5 else SLATE for v in vals]
+    ax2.barh(merged["label"], vals, color=colors_str, height=0.6, alpha=0.85)
+    ax2.set_xlabel(xlabel, color=SLATE, fontsize=9)
+    ax2.set_title("Contact Quality", color=SAGE, fontsize=11, fontweight="bold")
+    ax2.tick_params(colors=CREAM, labelsize=9)
+    ax2.set_yticklabels([])
+    for spine in ax2.spines.values():
+        spine.set_visible(False)
+
+    fig.suptitle(
+        f"{hitter_name} -- Pitch-Type Profile (2025)",
+        color=CREAM, fontsize=12, fontweight="bold", y=1.02,
+    )
+
+    add_watermark(fig)
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Stat configs per player type
 # ---------------------------------------------------------------------------
 PITCHER_STATS = [
@@ -876,6 +1051,48 @@ def page_player_profile() -> None:
             "Range = 95% credible interval."
         )
 
+    # --- Arsenal / Vulnerability Charts ---
+    if player_type == "Pitcher":
+        arsenal_df = load_pitcher_arsenal()
+        if not arsenal_df.empty:
+            p_arsenal = arsenal_df[arsenal_df["pitcher_id"] == player_id].copy()
+            if not p_arsenal.empty:
+                st.markdown('<div class="section-header">Pitch Arsenal</div>',
+                            unsafe_allow_html=True)
+                fig = _create_arsenal_fig(p_arsenal, selected_name)
+                _, chart_col, _ = st.columns([1, 3, 1])
+                with chart_col:
+                    st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
+                st.caption(
+                    "Bar color = whiff quality: "
+                    f'<span style="color:{SAGE};">elite (35%+)</span> | '
+                    f'<span style="color:{GOLD};">above-avg (25-35%)</span> | '
+                    f'<span style="color:{SLATE};">avg (15-25%)</span> | '
+                    f'<span style="color:{EMBER};">below-avg (<15%)</span>',
+                    unsafe_allow_html=True,
+                )
+    else:
+        vuln_df = load_hitter_vulnerability()
+        str_df = load_hitter_strength()
+        if not vuln_df.empty:
+            h_vuln = vuln_df[vuln_df["batter_id"] == player_id].copy()
+            h_str = str_df[str_df["batter_id"] == player_id].copy() if not str_df.empty else pd.DataFrame()
+            if not h_vuln.empty:
+                st.markdown('<div class="section-header">Pitch-Type Profile</div>',
+                            unsafe_allow_html=True)
+                fig = _create_hitter_vuln_fig(h_vuln, h_str, selected_name)
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
+                st.caption(
+                    "Left: whiff rate by pitch type "
+                    f'(<span style="color:{EMBER};">red = exploitable 30%+</span>, '
+                    f'<span style="color:{SAGE};">green = strong <20%</span>). '
+                    "Right: barrel rate on contact "
+                    f'(<span style="color:{SAGE};">green = dangerous 10%+</span>).',
+                    unsafe_allow_html=True,
+                )
+
     # --- Posterior KDE (for pitchers with K% samples) ---
     k_samples = load_k_samples()
     sample_key = str(player_id)
@@ -1089,6 +1306,221 @@ def page_game_k_sim() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Page: Matchup Explorer
+# ---------------------------------------------------------------------------
+def page_matchup_explorer() -> None:
+    """Head-to-head pitcher vs hitter matchup breakdown."""
+    from src.models.matchup import score_matchup
+    from src.utils.constants import LEAGUE_AVG_BY_PITCH_TYPE
+
+    st.markdown('<div class="section-header">Matchup Explorer</div>',
+                unsafe_allow_html=True)
+
+    arsenal_df = load_pitcher_arsenal()
+    vuln_df = load_hitter_vulnerability()
+    str_df = load_hitter_strength()
+    pitcher_proj = load_projections("pitcher")
+    hitter_proj = load_projections("hitter")
+
+    if arsenal_df.empty or vuln_df.empty:
+        st.warning(
+            "Matchup data not found. Re-run "
+            "`python scripts/precompute_dashboard_data.py` to generate it."
+        )
+        return
+
+    # --- Selectors ---
+    col1, col2 = st.columns(2)
+    with col1:
+        pitcher_names = sorted(pitcher_proj["pitcher_name"].unique().tolist()) if not pitcher_proj.empty else []
+        if not pitcher_names:
+            st.warning("No pitcher projections available.")
+            return
+        selected_pitcher = st.selectbox("Select Pitcher", pitcher_names, key="mu_pitcher")
+    with col2:
+        hitter_names = sorted(hitter_proj["batter_name"].unique().tolist()) if not hitter_proj.empty else []
+        if not hitter_names:
+            st.warning("No hitter projections available.")
+            return
+        selected_hitter = st.selectbox("Select Hitter", hitter_names, key="mu_hitter")
+
+    pitcher_row = pitcher_proj[pitcher_proj["pitcher_name"] == selected_pitcher].iloc[0]
+    hitter_row = hitter_proj[hitter_proj["batter_name"] == selected_hitter].iloc[0]
+    pitcher_id = int(pitcher_row["pitcher_id"])
+    batter_id = int(hitter_row["batter_id"])
+
+    # Score the matchup
+    baselines_pt: dict[str, dict[str, float]] = {}
+    for pt, vals in LEAGUE_AVG_BY_PITCH_TYPE.items():
+        baselines_pt[pt] = vals if isinstance(vals, dict) else {"whiff_rate": 0.25}
+
+    matchup = score_matchup(
+        pitcher_id, batter_id, arsenal_df, vuln_df, baselines_pt,
+    )
+
+    # --- Matchup header ---
+    lift = matchup["matchup_k_logit_lift"]
+    if lift > 0.15:
+        edge_label = "Pitcher Advantage"
+        edge_color = SAGE
+    elif lift < -0.15:
+        edge_label = "Hitter Advantage"
+        edge_color = EMBER
+    else:
+        edge_label = "Neutral Matchup"
+        edge_color = GOLD
+
+    pitcher_hand = pitcher_row.get("pitch_hand", "?")
+    hitter_hand = hitter_row.get("batter_stand", "?")
+    hand_str = f"{'LHP' if pitcher_hand == 'L' else 'RHP'} vs {'LHH' if hitter_hand == 'L' else 'RHH'}"
+
+    st.markdown(f"""
+    <div class="brand-header">
+        <div>
+            <div class="brand-title">{selected_pitcher} vs {selected_hitter}</div>
+            <div class="brand-subtitle">{hand_str} | 2025 pitch-type profiles</div>
+        </div>
+        <div style="text-align:right;">
+            <div style="color:{edge_color}; font-size:1.1rem; font-weight:600;">
+                {edge_label}
+            </div>
+            <div style="color:{SLATE}; font-size:0.85rem;">
+                K Lift: {lift:+.3f} logit
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # --- Summary metrics ---
+    m_cols = st.columns(4)
+    mwhiff = matchup["matchup_whiff_rate"]
+    bwhiff = matchup["baseline_whiff_rate"]
+    with m_cols[0]:
+        st.markdown(
+            _metric_card("Matchup Whiff", _fmt_pct(mwhiff) if pd.notna(mwhiff) else "--"),
+            unsafe_allow_html=True,
+        )
+    with m_cols[1]:
+        st.markdown(
+            _metric_card("Baseline Whiff", _fmt_pct(bwhiff) if pd.notna(bwhiff) else "--"),
+            unsafe_allow_html=True,
+        )
+    with m_cols[2]:
+        st.markdown(
+            _metric_card("Pitch Types", str(matchup["n_pitch_types"])),
+            unsafe_allow_html=True,
+        )
+    with m_cols[3]:
+        st.markdown(
+            _metric_card("Data Reliability", f"{matchup['avg_reliability']:.0%}"),
+            unsafe_allow_html=True,
+        )
+
+    # --- Pitch-by-pitch breakdown ---
+    st.markdown('<div class="section-header">Pitch-by-Pitch Breakdown</div>',
+                unsafe_allow_html=True)
+
+    p_arsenal = arsenal_df[
+        (arsenal_df["pitcher_id"] == pitcher_id) & (arsenal_df["pitches"] >= 20)
+    ].sort_values("usage_pct", ascending=False).copy()
+
+    if p_arsenal.empty:
+        st.info("Insufficient arsenal data for detailed breakdown.")
+    else:
+        breakdown_rows = []
+        for _, row in p_arsenal.iterrows():
+            pt = row["pitch_type"]
+            # Hitter's whiff against this pitch type
+            h_row = vuln_df[
+                (vuln_df["batter_id"] == batter_id) & (vuln_df["pitch_type"] == pt)
+            ]
+            h_whiff = float(h_row["whiff_rate"].iloc[0]) if len(h_row) > 0 and pd.notna(h_row["whiff_rate"].iloc[0]) else None
+            h_chase = float(h_row["chase_rate"].iloc[0]) if len(h_row) > 0 and "chase_rate" in h_row.columns and pd.notna(h_row["chase_rate"].iloc[0]) else None
+
+            # Hitter's strength against this pitch type
+            s_row = str_df[
+                (str_df["batter_id"] == batter_id) & (str_df["pitch_type"] == pt)
+            ] if not str_df.empty else pd.DataFrame()
+            h_barrel = float(s_row["barrel_rate_contact"].iloc[0]) if len(s_row) > 0 and pd.notna(s_row["barrel_rate_contact"].iloc[0]) else None
+
+            breakdown_rows.append({
+                "Pitch": PITCH_DISPLAY.get(pt, pt),
+                "Usage": f"{row['usage_pct']*100:.0f}%",
+                "Velo": f"{row['avg_velo']:.0f}" if pd.notna(row.get("avg_velo")) else "--",
+                "P Whiff%": f"{row['whiff_rate']*100:.0f}%" if pd.notna(row.get("whiff_rate")) else "--",
+                "H Whiff%": f"{h_whiff*100:.0f}%" if h_whiff is not None else "--",
+                "H Chase%": f"{h_chase*100:.0f}%" if h_chase is not None else "--",
+                "H Barrel%": f"{h_barrel*100:.1f}%" if h_barrel is not None else "--",
+            })
+
+        st.dataframe(
+            pd.DataFrame(breakdown_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "P Whiff% = pitcher's whiff rate with that pitch. "
+            "H Whiff% = hitter's whiff rate against that pitch type. "
+            "H Chase% = hitter's chase rate. H Barrel% = hitter's barrel rate on contact."
+        )
+
+    # --- Side-by-side arsenal + vulnerability charts ---
+    st.markdown('<div class="section-header">Visual Profiles</div>',
+                unsafe_allow_html=True)
+
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        if not p_arsenal.empty:
+            fig = _create_arsenal_fig(p_arsenal, selected_pitcher)
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+
+    with chart_col2:
+        h_vuln = vuln_df[vuln_df["batter_id"] == batter_id].copy()
+        h_str = str_df[str_df["batter_id"] == batter_id].copy() if not str_df.empty else pd.DataFrame()
+        if not h_vuln.empty:
+            fig = _create_hitter_vuln_fig(h_vuln, h_str, selected_hitter)
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+
+    # --- Plain English summary ---
+    if pd.notna(mwhiff) and pd.notna(bwhiff):
+        whiff_delta_pp = (mwhiff - bwhiff) * 100
+        if whiff_delta_pp > 2:
+            summary = (
+                f"This is a favorable matchup for **{selected_pitcher}**. "
+                f"The hitter's pitch-type vulnerabilities align well with the pitcher's "
+                f"arsenal, boosting the expected whiff rate by {whiff_delta_pp:.1f}pp above baseline."
+            )
+        elif whiff_delta_pp < -2:
+            summary = (
+                f"This is a tough matchup for **{selected_pitcher}**. "
+                f"**{selected_hitter}** handles this arsenal well, pulling the expected "
+                f"whiff rate {abs(whiff_delta_pp):.1f}pp below the pitcher's baseline."
+            )
+        else:
+            summary = (
+                f"A neutral matchup -- no strong edge either way. "
+                f"The whiff rate shifts by only {whiff_delta_pp:+.1f}pp from baseline."
+            )
+
+        st.markdown(f"""
+        <div class="insight-card">
+            <div class="insight-title">Matchup Summary</div>
+            <div class="insight-bullet">
+                <span class="dot" style="background:{edge_color};"></span>
+                {summary}
+            </div>
+            <div class="insight-bullet">
+                <span class="dot" style="background:{SLATE};"></span>
+                Data reliability: {matchup['avg_reliability']:.0%} (based on sample sizes
+                across {matchup['n_pitch_types']} pitch types).
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -1108,13 +1540,13 @@ def main() -> None:
         st.markdown("---")
         page = st.radio(
             "Navigate",
-            ["Projections", "Player Profile", "Game K Simulator"],
+            ["Projections", "Player Profile", "Matchup Explorer", "Game K Simulator"],
             label_visibility="collapsed",
         )
         st.markdown("---")
         st.markdown(
             f'<div style="color:{SLATE}; font-size:0.75rem; text-align:center;">'
-            f'v1.0 | 2026 Season<br>'
+            f'v1.2 | 2026 Season<br>'
             f'Trained on 2018-2025</div>',
             unsafe_allow_html=True,
         )
@@ -1132,6 +1564,8 @@ def main() -> None:
         page_projections()
     elif page == "Player Profile":
         page_player_profile()
+    elif page == "Matchup Explorer":
+        page_matchup_explorer()
     elif page == "Game K Simulator":
         page_game_k_sim()
 

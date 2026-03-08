@@ -24,7 +24,12 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.feature_eng import build_multi_season_pitcher_k_data
+from src.data.feature_eng import (
+    build_multi_season_pitcher_k_data,
+    get_pitcher_arsenal,
+    get_hitter_vulnerability,
+    get_hitter_strength,
+)
 from src.data.queries import get_pitcher_game_logs
 from src.models.bf_model import compute_pitcher_bf_priors
 from src.models.game_k_model import extract_pitcher_k_rate_samples
@@ -158,6 +163,24 @@ def main() -> None:
     logger.info("Saved BF priors: %d pitcher-seasons", len(bf_priors))
 
     # =================================================================
+    # 5. Matchup profiles (arsenal, vulnerability, strength)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Loading matchup profiles for %d...", FROM_SEASON)
+
+    pitcher_arsenal = get_pitcher_arsenal(FROM_SEASON)
+    pitcher_arsenal.to_parquet(DASHBOARD_DIR / "pitcher_arsenal.parquet", index=False)
+    logger.info("Saved pitcher arsenal: %d rows", len(pitcher_arsenal))
+
+    hitter_vuln = get_hitter_vulnerability(FROM_SEASON)
+    hitter_vuln.to_parquet(DASHBOARD_DIR / "hitter_vuln.parquet", index=False)
+    logger.info("Saved hitter vulnerability: %d rows", len(hitter_vuln))
+
+    hitter_str = get_hitter_strength(FROM_SEASON)
+    hitter_str.to_parquet(DASHBOARD_DIR / "hitter_str.parquet", index=False)
+    logger.info("Saved hitter strength: %d rows", len(hitter_str))
+
+    # =================================================================
     # Summary
     # =================================================================
     logger.info("=" * 60)
@@ -166,6 +189,9 @@ def main() -> None:
     logger.info("  Pitcher projections: %d players", len(pitcher_proj))
     logger.info("  K%% samples:          %d pitchers", len(k_samples_dict))
     logger.info("  BF priors:           %d pitcher-seasons", len(bf_priors))
+    logger.info("  Pitcher arsenal:     %d rows", len(pitcher_arsenal))
+    logger.info("  Hitter vulnerability:%d rows", len(hitter_vuln))
+    logger.info("  Hitter strength:     %d rows", len(hitter_str))
     logger.info("  Output dir:          %s", DASHBOARD_DIR)
 
 
