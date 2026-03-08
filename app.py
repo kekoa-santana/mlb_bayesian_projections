@@ -661,48 +661,102 @@ def _whiff_quality_color(whiff_rate: float) -> str:
         return EMBER
 
 
+def _xwoba_quality_color(xwoba: float) -> str:
+    """Color-code xwOBA against: green=suppresses contact, red=gets hit."""
+    if xwoba <= 0.280:
+        return SAGE
+    elif xwoba <= 0.340:
+        return GOLD
+    elif xwoba <= 0.400:
+        return SLATE
+    else:
+        return EMBER
+
+
 def _create_arsenal_fig(
     arsenal_df: pd.DataFrame,
     pitcher_name: str,
 ) -> plt.Figure:
-    """Horizontal bar chart of a pitcher's arsenal, color-coded by whiff quality."""
-    df = arsenal_df.sort_values("usage_pct", ascending=True).copy()
-    df["label"] = df["pitch_type"].map(PITCH_DISPLAY).fillna(df["pitch_type"])
+    """Pitcher arsenal chart.
 
-    fig, ax = plt.subplots(figsize=(7, max(2.2, len(df) * 0.55)))
+    Bar length = velocity (fixed 0-103 axis).
+    Bar thickness = usage %.
+    Bar color = whiff rate quality.
+    Dot at end = xwOBA against quality.
+    Ordered by usage % (highest at top).
+    """
+    df = arsenal_df.sort_values("usage_pct", ascending=True).copy()
+    df["label"] = (
+        df["pitch_type"].map(PITCH_DISPLAY).fillna(df["pitch_type"])
+        + "  " + (df["usage_pct"] * 100).round(0).astype(int).astype(str) + "%"
+    )
+
+    n = len(df)
+    # Bar thickness proportional to usage — min 0.25, max 0.85
+    max_usage = df["usage_pct"].max()
+    min_thickness, max_thickness = 0.25, 0.85
+    df["thickness"] = min_thickness + (
+        (df["usage_pct"] / max_usage) * (max_thickness - min_thickness)
+    )
+
+    fig, ax = plt.subplots(figsize=(7, max(2.5, n * 0.6)))
     fig.patch.set_facecolor(DARK)
     ax.set_facecolor(DARK)
 
-    colors = [_whiff_quality_color(w) if pd.notna(w) else SLATE for w in df["whiff_rate"]]
-    bars = ax.barh(df["label"], df["usage_pct"] * 100, color=colors, height=0.6, alpha=0.85)
+    y_positions = np.arange(n)
 
-    for bar, (_, row) in zip(bars, df.iterrows()):
-        usage = row["usage_pct"] * 100
+    for i, (_, row) in enumerate(df.iterrows()):
         velo = row.get("avg_velo", np.nan)
         whiff = row.get("whiff_rate", np.nan)
-        parts = []
-        if pd.notna(velo):
-            parts.append(f"{velo:.0f} mph")
-        if pd.notna(whiff):
-            parts.append(f"Whiff: {whiff*100:.0f}%")
-        annotation = "  " + " | ".join(parts) if parts else ""
-        ax.text(
-            usage + 0.8, bar.get_y() + bar.get_height() / 2,
-            annotation, color=CREAM, fontsize=9, va="center",
+        xwoba = row.get("xwoba_against", np.nan)
+        bar_len = velo if pd.notna(velo) else 0
+        color = _whiff_quality_color(whiff) if pd.notna(whiff) else SLATE
+        thickness = row["thickness"]
+
+        # Draw velocity bar
+        ax.barh(
+            y_positions[i], bar_len, height=thickness,
+            color=color, alpha=0.85, zorder=2,
         )
 
-    ax.set_xlabel("Usage %", color=SLATE, fontsize=10)
+        # xwOBA dot at end of bar
+        if pd.notna(xwoba) and bar_len > 0:
+            dot_color = _xwoba_quality_color(xwoba)
+            ax.scatter(
+                bar_len, y_positions[i],
+                s=90, color=dot_color, edgecolors=CREAM,
+                linewidths=0.8, zorder=3,
+            )
+
+        # Annotation: whiff% and xwOBA text to the right
+        parts = []
+        if pd.notna(whiff):
+            parts.append(f"Whiff {whiff*100:.0f}%")
+        if pd.notna(xwoba):
+            parts.append(f"xwOBA .{int(xwoba*1000):03d}")
+        if parts:
+            ax.text(
+                104, y_positions[i], "  " + " | ".join(parts),
+                color=CREAM, fontsize=8.5, va="center", ha="left",
+            )
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(df["label"])
+    ax.set_xlim(0, 103)
+    ax.set_xlabel("Velocity (mph)", color=SLATE, fontsize=10)
     ax.set_title(
         f"{pitcher_name} -- Pitch Arsenal (2025)",
         color=CREAM, fontsize=12, fontweight="bold", pad=10,
     )
-    ax.tick_params(colors=CREAM, labelsize=10)
-    ax.set_xlim(0, df["usage_pct"].max() * 100 + 18)
+    ax.tick_params(axis="y", colors=CREAM, labelsize=10)
+    ax.tick_params(axis="x", colors=SLATE, labelsize=9)
     for spine in ax.spines.values():
         spine.set_visible(False)
 
     add_watermark(fig)
     fig.tight_layout()
+    # Make room for annotations after tight_layout
+    fig.subplots_adjust(right=0.60)
     return fig
 
 
@@ -1065,11 +1119,16 @@ def page_player_profile() -> None:
                     st.pyplot(fig, use_container_width=True)
                 plt.close(fig)
                 st.caption(
-                    "Bar color = whiff quality: "
-                    f'<span style="color:{SAGE};">elite (35%+)</span> | '
-                    f'<span style="color:{GOLD};">above-avg (25-35%)</span> | '
-                    f'<span style="color:{SLATE};">avg (15-25%)</span> | '
-                    f'<span style="color:{EMBER};">below-avg (<15%)</span>',
+                    "**Bar length** = velocity (0-103 mph) | "
+                    "**Bar thickness** = usage % | "
+                    "**Bar color** = whiff quality "
+                    f'(<span style="color:{SAGE};">35%+</span> '
+                    f'<span style="color:{GOLD};">25-35%</span> '
+                    f'<span style="color:{SLATE};">15-25%</span> '
+                    f'<span style="color:{EMBER};">&lt;15%</span>) | '
+                    "**Dot** = xwOBA against "
+                    f'(<span style="color:{SAGE};">.280-</span> '
+                    f'<span style="color:{EMBER};">.400+</span>)',
                     unsafe_allow_html=True,
                 )
     else:

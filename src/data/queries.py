@@ -168,8 +168,8 @@ def get_pitcher_arsenal_profile(season: int) -> pd.DataFrame:
     -------
     pd.DataFrame
         Columns: pitcher_id, pitch_hand, pitch_type, pitches, total_pitches,
-        usage_pct, swings, whiffs, bip, barrels_proxy, avg_velo,
-        avg_pfx_x, avg_pfx_z, hard_hits.
+        usage_pct, swings, whiffs, bip, barrels_proxy, hard_hits,
+        xwoba_against, avg_velo, avg_pfx_x, avg_pfx_z.
     """
     query = """
     WITH pitcher_totals AS (
@@ -210,7 +210,8 @@ def get_pitcher_arsenal_profile(season: int) -> pd.DataFrame:
             SUM(CASE WHEN sbb.hard_hit THEN 1 ELSE 0 END) AS hard_hits,
             SUM(CASE WHEN sbb.launch_speed >= 98
                       AND sbb.launch_angle BETWEEN 26 AND 30
-                      THEN 1 ELSE 0 END)                   AS barrels_proxy
+                      THEN 1 ELSE 0 END)                   AS barrels_proxy,
+            AVG(CASE WHEN sbb.xwoba != 'NaN' THEN sbb.xwoba END) AS xwoba_against
         FROM production.fact_pitch fp
         JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
         JOIN production.sat_batted_balls sbb ON fp.pitch_id = sbb.pitch_id
@@ -231,6 +232,7 @@ def get_pitcher_arsenal_profile(season: int) -> pd.DataFrame:
         pa.bip,
         COALESCE(ba.barrels_proxy, 0)  AS barrels_proxy,
         COALESCE(ba.hard_hits, 0)      AS hard_hits,
+        ROUND(ba.xwoba_against::numeric, 3) AS xwoba_against,
         ROUND(pa.avg_velo::numeric, 1) AS avg_velo,
         ROUND(pa.avg_pfx_x::numeric, 2) AS avg_pfx_x,
         ROUND(pa.avg_pfx_z::numeric, 2) AS avg_pfx_z
