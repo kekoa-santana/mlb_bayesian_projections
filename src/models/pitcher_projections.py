@@ -134,10 +134,13 @@ def project_forward(
     first_df = first_data["df"]
 
     # Get pitchers from the projection season with enough BF
+    keep_cols = ["pitcher_id", "pitcher_name", "pitch_hand", "season", "age",
+                  "age_bucket", "batters_faced", "is_starter"]
+    if "skill_tier" in first_df.columns:
+        keep_cols.append("skill_tier")
     base = first_df[
         (first_df["season"] == from_season) & (first_df["batters_faced"] >= min_bf)
-    ][["pitcher_id", "pitcher_name", "pitch_hand", "season", "age",
-       "age_bucket", "batters_faced", "is_starter"]].copy()
+    ][keep_cols].copy()
 
     if len(base) == 0:
         logger.warning("No pitchers found in season %d with >= %d BF",

@@ -137,10 +137,13 @@ def project_forward(
     first_df = first_data["df"]
 
     # Get players from the projection season with enough PA
+    keep_cols = ["batter_id", "batter_name", "batter_stand", "season", "age",
+                  "age_bucket", "pa"]
+    if "skill_tier" in first_df.columns:
+        keep_cols.append("skill_tier")
     base = first_df[
         (first_df["season"] == from_season) & (first_df["pa"] >= min_pa)
-    ][["batter_id", "batter_name", "batter_stand", "season", "age",
-       "age_bucket", "pa"]].copy()
+    ][keep_cols].copy()
 
     if len(base) == 0:
         logger.warning("No players found in season %d with >= %d PA",

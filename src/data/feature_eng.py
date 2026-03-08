@@ -700,11 +700,111 @@ def build_multi_season_hitter_data(
 
     combined["age_bucket"] = combined["age_bucket"].astype(int)
 
+    combined = assign_skill_tier(combined, player_type="hitter")
+
     logger.info(
         "Multi-season hitter data: %d player-seasons across %s",
         len(combined), seasons,
     )
     return combined
+
+
+# ---------------------------------------------------------------------------
+# Statcast skill tier assignment
+# ---------------------------------------------------------------------------
+N_SKILL_TIERS = 4
+SKILL_TIER_LABELS = {
+    0: "below-avg",
+    1: "average",
+    2: "above-avg",
+    3: "elite",
+}
+
+
+def assign_skill_tier(
+    df: pd.DataFrame,
+    player_type: str = "hitter",
+) -> pd.DataFrame:
+    """Assign Statcast-based skill tiers to each player-season.
+
+    Computes a composite skill score from available Statcast indicators
+    and assigns quartile-based tiers (0=below-avg through 3=elite).
+
+    For hitters: barrel_pct + hard_hit_pct (contact quality).
+    For pitchers: whiff_rate + (1 - barrel_rate_against) (stuff quality).
+
+    Tiers are computed per season to avoid leaking cross-season info.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Multi-season player data with Statcast columns.
+    player_type : str
+        "hitter" or "pitcher".
+
+    Returns
+    -------
+    pd.DataFrame
+        Input DataFrame with ``skill_tier`` column added (int 0-3).
+    """
+    df = df.copy()
+    df["skill_tier"] = 1  # default to average
+
+    for season in df["season"].unique():
+        mask = df["season"] == season
+
+        if player_type == "hitter":
+            cols = ["barrel_pct", "hard_hit_pct"]
+        else:
+            cols = ["whiff_rate", "barrel_rate_against"]
+
+        available = [c for c in cols if c in df.columns]
+        if not available:
+            logger.warning(
+                "No skill tier columns found for %s (season %d), "
+                "defaulting to tier 1",
+                player_type, season,
+            )
+            continue
+
+        season_df = df.loc[mask, available].copy()
+
+        # Z-score each indicator within the season
+        z_scores = pd.DataFrame(index=season_df.index)
+        for col in available:
+            vals = season_df[col].astype(float)
+            mu, sd = vals.mean(), vals.std()
+            if np.isclose(sd, 0.0) or pd.isna(sd):
+                z_scores[col] = 0.0
+            else:
+                z_scores[col] = (vals - mu) / sd
+
+        # For pitchers, invert barrel_rate_against (lower = better)
+        if player_type == "pitcher" and "barrel_rate_against" in z_scores.columns:
+            z_scores["barrel_rate_against"] = -z_scores["barrel_rate_against"]
+
+        # Composite = mean of available z-scores (NaN-safe)
+        composite = z_scores.mean(axis=1).fillna(0.0)
+
+        # Assign quartile-based tiers
+        try:
+            tiers = pd.qcut(composite, q=N_SKILL_TIERS, labels=False)
+        except ValueError:
+            # Too few unique values for quartiles — fall back to rank
+            tiers = pd.cut(
+                composite.rank(method="first"),
+                bins=N_SKILL_TIERS,
+                labels=False,
+            )
+
+        df.loc[mask, "skill_tier"] = tiers.fillna(1).astype(int)
+
+    logger.info(
+        "Skill tiers assigned (%s): %s",
+        player_type,
+        df["skill_tier"].value_counts().sort_index().to_dict(),
+    )
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +901,8 @@ def build_multi_season_pitcher_data(
         logger.warning("Dropped %d pitcher rows with missing age", n_dropped)
 
     combined["age_bucket"] = combined["age_bucket"].astype(int)
+
+    combined = assign_skill_tier(combined, player_type="pitcher")
 
     logger.info(
         "Multi-season pitcher data: %d player-seasons across %s",

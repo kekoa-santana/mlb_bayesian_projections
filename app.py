@@ -771,6 +771,11 @@ def page_player_profile() -> None:
     if player_type == "Pitcher" and "is_starter" in player_row.index:
         role = "SP" if player_row["is_starter"] else "RP"
 
+    # Skill tier label
+    _TIER_LABELS = {0: "Below-Avg", 1: "Average", 2: "Above-Avg", 3: "Elite"}
+    skill_tier = int(player_row.get("skill_tier", 1)) if pd.notna(player_row.get("skill_tier")) else None
+    tier_label = _TIER_LABELS.get(skill_tier, "") if skill_tier is not None else ""
+
     header_parts = [f"Age {age}"]
     if hand:
         if player_type == "Pitcher":
@@ -779,6 +784,8 @@ def page_player_profile() -> None:
             header_parts.append(f"Bats {'L' if hand == 'L' else 'R'}")
     if role:
         header_parts.append(role)
+    if tier_label:
+        header_parts.append(f"Skill Tier: {tier_label}")
 
     composite = player_row["composite_score"]
     comp_color = POSITIVE if composite > 0 else NEGATIVE if composite < 0 else SLATE

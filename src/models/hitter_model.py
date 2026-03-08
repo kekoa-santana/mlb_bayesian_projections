@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 
+from src.data.feature_eng import N_SKILL_TIERS, SKILL_TIER_LABELS
 from src.utils.constants import LEAGUE_AVG_OVERALL
 
 logger = logging.getLogger(__name__)
@@ -169,8 +170,9 @@ def prepare_hitter_data(
     n_players = len(player_ids)
     n_seasons = df["season_idx"].max() + 1
 
-    # Age bucket per player (use most recent season's age bucket)
+    # Age bucket + skill tier per player (use most recent season)
     player_age_bucket = np.zeros(n_players, dtype=int)
+    player_skill_tier = np.ones(n_players, dtype=int)  # default: average (1)
     latest_season = df.groupby("player_idx")["season"].max()
     for pidx in range(n_players):
         if pidx in latest_season.index:
@@ -178,6 +180,10 @@ def prepare_hitter_data(
             rows = df[(df["player_idx"] == pidx) & (df["season"] == latest_s)]
             if len(rows) > 0:
                 player_age_bucket[pidx] = int(rows.iloc[0]["age_bucket"])
+                if "skill_tier" in rows.columns:
+                    player_skill_tier[pidx] = int(rows.iloc[0].get(
+                        "skill_tier", 1,
+                    ))
 
     # Z-score covariates
     cov_arrays = {}
@@ -201,6 +207,7 @@ def prepare_hitter_data(
         "player_ids": player_ids,
         "min_season": min_season,
         "player_age_bucket": player_age_bucket,
+        "player_skill_tier": player_skill_tier,
         "covariates": cov_arrays,
         "stat": stat,
         "df": df,
@@ -252,6 +259,7 @@ def build_hitter_model(
     n_players = data["n_players"]
     n_seasons = data["n_seasons"]
     age_bucket = data["player_age_bucket"]
+    skill_tier = data["player_skill_tier"]
 
     if cfg.likelihood == "binomial":
         league_logit = np.log(cfg.league_avg / (1 - cfg.league_avg))
@@ -259,12 +267,12 @@ def build_hitter_model(
         league_logit = cfg.league_avg  # not actually logit for normal
 
     with pm.Model() as model:
-        # --- Age-bucket population means ---
+        # --- Age-bucket x skill-tier population means ---
         mu_pop = pm.Normal(
             "mu_pop",
             mu=league_logit,
             sigma=0.3,
-            shape=N_AGE_BUCKETS,
+            shape=(N_AGE_BUCKETS, N_SKILL_TIERS),
         )
 
         sigma_player = pm.HalfNormal("sigma_player", sigma=cfg.sigma_player_prior)
@@ -280,7 +288,7 @@ def build_hitter_model(
         alpha_raw = pm.Normal("alpha_raw", mu=0, sigma=1, shape=n_players)
         alpha = pm.Deterministic(
             "alpha",
-            mu_pop[age_bucket] + sigma_player * alpha_raw,
+            mu_pop[age_bucket, skill_tier] + sigma_player * alpha_raw,
         )
 
         # --- Season random walk ---
@@ -438,6 +446,7 @@ def extract_posteriors(
             "season": row["season"],
             "age": row.get("age", None),
             "age_bucket": row.get("age_bucket", None),
+            "skill_tier": row.get("skill_tier", 1),
             "pa": row["pa"],
             f"observed_{stat}": row[cfg.rate_col],
             f"{stat}_mean": float(np.mean(samples)),

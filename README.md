@@ -145,41 +145,47 @@ Built on a PostgreSQL database with comprehensive MLB data (2018-2025):
 - Game-level K posterior simulator
 - Interactive dashboard with scouting reports and percentile rankings
 
-### v1.1 -- Matchup Explorer
+### v1.1 -- Statcast Skill Tier Priors
+- Cluster players into skill tiers (elite, above-average, average, below-average) using Statcast indicators (exit velo, hard-hit rate, whiff rate)
+- Replace single population prior with tier-specific priors in the hierarchical model -- young elite hitters regress toward the elite mean, not the league mean
+- Biggest impact for players with 1-2 seasons of data where shrinkage is heaviest
+- Show skill tier in dashboard player profiles
+
+### v1.2 -- Matchup Explorer
 - Surface the Layer 2 matchup model in the dashboard
 - Pitcher vs. hitter pitch-type breakdown visualizations
 - Arsenal and vulnerability profile charts
 
-### v1.2 -- Season Counting Stat Projections
+### v1.3 -- Season Counting Stat Projections (was v1.2)
 - Combine K% posteriors with season-level workload projections to produce full-season K totals (e.g., "projected 158-204 Ks with 95% confidence")
 - Extend to wins, IP, and other counting stats
 - More tangible output format for non-technical audiences
 
-### v1.3 -- Game Context Integration
+### v1.4 -- Game Context Integration
 - **Park factors** -- HR park adjustments by batter handedness into HR and xwOBA projections
 - **Umpire tendencies** -- Home plate umpire K-rate adjustments into the Game K model
 - **Weather** -- Temperature and wind effects on batted ball outcomes
 
-### v1.4 -- Lineup-Aware Game Simulator
+### v1.5 -- Lineup-Aware Game Simulator
 - Real lineup data feeds the Game K simulator instead of league-average assumptions
 - Per-batter matchup adjustments using Layer 2 profiles
 - Batting order position weighting for plate appearance probability
 
-### v1.5 -- In-Season Updating
+### v1.6 -- In-Season Updating
 - Bayesian posterior updating as 2026 games are played
 - Separate rolling form from true-talent shifts
 - Spring training signal integration
 
-### v1.6 -- Probability Calibration & Decision Support
+### v1.7 -- Probability Calibration & Decision Support
 - Systematic tracking of model calibration across all prediction types
 - Optimal decision-making framework under uncertainty (Kelly criterion)
 - Historical accuracy reporting and model comparison
 
-### v1.7 -- Fantasy Scoring Layer
+### v1.8 -- Fantasy Scoring Layer
 - Translate player projections into DraftKings and ESPN fantasy point distributions
 - Uncertainty-aware fantasy valuations
 
-### v1.8 -- Content Pipeline
+### v1.9 -- Content Pipeline
 - Auto-generated daily matchup cards using brand theme
 - Biggest posterior shift alerts (breakout/regression movers)
 - Streamlined social content workflow
