@@ -333,14 +333,15 @@ def _pctile_bar_html(
     color = _pctile_color(pctile)
     ci_str = f"{_fmt_stat(ci_lo, key)} - {_fmt_stat(ci_hi, key)}"
     return (
-        f'<div style="display:flex; align-items:center; margin:10px 0;">'
-        f'<div style="width:65px; color:{SLATE}; font-size:0.85rem; font-weight:600;">{label}</div>'
-        f'<div style="flex:1; background:{DARK}; border-radius:6px; height:22px; '
-        f'position:relative; overflow:hidden; border:1px solid {DARK_BORDER};">'
+        f'<div style="margin:12px 0;">'
+        f'<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">'
+        f'<span style="color:{SLATE}; font-size:0.85rem; font-weight:600;">{label}</span>'
+        f'<span style="color:{SLATE}; font-size:0.8rem;">{pctile:.0f}th percentile | Range: {ci_str}</span>'
+        f'</div>'
+        f'<div style="width:100%; background:{DARK}; border-radius:6px; height:22px; '
+        f'overflow:hidden; border:1px solid {DARK_BORDER};">'
         f'<div style="height:100%; width:{pctile:.0f}%; background:{color}; border-radius:5px;"></div>'
         f'</div>'
-        f'<div style="width:240px; text-align:right; color:{SLATE}; font-size:0.8rem; '
-        f'padding-left:12px;">{pctile:.0f}th percentile | Range: {ci_str}</div>'
         f'</div>'
     )
 
