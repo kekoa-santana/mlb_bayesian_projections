@@ -14,14 +14,6 @@ from src.viz.theme import (
     format_pct,
     save_card,
 )
-from src.viz.projections import (
-    enrich_with_team_info,
-    find_movers,
-    plot_hitter_k_movers,
-    plot_pitcher_card,
-    plot_pitcher_k_movers,
-    project_posteriors_forward,
-)
 
 __all__ = [
     "CREAM",
@@ -35,12 +27,6 @@ __all__ = [
     "add_header",
     "add_watermark",
     "apply_theme",
-    "enrich_with_team_info",
-    "find_movers",
     "format_pct",
-    "plot_hitter_k_movers",
-    "plot_pitcher_card",
-    "plot_pitcher_k_movers",
-    "project_posteriors_forward",
     "save_card",
 ]
