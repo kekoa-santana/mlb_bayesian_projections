@@ -71,8 +71,6 @@ def _short_name(full_name: str) -> str:
 _HITTER_STATS = [
     ("k_rate",  "K%",   -1, True),
     ("bb_rate", "BB%",  +1, True),
-    ("hr_rate", "HR%",  +1, True),
-    ("xwoba",   "xwOBA", +1, False),
 ]
 
 
@@ -110,11 +108,11 @@ def plot_hitter_composite(
     if card_type == "breakout":
         title = f"HITTER BREAKOUT CANDIDATES — {season_label}"
         accent = SAGE
-        subtitle = "Projected to improve across K%, BB%, HR%, xwOBA"
+        subtitle = "Composite score: contact, discipline, power, speed, trajectory"
     else:
         title = f"HITTER REGRESSION RISKS — {season_label}"
         accent = _RED
-        subtitle = "Projected to decline across K%, BB%, HR%, xwOBA"
+        subtitle = "Composite score: contact, discipline, power, speed, trajectory"
 
     fig.text(0.50, 0.94, title,
              ha="center", va="center", fontsize=22, color=GOLD,
@@ -132,12 +130,10 @@ def plot_hitter_composite(
     col_x = {
         "rank": 0.02,
         "name": 0.06,
-        "age": 0.28,
-        "k_rate": 0.36,
-        "bb_rate": 0.48,
-        "hr_rate": 0.60,
-        "xwoba": 0.72,
-        "score": 0.88,
+        "age": 0.30,
+        "k_rate": 0.42,
+        "bb_rate": 0.58,
+        "score": 0.80,
     }
 
     # Header row
@@ -208,8 +204,8 @@ def plot_hitter_composite(
     # Legend at bottom
     ax.text(0.01, -0.02,
             "\u0394 = projected change from 2025  |  "
-            "K%/BB%/HR% in percentage points  |  "
-            "Composite = z-score weighted across stats",
+            "K%/BB% in percentage points  |  "
+            "Composite = 6-dimension z-score (contact, discipline, power, speed, BB profile, trajectory)",
             fontsize=9, color=_TEXT_SEC, ha="left", va="top")
 
     add_watermark(fig)
@@ -224,7 +220,6 @@ def plot_hitter_composite(
 _PITCHER_STATS = [
     ("k_rate",    "K%",    +1, True),
     ("bb_rate",   "BB%",   -1, True),
-    ("hr_per_bf", "HR/BF", -1, True),
 ]
 
 
@@ -261,11 +256,11 @@ def plot_pitcher_composite(
     if card_type == "breakout":
         title = f"PITCHER BREAKOUT CANDIDATES — {season_label}"
         accent = SAGE
-        subtitle = "Projected to improve across K%, BB%, HR/BF"
+        subtitle = "Composite score: stuff, command, ground ball profile, trajectory"
     else:
         title = f"PITCHER REGRESSION RISKS — {season_label}"
         accent = _RED
-        subtitle = "Projected to decline across K%, BB%, HR/BF"
+        subtitle = "Composite score: stuff, command, ground ball profile, trajectory"
 
     fig.text(0.50, 0.94, title,
              ha="center", va="center", fontsize=22, color=GOLD,
@@ -283,10 +278,9 @@ def plot_pitcher_composite(
         "name": 0.06,
         "age": 0.30,
         "role": 0.37,
-        "k_rate": 0.47,
-        "bb_rate": 0.59,
-        "hr_per_bf": 0.71,
-        "score": 0.88,
+        "k_rate": 0.50,
+        "bb_rate": 0.65,
+        "score": 0.82,
     }
 
     header_y = 0.96
@@ -352,8 +346,8 @@ def plot_pitcher_composite(
 
     ax.text(0.01, -0.02,
             "\u0394 = projected change from 2025  |  "
-            "All deltas in percentage points  |  "
-            "Composite = z-score weighted across stats",
+            "K%/BB% in percentage points  |  "
+            "Composite = 4-dimension z-score (stuff, command, GB profile, trajectory)",
             fontsize=9, color=_TEXT_SEC, ha="left", va="top")
 
     add_watermark(fig)

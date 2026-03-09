@@ -13,14 +13,19 @@ import pandas as pd
 
 from src.data.queries import (
     get_game_batter_ks,
+    get_hitter_observed_profile,
     get_hitter_pitch_type_profile,
+    get_hitter_season_totals_extended,
     get_pitcher_arsenal_profile,
     get_pitcher_game_logs,
+    get_pitcher_observed_profile,
     get_pitcher_season_totals,
     get_pitcher_season_totals_with_age,
+    get_pitcher_season_totals_extended,
     get_season_totals,
     get_season_totals_by_pitcher_hand,
     get_season_totals_with_age,
+    get_sprint_speed,
 )
 from src.utils.constants import (
     EXCLUDED_PITCH_TYPES,
@@ -907,6 +912,165 @@ def build_multi_season_pitcher_data(
 
     logger.info(
         "Multi-season pitcher data: %d player-seasons across %s",
+        len(combined), seasons,
+    )
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Hitter observed profile (cached)
+# ---------------------------------------------------------------------------
+def get_cached_hitter_observed_profile(
+    season: int, force_rebuild: bool = False
+) -> pd.DataFrame:
+    """Hitter observed pitch-level profile with Parquet caching.
+
+    Returns per-batter: whiff_rate, chase_rate, z_contact_pct,
+    avg_exit_velo, fb_pct, hard_hit_pct.
+    """
+    return _load_or_build(
+        "hitter_observed_profile", season,
+        get_hitter_observed_profile, force_rebuild,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sprint speed (cached)
+# ---------------------------------------------------------------------------
+def get_cached_sprint_speed(
+    season: int, force_rebuild: bool = False
+) -> pd.DataFrame:
+    """Sprint speed with Parquet caching."""
+    return _load_or_build(
+        "sprint_speed", season, get_sprint_speed, force_rebuild,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pitcher observed profile (cached)
+# ---------------------------------------------------------------------------
+def get_cached_pitcher_observed_profile(
+    season: int, force_rebuild: bool = False
+) -> pd.DataFrame:
+    """Pitcher observed pitch-level profile with Parquet caching.
+
+    Returns per-pitcher: whiff_rate, avg_velo, release_extension,
+    zone_pct, gb_pct.
+    """
+    return _load_or_build(
+        "pitcher_observed_profile", season,
+        get_pitcher_observed_profile, force_rebuild,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Extended hitter season totals (cached) — includes games, SB, CS
+# ---------------------------------------------------------------------------
+def get_cached_hitter_season_totals_extended(
+    season: int, force_rebuild: bool = False
+) -> pd.DataFrame:
+    """Extended hitter season totals with games, SB, CS from boxscores."""
+    return _load_or_build(
+        "hitter_season_extended", season,
+        get_hitter_season_totals_extended, force_rebuild,
+    )
+
+
+def build_multi_season_hitter_extended(
+    seasons: list[int], min_pa: int = 1
+) -> pd.DataFrame:
+    """Stack extended hitter totals and merge sprint speed.
+
+    Parameters
+    ----------
+    seasons : list[int]
+        Seasons to include.
+    min_pa : int
+        Minimum PA per player-season.
+
+    Returns
+    -------
+    pd.DataFrame
+        Extended hitter data with sprint_speed merged.
+    """
+    frames = []
+    for s in seasons:
+        df = get_cached_hitter_season_totals_extended(s, force_rebuild=False)
+        if min_pa > 1:
+            df = df[df["pa"] >= min_pa]
+
+        # Merge sprint speed
+        try:
+            sprint = get_cached_sprint_speed(s)
+            df = df.merge(
+                sprint[["player_id", "sprint_speed"]].rename(
+                    columns={"player_id": "batter_id"}
+                ),
+                on="batter_id",
+                how="left",
+            )
+        except Exception:
+            if "sprint_speed" not in df.columns:
+                df["sprint_speed"] = np.nan
+
+        frames.append(df)
+
+    combined = pd.concat(frames, ignore_index=True)
+
+    # Drop rows with missing age
+    combined = combined.dropna(subset=["age", "age_bucket"])
+    combined["age_bucket"] = combined["age_bucket"].astype(int)
+
+    logger.info(
+        "Multi-season extended hitter data: %d player-seasons across %s",
+        len(combined), seasons,
+    )
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Extended pitcher season totals (cached) — includes outs directly
+# ---------------------------------------------------------------------------
+def get_cached_pitcher_season_totals_extended(
+    season: int, force_rebuild: bool = False
+) -> pd.DataFrame:
+    """Extended pitcher season totals with outs from pitching boxscores."""
+    return _load_or_build(
+        "pitcher_season_extended", season,
+        get_pitcher_season_totals_extended, force_rebuild,
+    )
+
+
+def build_multi_season_pitcher_extended(
+    seasons: list[int], min_bf: int = 1
+) -> pd.DataFrame:
+    """Stack extended pitcher totals across seasons.
+
+    Parameters
+    ----------
+    seasons : list[int]
+        Seasons to include.
+    min_bf : int
+        Minimum BF per player-season.
+
+    Returns
+    -------
+    pd.DataFrame
+        Extended pitcher data.
+    """
+    frames = []
+    for s in seasons:
+        df = get_cached_pitcher_season_totals_extended(s, force_rebuild=False)
+        if min_bf > 1:
+            df = df[df["batters_faced"] >= min_bf]
+        frames.append(df)
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.dropna(subset=["age", "age_bucket"])
+    combined["age_bucket"] = combined["age_bucket"].astype(int)
+
+    logger.info(
+        "Multi-season extended pitcher data: %d player-seasons across %s",
         len(combined), seasons,
     )
     return combined

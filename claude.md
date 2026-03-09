@@ -231,6 +231,8 @@ Every model must be evaluated with:
 16b. [x] Expand pitcher targets: K%, BB%, HR/BF — generalized pitcher model (`src/models/pitcher_model.py`), composite projections (`src/models/pitcher_projections.py`), age-bucket priors, starter/reliever covariate, backtest: HR/BF beats Marcel MAE all 3, all stats beat Brier, coverage 88-93%
 17. [ ] Betting edge finder and tracker (Kelly sizing)
 18. [x] Content visualizations: `src/viz/theme.py`, `src/viz/projections.py`, `scripts/generate_preseason_content.py`, `docs/style_guide.md` — pitcher/hitter K% mover cards + individual pitcher cards generated for 2026
+19. [x] Counting stat projections: `src/models/pa_model.py` (PA shrinkage), `src/models/counting_projections.py` (rate × playing time Monte Carlo). Hitters: K, BB, HR (beat Marcel 14-17%, 9-17%, 5-11%). Pitchers: K, BB, Outs (beat Marcel 10-18%, 2-13%, 13-16%). Dashboard integrated.
+20. [ ] Fix SB projections — Bayes loses to Marcel (era adjustment too blunt). Retune SB_ERA_FACTOR or use cross-validated era factor, or fall back to Marcel for SB.
 
 ### Projection Target
 - **Full seasons available:** 2018–2025

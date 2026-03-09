@@ -2,9 +2,9 @@
 """
 Pre-compute all data needed by the Streamlit dashboard.
 
-Fits composite hitter + pitcher models, extracts projections and
-posterior K% samples, computes BF priors, and saves everything to
-data/dashboard/.
+Fits composite hitter + pitcher models (K% and BB% only), enriches with
+observed profiles, extracts posterior K% samples, computes BF priors,
+and saves everything to data/dashboard/.
 
 Usage
 -----
@@ -25,18 +25,28 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.feature_eng import (
+    build_multi_season_hitter_extended,
+    build_multi_season_pitcher_extended,
     build_multi_season_pitcher_k_data,
-    get_pitcher_arsenal,
-    get_hitter_vulnerability,
+    get_cached_hitter_observed_profile,
+    get_cached_pitcher_observed_profile,
+    get_cached_sprint_speed,
     get_hitter_strength,
+    get_hitter_vulnerability,
+    get_pitcher_arsenal,
 )
 from src.data.queries import get_pitcher_game_logs
 from src.models.bf_model import compute_pitcher_bf_priors
+from src.models.counting_projections import (
+    project_hitter_counting,
+    project_pitcher_counting,
+)
 from src.models.game_k_model import extract_pitcher_k_rate_samples
 from src.models.hitter_projections import (
     fit_all_models as fit_hitter_models,
     project_forward as project_hitter_forward,
 )
+from src.models.pa_model import compute_hitter_pa_priors
 from src.models.pitcher_k_rate_model import (
     check_pitcher_convergence,
     fit_pitcher_k_rate_model,
@@ -80,10 +90,33 @@ def main() -> None:
         logger.info("FULL mode: draws=%d, tune=%d, chains=%d", draws, tune, chains)
 
     # =================================================================
-    # 1. Hitter composite projections
+    # 0. Pre-cache observed profiles (needed by projection enrichment)
     # =================================================================
     logger.info("=" * 60)
-    logger.info("Fitting hitter composite models...")
+    logger.info("Pre-caching observed profiles for %d...", FROM_SEASON)
+    try:
+        obs_h = get_cached_hitter_observed_profile(FROM_SEASON)
+        logger.info("Hitter observed profile: %d rows", len(obs_h))
+    except Exception as e:
+        logger.warning("Could not cache hitter observed profile: %s", e)
+
+    try:
+        sprint = get_cached_sprint_speed(FROM_SEASON)
+        logger.info("Sprint speed: %d rows", len(sprint))
+    except Exception as e:
+        logger.warning("Could not cache sprint speed: %s", e)
+
+    try:
+        obs_p = get_cached_pitcher_observed_profile(FROM_SEASON)
+        logger.info("Pitcher observed profile: %d rows", len(obs_p))
+    except Exception as e:
+        logger.warning("Could not cache pitcher observed profile: %s", e)
+
+    # =================================================================
+    # 1. Hitter composite projections (K% + BB% projected, observed enriched)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Fitting hitter composite models (K%%, BB%%)...")
     hitter_results = fit_hitter_models(
         seasons=SEASONS, min_pa=100,
         draws=draws, tune=tune, chains=chains, random_seed=42,
@@ -95,10 +128,10 @@ def main() -> None:
     logger.info("Saved hitter projections: %d players", len(hitter_proj))
 
     # =================================================================
-    # 2. Pitcher composite projections
+    # 2. Pitcher composite projections (K% + BB% projected, observed enriched)
     # =================================================================
     logger.info("=" * 60)
-    logger.info("Fitting pitcher composite models...")
+    logger.info("Fitting pitcher composite models (K%%, BB%%)...")
     pitcher_results = fit_pitcher_models(
         seasons=SEASONS, min_bf=100,
         draws=draws, tune=tune, chains=chains, random_seed=42,
@@ -108,6 +141,42 @@ def main() -> None:
     )
     pitcher_proj.to_parquet(DASHBOARD_DIR / "pitcher_projections.parquet", index=False)
     logger.info("Saved pitcher projections: %d players", len(pitcher_proj))
+
+    # =================================================================
+    # 2b. Counting stat projections (K, BB, HR, SB for hitters; K, BB, Outs for pitchers)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Computing counting stat projections...")
+
+    # Hitter counting stats
+    hitter_ext = build_multi_season_hitter_extended(SEASONS, min_pa=1)
+    pa_priors = compute_hitter_pa_priors(
+        hitter_ext, from_season=FROM_SEASON, min_pa=100,
+    )
+    hitter_counting = project_hitter_counting(
+        rate_model_results=hitter_results,
+        pa_priors=pa_priors,
+        hitter_extended=hitter_ext,
+        from_season=FROM_SEASON,
+        n_draws=4000,
+        min_pa=200,
+        random_seed=42,
+    )
+    hitter_counting.to_parquet(DASHBOARD_DIR / "hitter_counting.parquet", index=False)
+    logger.info("Saved hitter counting projections: %d players", len(hitter_counting))
+
+    # Pitcher counting stats
+    pitcher_ext = build_multi_season_pitcher_extended(SEASONS, min_bf=1)
+    pitcher_counting = project_pitcher_counting(
+        rate_model_results=pitcher_results,
+        pitcher_extended=pitcher_ext,
+        from_season=FROM_SEASON,
+        n_draws=4000,
+        min_bf=200,
+        random_seed=42,
+    )
+    pitcher_counting.to_parquet(DASHBOARD_DIR / "pitcher_counting.parquet", index=False)
+    logger.info("Saved pitcher counting projections: %d players", len(pitcher_counting))
 
     # =================================================================
     # 3. Pitcher K% model (for posterior samples → Game K sim)
@@ -256,12 +325,41 @@ def main() -> None:
     logger.info("Saved career hitter strength: %d rows", len(career_str))
 
     # =================================================================
+    # 6. Save preseason snapshot (frozen projections for end-of-season comparison)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Saving preseason snapshot...")
+    snapshot_dir = DASHBOARD_DIR / "snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    from datetime import date
+    snapshot_date = date.today().isoformat()
+    target_season = FROM_SEASON + 1  # projecting INTO this season
+
+    hitter_proj["snapshot_date"] = snapshot_date
+    hitter_proj["target_season"] = target_season
+    pitcher_proj["snapshot_date"] = snapshot_date
+    pitcher_proj["target_season"] = target_season
+
+    h_path = snapshot_dir / f"hitter_projections_{target_season}_preseason.parquet"
+    p_path = snapshot_dir / f"pitcher_projections_{target_season}_preseason.parquet"
+    hitter_proj.to_parquet(h_path, index=False)
+    pitcher_proj.to_parquet(p_path, index=False)
+    logger.info("Saved preseason snapshot: %s, %s", h_path.name, p_path.name)
+
+    # Remove snapshot columns from live projections (they stay in the snapshot files)
+    hitter_proj.drop(columns=["snapshot_date", "target_season"], inplace=True)
+    pitcher_proj.drop(columns=["snapshot_date", "target_season"], inplace=True)
+
+    # =================================================================
     # Summary
     # =================================================================
     logger.info("=" * 60)
     logger.info("Dashboard pre-computation complete!")
     logger.info("  Hitter projections:  %d players", len(hitter_proj))
     logger.info("  Pitcher projections: %d players", len(pitcher_proj))
+    logger.info("  Hitter counting:     %d players", len(hitter_counting))
+    logger.info("  Pitcher counting:    %d players", len(pitcher_counting))
     logger.info("  K%% samples:          %d pitchers", len(k_samples_dict))
     logger.info("  BF priors:           %d pitcher-seasons", len(bf_priors))
     logger.info("  Pitcher arsenal:     %d rows", len(pitcher_arsenal))

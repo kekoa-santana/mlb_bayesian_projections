@@ -926,3 +926,343 @@ def get_pitch_shape_offerings(season: int) -> pd.DataFrame:
     """
     logger.info("Fetching pitch shape offerings for %d", season)
     return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# 14. Hitter observed profile (pitch-level aggregates)
+# ---------------------------------------------------------------------------
+def get_hitter_observed_profile(season: int) -> pd.DataFrame:
+    """Per-batter pitch-level and batted-ball aggregates for composite scoring.
+
+    Returns whiff rate, chase rate, zone contact %, avg exit velocity,
+    fly ball %, and hard-hit % — all aggregated to the batter level.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, whiff_rate, chase_rate, z_contact_pct,
+        avg_exit_velo, fb_pct, hard_hit_pct, bip.
+    """
+    query = """
+    WITH pitch_agg AS (
+        SELECT
+            fp.batter_id,
+            SUM(fp.is_swing::int)                           AS swings,
+            SUM(fp.is_whiff::int)                           AS whiffs,
+            -- Zone: zones 1-9
+            SUM(CASE WHEN fp.zone BETWEEN 1 AND 9
+                     THEN fp.is_swing::int ELSE 0 END)     AS z_swings,
+            SUM(CASE WHEN fp.zone BETWEEN 1 AND 9
+                     THEN fp.is_whiff::int ELSE 0 END)     AS z_whiffs,
+            -- Out of zone: zone > 9 or zone IS NULL
+            SUM(CASE WHEN fp.zone > 9 OR fp.zone IS NULL
+                     THEN 1 ELSE 0 END)                    AS ooz_pitches,
+            SUM(CASE WHEN (fp.zone > 9 OR fp.zone IS NULL)
+                      AND fp.is_swing
+                     THEN 1 ELSE 0 END)                    AS chase_swings
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+          AND fp.pitch_type IS NOT NULL
+          AND fp.pitch_type NOT IN ('PO', 'UN', 'SC', 'FA')
+        GROUP BY fp.batter_id
+    ),
+    batted_agg AS (
+        SELECT
+            fpa.batter_id,
+            COUNT(*)                                                    AS bip,
+            AVG(sbb.launch_speed)                                       AS avg_exit_velo,
+            SUM(CASE WHEN sbb.hard_hit THEN 1 ELSE 0 END)::float
+                / NULLIF(COUNT(*), 0)                                   AS hard_hit_pct,
+            SUM(CASE WHEN sbb.launch_angle > 25 THEN 1 ELSE 0 END)::float
+                / NULLIF(COUNT(*), 0)                                   AS fb_pct
+        FROM production.fact_pa fpa
+        JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
+        JOIN production.sat_batted_balls sbb ON fpa.pa_id = sbb.pa_id
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+          AND sbb.launch_speed != 'NaN'
+        GROUP BY fpa.batter_id
+    )
+    SELECT
+        pa.batter_id,
+        ROUND((pa.whiffs::numeric / NULLIF(pa.swings, 0)), 4)     AS whiff_rate,
+        ROUND((pa.chase_swings::numeric / NULLIF(pa.ooz_pitches, 0)), 4)
+                                                                    AS chase_rate,
+        ROUND(((pa.z_swings - pa.z_whiffs)::numeric
+               / NULLIF(pa.z_swings, 0)), 4)                       AS z_contact_pct,
+        ROUND(ba.avg_exit_velo::numeric, 1)                         AS avg_exit_velo,
+        ROUND(ba.fb_pct::numeric, 4)                                AS fb_pct,
+        ROUND(ba.hard_hit_pct::numeric, 4)                          AS hard_hit_pct,
+        ba.bip
+    FROM pitch_agg pa
+    LEFT JOIN batted_agg ba ON pa.batter_id = ba.batter_id
+    WHERE pa.swings >= 50
+    ORDER BY pa.swings DESC
+    """
+    logger.info("Fetching hitter observed profile for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# 15. Sprint speed
+# ---------------------------------------------------------------------------
+def get_sprint_speed(season: int) -> pd.DataFrame:
+    """Sprint speed from Statcast sprint speed table.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: player_id, sprint_speed, hp_to_1b, bolts.
+    """
+    query = """
+    SELECT
+        player_id,
+        sprint_speed,
+        hp_to_1b,
+        bolts
+    FROM staging.statcast_sprint_speed
+    WHERE season = :season
+      AND sprint_speed IS NOT NULL
+    """
+    logger.info("Fetching sprint speed for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# 16. Pitcher observed profile (pitch-level aggregates)
+# ---------------------------------------------------------------------------
+def get_pitcher_observed_profile(season: int) -> pd.DataFrame:
+    """Per-pitcher pitch-level aggregates for composite scoring.
+
+    Returns whiff rate, avg velo, release extension, zone %, and GB%.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, whiff_rate, avg_velo, release_extension,
+        zone_pct, gb_pct.
+    """
+    query = """
+    WITH pitch_agg AS (
+        SELECT
+            fp.pitcher_id,
+            SUM(fp.is_swing::int)                           AS swings,
+            SUM(fp.is_whiff::int)                           AS whiffs,
+            COUNT(*)                                        AS pitches,
+            SUM(CASE WHEN fp.zone BETWEEN 1 AND 9
+                     THEN 1 ELSE 0 END)                    AS zone_pitches
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+          AND fp.pitch_type IS NOT NULL
+          AND fp.pitch_type NOT IN ('PO', 'UN', 'SC', 'FA')
+        GROUP BY fp.pitcher_id
+    ),
+    shape_agg AS (
+        SELECT
+            fp.pitcher_id,
+            AVG(sps.release_speed)       AS avg_velo,
+            AVG(sps.release_extension)   AS release_extension
+        FROM production.sat_pitch_shape sps
+        JOIN production.fact_pitch fp ON sps.pitch_id = fp.pitch_id
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+          AND fp.pitch_type IS NOT NULL
+          AND sps.release_speed     != 'NaN'
+          AND sps.release_extension != 'NaN'
+        GROUP BY fp.pitcher_id
+    ),
+    batted_agg AS (
+        SELECT
+            fpa.pitcher_id,
+            COUNT(*)                                                    AS bip,
+            SUM(CASE WHEN sbb.launch_angle < 10 THEN 1 ELSE 0 END)::float
+                / NULLIF(COUNT(*), 0)                                   AS gb_pct
+        FROM production.fact_pa fpa
+        JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
+        JOIN production.sat_batted_balls sbb ON fpa.pa_id = sbb.pa_id
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+          AND sbb.launch_angle != 'NaN'
+        GROUP BY fpa.pitcher_id
+    )
+    SELECT
+        pa.pitcher_id,
+        ROUND((pa.whiffs::numeric / NULLIF(pa.swings, 0)), 4)   AS whiff_rate,
+        ROUND(sa.avg_velo::numeric, 1)                           AS avg_velo,
+        ROUND(sa.release_extension::numeric, 2)                  AS release_extension,
+        ROUND((pa.zone_pitches::numeric / NULLIF(pa.pitches, 0)), 4)
+                                                                  AS zone_pct,
+        ROUND(ba.gb_pct::numeric, 4)                              AS gb_pct
+    FROM pitch_agg pa
+    LEFT JOIN shape_agg sa ON pa.pitcher_id = sa.pitcher_id
+    LEFT JOIN batted_agg ba ON pa.pitcher_id = ba.pitcher_id
+    WHERE pa.swings >= 50
+    ORDER BY pa.pitches DESC
+    """
+    logger.info("Fetching pitcher observed profile for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# 17. Extended hitter season totals (from batting boxscores — includes games, SB)
+# ---------------------------------------------------------------------------
+def get_hitter_season_totals_extended(season: int) -> pd.DataFrame:
+    """Per-batter season totals from batting boxscores.
+
+    Includes games played, stolen bases, caught stealing, total bases,
+    runs, RBI — columns not available from fact_pa.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, batter_name, season, age, games, pa, k, bb,
+        hits, hr, sb, cs, total_bases, runs, rbi, doubles, triples,
+        hit_by_pitch, age_bucket.
+    """
+    query = """
+    SELECT
+        bb.batter_id,
+        dp.player_name                  AS batter_name,
+        dg.season,
+        dp.birth_date,
+        EXTRACT(YEAR FROM AGE(
+            DATE(dg.season || '-07-01'), dp.birth_date
+        ))::int                         AS age,
+        COUNT(DISTINCT bb.game_pk)      AS games,
+        SUM(bb.plate_appearances)       AS pa,
+        SUM(bb.strikeouts)              AS k,
+        SUM(bb.walks + bb.intentional_walks) AS bb,
+        SUM(bb.hits)                    AS hits,
+        SUM(bb.home_runs)              AS hr,
+        SUM(bb.sb)                     AS sb,
+        SUM(bb.caught_stealing)        AS cs,
+        SUM(bb.total_bases)            AS total_bases,
+        SUM(bb.runs)                   AS runs,
+        SUM(bb.rbi)                    AS rbi,
+        SUM(bb.doubles)                AS doubles,
+        SUM(bb.triples)                AS triples,
+        SUM(bb.hit_by_pitch)           AS hit_by_pitch
+    FROM staging.batting_boxscores bb
+    JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+    LEFT JOIN production.dim_player dp ON bb.batter_id = dp.player_id
+    WHERE dg.season = :season
+      AND dg.game_type = 'R'
+    GROUP BY bb.batter_id, dp.player_name, dg.season, dp.birth_date
+    HAVING SUM(bb.plate_appearances) >= 1
+    ORDER BY SUM(bb.plate_appearances) DESC
+    """
+    logger.info("Fetching extended hitter season totals for %d", season)
+    df = read_sql(query, {"season": season})
+
+    # Compute age_bucket: 0=young(<=25), 1=prime(26-30), 2=veteran(31+)
+    import pandas as _pd
+    df["age_bucket"] = _pd.cut(
+        df["age"],
+        bins=[0, 25, 30, 99],
+        labels=[0, 1, 2],
+        right=True,
+    ).astype("Int64")
+
+    # Derived rates
+    df["k_rate"] = (df["k"] / df["pa"]).round(4)
+    df["bb_rate"] = (df["bb"] / df["pa"]).round(4)
+    df["hr_rate"] = (df["hr"] / df["pa"]).round(4)
+    df["hit_rate"] = (df["hits"] / df["pa"]).round(4)
+    df["sb_per_game"] = (df["sb"] / df["games"].replace(0, float("nan"))).round(4)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 18. Extended pitcher season totals (from pitching boxscores — includes outs)
+# ---------------------------------------------------------------------------
+def get_pitcher_season_totals_extended(season: int) -> pd.DataFrame:
+    """Per-pitcher season totals from pitching boxscores.
+
+    Includes outs recorded directly, plus games, IP, BF.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, pitcher_name, pitch_hand, season, age, games,
+        ip, batters_faced, k, bb, hr, outs, hits_allowed, runs_allowed,
+        is_starter, age_bucket.
+    """
+    query = """
+    SELECT
+        pb.pitcher_id,
+        dp.player_name                  AS pitcher_name,
+        dp.pitch_hand,
+        dg.season,
+        dp.birth_date,
+        EXTRACT(YEAR FROM AGE(
+            DATE(dg.season || '-07-01'), dp.birth_date
+        ))::int                         AS age,
+        COUNT(DISTINCT pb.game_pk)      AS games,
+        SUM(pb.innings_pitched)         AS ip,
+        SUM(pb.batters_faced)           AS batters_faced,
+        SUM(pb.strike_outs)             AS k,
+        SUM(pb.outs)                    AS outs,
+        SUM(pb.is_starter::int)         AS starts,
+        SUM(pb.home_runs)               AS hr,
+        SUM(pb.walks + pb.intentional_walks) AS bb,
+        SUM(pb.hits)                    AS hits_allowed,
+        SUM(pb.earned_runs)             AS earned_runs
+    FROM staging.pitching_boxscores pb
+    JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+    LEFT JOIN production.dim_player dp ON pb.pitcher_id = dp.player_id
+    WHERE dg.season = :season
+      AND dg.game_type = 'R'
+    GROUP BY pb.pitcher_id, dp.player_name, dp.pitch_hand,
+             dg.season, dp.birth_date
+    HAVING SUM(pb.batters_faced) >= 1
+    ORDER BY SUM(pb.batters_faced) DESC
+    """
+    logger.info("Fetching extended pitcher season totals for %d", season)
+    df = read_sql(query, {"season": season})
+
+    import pandas as _pd
+    df["age_bucket"] = _pd.cut(
+        df["age"],
+        bins=[0, 25, 30, 99],
+        labels=[0, 1, 2],
+        right=True,
+    ).astype("Int64")
+
+    # Derive starter flag and rates
+    df["is_starter"] = (df["starts"] >= 3).astype(int)
+    df["k_rate"] = (df["k"] / df["batters_faced"].replace(0, float("nan"))).round(4)
+    df["bb_rate"] = (df["bb"] / df["batters_faced"].replace(0, float("nan"))).round(4)
+    df["outs_per_bf"] = (df["outs"] / df["batters_faced"].replace(0, float("nan"))).round(4)
+
+    return df

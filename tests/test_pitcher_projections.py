@@ -7,7 +7,7 @@ import pytest
 
 from src.models.pitcher_projections import (
     ALL_STATS,
-    COMPOSITE_WEIGHTS,
+    COMPOSITE_DIMENSIONS,
     find_breakouts_and_regressions,
     project_forward,
 )
@@ -61,23 +61,23 @@ def _make_synthetic_pitcher_data(
     return pd.DataFrame(records)
 
 
-class TestCompositeWeights:
-    """Test composite weight configuration."""
+class TestCompositeDimensions:
+    """Test composite dimension configuration."""
 
     def test_weights_sum_to_one(self):
-        total = sum(w for w, _ in COMPOSITE_WEIGHTS.values())
+        total = sum(w for w, _ in COMPOSITE_DIMENSIONS.values())
         assert abs(total - 1.0) < 1e-9
 
-    def test_all_stats_have_weights(self):
-        for stat in ALL_STATS:
-            assert stat in COMPOSITE_WEIGHTS
+    def test_all_projected_stats_have_models(self):
+        """ALL_STATS should only contain stable, projectable stats."""
+        assert "k_rate" in ALL_STATS
+        assert "bb_rate" in ALL_STATS
+        # HR/BF removed — not stable enough for Bayesian projection
+        assert "hr_per_bf" not in ALL_STATS
 
-    def test_signs_correct(self):
-        # K rate: higher is better for pitcher -> sign = +1
-        assert COMPOSITE_WEIGHTS["k_rate"][1] == +1
-        # BB, HR/BF: lower is better for pitcher -> sign = -1
-        assert COMPOSITE_WEIGHTS["bb_rate"][1] == -1
-        assert COMPOSITE_WEIGHTS["hr_per_bf"][1] == -1
+    def test_four_dimensions(self):
+        expected = {"stuff", "command", "ground_ball", "trajectory"}
+        assert set(COMPOSITE_DIMENSIONS.keys()) == expected
 
 
 class TestProjectForward:

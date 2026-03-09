@@ -1,9 +1,18 @@
 """
-Composite hitter projections combining K%, BB%, HR/PA, and xwOBA.
+Composite hitter projections — 6-dimension scoring.
 
-Fits all four stat models, forward-projects posteriors, and produces
-a unified projection DataFrame with per-stat deltas and a weighted
-composite improvement score.
+Fits K% and BB% Bayesian models (stable, projectable stats), then enriches
+with observed profile stats (whiff rate, chase rate, exit velo, hard-hit%,
+sprint speed, FB%) for a comprehensive composite score.
+
+Dimensions
+----------
+1. Contact ability (20%): whiff_rate + z_contact_pct
+2. Plate discipline (20%): chase_rate + projected BB% delta
+3. Raw power (25%): avg_exit_velo + hard_hit_pct
+4. Speed (15%): sprint_speed
+5. Batted ball profile (5%): fb_pct
+6. Projected trajectory (15%): K% delta + BB% delta
 """
 from __future__ import annotations
 
@@ -13,7 +22,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.data.feature_eng import build_multi_season_hitter_data
+from src.data.feature_eng import (
+    build_multi_season_hitter_data,
+    get_cached_hitter_observed_profile,
+    get_cached_sprint_speed,
+)
 from src.models.hitter_model import (
     STAT_CONFIGS,
     check_convergence,
@@ -25,18 +38,38 @@ from src.models.hitter_model import (
 
 logger = logging.getLogger(__name__)
 
-# Stats to fit (order matters for composite)
-ALL_STATS = ["k_rate", "bb_rate", "hr_rate", "xwoba"]
+# Only project stable stats with the Bayesian model
+ALL_STATS = ["k_rate", "bb_rate"]
 
-# Composite weights — xwOBA weighted heavier as best single predictor
-# of run production. Signs: positive delta = improvement for hitter.
-COMPOSITE_WEIGHTS: dict[str, tuple[float, int]] = {
-    # stat: (weight, sign_for_improvement)
-    # sign: -1 means lower is better (K%), +1 means higher is better
-    "k_rate": (0.15, -1),
-    "bb_rate": (0.15, +1),
-    "hr_rate": (0.20, +1),
-    "xwoba":  (0.50, +1),
+# --------------------------------------------------------------------------
+# Composite dimension weights and components
+# --------------------------------------------------------------------------
+# Each dimension: (weight, [(col, sign, source)])
+#   sign: +1 means higher percentile = better, -1 means lower = better
+#   source: "observed" or "projected_delta"
+COMPOSITE_DIMENSIONS: dict[str, tuple[float, list[tuple[str, int, str]]]] = {
+    "contact": (0.20, [
+        ("whiff_rate", -1, "observed"),       # lower whiff = better
+        ("z_contact_pct", +1, "observed"),    # higher zone contact = better
+    ]),
+    "discipline": (0.20, [
+        ("chase_rate", -1, "observed"),       # lower chase = better
+        ("delta_bb_rate", +1, "projected_delta"),  # improving BB% = better
+    ]),
+    "power": (0.25, [
+        ("avg_exit_velo", +1, "observed"),    # higher EV = better
+        ("hard_hit_pct", +1, "observed"),     # higher HH% = better
+    ]),
+    "speed": (0.15, [
+        ("sprint_speed", +1, "observed"),     # faster = better
+    ]),
+    "batted_ball": (0.05, [
+        ("fb_pct", +1, "observed"),           # more fly balls = power indicator
+    ]),
+    "trajectory": (0.15, [
+        ("delta_k_rate", -1, "projected_delta"),  # decreasing K% = better
+        ("delta_bb_rate", +1, "projected_delta"),  # increasing BB% = better
+    ]),
 }
 
 
@@ -49,7 +82,7 @@ def fit_all_models(
     random_seed: int = 42,
     stats: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Fit all hitter projection models.
+    """Fit K% and BB% hitter projection models.
 
     Parameters
     ----------
@@ -60,7 +93,7 @@ def fit_all_models(
     draws, tune, chains, random_seed
         MCMC parameters.
     stats : list[str] | None
-        Stats to fit. Defaults to ALL_STATS.
+        Stats to fit. Defaults to ALL_STATS (k_rate, bb_rate).
 
     Returns
     -------
@@ -106,13 +139,94 @@ def fit_all_models(
     return results
 
 
+def _enrich_with_observed(
+    base: pd.DataFrame,
+    from_season: int,
+) -> pd.DataFrame:
+    """Merge observed pitch-level stats and sprint speed into base."""
+    # Pitch-level observed profile
+    try:
+        obs = get_cached_hitter_observed_profile(from_season)
+        merge_cols = ["whiff_rate", "chase_rate", "z_contact_pct",
+                      "avg_exit_velo", "fb_pct", "hard_hit_pct"]
+        base = base.merge(
+            obs[["batter_id"] + merge_cols],
+            on="batter_id",
+            how="left",
+            suffixes=("", "_obs"),
+        )
+    except Exception as e:
+        logger.warning("Could not load hitter observed profile: %s", e)
+        for col in ["whiff_rate", "chase_rate", "z_contact_pct",
+                     "avg_exit_velo", "fb_pct", "hard_hit_pct"]:
+            if col not in base.columns:
+                base[col] = np.nan
+
+    # Sprint speed
+    try:
+        sprint = get_cached_sprint_speed(from_season)
+        base = base.merge(
+            sprint[["player_id", "sprint_speed"]].rename(
+                columns={"player_id": "batter_id"}
+            ),
+            on="batter_id",
+            how="left",
+        )
+    except Exception as e:
+        logger.warning("Could not load sprint speed: %s", e)
+        if "sprint_speed" not in base.columns:
+            base["sprint_speed"] = np.nan
+
+    return base
+
+
+def _compute_composite(base: pd.DataFrame) -> pd.DataFrame:
+    """Compute 6-dimension composite score using z-score normalization."""
+    base["composite_score"] = 0.0
+    base["_total_weight"] = 0.0
+
+    for dim_name, (weight, components) in COMPOSITE_DIMENSIONS.items():
+        dim_z_scores = []
+
+        for col, sign, source in components:
+            if col not in base.columns:
+                continue
+            vals = base[col].astype(float)
+            mu, sd = vals.mean(), vals.std()
+            if pd.isna(sd) or np.isclose(sd, 0.0):
+                continue
+            z = (vals - mu) / sd * sign
+            dim_z_scores.append(z)
+
+        if not dim_z_scores:
+            continue
+
+        # Average z-scores within dimension (NaN-safe)
+        dim_df = pd.concat(dim_z_scores, axis=1)
+        dim_avg = dim_df.mean(axis=1)
+
+        has_value = dim_avg.notna()
+        base["composite_score"] += weight * dim_avg.fillna(0)
+        base["_total_weight"] += has_value.astype(float) * weight
+
+    # Re-scale so players with partial stats are comparable
+    base["composite_score"] = np.where(
+        base["_total_weight"] > 0,
+        base["composite_score"] / base["_total_weight"],
+        0.0,
+    )
+    base.drop(columns=["_total_weight"], inplace=True)
+
+    return base
+
+
 def project_forward(
     model_results: dict[str, dict[str, Any]],
     from_season: int,
     min_pa: int = 200,
     random_seed: int = 42,
 ) -> pd.DataFrame:
-    """Forward-project all stats and build composite projections.
+    """Forward-project K%/BB% and build 6-dimension composite.
 
     Parameters
     ----------
@@ -128,7 +242,7 @@ def project_forward(
     Returns
     -------
     pd.DataFrame
-        One row per player with observed/projected values for each stat,
+        One row per player with projected K%/BB%, observed stats,
         per-stat deltas, and composite improvement score.
     """
     # Start with player info from any stat (they all use the same data)
@@ -150,7 +264,7 @@ def project_forward(
                        from_season, min_pa)
         return pd.DataFrame()
 
-    # For each stat, extract observed + projected
+    # For each Bayesian stat (K%, BB%), extract observed + projected
     for stat, res in model_results.items():
         cfg = STAT_CONFIGS[stat]
         data = res["data"]
@@ -159,7 +273,6 @@ def project_forward(
         stat_df = data["df"]
         stat_season = stat_df[stat_df["season"] == from_season]
 
-        # Observed values
         obs_col = f"observed_{stat}"
         proj_col = f"projected_{stat}"
         delta_col = f"delta_{stat}"
@@ -175,22 +288,12 @@ def project_forward(
         career_group = stat_df[
             stat_df["batter_id"].isin(base["batter_id"])
         ].groupby("batter_id")
-        if cfg.likelihood == "binomial":
-            # Weighted by trials (PA)
-            career_sum = career_group.apply(
-                lambda g: (g[cfg.rate_col] * g[cfg.trials_col]).sum()
-                / g[cfg.trials_col].sum()
-                if g[cfg.trials_col].sum() > 0 else np.nan,
-                include_groups=False,
-            )
-        else:
-            # Normal likelihood — weight by PA
-            career_sum = career_group.apply(
-                lambda g: (g[cfg.rate_col] * g[cfg.trials_col]).sum()
-                / g[cfg.trials_col].sum()
-                if g[cfg.trials_col].sum() > 0 else np.nan,
-                include_groups=False,
-            )
+        career_sum = career_group.apply(
+            lambda g: (g[cfg.rate_col] * g[cfg.trials_col]).sum()
+            / g[cfg.trials_col].sum()
+            if g[cfg.trials_col].sum() > 0 else np.nan,
+            include_groups=False,
+        )
         base[career_col] = base["batter_id"].map(career_sum)
 
         # Forward-project each player
@@ -218,30 +321,11 @@ def project_forward(
         base[ci_hi_col] = base["batter_id"].map(proj_hi)
         base[delta_col] = base[proj_col] - base[obs_col]
 
-    # Composite improvement score — handle missing stats gracefully
-    base["composite_score"] = 0.0
-    base["_total_weight"] = 0.0
-    for stat, (weight, sign) in COMPOSITE_WEIGHTS.items():
-        delta_col = f"delta_{stat}"
-        if delta_col in base.columns:
-            stat_sd = base[delta_col].std()
-            if stat_sd > 0:
-                normalized_delta = base[delta_col] / stat_sd
-            else:
-                normalized_delta = pd.Series(0.0, index=base.index)
-            has_value = base[delta_col].notna()
-            base["composite_score"] += (
-                weight * sign * normalized_delta.fillna(0)
-            )
-            base["_total_weight"] += has_value.astype(float) * weight
+    # Enrich with observed stats (whiff, chase, EV, sprint speed, etc.)
+    base = _enrich_with_observed(base, from_season)
 
-    # Re-scale so players with partial stats are comparable
-    base["composite_score"] = np.where(
-        base["_total_weight"] > 0,
-        base["composite_score"] / base["_total_weight"],
-        0.0,
-    )
-    base.drop(columns=["_total_weight"], inplace=True)
+    # Compute 6-dimension composite
+    base = _compute_composite(base)
 
     # Sort by composite score (biggest improvers first)
     base = base.sort_values("composite_score", ascending=False).reset_index(drop=True)
