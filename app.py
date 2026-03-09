@@ -1177,6 +1177,7 @@ def _build_matchup_table(
     h_whiffs = []
     h_chases = []
     h_xwobas = []
+    h_hard_hit_rates = []
     for _, row in p_df.iterrows():
         pt = row["pitch_type"]
         h_row = v_df[v_df["pitch_type"] == pt]
@@ -1201,6 +1202,10 @@ def _build_matchup_table(
             h_xwobas.append(h_row["xwoba_contact"].iloc[0])
         else:
             h_xwobas.append(np.nan)
+        if len(s_row) > 0 and "hard_hit_rate" in s_row.columns:
+            h_hard_hit_rates.append(s_row["hard_hit_rate"].iloc[0])
+        else:
+            h_hard_hit_rates.append(np.nan)
 
     max_h_whiff = max(pd.Series(h_whiffs).dropna().max(), 0.01) if any(pd.notna(v) for v in h_whiffs) else 0.40
     max_h_chase = max(pd.Series(h_chases).dropna().max(), 0.01) if any(pd.notna(v) for v in h_chases) else 0.40
@@ -1272,25 +1277,32 @@ def _build_matchup_table(
         else:
             hx_cell = f'<span style="color:{SLATE};">--</span>'
 
-        # Edge indicator: pitcher advantage if P whiff > lg AND H whiff > lg
-        # Hitter advantage if H xwOBA high and H whiff < lg
-        edge_score = 0.0
-        if pd.notna(p_whiff) and pd.notna(h_whiff):
-            # Pitcher gets credit for high P whiff AND hitter vulnerability
-            edge_score += (p_whiff - lg_whiff) * 2  # pitcher's pitch quality
-            edge_score += (h_whiff - lg_whiff) * 2  # hitter vulnerable here
-        if pd.notna(h_chase) and pd.notna(lg_chase):
-            edge_score += (h_chase - lg_chase)  # hitter chases = pitcher edge
-        if pd.notna(h_xwoba):
-            # High xwOBA on contact = hitter edge on this pitch
-            edge_score -= (h_xwoba - 0.350) * 3
+        # Edge indicator: balanced pitcher skill vs hitter damage
+        lg_xwoba = lg.get("xwoba_contact", 0.320)
+        lg_hh = lg.get("hard_hit_rate", 0.33)
+        h_hh = h_hard_hit_rates[idx]
 
-        if edge_score > 0.08:
+        edge_score = 0.0
+        # Pitcher skill: how much better is this pitch at generating whiffs?
+        if pd.notna(p_whiff):
+            edge_score += (p_whiff - lg_whiff) * 2.0
+        # Hitter vulnerability: whiff + chase tendencies on this pitch type
+        if pd.notna(h_whiff):
+            edge_score += (h_whiff - lg_whiff) * 1.5
+        if pd.notna(h_chase):
+            edge_score += (h_chase - lg_chase) * 1.0
+        # Hitter damage: xwOBA and hard-hit rate vs per-pitch-type baselines
+        if pd.notna(h_xwoba):
+            edge_score -= (h_xwoba - lg_xwoba) * 4.0
+        if pd.notna(h_hh):
+            edge_score -= (h_hh - lg_hh) * 2.0
+
+        if edge_score > 0.10:
             edge_color = SAGE
-        elif edge_score < -0.08:
+        elif edge_score < -0.10:
             edge_color = EMBER
         else:
-            edge_color = GOLD
+            edge_color = SLATE
         edge_cell = f'<span class="edge-dot" style="background:{edge_color};"></span>'
 
         rows_html += (
@@ -1375,22 +1387,41 @@ def _build_matchup_scouting_bullets(
         elif len(h_row) > 0 and "xwoba_contact" in h_row.columns:
             h_xwoba = h_row["xwoba_contact"].iloc[0]
 
-        # Score this pitch's edge
+        # Score this pitch's edge (balanced: pitcher skill vs hitter damage)
+        lg_xwoba = lg.get("xwoba_contact", 0.320)
+        lg_hh = lg.get("hard_hit_rate", 0.33)
+        lg_chase = lg.get("chase_rate", 0.30)
+
+        h_chase = np.nan
+        if len(h_row) > 0 and "chase_swings" in h_row.columns and "out_of_zone_pitches" in h_row.columns:
+            cs = h_row["chase_swings"].iloc[0]
+            oz = h_row["out_of_zone_pitches"].iloc[0]
+            h_chase = cs / oz if pd.notna(oz) and oz > 0 else np.nan
+
+        h_hh = np.nan
+        if len(s_row) > 0 and "hard_hit_rate" in s_row.columns:
+            h_hh = s_row["hard_hit_rate"].iloc[0]
+
         edge = 0.0
         detail_parts = []
-        if pd.notna(p_whiff) and pd.notna(h_whiff):
-            edge += (p_whiff - lg_whiff) + (h_whiff - lg_whiff)
+        if pd.notna(p_whiff):
+            edge += (p_whiff - lg_whiff) * 2.0
             if p_whiff > lg_whiff * 1.1:
                 detail_parts.append(f"pitcher's whiff rate {p_whiff*100:.0f}%")
+        if pd.notna(h_whiff):
+            edge += (h_whiff - lg_whiff) * 1.5
             if h_whiff > lg_whiff * 1.15:
                 detail_parts.append(f"hitter whiffs {h_whiff*100:.0f}% of the time")
+        if pd.notna(h_chase):
+            edge += (h_chase - lg_chase) * 1.0
         if pd.notna(h_xwoba):
+            edge -= (h_xwoba - lg_xwoba) * 4.0
             if h_xwoba >= 0.400:
-                edge -= 0.15
                 detail_parts.append(f"but hitter does damage on contact (.{int(h_xwoba*1000):03d} xwOBA)")
             elif h_xwoba <= 0.280:
-                edge += 0.05
                 detail_parts.append(f"weak contact (.{int(h_xwoba*1000):03d} xwOBA)")
+        if pd.notna(h_hh):
+            edge -= (h_hh - lg_hh) * 2.0
 
         detail = ", ".join(detail_parts) if detail_parts else ""
         pitch_edges.append((pt_name, edge, detail, usage))
@@ -2313,17 +2344,45 @@ def page_matchup_explorer() -> None:
         pitcher_id, batter_id, arsenal_df, vuln_filtered, baselines_pt,
     )
 
+    # --- Compute contact-quality adjustment ---
+    # Usage-weighted xwOBA and hard-hit delta vs league baselines
+    p_ars = arsenal_df[
+        (arsenal_df["pitcher_id"] == pitcher_id) & (arsenal_df["pitches"] >= 20)
+    ].copy()
+    h_str_filt = str_filtered[str_filtered["batter_id"] == batter_id] if not str_filtered.empty else pd.DataFrame()
+    damage_score = 0.0
+    total_usage = p_ars["usage_pct"].sum() if not p_ars.empty else 0.0
+    if total_usage > 0 and not h_str_filt.empty:
+        for _, prow in p_ars.iterrows():
+            pt = prow["pitch_type"]
+            usage_w = prow["usage_pct"] / total_usage
+            lg = LEAGUE_AVG_BY_PITCH_TYPE.get(pt, {})
+            lg_xwoba = lg.get("xwoba_contact", 0.320)
+            lg_hh = lg.get("hard_hit_rate", 0.33)
+            s_row = h_str_filt[h_str_filt["pitch_type"] == pt]
+            if s_row.empty:
+                continue
+            h_xwoba = s_row["xwoba_contact"].iloc[0] if "xwoba_contact" in s_row.columns else np.nan
+            h_hh = s_row["hard_hit_rate"].iloc[0] if "hard_hit_rate" in s_row.columns else np.nan
+            if pd.notna(h_xwoba):
+                damage_score += usage_w * (h_xwoba - lg_xwoba)
+            if pd.notna(h_hh):
+                damage_score += usage_w * (h_hh - lg_hh) * 0.5
+
     # --- Matchup header ---
+    # Blend whiff lift (pitcher-favorable when positive) with damage score
+    # (hitter-favorable when positive). Convert damage to same scale as logit lift.
     lift = matchup["matchup_k_logit_lift"]
-    if lift > 0.15:
+    blended_edge = lift - damage_score * 6.0  # scale damage to logit-lift magnitude
+    if blended_edge > 0.15:
         edge_label = "Pitcher Advantage"
         edge_color = SAGE
-    elif lift < -0.15:
+    elif blended_edge < -0.15:
         edge_label = "Hitter Advantage"
         edge_color = EMBER
     else:
         edge_label = "Neutral Matchup"
-        edge_color = GOLD
+        edge_color = SLATE
 
     pitcher_label = "LHP" if pitcher_hand == "L" else "RHP"
     hitter_label = "LHH" if hitter_hand == "L" else "RHH"
@@ -2446,22 +2505,36 @@ def page_matchup_explorer() -> None:
     st.markdown('<div class="section-header">Matchup Scouting Report</div>',
                 unsafe_allow_html=True)
 
-    # Overall summary
+    # Overall summary — use blended edge (whiff lift + contact quality)
     bullets_html = ""
     if pd.notna(mwhiff) and pd.notna(bwhiff):
         whiff_delta_pp = (mwhiff - bwhiff) * 100
-        if whiff_delta_pp > 2:
+        if blended_edge > 0.15:
             summary = (
                 f"Favorable matchup for <b>{selected_pitcher}</b>. "
-                f"The hitter's pitch-type vulnerabilities align well with the arsenal, "
-                f"boosting the expected whiff rate by {whiff_delta_pp:.1f}pp above baseline."
+                f"The hitter's pitch-type vulnerabilities align well with the arsenal"
             )
-        elif whiff_delta_pp < -2:
+            if whiff_delta_pp > 1:
+                summary += f", boosting the expected whiff rate by {whiff_delta_pp:.1f}pp above baseline."
+            else:
+                summary += "."
+        elif blended_edge < -0.15:
             summary = (
                 f"Tough matchup for <b>{selected_pitcher}</b>. "
-                f"<b>{selected_hitter}</b> handles this arsenal well, pulling the expected "
-                f"whiff rate {abs(whiff_delta_pp):.1f}pp below baseline."
             )
+            if damage_score > 0.03:
+                summary += (
+                    f"<b>{selected_hitter}</b> does significant damage on contact against this arsenal"
+                )
+                if whiff_delta_pp > 1:
+                    summary += f" despite an elevated whiff rate (+{whiff_delta_pp:.1f}pp)."
+                else:
+                    summary += f" and handles the pitch mix well."
+            else:
+                summary += (
+                    f"<b>{selected_hitter}</b> handles this arsenal well, pulling the expected "
+                    f"whiff rate {abs(whiff_delta_pp):.1f}pp below baseline."
+                )
         else:
             summary = (
                 f"Neutral matchup — no strong edge either way. "
