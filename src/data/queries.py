@@ -126,10 +126,11 @@ def get_hitter_pitch_type_profile(season: int) -> pd.DataFrame:
                       THEN 1 ELSE 0 END)                      AS barrels_proxy
         FROM production.fact_pitch fp
         JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
-        JOIN production.sat_batted_balls sbb ON fp.pitch_id = sbb.pitch_id
+        JOIN production.sat_batted_balls sbb ON fp.pa_id = sbb.pa_id
         WHERE dg.season = :season
           AND dg.game_type = 'R'
           AND fp.pitch_type IS NOT NULL
+          AND fp.is_bip
         GROUP BY fp.batter_id, fp.pitch_type
     )
     SELECT
@@ -217,10 +218,11 @@ def get_pitcher_arsenal_profile(season: int) -> pd.DataFrame:
             AVG(CASE WHEN sbb.xwoba != 'NaN' THEN sbb.xwoba END) AS xwoba_against
         FROM production.fact_pitch fp
         JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
-        JOIN production.sat_batted_balls sbb ON fp.pitch_id = sbb.pitch_id
+        JOIN production.sat_batted_balls sbb ON fp.pa_id = sbb.pa_id
         WHERE dg.season = :season
           AND dg.game_type = 'R'
           AND fp.pitch_type IS NOT NULL
+          AND fp.is_bip
         GROUP BY fp.pitcher_id, fp.pitch_type
     )
     SELECT
@@ -611,11 +613,12 @@ def get_pitcher_outcomes_by_stand(season: int) -> pd.DataFrame:
                                                               AS xwoba_contact_n
         FROM production.fact_pitch fp
         JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
-        JOIN production.sat_batted_balls sbb ON fp.pitch_id = sbb.pitch_id
+        JOIN production.sat_batted_balls sbb ON fp.pa_id = sbb.pa_id
         WHERE dg.season = :season
           AND dg.game_type = 'R'
           AND fp.pitch_type IS NOT NULL
           AND fp.pitch_type NOT IN ('PO','UN','SC','FA')
+          AND fp.is_bip
         GROUP BY fp.pitcher_id, fp.pitch_type, fp.batter_stand
     )
     SELECT
