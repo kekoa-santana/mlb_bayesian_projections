@@ -1119,8 +1119,8 @@ def _build_pitcher_profile_table(arsenal_df: pd.DataFrame) -> str:
             f'<td>{whiff_cell}</td>'
             f'<td>{csw_cell}</td>'
             f'<td>{xwoba_cell}</td>'
-            f'<td style="color:{SLATE}; font-size:0.82rem;">{velo_str}</td>'
-            f'<td style="color:{SLATE}; font-size:0.82rem;">{usage_str}</td>'
+            f'<td style="color:{CREAM}; font-size:0.82rem; font-weight:600;">{velo_str}</td>'
+            f'<td style="color:{CREAM}; font-size:0.82rem; font-weight:600;">{usage_str}</td>'
             f'</tr>'
         )
 
