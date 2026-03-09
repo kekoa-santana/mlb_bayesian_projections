@@ -251,6 +251,7 @@ def _build_pitcher_arsenal(season: int) -> pd.DataFrame:
     df = df[~df["pitch_type"].isin(EXCLUDED_PITCH_TYPES)].copy()
 
     df["whiff_rate"] = df["whiffs"] / df["swings"].replace(0, np.nan)
+    df["csw_pct"] = df["csw"] / df["pitches"].replace(0, np.nan) if "csw" in df.columns else np.nan
     df["barrel_rate_against"] = df["barrels_proxy"] / df["bip"].replace(0, np.nan)
     df["hard_hit_rate_against"] = df["hard_hits"] / df["bip"].replace(0, np.nan)
     df["pitch_family"] = df["pitch_type"].map(PITCH_TO_FAMILY)

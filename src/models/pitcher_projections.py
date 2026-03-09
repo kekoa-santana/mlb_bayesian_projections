@@ -166,6 +166,19 @@ def project_forward(
         obs_map = dict(zip(stat_season["pitcher_id"], stat_season[cfg.rate_col]))
         base[obs_col] = base["pitcher_id"].map(obs_map)
 
+        # Career BF-weighted average across all training seasons
+        career_col = f"career_{stat}"
+        career_group = stat_df[
+            stat_df["pitcher_id"].isin(base["pitcher_id"])
+        ].groupby("pitcher_id")
+        career_sum = career_group.apply(
+            lambda g: (g[cfg.rate_col] * g["batters_faced"]).sum()
+            / g["batters_faced"].sum()
+            if g["batters_faced"].sum() > 0 else np.nan,
+            include_groups=False,
+        )
+        base[career_col] = base["pitcher_id"].map(career_sum)
+
         proj_means = {}
         proj_sds = {}
         proj_lo = {}

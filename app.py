@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -204,6 +205,98 @@ st.markdown(f"""
         padding-bottom: 0.4rem;
         border-bottom: 1px solid {DARK_BORDER};
     }}
+
+    /* Pitch profile tables */
+    .pitch-table {{
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 0;
+        font-size: 0.85rem;
+    }}
+    .pitch-table th {{
+        color: {SLATE};
+        font-size: 0.72rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        padding: 6px 10px;
+        border-bottom: 1px solid {DARK_BORDER};
+        text-align: left;
+    }}
+    .pitch-table td {{
+        color: {CREAM};
+        padding: 8px 10px;
+        border-bottom: 1px solid {DARK_BORDER}22;
+        vertical-align: middle;
+    }}
+    .pitch-table tr:last-child td {{
+        border-bottom: none;
+    }}
+    .pitch-table .pt-name {{
+        font-weight: 600;
+        white-space: nowrap;
+    }}
+    .pitch-table .pt-n {{
+        color: {SLATE};
+        font-size: 0.75rem;
+    }}
+    .spark-cell {{
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }}
+    .spark-bar {{
+        height: 14px;
+        border-radius: 7px;
+        min-width: 3px;
+    }}
+    .spark-val {{
+        font-size: 0.82rem;
+        font-weight: 500;
+        min-width: 36px;
+    }}
+
+    /* Matchup edge indicator */
+    .edge-dot {{
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        margin: 0 auto;
+    }}
+    .matchup-table {{
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 0;
+        font-size: 0.85rem;
+    }}
+    .matchup-table th {{
+        color: {SLATE};
+        font-size: 0.70rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        padding: 6px 8px;
+        border-bottom: 1px solid {DARK_BORDER};
+        text-align: left;
+    }}
+    .matchup-table td {{
+        color: {CREAM};
+        padding: 7px 8px;
+        border-bottom: 1px solid {DARK_BORDER}22;
+        vertical-align: middle;
+    }}
+    .matchup-table tr:last-child td {{
+        border-bottom: none;
+    }}
+    .matchup-table .pt-name {{
+        font-weight: 600;
+        white-space: nowrap;
+    }}
+    .matchup-table .pt-n {{
+        color: {SLATE};
+        font-size: 0.75rem;
+    }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -249,8 +342,13 @@ def load_pitcher_arsenal() -> pd.DataFrame:
 
 
 @st.cache_data
-def load_hitter_vulnerability() -> pd.DataFrame:
-    """Load hitter vulnerability profiles."""
+def load_hitter_vulnerability(career: bool = False) -> pd.DataFrame:
+    """Load hitter vulnerability profiles (career-aggregated or single season)."""
+    if career:
+        path = DASHBOARD_DIR / "hitter_vuln_career.parquet"
+        if path.exists():
+            return pd.read_parquet(path)
+    # Fallback to single-season
     path = DASHBOARD_DIR / "hitter_vuln.parquet"
     if not path.exists():
         return pd.DataFrame()
@@ -258,8 +356,13 @@ def load_hitter_vulnerability() -> pd.DataFrame:
 
 
 @st.cache_data
-def load_hitter_strength() -> pd.DataFrame:
-    """Load hitter strength profiles."""
+def load_hitter_strength(career: bool = False) -> pd.DataFrame:
+    """Load hitter strength profiles (career-aggregated or single season)."""
+    if career:
+        path = DASHBOARD_DIR / "hitter_str_career.parquet"
+        if path.exists():
+            return pd.read_parquet(path)
+    # Fallback to single-season
     path = DASHBOARD_DIR / "hitter_str.parquet"
     if not path.exists():
         return pd.DataFrame()
@@ -355,19 +458,43 @@ def _pctile_bar_html(
     ci_lo: float,
     ci_hi: float,
     key: str,
+    pctile_prev: float | None = None,
 ) -> str:
-    """Render a percentile bar row."""
+    """Render a percentile bar row with optional 2025 dashed reference line."""
     color = _pctile_color(pctile)
     ci_str = f"{_fmt_stat(ci_lo, key)} - {_fmt_stat(ci_hi, key)}"
+
+    # Dashed line for previous-season percentile
+    prev_line = ""
+    prev_label = ""
+    if pctile_prev is not None:
+        # Direction arrow
+        diff = pctile - pctile_prev
+        if abs(diff) >= 1:
+            arrow = "&#9650;" if diff > 0 else "&#9660;"
+            arrow_color = SAGE if diff > 0 else EMBER
+        else:
+            arrow = ""
+            arrow_color = SLATE
+        prev_line = (
+            f'<div style="position:absolute; left:{pctile_prev:.0f}%; top:0; '
+            f'height:100%; width:2px; border-left:2px dashed {SLATE}; opacity:0.7; z-index:2;"></div>'
+        )
+        prev_label = (
+            f'<span style="color:{arrow_color}; font-size:0.75rem; margin-left:8px;">'
+            f'{arrow} 2025: {pctile_prev:.0f}th</span>'
+        )
+
     return (
         f'<div style="margin:12px 0;">'
         f'<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">'
-        f'<span style="color:{SLATE}; font-size:0.85rem; font-weight:600;">{label}</span>'
+        f'<span style="color:{SLATE}; font-size:0.85rem; font-weight:600;">{label}{prev_label}</span>'
         f'<span style="color:{SLATE}; font-size:0.8rem;">{pctile:.0f}th percentile | Range: {ci_str}</span>'
         f'</div>'
-        f'<div style="width:100%; background:{DARK}; border-radius:6px; height:22px; '
+        f'<div style="position:relative; width:100%; background:{DARK}; border-radius:6px; height:22px; '
         f'overflow:hidden; border:1px solid {DARK_BORDER};">'
         f'<div style="height:100%; width:{pctile:.0f}%; background:{color}; border-radius:5px;"></div>'
+        f'{prev_line}'
         f'</div>'
         f'</div>'
     )
@@ -635,6 +762,13 @@ PITCH_DISPLAY: dict[str, str] = {
     "SV": "Slurve", "CS": "Slow Curve", "FO": "Forkball",
     "EP": "Eephus", "KN": "Knuckleball",
 }
+# Fixed display order: fastballs → breaking → offspeed
+PITCH_ORDER: list[str] = [
+    "FF", "SI", "FC",
+    "SL", "ST", "CU", "KC", "SV", "CS",
+    "CH", "FS", "FO",
+    "EP", "KN",
+]
 PITCH_FAMILY_COLORS: dict[str, str] = {
     "fastball": "#E8575A",   # warm red
     "breaking": "#5B9BD5",   # cool blue
@@ -673,6 +807,621 @@ def _xwoba_quality_color(xwoba: float) -> str:
         return EMBER
 
 
+# ---------------------------------------------------------------------------
+# Pitch profile stat tables (sparkbar style)
+# ---------------------------------------------------------------------------
+def _spark_color_rate(value: float, league_avg: float, higher_is_worse: bool) -> str:
+    """Color a rate stat relative to league average.
+
+    For hitter vulnerabilities (higher_is_worse=True): red if above avg, green if below.
+    For pitcher skills (higher_is_worse=False): green if above avg, red if below.
+    """
+    ratio = value / league_avg if league_avg > 0 else 1.0
+    if higher_is_worse:
+        if ratio >= 1.25:
+            return EMBER
+        elif ratio >= 1.05:
+            return GOLD
+        elif ratio >= 0.85:
+            return SLATE
+        else:
+            return SAGE
+    else:
+        if ratio >= 1.25:
+            return SAGE
+        elif ratio >= 1.05:
+            return GOLD
+        elif ratio >= 0.85:
+            return SLATE
+        else:
+            return EMBER
+
+
+def _spark_color_xwoba(value: float, for_pitcher: bool = False) -> str:
+    """Color xwOBA — green = dangerous for hitters, green = suppresses for pitchers."""
+    if for_pitcher:
+        # Lower is better for pitchers
+        if value <= 0.280:
+            return SAGE
+        elif value <= 0.340:
+            return GOLD
+        elif value <= 0.400:
+            return SLATE
+        else:
+            return EMBER
+    else:
+        # Higher is better for hitters (more damage)
+        if value >= 0.420:
+            return SAGE
+        elif value >= 0.350:
+            return GOLD
+        elif value >= 0.300:
+            return SLATE
+        else:
+            return EMBER
+
+
+def _spark_html(value: float, max_val: float, color: str,
+                alpha: float = 0.85) -> str:
+    """Render an inline pill-shaped sparkbar."""
+    width_pct = min(value / max_val * 100, 100) if max_val > 0 else 0
+    return (
+        f'<div class="spark-bar" style="width:{width_pct:.0f}%; '
+        f'background:{color}; opacity:{alpha:.2f};"></div>'
+    )
+
+
+def _combine_platoon_vuln(vuln_df: pd.DataFrame) -> pd.DataFrame:
+    """Combine L/R platoon splits into a single row per pitch type.
+
+    Sums raw counts and recomputes rates.  xwOBA is BIP-weighted.
+    """
+    sum_cols = [
+        "pitches", "swings", "whiffs", "out_of_zone_pitches",
+        "chase_swings", "called_strikes", "csw", "bip",
+        "hard_hits", "barrels_proxy",
+    ]
+    agg = {c: "sum" for c in sum_cols if c in vuln_df.columns}
+    combined = vuln_df.groupby("pitch_type").agg(agg).reset_index()
+    combined["whiff_rate"] = combined["whiffs"] / combined["swings"].replace(0, np.nan)
+    combined["chase_rate"] = combined["chase_swings"] / combined["out_of_zone_pitches"].replace(0, np.nan)
+    combined["csw_pct"] = combined["csw"] / combined["pitches"].replace(0, np.nan)
+    if "pitch_family" in vuln_df.columns:
+        fam_map = vuln_df.drop_duplicates("pitch_type").set_index("pitch_type")["pitch_family"].to_dict()
+        combined["pitch_family"] = combined["pitch_type"].map(fam_map)
+    if "xwoba_contact" in vuln_df.columns:
+        xw = vuln_df[vuln_df["xwoba_contact"].notna() & (vuln_df["bip"] > 0)]
+        if not xw.empty:
+            xw_agg = xw.groupby("pitch_type").apply(
+                lambda g: (g["xwoba_contact"] * g["bip"]).sum() / g["bip"].sum()
+                if g["bip"].sum() > 0 else np.nan,
+                include_groups=False,
+            ).reset_index(name="xwoba_contact")
+            combined = combined.merge(xw_agg, on="pitch_type", how="left")
+        else:
+            combined["xwoba_contact"] = np.nan
+    # Keep batter_id for downstream filtering
+    combined["batter_id"] = vuln_df["batter_id"].iloc[0]
+    return combined
+
+
+def _build_hitter_profile_table(vuln_df: pd.DataFrame) -> str:
+    """Build HTML stat table for a hitter's pitch-type profile.
+
+    Columns: Pitch | Whiff% | CStr% | Chase% | xwOBA | Pitches
+    """
+    from src.utils.constants import LEAGUE_AVG_BY_PITCH_TYPE, LEAGUE_AVG_OVERALL
+
+    df = vuln_df.copy()
+    df = df[df["pitches"] >= 15]  # Minimum sample
+    if df.empty:
+        return ""
+
+    # Compute rates from raw counts
+    df["called_str_rate"] = df["called_strikes"] / df["pitches"].replace(0, np.nan)
+    df["whiff_rate_raw"] = df["whiffs"] / df["swings"].replace(0, np.nan)
+    df["chase_rate_raw"] = df["chase_swings"] / df["out_of_zone_pitches"].replace(0, np.nan)
+
+    # Fixed order: fastballs → breaking → offspeed
+    df["_order"] = df["pitch_type"].map({pt: i for i, pt in enumerate(PITCH_ORDER)}).fillna(99)
+    df = df.sort_values("_order")
+
+    # Max values for sparkbar scaling
+    max_whiff = max(df["whiff_rate_raw"].dropna().max(), 0.01)
+    max_cstr = max(df["called_str_rate"].dropna().max(), 0.01)
+    max_chase = max(df["chase_rate_raw"].dropna().max(), 0.01)
+    max_xwoba = max(df["xwoba_contact"].dropna().max(), 0.01) if "xwoba_contact" in df.columns else 0.5
+
+    rows_html = ""
+    for _, row in df.iterrows():
+        pt = row["pitch_type"]
+        pt_name = PITCH_DISPLAY.get(pt, pt)
+        family = PITCH_TYPE_TO_FAMILY.get(pt, "offspeed")
+        family_color = PITCH_FAMILY_COLORS.get(family, SLATE)
+        n_pitches = int(row["pitches"])
+
+        # League averages for this pitch type
+        lg = LEAGUE_AVG_BY_PITCH_TYPE.get(pt, LEAGUE_AVG_OVERALL)
+        lg_whiff = lg.get("whiff_rate", 0.25)
+        lg_chase = lg.get("chase_rate", 0.30)
+
+        # Reliability alpha (fade small samples)
+        swings = row.get("swings", 0) or 0
+        alpha = min(1.0, 0.45 + 0.55 * (min(swings, 80) / 80))
+
+        # Whiff%
+        whiff = row.get("whiff_rate_raw", np.nan)
+        if pd.notna(whiff):
+            w_color = _spark_color_rate(whiff, lg_whiff, higher_is_worse=True)
+            whiff_cell = (
+                f'<div class="spark-cell">'
+                f'{_spark_html(whiff, max_whiff, w_color, alpha)}'
+                f'<span class="spark-val" style="color:{w_color};">{whiff*100:.0f}%</span>'
+                f'</div>'
+            )
+        else:
+            whiff_cell = f'<span style="color:{SLATE};">--</span>'
+
+        # Called Strike%
+        cstr = row.get("called_str_rate", np.nan)
+        if pd.notna(cstr):
+            # Higher called strike rate = pitcher is freezing the hitter = bad for hitter
+            c_color = _spark_color_rate(cstr, 0.14, higher_is_worse=True)
+            cstr_cell = (
+                f'<div class="spark-cell">'
+                f'{_spark_html(cstr, max_cstr, c_color, alpha)}'
+                f'<span class="spark-val" style="color:{c_color};">{cstr*100:.0f}%</span>'
+                f'</div>'
+            )
+        else:
+            cstr_cell = f'<span style="color:{SLATE};">--</span>'
+
+        # Chase%
+        chase = row.get("chase_rate_raw", np.nan)
+        if pd.notna(chase):
+            ch_color = _spark_color_rate(chase, lg_chase, higher_is_worse=True)
+            chase_cell = (
+                f'<div class="spark-cell">'
+                f'{_spark_html(chase, max_chase, ch_color, alpha)}'
+                f'<span class="spark-val" style="color:{ch_color};">{chase*100:.0f}%</span>'
+                f'</div>'
+            )
+        else:
+            chase_cell = f'<span style="color:{SLATE};">--</span>'
+
+        # xwOBA on contact
+        xwoba = row.get("xwoba_contact", np.nan)
+        if pd.notna(xwoba) and xwoba > 0 and xwoba < 2.0:
+            x_color = _spark_color_xwoba(xwoba, for_pitcher=False)
+            xwoba_cell = (
+                f'<div class="spark-cell">'
+                f'{_spark_html(xwoba, max_xwoba, x_color, alpha)}'
+                f'<span class="spark-val" style="color:{x_color};">.{int(xwoba*1000):03d}</span>'
+                f'</div>'
+            )
+        else:
+            xwoba_cell = f'<span style="color:{SLATE};">--</span>'
+
+        rows_html += (
+            f'<tr>'
+            f'<td><span class="pt-name" style="color:{family_color};">{pt_name}</span></td>'
+            f'<td>{whiff_cell}</td>'
+            f'<td>{cstr_cell}</td>'
+            f'<td>{chase_cell}</td>'
+            f'<td>{xwoba_cell}</td>'
+            f'<td class="pt-n">{n_pitches:,}</td>'
+            f'</tr>'
+        )
+
+    return (
+        f'<table class="pitch-table">'
+        f'<thead><tr>'
+        f'<th>Pitch</th><th>Whiff%</th><th>CStr%</th>'
+        f'<th>Chase%</th><th>xwOBA</th><th>Pitches</th>'
+        f'</tr></thead>'
+        f'<tbody>{rows_html}</tbody>'
+        f'</table>'
+    )
+
+
+def _build_pitcher_profile_table(arsenal_df: pd.DataFrame) -> str:
+    """Build HTML stat table for a pitcher's arsenal profile.
+
+    Columns: Pitch | Whiff% | CSW% | xwOBA Ag | Velo | Usage
+    """
+    from src.utils.constants import LEAGUE_AVG_BY_PITCH_TYPE, LEAGUE_AVG_OVERALL
+
+    df = arsenal_df.copy()
+    df = df[df["pitches"] >= 20]
+    if df.empty:
+        return ""
+
+    # CSW% = (whiffs + called_strikes-equivalent) — approximate from whiff_rate * swings + csw
+    # Arsenal df has whiff_rate, usage, velo, xwoba_against
+    # Need to compute CSW if not present
+    if "csw_pct" not in df.columns:
+        # Approximate: csw_pct ≈ whiff_rate * (swings/pitches) + called_strike_rate
+        # But we may not have called_strikes, so derive from what we have
+        if "swings" in df.columns and "whiffs" in df.columns:
+            df["csw_pct"] = (df["whiffs"] + df.get("called_strikes", 0)) / df["pitches"].replace(0, np.nan)
+        else:
+            df["csw_pct"] = np.nan
+
+    # Fixed order: fastballs → breaking → offspeed
+    df["_order"] = df["pitch_type"].map({pt: i for i, pt in enumerate(PITCH_ORDER)}).fillna(99)
+    df = df.sort_values("_order")
+
+    # Max values for sparkbar scaling
+    max_whiff = max(df["whiff_rate"].dropna().max(), 0.01)
+    max_csw = max(df["csw_pct"].dropna().max(), 0.01) if "csw_pct" in df.columns else 0.40
+    max_xwoba = 0.500  # Fixed scale for pitcher xwOBA against
+
+    rows_html = ""
+    for _, row in df.iterrows():
+        pt = row["pitch_type"]
+        pt_name = PITCH_DISPLAY.get(pt, pt)
+        family = PITCH_TYPE_TO_FAMILY.get(pt, "offspeed")
+        family_color = PITCH_FAMILY_COLORS.get(family, SLATE)
+
+        lg = LEAGUE_AVG_BY_PITCH_TYPE.get(pt, LEAGUE_AVG_OVERALL)
+        lg_whiff = lg.get("whiff_rate", 0.25)
+        lg_csw = lg.get("csw_pct", 0.29)
+
+        usage = row.get("usage_pct", 0)
+        velo = row.get("avg_velo", np.nan)
+
+        # Whiff%
+        whiff = row.get("whiff_rate", np.nan)
+        if pd.notna(whiff):
+            w_color = _spark_color_rate(whiff, lg_whiff, higher_is_worse=False)
+            whiff_cell = (
+                f'<div class="spark-cell">'
+                f'{_spark_html(whiff, max_whiff, w_color)}'
+                f'<span class="spark-val" style="color:{w_color};">{whiff*100:.0f}%</span>'
+                f'</div>'
+            )
+        else:
+            whiff_cell = f'<span style="color:{SLATE};">--</span>'
+
+        # CSW%
+        csw = row.get("csw_pct", np.nan)
+        if pd.notna(csw):
+            csw_color = _spark_color_rate(csw, lg_csw, higher_is_worse=False)
+            csw_cell = (
+                f'<div class="spark-cell">'
+                f'{_spark_html(csw, max_csw, csw_color)}'
+                f'<span class="spark-val" style="color:{csw_color};">{csw*100:.0f}%</span>'
+                f'</div>'
+            )
+        else:
+            csw_cell = f'<span style="color:{SLATE};">--</span>'
+
+        # xwOBA against
+        xwoba = row.get("xwoba_against", np.nan)
+        if pd.notna(xwoba):
+            x_color = _spark_color_xwoba(xwoba, for_pitcher=True)
+            xwoba_cell = (
+                f'<div class="spark-cell">'
+                f'{_spark_html(xwoba, max_xwoba, x_color)}'
+                f'<span class="spark-val" style="color:{x_color};">.{int(xwoba*1000):03d}</span>'
+                f'</div>'
+            )
+        else:
+            xwoba_cell = f'<span style="color:{SLATE};">--</span>'
+
+        # Velo + Usage annotations
+        velo_str = f'{velo:.1f}' if pd.notna(velo) else '--'
+        usage_str = f'{usage*100:.0f}%'
+
+        rows_html += (
+            f'<tr>'
+            f'<td><span class="pt-name" style="color:{family_color};">{pt_name}</span></td>'
+            f'<td>{whiff_cell}</td>'
+            f'<td>{csw_cell}</td>'
+            f'<td>{xwoba_cell}</td>'
+            f'<td style="color:{SLATE}; font-size:0.82rem;">{velo_str}</td>'
+            f'<td style="color:{SLATE}; font-size:0.82rem;">{usage_str}</td>'
+            f'</tr>'
+        )
+
+    return (
+        f'<table class="pitch-table">'
+        f'<thead><tr>'
+        f'<th>Pitch</th><th>Whiff%</th><th>CSW%</th>'
+        f'<th>xwOBA Ag</th><th>Velo</th><th>Usage</th>'
+        f'</tr></thead>'
+        f'<tbody>{rows_html}</tbody>'
+        f'</table>'
+    )
+
+
+def _build_matchup_table(
+    arsenal_df: pd.DataFrame,
+    vuln_df: pd.DataFrame,
+    str_df: pd.DataFrame,
+) -> str:
+    """Build combined pitcher-vs-hitter matchup table with sparkbars.
+
+    Columns: Pitch | Usage | P Whiff% | H Whiff% | H Chase% | H xwOBA | Edge
+    """
+    from src.utils.constants import LEAGUE_AVG_BY_PITCH_TYPE, LEAGUE_AVG_OVERALL
+
+    p_df = arsenal_df.copy()
+    p_df = p_df[p_df["pitches"] >= 20]
+    if p_df.empty:
+        return ""
+
+    # Filter vuln/str to meaningful samples and deduplicate by keeping
+    # the row with the most pitches per pitch_type (career parquets may
+    # have duplicate rows from multi-season aggregation).
+    v_df = vuln_df.copy()
+    v_df = v_df[v_df["pitches"] >= 15]
+    if not v_df.empty:
+        v_df = v_df.sort_values("pitches", ascending=False).drop_duplicates(
+            subset=["pitch_type"], keep="first"
+        )
+    s_df = str_df.copy() if not str_df.empty else pd.DataFrame()
+    if not s_df.empty and "pitches" in s_df.columns:
+        s_df = s_df.sort_values("pitches", ascending=False).drop_duplicates(
+            subset=["pitch_type"], keep="first"
+        )
+
+    # Fixed pitch order
+    p_df["_order"] = p_df["pitch_type"].map(
+        {pt: i for i, pt in enumerate(PITCH_ORDER)}
+    ).fillna(99)
+    p_df = p_df.sort_values("_order")
+
+    # Precompute max values for sparkbar scaling
+    max_p_whiff = max(p_df["whiff_rate"].dropna().max(), 0.01)
+    h_whiffs = []
+    h_chases = []
+    h_xwobas = []
+    for _, row in p_df.iterrows():
+        pt = row["pitch_type"]
+        h_row = v_df[v_df["pitch_type"] == pt]
+        if len(h_row) > 0:
+            sw = h_row["swings"].iloc[0] if "swings" in h_row.columns else 0
+            wh = h_row["whiffs"].iloc[0] if "whiffs" in h_row.columns else 0
+            whiff_r = wh / sw if pd.notna(sw) and sw > 0 else np.nan
+            h_whiffs.append(whiff_r)
+            if "chase_swings" in h_row.columns and "out_of_zone_pitches" in h_row.columns:
+                cs = h_row["chase_swings"].iloc[0]
+                oz = h_row["out_of_zone_pitches"].iloc[0]
+                h_chases.append(cs / oz if pd.notna(oz) and oz > 0 else np.nan)
+            else:
+                h_chases.append(np.nan)
+        else:
+            h_whiffs.append(np.nan)
+            h_chases.append(np.nan)
+        s_row = s_df[s_df["pitch_type"] == pt] if not s_df.empty else pd.DataFrame()
+        if len(s_row) > 0 and "xwoba_contact" in s_row.columns:
+            h_xwobas.append(s_row["xwoba_contact"].iloc[0])
+        elif len(h_row) > 0 and "xwoba_contact" in h_row.columns:
+            h_xwobas.append(h_row["xwoba_contact"].iloc[0])
+        else:
+            h_xwobas.append(np.nan)
+
+    max_h_whiff = max(pd.Series(h_whiffs).dropna().max(), 0.01) if any(pd.notna(v) for v in h_whiffs) else 0.40
+    max_h_chase = max(pd.Series(h_chases).dropna().max(), 0.01) if any(pd.notna(v) for v in h_chases) else 0.40
+    max_h_xwoba = max(pd.Series(h_xwobas).dropna().max(), 0.01) if any(pd.notna(v) for v in h_xwobas) else 0.50
+
+    rows_html = ""
+    for idx, (_, row) in enumerate(p_df.iterrows()):
+        pt = row["pitch_type"]
+        pt_name = PITCH_DISPLAY.get(pt, pt)
+        family = PITCH_TYPE_TO_FAMILY.get(pt, "offspeed")
+        family_color = PITCH_FAMILY_COLORS.get(family, SLATE)
+
+        lg = LEAGUE_AVG_BY_PITCH_TYPE.get(pt, LEAGUE_AVG_OVERALL)
+        lg_whiff = lg.get("whiff_rate", 0.25)
+        lg_chase = lg.get("chase_rate", 0.30)
+
+        usage = row.get("usage_pct", 0)
+        usage_str = f'{usage * 100:.0f}%'
+
+        # Pitcher whiff%
+        p_whiff = row.get("whiff_rate", np.nan)
+        if pd.notna(p_whiff):
+            pw_color = _spark_color_rate(p_whiff, lg_whiff, higher_is_worse=False)
+            pw_cell = (
+                f'<div class="spark-cell">'
+                f'{_spark_html(p_whiff, max_p_whiff, pw_color)}'
+                f'<span class="spark-val" style="color:{pw_color};">{p_whiff*100:.0f}%</span>'
+                f'</div>'
+            )
+        else:
+            pw_cell = f'<span style="color:{SLATE};">--</span>'
+
+        # Hitter whiff%
+        h_whiff = h_whiffs[idx]
+        if pd.notna(h_whiff):
+            hw_color = _spark_color_rate(h_whiff, lg_whiff, higher_is_worse=True)
+            hw_cell = (
+                f'<div class="spark-cell">'
+                f'{_spark_html(h_whiff, max_h_whiff, hw_color)}'
+                f'<span class="spark-val" style="color:{hw_color};">{h_whiff*100:.0f}%</span>'
+                f'</div>'
+            )
+        else:
+            hw_cell = f'<span style="color:{SLATE};">--</span>'
+
+        # Hitter chase%
+        h_chase = h_chases[idx]
+        if pd.notna(h_chase):
+            hc_color = _spark_color_rate(h_chase, lg_chase, higher_is_worse=True)
+            hc_cell = (
+                f'<div class="spark-cell">'
+                f'{_spark_html(h_chase, max_h_chase, hc_color)}'
+                f'<span class="spark-val" style="color:{hc_color};">{h_chase*100:.0f}%</span>'
+                f'</div>'
+            )
+        else:
+            hc_cell = f'<span style="color:{SLATE};">--</span>'
+
+        # Hitter xwOBA on contact
+        h_xwoba = h_xwobas[idx]
+        if pd.notna(h_xwoba) and 0 < h_xwoba < 2.0:
+            hx_color = _spark_color_xwoba(h_xwoba, for_pitcher=False)
+            hx_cell = (
+                f'<div class="spark-cell">'
+                f'{_spark_html(h_xwoba, max_h_xwoba, hx_color)}'
+                f'<span class="spark-val" style="color:{hx_color};">.{int(h_xwoba*1000):03d}</span>'
+                f'</div>'
+            )
+        else:
+            hx_cell = f'<span style="color:{SLATE};">--</span>'
+
+        # Edge indicator: pitcher advantage if P whiff > lg AND H whiff > lg
+        # Hitter advantage if H xwOBA high and H whiff < lg
+        edge_score = 0.0
+        if pd.notna(p_whiff) and pd.notna(h_whiff):
+            # Pitcher gets credit for high P whiff AND hitter vulnerability
+            edge_score += (p_whiff - lg_whiff) * 2  # pitcher's pitch quality
+            edge_score += (h_whiff - lg_whiff) * 2  # hitter vulnerable here
+        if pd.notna(h_chase) and pd.notna(lg_chase):
+            edge_score += (h_chase - lg_chase)  # hitter chases = pitcher edge
+        if pd.notna(h_xwoba):
+            # High xwOBA on contact = hitter edge on this pitch
+            edge_score -= (h_xwoba - 0.350) * 3
+
+        if edge_score > 0.08:
+            edge_color = SAGE
+        elif edge_score < -0.08:
+            edge_color = EMBER
+        else:
+            edge_color = GOLD
+        edge_cell = f'<span class="edge-dot" style="background:{edge_color};"></span>'
+
+        rows_html += (
+            f'<tr>'
+            f'<td><span class="pt-name" style="color:{family_color};">{pt_name}</span></td>'
+            f'<td style="color:{SLATE}; font-size:0.82rem;">{usage_str}</td>'
+            f'<td>{pw_cell}</td>'
+            f'<td>{hw_cell}</td>'
+            f'<td>{hc_cell}</td>'
+            f'<td>{hx_cell}</td>'
+            f'<td style="text-align:center;">{edge_cell}</td>'
+            f'</tr>'
+        )
+
+    return (
+        f'<table class="matchup-table">'
+        f'<thead><tr>'
+        f'<th>Pitch</th><th>Usage</th><th>P Whiff%</th>'
+        f'<th>H Whiff%</th><th>H Chase%</th><th>H xwOBA</th><th>Edge</th>'
+        f'</tr></thead>'
+        f'<tbody>{rows_html}</tbody>'
+        f'</table>'
+    )
+
+
+def _build_matchup_scouting_bullets(
+    arsenal_df: pd.DataFrame,
+    vuln_df: pd.DataFrame,
+    str_df: pd.DataFrame,
+    pitcher_name: str,
+    hitter_name: str,
+) -> list[tuple[str, str]]:
+    """Generate per-pitch scouting bullets for the matchup.
+
+    Returns list of (color, text) tuples.
+    """
+    from src.utils.constants import LEAGUE_AVG_BY_PITCH_TYPE, LEAGUE_AVG_OVERALL
+
+    p_df = arsenal_df.copy()
+    p_df = p_df[p_df["pitches"] >= 20]
+    if p_df.empty:
+        return []
+
+    # Deduplicate vuln/str — keep row with most pitches per pitch_type
+    v_df = vuln_df.copy()
+    v_df = v_df[v_df["pitches"] >= 15] if "pitches" in v_df.columns else v_df
+    if not v_df.empty:
+        v_df = v_df.sort_values("pitches", ascending=False).drop_duplicates(
+            subset=["pitch_type"], keep="first"
+        )
+    s_df = str_df.copy() if not str_df.empty else pd.DataFrame()
+    if not s_df.empty and "pitches" in s_df.columns:
+        s_df = s_df.sort_values("pitches", ascending=False).drop_duplicates(
+            subset=["pitch_type"], keep="first"
+        )
+
+    bullets: list[tuple[str, str]] = []
+
+    # Gather per-pitch edges
+    pitch_edges: list[tuple[str, float, str]] = []  # (pitch_name, edge_score, detail)
+
+    for _, row in p_df.iterrows():
+        pt = row["pitch_type"]
+        pt_name = PITCH_DISPLAY.get(pt, pt)
+        lg = LEAGUE_AVG_BY_PITCH_TYPE.get(pt, LEAGUE_AVG_OVERALL)
+        lg_whiff = lg.get("whiff_rate", 0.25)
+
+        p_whiff = row.get("whiff_rate", np.nan)
+        usage = row.get("usage_pct", 0)
+
+        h_row = v_df[v_df["pitch_type"] == pt]
+        h_whiff = np.nan
+        if len(h_row) > 0 and "swings" in h_row.columns and "whiffs" in h_row.columns:
+            sw = h_row["swings"].iloc[0]
+            wh = h_row["whiffs"].iloc[0]
+            h_whiff = wh / sw if pd.notna(sw) and sw > 0 else np.nan
+
+        s_row = s_df[s_df["pitch_type"] == pt] if not s_df.empty else pd.DataFrame()
+        h_xwoba = np.nan
+        if len(s_row) > 0 and "xwoba_contact" in s_row.columns:
+            h_xwoba = s_row["xwoba_contact"].iloc[0]
+        elif len(h_row) > 0 and "xwoba_contact" in h_row.columns:
+            h_xwoba = h_row["xwoba_contact"].iloc[0]
+
+        # Score this pitch's edge
+        edge = 0.0
+        detail_parts = []
+        if pd.notna(p_whiff) and pd.notna(h_whiff):
+            edge += (p_whiff - lg_whiff) + (h_whiff - lg_whiff)
+            if p_whiff > lg_whiff * 1.1:
+                detail_parts.append(f"pitcher's whiff rate {p_whiff*100:.0f}%")
+            if h_whiff > lg_whiff * 1.15:
+                detail_parts.append(f"hitter whiffs {h_whiff*100:.0f}% of the time")
+        if pd.notna(h_xwoba):
+            if h_xwoba >= 0.400:
+                edge -= 0.15
+                detail_parts.append(f"but hitter does damage on contact (.{int(h_xwoba*1000):03d} xwOBA)")
+            elif h_xwoba <= 0.280:
+                edge += 0.05
+                detail_parts.append(f"weak contact (.{int(h_xwoba*1000):03d} xwOBA)")
+
+        detail = ", ".join(detail_parts) if detail_parts else ""
+        pitch_edges.append((pt_name, edge, detail, usage))
+
+    # Sort by absolute edge to find most interesting matchups
+    pitch_edges.sort(key=lambda x: abs(x[1]), reverse=True)
+
+    for pt_name, edge, detail, usage in pitch_edges[:3]:
+        if abs(edge) < 0.02:
+            continue
+        if edge > 0:
+            color = SAGE
+            direction = "Pitcher advantage"
+        else:
+            color = EMBER
+            direction = "Hitter advantage"
+
+        text = f"<b>{pt_name}</b> ({usage*100:.0f}% usage) — {direction}"
+        if detail:
+            text += f": {detail}"
+        bullets.append((color, text))
+
+    if not bullets:
+        bullets.append((GOLD, "No strong pitch-level edges in this matchup"))
+
+    return bullets
+
+
+# ---------------------------------------------------------------------------
+# Matplotlib chart builders (used in matchup explorer)
+# ---------------------------------------------------------------------------
 def _create_arsenal_fig(
     arsenal_df: pd.DataFrame,
     pitcher_name: str,
@@ -713,19 +1462,24 @@ def _create_arsenal_fig(
         color = _whiff_quality_color(whiff) if pd.notna(whiff) else SLATE
         thickness = row["thickness"]
 
-        # Draw velocity bar
-        ax.barh(
-            y_positions[i], bar_len, height=thickness,
-            color=color, alpha=0.85, zorder=2,
-        )
+        # Draw rounded velocity bar
+        if bar_len > 0:
+            rsize = min(thickness * 0.7, 2.0)
+            bar = FancyBboxPatch(
+                (0, y_positions[i] - thickness / 2),
+                bar_len, thickness,
+                boxstyle=f"round,pad=0,rounding_size={rsize:.2f}",
+                facecolor=color, alpha=0.85, zorder=2,
+            )
+            ax.add_patch(bar)
 
-        # xwOBA dot at end of bar
+        # xwOBA dot — small, positioned inside the bar near the tip
         if pd.notna(xwoba) and bar_len > 0:
             dot_color = _xwoba_quality_color(xwoba)
             ax.scatter(
-                bar_len, y_positions[i],
-                s=90, color=dot_color, edgecolors=CREAM,
-                linewidths=0.8, zorder=3,
+                bar_len - 3, y_positions[i],
+                s=20, color=dot_color, edgecolors="none",
+                zorder=3,
             )
 
         # Annotation: whiff% and xwOBA text to the right
@@ -743,6 +1497,7 @@ def _create_arsenal_fig(
     ax.set_yticks(y_positions)
     ax.set_yticklabels(df["label"])
     ax.set_xlim(0, 103)
+    ax.set_ylim(-0.6, n - 0.4)
     ax.set_xlabel("Velocity (mph)", color=SLATE, fontsize=10)
     ax.set_title(
         f"{pitcher_name} -- Pitch Arsenal (2025)",
@@ -760,56 +1515,118 @@ def _create_arsenal_fig(
     return fig
 
 
+def _blend_whiff_rate(row: pd.Series) -> float:
+    """Blend raw whiff rate toward league baseline by sample reliability.
+
+    reliability = min(swings, 50) / 50
+    blended = reliability * raw + (1 - reliability) * league_avg
+    """
+    from src.utils.constants import LEAGUE_AVG_BY_PITCH_TYPE, LEAGUE_AVG_OVERALL
+
+    raw = row.get("whiff_rate", 0) or 0
+    swings = row.get("swings", 0) or 0
+    pt = row.get("pitch_type", "")
+    league = LEAGUE_AVG_BY_PITCH_TYPE.get(pt, {}).get(
+        "whiff_rate", LEAGUE_AVG_OVERALL.get("whiff_rate", 0.25),
+    )
+    reliability = min(swings, 50) / 50
+    return reliability * raw + (1 - reliability) * league
+
+
 def _create_hitter_vuln_fig(
     vuln_df: pd.DataFrame,
     strength_df: pd.DataFrame,
     hitter_name: str,
 ) -> plt.Figure:
-    """Dual bar chart: vulnerabilities (whiff/chase) and strengths (barrel/hard-hit)."""
-    # Merge vuln + strength on pitch_type, keep only types with enough swings
-    vuln = vuln_df[vuln_df["swings"] >= 10].copy() if "swings" in vuln_df.columns else vuln_df.copy()
-    vuln["label"] = vuln["pitch_type"].map(PITCH_DISPLAY).fillna(vuln["pitch_type"])
+    """Dual bar chart: vulnerabilities (whiff rate, sample-blended) and
+    strengths (xwOBA on contact)."""
+    # Keep only pitch types with at least 10 swings
+    merged = vuln_df[vuln_df["swings"] >= 10].copy() if "swings" in vuln_df.columns else vuln_df.copy()
+    merged["label"] = merged["pitch_type"].map(PITCH_DISPLAY).fillna(merged["pitch_type"])
 
-    if strength_df is not None and not strength_df.empty:
-        str_cols = ["pitch_type", "barrel_rate_contact", "hard_hit_rate", "xwoba_contact"]
-        str_cols = [c for c in str_cols if c in strength_df.columns]
-        merged = vuln.merge(strength_df[str_cols], on="pitch_type", how="left")
-    else:
-        merged = vuln.copy()
+    # Reliability-blend whiff rate toward league baseline
+    merged["blended_whiff"] = merged.apply(_blend_whiff_rate, axis=1)
 
-    merged = merged.sort_values("whiff_rate", ascending=True)
+    # xwoba_contact lives on the vuln df already; if missing, pull from strength_df
+    if "xwoba_contact" not in merged.columns or merged["xwoba_contact"].isna().all():
+        if strength_df is not None and not strength_df.empty and "xwoba_contact" in strength_df.columns:
+            xwoba_map = strength_df.set_index("pitch_type")["xwoba_contact"].to_dict()
+            merged["xwoba_contact"] = merged["pitch_type"].map(xwoba_map)
 
-    fig, axes = plt.subplots(1, 2, figsize=(7, max(2.2, len(merged) * 0.5)))
+    merged = merged.sort_values("blended_whiff", ascending=True)
+
+    n_rows = len(merged)
+    fig, axes = plt.subplots(1, 2, figsize=(7, max(2.2, n_rows * 0.5)))
     fig.patch.set_facecolor(DARK)
 
-    # Left: Vulnerability (whiff rate)
+    # Left: Vulnerability (blended whiff rate) with rounded bars
     ax1 = axes[0]
     ax1.set_facecolor(DARK)
-    colors_vuln = [EMBER if w >= 0.30 else GOLD if w >= 0.20 else SAGE
-                   for w in merged["whiff_rate"].fillna(0)]
-    ax1.barh(merged["label"], merged["whiff_rate"].fillna(0) * 100,
-             color=colors_vuln, height=0.6, alpha=0.85)
+    y_pos = np.arange(n_rows)
+    for i, (_, row) in enumerate(merged.iterrows()):
+        w = row["blended_whiff"]
+        swings = row.get("swings", 50) or 50
+        color = EMBER if w >= 0.30 else GOLD if w >= 0.20 else SAGE
+        # Fade bars with fewer swings (alpha 0.4 at 10 swings → 1.0 at 100+)
+        alpha = min(1.0, 0.4 + 0.6 * (min(swings, 100) - 10) / 90)
+        bar_w = w * 100
+        rsize = min(0.3, bar_w / 5) if bar_w > 0 else 0.1
+        bar = FancyBboxPatch(
+            (0, y_pos[i] - 0.3), bar_w, 0.6,
+            boxstyle=f"round,pad=0,rounding_size={rsize:.2f}",
+            facecolor=color, alpha=alpha, zorder=2,
+        )
+        ax1.add_patch(bar)
+        # Pitch count annotation
+        ax1.text(
+            w * 100 + 1, y_pos[i], f"n={int(swings)}",
+            color=SLATE, fontsize=7, va="center", alpha=0.7,
+        )
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels(merged["label"])
+    ax1.set_xlim(0, max(merged["blended_whiff"].max() * 100 + 12, 45))
+    ax1.set_ylim(-0.6, n_rows - 0.4)
     ax1.set_xlabel("Whiff Rate %", color=SLATE, fontsize=9)
     ax1.set_title("Vulnerability", color=EMBER, fontsize=11, fontweight="bold")
     ax1.tick_params(colors=CREAM, labelsize=9)
     for spine in ax1.spines.values():
         spine.set_visible(False)
 
-    # Right: Strength (barrel rate on contact or hard-hit rate)
+    # Right: Contact quality — xwOBA on contact
     ax2 = axes[1]
     ax2.set_facecolor(DARK)
-    if "barrel_rate_contact" in merged.columns:
-        vals = merged["barrel_rate_contact"].fillna(0) * 100
-        xlabel = "Barrel Rate %"
-    elif "hard_hit_rate" in merged.columns:
-        vals = merged["hard_hit_rate"].fillna(0) * 100
-        xlabel = "Hard-Hit Rate %"
-    else:
-        vals = pd.Series([0] * len(merged))
-        xlabel = "Contact Quality"
+    xlabel = "xwOBA on Contact"
 
-    colors_str = [SAGE if v >= 10 else GOLD if v >= 5 else SLATE for v in vals]
-    ax2.barh(merged["label"], vals, color=colors_str, height=0.6, alpha=0.85)
+    if "xwoba_contact" in merged.columns:
+        vals = merged["xwoba_contact"].fillna(0)
+    else:
+        vals = pd.Series([0.0] * n_rows, index=merged.index)
+
+    for i, (_, row) in enumerate(merged.iterrows()):
+        v = vals.iloc[i]
+        if v > 0 and pd.notna(v):
+            bar_width = v * 100  # Scale for display (0.400 → 40)
+            color = SAGE if v >= 0.400 else GOLD if v >= 0.340 else SLATE
+            rsize = min(0.3, bar_width / 5)
+            bar = FancyBboxPatch(
+                (0, y_pos[i] - 0.3), bar_width, 0.6,
+                boxstyle=f"round,pad=0,rounding_size={rsize:.2f}",
+                facecolor=color, alpha=0.85, zorder=2,
+            )
+            ax2.add_patch(bar)
+
+    ax2.set_yticks(y_pos)
+    ax2.set_ylim(-0.6, n_rows - 0.4)
+    max_val = vals.max() if vals.max() > 0 else 0.5
+    x_max = min(max_val * 100 + 8, 100)  # Cap at 1.000
+    ax2.set_xlim(0, x_max)
+    # Adaptive ticks based on data range
+    if max_val > 0.6:
+        tick_vals = [0, 0.200, 0.400, 0.600, 0.800]
+    else:
+        tick_vals = [0, 0.100, 0.200, 0.300, 0.400, 0.500]
+    ax2.set_xticks([t * 100 for t in tick_vals])
+    ax2.set_xticklabels([f".{int(t*1000):03d}" for t in tick_vals])
     ax2.set_xlabel(xlabel, color=SLATE, fontsize=9)
     ax2.set_title("Contact Quality", color=SAGE, fontsize=11, fontweight="bold")
     ax2.tick_params(colors=CREAM, labelsize=9)
@@ -818,7 +1635,7 @@ def _create_hitter_vuln_fig(
         spine.set_visible(False)
 
     fig.suptitle(
-        f"{hitter_name} -- Pitch-Type Profile (2025)",
+        f"{hitter_name} -- Pitch-Type Profile",
         color=CREAM, fontsize=12, fontweight="bold", y=1.02,
     )
 
@@ -1032,17 +1849,37 @@ def page_player_profile() -> None:
     </div>
     """, unsafe_allow_html=True)
 
+    # --- Comparison baseline toggle ---
+    compare_to = st.radio(
+        "Compare projection to",
+        ["Career Avg", "2025"],
+        horizontal=True,
+        key="compare_baseline",
+    )
+
     # --- Stat metric cards ---
     cols = st.columns(len(stat_configs))
     for col, (label, key, higher_better, _) in zip(cols, stat_configs):
         obs_col = f"observed_{key}"
+        career_col = f"career_{key}"
         proj_col = f"projected_{key}"
-        if obs_col in player_row.index and pd.notna(player_row.get(obs_col)):
+
+        if compare_to == "Career Avg" and career_col in player_row.index and pd.notna(player_row.get(career_col)):
+            baseline = player_row[career_col]
+            baseline_label = "Career"
+        elif obs_col in player_row.index and pd.notna(player_row.get(obs_col)):
+            baseline = player_row[obs_col]
+            baseline_label = "2025"
+        else:
+            baseline = None
+            baseline_label = ""
+
+        if baseline is not None and proj_col in player_row.index and pd.notna(player_row.get(proj_col)):
             proj_str = _fmt_stat(player_row[proj_col], key)
-            delta = player_row[f"delta_{key}"]
-            obs_str = _fmt_stat(player_row[obs_col], key)
+            delta = player_row[proj_col] - baseline
+            base_str = _fmt_stat(baseline, key)
             delta_str = (
-                f"2025: {obs_str} ({_delta_html(delta, higher_better)})"
+                f"{baseline_label}: {base_str} ({_delta_html(delta, higher_better)})"
             )
             with col:
                 st.markdown(
@@ -1080,6 +1917,7 @@ def page_player_profile() -> None:
     bars_html = ""
     for label, key, higher_better, _ in stat_configs:
         proj_col = f"projected_{key}"
+        obs_col = f"observed_{key}"
         ci_lo_col = f"projected_{key}_2_5"
         ci_hi_col = f"projected_{key}_97_5"
 
@@ -1090,7 +1928,14 @@ def page_player_profile() -> None:
         ci_lo = player_row.get(ci_lo_col, player_row[proj_col])
         ci_hi = player_row.get(ci_hi_col, player_row[proj_col])
 
-        bars_html += _pctile_bar_html(label, pctile, ci_lo, ci_hi, key)
+        # 2025 observed percentile (rank among 2025 observed values)
+        pctile_2025 = None
+        if obs_col in player_row.index and pd.notna(player_row.get(obs_col)):
+            pctile_2025 = _percentile_rank(
+                df[obs_col], player_row[obs_col], higher_better,
+            )
+
+        bars_html += _pctile_bar_html(label, pctile, ci_lo, ci_hi, key, pctile_2025)
 
     if bars_html:
         st.markdown(
@@ -1100,12 +1945,13 @@ def page_player_profile() -> None:
         st.caption(
             "How this player ranks vs. all projected players (like Baseball Savant rankings). "
             "100th = best, 1st = worst. "
+            "Dashed line = 2025 observed percentile. "
             "Green = elite (80+), gold = above-avg (60-79), "
             "gray = mid-tier (40-59), orange = below-avg (<40). "
             "Range = 95% credible interval."
         )
 
-    # --- Arsenal / Vulnerability Charts ---
+    # --- Pitch Profile Tables ---
     if player_type == "Pitcher":
         arsenal_df = load_pitcher_arsenal()
         if not arsenal_df.empty:
@@ -1113,44 +1959,69 @@ def page_player_profile() -> None:
             if not p_arsenal.empty:
                 st.markdown('<div class="section-header">Pitch Arsenal</div>',
                             unsafe_allow_html=True)
-                fig = _create_arsenal_fig(p_arsenal, selected_name)
-                _, chart_col, _ = st.columns([1, 3, 1])
-                with chart_col:
-                    st.pyplot(fig, use_container_width=True)
-                plt.close(fig)
-                st.caption(
-                    "**Bar length** = velocity (0-103 mph) | "
-                    "**Bar thickness** = usage % | "
-                    "**Bar color** = whiff quality "
-                    f'(<span style="color:{SAGE};">35%+</span> '
-                    f'<span style="color:{GOLD};">25-35%</span> '
-                    f'<span style="color:{SLATE};">15-25%</span> '
-                    f'<span style="color:{EMBER};">&lt;15%</span>) | '
-                    "**Dot** = xwOBA against "
-                    f'(<span style="color:{SAGE};">.280-</span> '
-                    f'<span style="color:{EMBER};">.400+</span>)',
-                    unsafe_allow_html=True,
-                )
+                table_html = _build_pitcher_profile_table(p_arsenal)
+                if table_html:
+                    st.markdown(
+                        f'<div class="insight-card">{table_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        "Colors relative to league average per pitch type. "
+                        f'<span style="color:{SAGE};">Green</span> = above avg, '
+                        f'<span style="color:{GOLD};">gold</span> = avg, '
+                        f'<span style="color:{EMBER};">orange</span> = below avg. '
+                        "CSW% = called strikes + whiffs / pitches.",
+                        unsafe_allow_html=True,
+                    )
     else:
-        vuln_df = load_hitter_vulnerability()
-        str_df = load_hitter_strength()
+        vuln_df = load_hitter_vulnerability(career=True)
         if not vuln_df.empty:
-            h_vuln = vuln_df[vuln_df["batter_id"] == player_id].copy()
-            h_str = str_df[str_df["batter_id"] == player_id].copy() if not str_df.empty else pd.DataFrame()
-            if not h_vuln.empty:
-                st.markdown('<div class="section-header">Pitch-Type Profile</div>',
-                            unsafe_allow_html=True)
-                fig = _create_hitter_vuln_fig(h_vuln, h_str, selected_name)
-                st.pyplot(fig, use_container_width=True)
-                plt.close(fig)
-                st.caption(
-                    "Left: whiff rate by pitch type "
-                    f'(<span style="color:{EMBER};">red = exploitable 30%+</span>, '
-                    f'<span style="color:{SAGE};">green = strong <20%</span>). '
-                    "Right: barrel rate on contact "
-                    f'(<span style="color:{SAGE};">green = dangerous 10%+</span>).',
-                    unsafe_allow_html=True,
+            h_vuln_all = vuln_df[vuln_df["batter_id"] == player_id].copy()
+            if not h_vuln_all.empty:
+                # Detect switch hitter: significant data on both sides
+                side_counts = h_vuln_all.groupby("batter_stand")["pitches"].sum()
+                is_switch = (
+                    len(side_counts) > 1
+                    and all(v >= 50 for v in side_counts.values)
                 )
+
+                section_label = "Pitch-Type Profile (Career)"
+                if is_switch:
+                    platoon_side = st.radio(
+                        "Batter side",
+                        ["vs RHP (bats L)", "vs LHP (bats R)", "Combined"],
+                        horizontal=True,
+                        key="profile_platoon",
+                    )
+                    if platoon_side.startswith("vs RHP"):
+                        h_vuln = h_vuln_all[h_vuln_all["batter_stand"] == "L"].copy()
+                        section_label = "Pitch-Type Profile (Career — vs RHP)"
+                    elif platoon_side.startswith("vs LHP"):
+                        h_vuln = h_vuln_all[h_vuln_all["batter_stand"] == "R"].copy()
+                        section_label = "Pitch-Type Profile (Career — vs LHP)"
+                    else:
+                        # Combined: sum raw counts across sides, recompute rates
+                        h_vuln = _combine_platoon_vuln(h_vuln_all)
+                        section_label = "Pitch-Type Profile (Career — Combined)"
+                else:
+                    h_vuln = h_vuln_all
+
+                st.markdown(f'<div class="section-header">{section_label}</div>',
+                            unsafe_allow_html=True)
+                table_html = _build_hitter_profile_table(h_vuln)
+                if table_html:
+                    st.markdown(
+                        f'<div class="insight-card">{table_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        "Colors relative to league average per pitch type. "
+                        f'<span style="color:{EMBER};">Orange</span> = exploitable, '
+                        f'<span style="color:{SAGE};">green</span> = strength. '
+                        "CStr% = called strikes / pitches. "
+                        "Bar opacity reflects sample confidence.",
+                        unsafe_allow_html=True,
+                    )
 
     # --- Posterior KDE (for pitchers with K% samples) ---
     k_samples = load_k_samples()
@@ -1376,8 +2247,8 @@ def page_matchup_explorer() -> None:
                 unsafe_allow_html=True)
 
     arsenal_df = load_pitcher_arsenal()
-    vuln_df = load_hitter_vulnerability()
-    str_df = load_hitter_strength()
+    vuln_df = load_hitter_vulnerability(career=True)
+    str_df = load_hitter_strength(career=True)
     pitcher_proj = load_projections("pitcher")
     hitter_proj = load_projections("hitter")
 
@@ -1407,14 +2278,39 @@ def page_matchup_explorer() -> None:
     hitter_row = hitter_proj[hitter_proj["batter_name"] == selected_hitter].iloc[0]
     pitcher_id = int(pitcher_row["pitcher_id"])
     batter_id = int(hitter_row["batter_id"])
+    pitcher_hand = pitcher_row.get("pitch_hand", "R")
 
-    # Score the matchup
+    # --- Platoon-aware filtering for switch hitters ---
+    # Determine which side the hitter bats from against this pitcher
+    batter_vuln_all = vuln_df[vuln_df["batter_id"] == batter_id]
+    batter_str_all = str_df[str_df["batter_id"] == batter_id] if not str_df.empty else pd.DataFrame()
+    side_counts = batter_vuln_all.groupby("batter_stand")["pitches"].sum() if not batter_vuln_all.empty else pd.Series(dtype=float)
+    is_switch = len(side_counts) > 1 and all(v >= 50 for v in side_counts.values)
+
+    if is_switch:
+        # Switch hitter bats from opposite side of pitcher
+        platoon_side = "L" if pitcher_hand == "R" else "R"
+        vuln_filtered = vuln_df[
+            (vuln_df["batter_id"] != batter_id)
+            | (vuln_df["batter_stand"] == platoon_side)
+        ].copy()
+        str_filtered = str_df[
+            (str_df["batter_id"] != batter_id)
+            | (str_df["batter_stand"] == platoon_side)
+        ].copy() if not str_df.empty else pd.DataFrame()
+        hitter_hand = platoon_side
+    else:
+        vuln_filtered = vuln_df
+        str_filtered = str_df
+        hitter_hand = hitter_row.get("batter_stand", "?")
+
+    # Score the matchup (using platoon-filtered data)
     baselines_pt: dict[str, dict[str, float]] = {}
     for pt, vals in LEAGUE_AVG_BY_PITCH_TYPE.items():
         baselines_pt[pt] = vals if isinstance(vals, dict) else {"whiff_rate": 0.25}
 
     matchup = score_matchup(
-        pitcher_id, batter_id, arsenal_df, vuln_df, baselines_pt,
+        pitcher_id, batter_id, arsenal_df, vuln_filtered, baselines_pt,
     )
 
     # --- Matchup header ---
@@ -1429,15 +2325,16 @@ def page_matchup_explorer() -> None:
         edge_label = "Neutral Matchup"
         edge_color = GOLD
 
-    pitcher_hand = pitcher_row.get("pitch_hand", "?")
-    hitter_hand = hitter_row.get("batter_stand", "?")
-    hand_str = f"{'LHP' if pitcher_hand == 'L' else 'RHP'} vs {'LHH' if hitter_hand == 'L' else 'RHH'}"
+    pitcher_label = "LHP" if pitcher_hand == "L" else "RHP"
+    hitter_label = "LHH" if hitter_hand == "L" else "RHH"
+    switch_tag = " (switch)" if is_switch else ""
+    hand_str = f"{pitcher_label} vs {hitter_label}{switch_tag}"
 
     st.markdown(f"""
     <div class="brand-header">
         <div>
             <div class="brand-title">{selected_pitcher} vs {selected_hitter}</div>
-            <div class="brand-subtitle">{hand_str} | 2025 pitch-type profiles</div>
+            <div class="brand-subtitle">{hand_str} | Career pitch-type profiles</div>
         </div>
         <div style="text-align:right;">
             <div style="color:{edge_color}; font-size:1.1rem; font-weight:600;">
@@ -1451,12 +2348,19 @@ def page_matchup_explorer() -> None:
     """, unsafe_allow_html=True)
 
     # --- Summary metrics ---
-    m_cols = st.columns(4)
     mwhiff = matchup["matchup_whiff_rate"]
     bwhiff = matchup["baseline_whiff_rate"]
+    whiff_delta = (mwhiff - bwhiff) if pd.notna(mwhiff) and pd.notna(bwhiff) else 0.0
+    whiff_delta_html = _delta_html(whiff_delta, higher_is_better=True) if whiff_delta != 0 else ""
+
+    m_cols = st.columns(4)
     with m_cols[0]:
         st.markdown(
-            _metric_card("Matchup Whiff", _fmt_pct(mwhiff) if pd.notna(mwhiff) else "--"),
+            _metric_card(
+                "Matchup Whiff",
+                _fmt_pct(mwhiff) if pd.notna(mwhiff) else "--",
+                whiff_delta_html,
+            ),
             unsafe_allow_html=True,
         )
     with m_cols[1]:
@@ -1475,108 +2379,127 @@ def page_matchup_explorer() -> None:
             unsafe_allow_html=True,
         )
 
-    # --- Pitch-by-pitch breakdown ---
-    st.markdown('<div class="section-header">Pitch-by-Pitch Breakdown</div>',
+    # --- Combined matchup breakdown table ---
+    st.markdown('<div class="section-header">Pitch-by-Pitch Matchup</div>',
                 unsafe_allow_html=True)
 
     p_arsenal = arsenal_df[
-        (arsenal_df["pitcher_id"] == pitcher_id) & (arsenal_df["pitches"] >= 20)
-    ].sort_values("usage_pct", ascending=False).copy()
+        arsenal_df["pitcher_id"] == pitcher_id
+    ].copy()
+    h_vuln = vuln_filtered[vuln_filtered["batter_id"] == batter_id].copy()
+    h_str = str_filtered[str_filtered["batter_id"] == batter_id].copy() if not str_filtered.empty else pd.DataFrame()
 
     if p_arsenal.empty:
         st.info("Insufficient arsenal data for detailed breakdown.")
     else:
-        breakdown_rows = []
-        for _, row in p_arsenal.iterrows():
-            pt = row["pitch_type"]
-            # Hitter's whiff against this pitch type
-            h_row = vuln_df[
-                (vuln_df["batter_id"] == batter_id) & (vuln_df["pitch_type"] == pt)
-            ]
-            h_whiff = float(h_row["whiff_rate"].iloc[0]) if len(h_row) > 0 and pd.notna(h_row["whiff_rate"].iloc[0]) else None
-            h_chase = float(h_row["chase_rate"].iloc[0]) if len(h_row) > 0 and "chase_rate" in h_row.columns and pd.notna(h_row["chase_rate"].iloc[0]) else None
+        matchup_html = _build_matchup_table(p_arsenal, h_vuln, h_str)
+        if matchup_html:
+            st.markdown(
+                f'<div class="insight-card">{matchup_html}</div>',
+                unsafe_allow_html=True,
+            )
+            platoon_note = f" Hitter stats from {hitter_label} side." if is_switch else ""
+            st.caption(
+                "P Whiff% = pitcher's whiff rate with that pitch | "
+                "H Whiff% = hitter's whiff rate against that pitch type | "
+                "H Chase% = hitter's chase rate | H xwOBA = xwOBA on contact | "
+                f"Edge: green = pitcher advantage, red = hitter advantage.{platoon_note}"
+            )
 
-            # Hitter's strength against this pitch type
-            s_row = str_df[
-                (str_df["batter_id"] == batter_id) & (str_df["pitch_type"] == pt)
-            ] if not str_df.empty else pd.DataFrame()
-            h_barrel = float(s_row["barrel_rate_contact"].iloc[0]) if len(s_row) > 0 and pd.notna(s_row["barrel_rate_contact"].iloc[0]) else None
-
-            breakdown_rows.append({
-                "Pitch": PITCH_DISPLAY.get(pt, pt),
-                "Usage": f"{row['usage_pct']*100:.0f}%",
-                "Velo": f"{row['avg_velo']:.0f}" if pd.notna(row.get("avg_velo")) else "--",
-                "P Whiff%": f"{row['whiff_rate']*100:.0f}%" if pd.notna(row.get("whiff_rate")) else "--",
-                "H Whiff%": f"{h_whiff*100:.0f}%" if h_whiff is not None else "--",
-                "H Chase%": f"{h_chase*100:.0f}%" if h_chase is not None else "--",
-                "H Barrel%": f"{h_barrel*100:.1f}%" if h_barrel is not None else "--",
-            })
-
-        st.dataframe(
-            pd.DataFrame(breakdown_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.caption(
-            "P Whiff% = pitcher's whiff rate with that pitch. "
-            "H Whiff% = hitter's whiff rate against that pitch type. "
-            "H Chase% = hitter's chase rate. H Barrel% = hitter's barrel rate on contact."
-        )
-
-    # --- Side-by-side arsenal + vulnerability charts ---
-    st.markdown('<div class="section-header">Visual Profiles</div>',
+    # --- Side-by-side profile tables ---
+    st.markdown('<div class="section-header">Individual Profiles</div>',
                 unsafe_allow_html=True)
 
-    chart_col1, chart_col2 = st.columns(2)
-    with chart_col1:
+    prof_col1, prof_col2 = st.columns(2)
+    with prof_col1:
+        st.markdown(
+            f'<div style="color:{GOLD}; font-size:0.95rem; font-weight:600; '
+            f'margin-bottom:0.5rem;">{selected_pitcher} — Arsenal</div>',
+            unsafe_allow_html=True,
+        )
         if not p_arsenal.empty:
-            fig = _create_arsenal_fig(p_arsenal, selected_pitcher)
-            st.pyplot(fig, use_container_width=True)
-            plt.close(fig)
+            p_table = _build_pitcher_profile_table(p_arsenal)
+            if p_table:
+                st.markdown(
+                    f'<div class="insight-card">{p_table}</div>',
+                    unsafe_allow_html=True,
+                )
 
-    with chart_col2:
-        h_vuln = vuln_df[vuln_df["batter_id"] == batter_id].copy()
-        h_str = str_df[str_df["batter_id"] == batter_id].copy() if not str_df.empty else pd.DataFrame()
+    with prof_col2:
+        vuln_label = f"{selected_hitter} — Vulnerabilities"
+        if is_switch:
+            vuln_label += f" (batting {hitter_hand})"
+        st.markdown(
+            f'<div style="color:{GOLD}; font-size:0.95rem; font-weight:600; '
+            f'margin-bottom:0.5rem;">{vuln_label}</div>',
+            unsafe_allow_html=True,
+        )
         if not h_vuln.empty:
-            fig = _create_hitter_vuln_fig(h_vuln, h_str, selected_hitter)
-            st.pyplot(fig, use_container_width=True)
-            plt.close(fig)
+            h_table = _build_hitter_profile_table(h_vuln)
+            if h_table:
+                st.markdown(
+                    f'<div class="insight-card">{h_table}</div>',
+                    unsafe_allow_html=True,
+                )
 
-    # --- Plain English summary ---
+    # --- Scouting report ---
+    st.markdown('<div class="section-header">Matchup Scouting Report</div>',
+                unsafe_allow_html=True)
+
+    # Overall summary
+    bullets_html = ""
     if pd.notna(mwhiff) and pd.notna(bwhiff):
         whiff_delta_pp = (mwhiff - bwhiff) * 100
         if whiff_delta_pp > 2:
             summary = (
-                f"This is a favorable matchup for **{selected_pitcher}**. "
-                f"The hitter's pitch-type vulnerabilities align well with the pitcher's "
-                f"arsenal, boosting the expected whiff rate by {whiff_delta_pp:.1f}pp above baseline."
+                f"Favorable matchup for <b>{selected_pitcher}</b>. "
+                f"The hitter's pitch-type vulnerabilities align well with the arsenal, "
+                f"boosting the expected whiff rate by {whiff_delta_pp:.1f}pp above baseline."
             )
         elif whiff_delta_pp < -2:
             summary = (
-                f"This is a tough matchup for **{selected_pitcher}**. "
-                f"**{selected_hitter}** handles this arsenal well, pulling the expected "
-                f"whiff rate {abs(whiff_delta_pp):.1f}pp below the pitcher's baseline."
+                f"Tough matchup for <b>{selected_pitcher}</b>. "
+                f"<b>{selected_hitter}</b> handles this arsenal well, pulling the expected "
+                f"whiff rate {abs(whiff_delta_pp):.1f}pp below baseline."
             )
         else:
             summary = (
-                f"A neutral matchup -- no strong edge either way. "
+                f"Neutral matchup — no strong edge either way. "
                 f"The whiff rate shifts by only {whiff_delta_pp:+.1f}pp from baseline."
             )
 
-        st.markdown(f"""
-        <div class="insight-card">
-            <div class="insight-title">Matchup Summary</div>
-            <div class="insight-bullet">
-                <span class="dot" style="background:{edge_color};"></span>
-                {summary}
-            </div>
-            <div class="insight-bullet">
-                <span class="dot" style="background:{SLATE};"></span>
-                Data reliability: {matchup['avg_reliability']:.0%} (based on sample sizes
-                across {matchup['n_pitch_types']} pitch types).
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        bullets_html += (
+            f'<div class="insight-bullet">'
+            f'<span class="dot" style="background:{edge_color};"></span>'
+            f'{summary}</div>'
+        )
+
+    # Per-pitch scouting bullets
+    if not p_arsenal.empty and not h_vuln.empty:
+        pitch_bullets = _build_matchup_scouting_bullets(
+            p_arsenal, h_vuln, h_str, selected_pitcher, selected_hitter,
+        )
+        for color, text in pitch_bullets:
+            bullets_html += (
+                f'<div class="insight-bullet">'
+                f'<span class="dot" style="background:{color};"></span>'
+                f'{text}</div>'
+            )
+
+    # Reliability note
+    bullets_html += (
+        f'<div class="insight-bullet">'
+        f'<span class="dot" style="background:{SLATE};"></span>'
+        f'Data reliability: {matchup["avg_reliability"]:.0%} '
+        f'(based on sample sizes across {matchup["n_pitch_types"]} pitch types)</div>'
+    )
+
+    st.markdown(
+        f'<div class="insight-card">'
+        f'<div class="insight-title">Matchup Summary</div>'
+        f'{bullets_html}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ---------------------------------------------------------------------------

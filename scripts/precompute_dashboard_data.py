@@ -180,6 +180,81 @@ def main() -> None:
     hitter_str.to_parquet(DASHBOARD_DIR / "hitter_str.parquet", index=False)
     logger.info("Saved hitter strength: %d rows", len(hitter_str))
 
+    # Career-aggregated vulnerability (weighted across all seasons)
+    vuln_frames = []
+    for s in SEASONS:
+        v = get_hitter_vulnerability(s)
+        vuln_frames.append(v)
+    all_vuln = pd.concat(vuln_frames, ignore_index=True)
+
+    # Aggregate: sum raw counts, recompute rates
+    career_vuln = all_vuln.groupby(["batter_id", "batter_stand", "pitch_type"]).agg(
+        pitches=("pitches", "sum"),
+        swings=("swings", "sum"),
+        whiffs=("whiffs", "sum"),
+        out_of_zone_pitches=("out_of_zone_pitches", "sum"),
+        chase_swings=("chase_swings", "sum"),
+        called_strikes=("called_strikes", "sum"),
+        csw=("csw", "sum"),
+        bip=("bip", "sum"),
+        hard_hits=("hard_hits", "sum"),
+        barrels_proxy=("barrels_proxy", "sum"),
+    ).reset_index()
+    career_vuln["whiff_rate"] = career_vuln["whiffs"] / career_vuln["swings"].replace(0, np.nan)
+    career_vuln["chase_rate"] = career_vuln["chase_swings"] / career_vuln["out_of_zone_pitches"].replace(0, np.nan)
+    career_vuln["csw_pct"] = career_vuln["csw"] / career_vuln["pitches"].replace(0, np.nan)
+    career_vuln["pitch_family"] = career_vuln["pitch_type"].map(
+        hitter_vuln.set_index("pitch_type")["pitch_family"].to_dict()
+        if "pitch_family" in hitter_vuln.columns else {}
+    )
+    # xwoba_contact: weighted average by BIP across seasons
+    xwoba_rows = all_vuln[all_vuln["xwoba_contact"].notna() & (all_vuln["bip"] > 0)]
+    if not xwoba_rows.empty:
+        xwoba_career = xwoba_rows.groupby(["batter_id", "pitch_type"]).apply(
+            lambda g: (g["xwoba_contact"] * g["bip"]).sum() / g["bip"].sum()
+            if g["bip"].sum() > 0 else np.nan,
+            include_groups=False,
+        ).reset_index(name="xwoba_contact")
+        career_vuln = career_vuln.merge(xwoba_career, on=["batter_id", "pitch_type"], how="left")
+    else:
+        career_vuln["xwoba_contact"] = np.nan
+
+    career_vuln.to_parquet(DASHBOARD_DIR / "hitter_vuln_career.parquet", index=False)
+    logger.info("Saved career hitter vulnerability: %d rows", len(career_vuln))
+
+    # Career-aggregated strength
+    str_frames = []
+    for s in SEASONS:
+        st_df = get_hitter_strength(s)
+        str_frames.append(st_df)
+    all_str = pd.concat(str_frames, ignore_index=True)
+
+    career_str = all_str.groupby(["batter_id", "batter_stand", "pitch_type"]).agg(
+        bip=("bip", "sum"),
+        barrels_proxy=("barrels_proxy", "sum"),
+        hard_hits=("hard_hits", "sum"),
+    ).reset_index()
+    career_str["barrel_rate_contact"] = career_str["barrels_proxy"] / career_str["bip"].replace(0, np.nan)
+    career_str["hard_hit_rate"] = career_str["hard_hits"] / career_str["bip"].replace(0, np.nan)
+    career_str["pitch_family"] = career_str["pitch_type"].map(
+        hitter_str.set_index("pitch_type")["pitch_family"].to_dict()
+        if "pitch_family" in hitter_str.columns else {}
+    )
+    # xwoba_contact: weighted average by BIP
+    xwoba_str_rows = all_str[all_str["xwoba_contact"].notna() & (all_str["bip"] > 0)]
+    if not xwoba_str_rows.empty:
+        xwoba_str_career = xwoba_str_rows.groupby(["batter_id", "pitch_type"]).apply(
+            lambda g: (g["xwoba_contact"] * g["bip"]).sum() / g["bip"].sum()
+            if g["bip"].sum() > 0 else np.nan,
+            include_groups=False,
+        ).reset_index(name="xwoba_contact")
+        career_str = career_str.merge(xwoba_str_career, on=["batter_id", "pitch_type"], how="left")
+    else:
+        career_str["xwoba_contact"] = np.nan
+
+    career_str.to_parquet(DASHBOARD_DIR / "hitter_str_career.parquet", index=False)
+    logger.info("Saved career hitter strength: %d rows", len(career_str))
+
     # =================================================================
     # Summary
     # =================================================================

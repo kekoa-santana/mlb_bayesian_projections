@@ -170,6 +170,29 @@ def project_forward(
         obs_map = dict(zip(stat_season["batter_id"], stat_season[cfg.rate_col]))
         base[obs_col] = base["batter_id"].map(obs_map)
 
+        # Career PA-weighted average across all training seasons
+        career_col = f"career_{stat}"
+        career_group = stat_df[
+            stat_df["batter_id"].isin(base["batter_id"])
+        ].groupby("batter_id")
+        if cfg.likelihood == "binomial":
+            # Weighted by trials (PA)
+            career_sum = career_group.apply(
+                lambda g: (g[cfg.rate_col] * g[cfg.trials_col]).sum()
+                / g[cfg.trials_col].sum()
+                if g[cfg.trials_col].sum() > 0 else np.nan,
+                include_groups=False,
+            )
+        else:
+            # Normal likelihood — weight by PA
+            career_sum = career_group.apply(
+                lambda g: (g[cfg.rate_col] * g[cfg.trials_col]).sum()
+                / g[cfg.trials_col].sum()
+                if g[cfg.trials_col].sum() > 0 else np.nan,
+                include_groups=False,
+            )
+        base[career_col] = base["batter_id"].map(career_sum)
+
         # Forward-project each player
         proj_means = {}
         proj_sds = {}

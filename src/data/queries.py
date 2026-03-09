@@ -191,6 +191,9 @@ def get_pitcher_arsenal_profile(season: int) -> pd.DataFrame:
             COUNT(*)                          AS pitches,
             SUM(fp.is_swing::int)             AS swings,
             SUM(fp.is_whiff::int)             AS whiffs,
+            SUM(fp.is_called_strike::int)     AS called_strikes,
+            SUM(CASE WHEN fp.is_whiff OR fp.is_called_strike THEN 1 ELSE 0 END)
+                                              AS csw,
             SUM(fp.is_bip::int)               AS bip,
             AVG(fp.release_speed)             AS avg_velo,
             AVG(fp.pfx_x)                     AS avg_pfx_x,
@@ -229,6 +232,8 @@ def get_pitcher_arsenal_profile(season: int) -> pd.DataFrame:
         ROUND((pa.pitches::numeric / pt.total_pitches), 4) AS usage_pct,
         pa.swings,
         pa.whiffs,
+        pa.called_strikes,
+        pa.csw,
         pa.bip,
         COALESCE(ba.barrels_proxy, 0)  AS barrels_proxy,
         COALESCE(ba.hard_hits, 0)      AS hard_hits,
