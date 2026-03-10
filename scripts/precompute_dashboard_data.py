@@ -38,9 +38,11 @@ from src.data.feature_eng import (
 from src.data.queries import (
     get_game_batter_ks,
     get_game_lineups,
+    get_hitter_traditional_stats,
     get_park_factors,
     get_hitter_team_venue,
     get_pitcher_game_logs,
+    get_pitcher_traditional_stats,
     get_player_teams,
     get_umpire_k_tendencies,
     get_weather_effects,
@@ -548,7 +550,20 @@ def main() -> None:
                     len(career_zones), career_zones["batter_id"].nunique())
 
     # =================================================================
-    # 6. Save preseason snapshot (frozen projections for end-of-season comparison)
+    # 6. Traditional / actual stats (2025 season from boxscores + Statcast)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Computing traditional stats (2025)...")
+    hitter_trad = get_hitter_traditional_stats(FROM_SEASON)
+    hitter_trad.to_parquet(DASHBOARD_DIR / "hitter_traditional.parquet", index=False)
+    logger.info("Saved hitter traditional stats: %d players", len(hitter_trad))
+
+    pitcher_trad = get_pitcher_traditional_stats(FROM_SEASON)
+    pitcher_trad.to_parquet(DASHBOARD_DIR / "pitcher_traditional.parquet", index=False)
+    logger.info("Saved pitcher traditional stats: %d players", len(pitcher_trad))
+
+    # =================================================================
+    # 7. Save preseason snapshot (frozen projections for end-of-season comparison)
     # =================================================================
     logger.info("=" * 60)
     logger.info("Saving preseason snapshot...")
@@ -583,6 +598,8 @@ def main() -> None:
     logger.info("  Pitcher projections: %d players", len(pitcher_proj))
     logger.info("  Hitter counting:     %d players", len(hitter_counting))
     logger.info("  Pitcher counting:    %d players", len(pitcher_counting))
+    logger.info("  Hitter traditional:  %d players", len(hitter_trad))
+    logger.info("  Pitcher traditional: %d players", len(pitcher_trad))
     logger.info("  K%% samples:          %d pitchers", len(k_samples_dict))
     logger.info("  BF priors:           %d pitcher-seasons", len(bf_priors))
     logger.info("  Pitcher arsenal:     %d rows", len(pitcher_arsenal))

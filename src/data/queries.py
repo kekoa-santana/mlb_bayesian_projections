@@ -1782,3 +1782,241 @@ def get_hitter_zone_grid(season: int) -> pd.DataFrame:
     """
     logger.info("Fetching hitter zone grid for %d", season)
     return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# 27. Hitter traditional stats (AVG, OBP, SLG, OPS, ISO, wOBA, BABIP)
+# ---------------------------------------------------------------------------
+def get_hitter_traditional_stats(season: int) -> pd.DataFrame:
+    """Season-level traditional batting stats from boxscores + Statcast.
+
+    Combines counting stats from ``staging.batting_boxscores``,
+    sac-fly counts from ``production.fact_pa``, and wOBA linear weights
+    from ``production.sat_batted_balls`` (BIP) plus standard non-BIP
+    weights for BB/HBP.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, batter_name, season, games, pa, ab, hits,
+        doubles, triples, hr, runs, rbi, bb, ibb, hbp, k, sb, cs,
+        total_bases, sf, avg, obp, slg, ops, iso, babip, woba.
+    """
+    query = """
+    WITH box AS (
+        SELECT
+            bb.batter_id,
+            dp.player_name              AS batter_name,
+            dg.season,
+            COUNT(DISTINCT bb.game_pk)  AS games,
+            SUM(bb.plate_appearances)   AS pa,
+            SUM(bb.at_bats)             AS ab,
+            SUM(bb.hits)                AS hits,
+            SUM(bb.doubles)             AS doubles,
+            SUM(bb.triples)             AS triples,
+            SUM(bb.home_runs)           AS hr,
+            SUM(bb.runs)                AS runs,
+            SUM(bb.rbi)                 AS rbi,
+            SUM(bb.walks)               AS bb,
+            SUM(bb.intentional_walks)   AS ibb,
+            SUM(bb.hit_by_pitch)        AS hbp,
+            SUM(bb.strikeouts)          AS k,
+            SUM(bb.sb)                  AS sb,
+            SUM(bb.caught_stealing)     AS cs,
+            SUM(bb.total_bases)         AS total_bases
+        FROM staging.batting_boxscores bb
+        JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+        LEFT JOIN production.dim_player dp ON bb.batter_id = dp.player_id
+        WHERE dg.season = :season AND dg.game_type = 'R'
+        GROUP BY bb.batter_id, dp.player_name, dg.season
+        HAVING SUM(bb.plate_appearances) >= 1
+    ),
+    sac_flies AS (
+        SELECT
+            fp.batter_id,
+            SUM(CASE WHEN fp.events = 'sac_fly' THEN 1
+                     WHEN fp.events = 'sac_fly_double_play' THEN 1
+                     ELSE 0 END) AS sf
+        FROM production.fact_pa fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+        GROUP BY fp.batter_id
+    ),
+    woba_bip AS (
+        -- wOBA linear weights on batted balls
+        SELECT
+            fp.batter_id,
+            SUM(sbb.woba_value)  AS woba_bip_sum,
+            COUNT(*)             AS bip_with_woba
+        FROM production.sat_batted_balls sbb
+        JOIN production.fact_pa fp ON sbb.pa_id = fp.pa_id
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND sbb.woba_value IS NOT NULL
+        GROUP BY fp.batter_id
+    ),
+    babip_stat AS (
+        SELECT
+            fp.batter_id,
+            AVG(sbb.babip_value) AS babip
+        FROM production.sat_batted_balls sbb
+        JOIN production.fact_pa fp ON sbb.pa_id = fp.pa_id
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND sbb.babip_value IS NOT NULL
+          AND fp.events NOT IN ('home_run', 'sac_fly', 'sac_fly_double_play',
+                                'sac_bunt', 'sac_bunt_double_play',
+                                'catcher_interf')
+        GROUP BY fp.batter_id
+    )
+    SELECT
+        b.batter_id,
+        b.batter_name,
+        b.season,
+        b.games,
+        b.pa,
+        b.ab,
+        b.hits,
+        b.doubles,
+        b.triples,
+        b.hr,
+        b.runs,
+        b.rbi,
+        b.bb,
+        b.ibb,
+        b.hbp,
+        b.k,
+        b.sb,
+        b.cs,
+        b.total_bases,
+        COALESCE(sf.sf, 0)              AS sf,
+        w.woba_bip_sum,
+        w.bip_with_woba,
+        bs.babip
+    FROM box b
+    LEFT JOIN sac_flies sf ON b.batter_id = sf.batter_id
+    LEFT JOIN woba_bip w ON b.batter_id = w.batter_id
+    LEFT JOIN babip_stat bs ON b.batter_id = bs.batter_id
+    ORDER BY b.pa DESC
+    """
+    logger.info("Fetching hitter traditional stats for %d", season)
+    df = read_sql(query, {"season": season})
+
+    # -- Compute rate stats in Python (cleaner than SQL for NaN handling) --
+    ab = df["ab"].replace(0, float("nan"))
+    pa = df["pa"].replace(0, float("nan"))
+
+    df["avg"] = (df["hits"] / ab).round(3)
+    df["slg"] = (df["total_bases"] / ab).round(3)
+    df["iso"] = (df["slg"] - df["avg"]).round(3)
+
+    # OBP = (H + BB + HBP) / (AB + BB + HBP + SF)
+    obp_num = df["hits"] + df["bb"] + df["hbp"]
+    obp_den = (df["ab"] + df["bb"] + df["hbp"] + df["sf"]).replace(0, float("nan"))
+    df["obp"] = (obp_num / obp_den).round(3)
+    df["ops"] = (df["obp"] + df["slg"]).round(3)
+
+    # wOBA: BIP contribution + non-BIP weights (uBB=0.69, HBP=0.72, K=0)
+    # Standard wOBA weights (2024 FanGraphs scale, close enough for 2018-2025)
+    woba_bb_weight = 0.69
+    woba_hbp_weight = 0.72
+    non_ibb_bb = df["bb"] - df["ibb"]  # IBB excluded from wOBA
+    woba_num = (
+        df["woba_bip_sum"].fillna(0)
+        + non_ibb_bb * woba_bb_weight
+        + df["hbp"] * woba_hbp_weight
+    )
+    # wOBA denominator = AB + non-IBB BB + SF + HBP
+    woba_den = (df["ab"] + non_ibb_bb + df["sf"] + df["hbp"]).replace(0, float("nan"))
+    df["woba"] = (woba_num / woba_den).round(3)
+
+    # BABIP already computed in SQL (from sat_batted_balls, excludes HR/sac)
+    df["babip"] = df["babip"].round(3)
+
+    # Drop intermediate columns
+    df.drop(columns=["woba_bip_sum", "bip_with_woba"], inplace=True)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 28. Pitcher traditional stats (ERA, WHIP, K/9, BB/9, FIP, W/L/SV)
+# ---------------------------------------------------------------------------
+def get_pitcher_traditional_stats(season: int) -> pd.DataFrame:
+    """Season-level traditional pitching stats from boxscores.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, pitcher_name, pitch_hand, season, games,
+        starts, w, l, sv, hld, ip, bf, hits_allowed, er, hr_allowed,
+        k, bb, hbp, number_of_pitches, era, whip, k_per_9, bb_per_9,
+        hr_per_9, k_per_bb, fip.
+    """
+    query = """
+    SELECT
+        pb.pitcher_id,
+        dp.player_name                  AS pitcher_name,
+        dp.pitch_hand,
+        dg.season,
+        COUNT(DISTINCT pb.game_pk)      AS games,
+        SUM(pb.is_starter::int)         AS starts,
+        SUM(pb.wins)                    AS w,
+        SUM(pb.losses)                  AS l,
+        SUM(pb.saves)                   AS sv,
+        SUM(pb.holds)                   AS hld,
+        SUM(pb.innings_pitched)         AS ip,
+        SUM(pb.batters_faced)           AS bf,
+        SUM(pb.hits)                    AS hits_allowed,
+        SUM(pb.earned_runs)             AS er,
+        SUM(pb.home_runs)               AS hr_allowed,
+        SUM(pb.strike_outs)             AS k,
+        SUM(pb.walks + pb.intentional_walks) AS bb,
+        SUM(pb.hit_by_pitch)            AS hbp,
+        SUM(pb.number_of_pitches)       AS number_of_pitches,
+        SUM(pb.wild_pitches)            AS wild_pitches,
+        SUM(pb.ground_outs)             AS ground_outs,
+        SUM(pb.air_outs)                AS air_outs
+    FROM staging.pitching_boxscores pb
+    JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+    LEFT JOIN production.dim_player dp ON pb.pitcher_id = dp.player_id
+    WHERE dg.season = :season AND dg.game_type = 'R'
+    GROUP BY pb.pitcher_id, dp.player_name, dp.pitch_hand, dg.season
+    HAVING SUM(pb.batters_faced) >= 1
+    ORDER BY SUM(pb.innings_pitched) DESC
+    """
+    logger.info("Fetching pitcher traditional stats for %d", season)
+    df = read_sql(query, {"season": season})
+
+    ip = df["ip"].replace(0, float("nan"))
+
+    df["era"] = ((df["er"] / ip) * 9).round(2)
+    df["whip"] = ((df["hits_allowed"] + df["bb"]) / ip).round(2)
+    df["k_per_9"] = ((df["k"] / ip) * 9).round(2)
+    df["bb_per_9"] = ((df["bb"] / ip) * 9).round(2)
+    df["hr_per_9"] = ((df["hr_allowed"] / ip) * 9).round(2)
+    df["k_per_bb"] = (df["k"] / df["bb"].replace(0, float("nan"))).round(2)
+
+    # FIP = ((13*HR + 3*(BB+HBP) - 2*K) / IP) + cFIP
+    # cFIP ≈ 3.20 (league constant, varies slightly by year)
+    cfip = 3.20
+    df["fip"] = (
+        ((13 * df["hr_allowed"] + 3 * (df["bb"] + df["hbp"]) - 2 * df["k"]) / ip)
+        + cfip
+    ).round(2)
+
+    df["go_ao"] = (
+        df["ground_outs"] / df["air_outs"].replace(0, float("nan"))
+    ).round(2)
+
+    return df

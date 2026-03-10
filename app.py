@@ -445,6 +445,15 @@ def load_todays_lineups() -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+@st.cache_data
+def load_traditional_stats(player_type: str) -> pd.DataFrame:
+    """Load pre-computed traditional stats parquet."""
+    path = DASHBOARD_DIR / f"{player_type}_traditional.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
 def load_update_metadata() -> dict:
     """Load update timestamp and stats."""
     path = DASHBOARD_DIR / "update_metadata.json"
@@ -2064,12 +2073,116 @@ def page_todays_games() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Inline stats table (shared by Projections toggle & Player Profile toggle)
+# ---------------------------------------------------------------------------
+def _inline_stats_table(player_type: str, key_prefix: str = "proj_inline") -> None:
+    """Render a compact 2025 traditional stats table inline."""
+    df = load_traditional_stats(player_type.lower())
+    if df.empty:
+        st.info("No 2025 stats data found. Run precompute first.")
+        return
+
+    if player_type == "Hitter":
+        id_col, name_col = "batter_id", "batter_name"
+        rate_configs = HITTER_TRAD_STATS
+        counting_configs = HITTER_TRAD_COUNTING
+        default_sort = "OPS"
+    else:
+        id_col, name_col = "pitcher_id", "pitcher_name"
+        rate_configs = PITCHER_TRAD_STATS
+        counting_configs = PITCHER_TRAD_COUNTING
+        default_sort = "ERA"
+
+    # Merge team abbreviations
+    teams_df = load_player_teams()
+    if not teams_df.empty:
+        df = df.merge(
+            teams_df[["player_id", "team_abbr"]].rename(columns={"player_id": id_col}),
+            on=id_col, how="left",
+        )
+        df["team_abbr"] = df["team_abbr"].fillna("")
+    else:
+        df["team_abbr"] = ""
+
+    # Filters
+    filter_cols = st.columns([2, 1, 1, 1, 1])
+    with filter_cols[0]:
+        search = st.text_input("Search", "", placeholder="Type a name...", key=f"{key_prefix}_search")
+    with filter_cols[1]:
+        team_options = ["All"] + sorted(df["team_abbr"].replace("", pd.NA).dropna().unique().tolist())
+        team_filter = st.selectbox("Team", team_options, key=f"{key_prefix}_team")
+    with filter_cols[2]:
+        if player_type == "Pitcher":
+            role = st.selectbox("Role", ["All", "Starters", "Relievers"], key=f"{key_prefix}_role")
+        else:
+            role = "All"
+    with filter_cols[3]:
+        if player_type == "Hitter":
+            min_pa = st.selectbox("Min PA", [0, 50, 100, 200, 400, 502], index=4, key=f"{key_prefix}_min")
+        else:
+            min_ip = st.selectbox("Min IP", [0, 10, 30, 50, 100, 162], index=3, key=f"{key_prefix}_min")
+    with filter_cols[4]:
+        sort_options = [s[0] for s in rate_configs] + [s[0] for s in counting_configs]
+        sort_by = st.selectbox("Sort by", sort_options, index=sort_options.index(default_sort), key=f"{key_prefix}_sort")
+
+    # Apply filters
+    if search:
+        _search_norm = _strip_accents(search)
+        df = df[df[name_col].apply(lambda x: _search_norm.lower() in _strip_accents(str(x)).lower())]
+    if team_filter != "All":
+        df = df[df["team_abbr"] == team_filter]
+    if player_type == "Pitcher":
+        if role == "Starters" and "starts" in df.columns:
+            df = df[df["starts"] >= 3]
+        elif role == "Relievers" and "starts" in df.columns:
+            df = df[df["starts"] < 3]
+    if player_type == "Hitter":
+        df = df[df["pa"] >= min_pa]
+    else:
+        df = df[df["ip"] >= min_ip]
+
+    # Sort
+    all_configs = rate_configs + counting_configs
+    sort_col = next((s[1] for s in all_configs if s[0] == sort_by), "ops")
+    is_rate = any(s[0] == sort_by for s in rate_configs)
+    ascending = (not next(s[2] for s in rate_configs if s[0] == sort_by)) if is_rate else False
+
+    df_sorted = df.sort_values(sort_col, ascending=ascending, na_position="last").reset_index(drop=True)
+
+    # Build display
+    display_rows = []
+    for _, row in df_sorted.iterrows():
+        name_display = row[name_col]
+        team = row.get("team_abbr", "")
+        if team:
+            name_display = f"{name_display} ({team})"
+        r: dict[str, object] = {"Rank": len(display_rows) + 1, "Name": name_display}
+        for label, col_name in counting_configs:
+            val = row.get(col_name)
+            if pd.notna(val):
+                r[label] = f"{val:.1f}" if col_name == "ip" else int(val)
+            else:
+                r[label] = "--"
+        for label, col_name, _, fmt in rate_configs:
+            r[label] = _fmt_trad(row.get(col_name), fmt)
+        display_rows.append(r)
+
+    display_df = pd.DataFrame(display_rows)
+    st.dataframe(display_df, use_container_width=True, hide_index=True, height=600)
+    st.caption(f"Showing {len(display_df)} {player_type.lower()}s | 2025 regular season")
+
+
+# ---------------------------------------------------------------------------
 # Page: Projections
 # ---------------------------------------------------------------------------
 def page_projections() -> None:
     """Sortable projection tables for pitchers and hitters."""
-    st.markdown('<div class="section-header">2026 Projections</div>',
-                unsafe_allow_html=True)
+    header_cols = st.columns([3, 1])
+    with header_cols[0]:
+        st.markdown('<div class="section-header">2026 Projections</div>',
+                    unsafe_allow_html=True)
+    with header_cols[1]:
+        proj_view = st.toggle("Show 2025 Stats", value=False, key="proj_stats_toggle")
 
     player_type = st.radio(
         "Player type",
@@ -2077,6 +2190,11 @@ def page_projections() -> None:
         horizontal=True,
         key="proj_type",
     )
+
+    # If stats toggle is on, redirect to inline stats view
+    if proj_view:
+        _inline_stats_table(player_type)
+        return
 
     df = load_projections(player_type.lower())
     if df.empty:
@@ -2296,6 +2414,9 @@ def page_player_profile() -> None:
     player_row = df[df[name_col] == selected_name].iloc[0]
     player_id = int(player_row[id_col])
 
+    # --- View toggle: Projection vs 2025 Stats ---
+    show_trad = st.toggle("Show 2025 Stats", value=False, key="profile_stats_toggle")
+
     # --- Header card ---
     # Team abbreviation
     teams_df = load_player_teams()
@@ -2361,7 +2482,8 @@ def page_player_profile() -> None:
         f'<div class="brand-header">'
         f'<div>'
         f'<div class="brand-title">{selected_name}</div>'
-        f'<div class="brand-subtitle">{" | ".join(header_parts)} | 2026 Projection</div>'
+        f'<div class="brand-subtitle">{" | ".join(header_parts)} | '
+        f'{"2025 Stats" if show_trad else "2026 Projection"}</div>'
         f'{injury_html}'
         f'</div>'
         f'<div style="color:{comp_color}; font-size:1.2rem; font-weight:600;">'
@@ -2370,6 +2492,56 @@ def page_player_profile() -> None:
         f'</div>'
     )
     st.markdown(header_html, unsafe_allow_html=True)
+
+    # --- Traditional stats view ---
+    if show_trad:
+        trad_df = load_traditional_stats(player_type.lower())
+        if not trad_df.empty:
+            trad_row = trad_df[trad_df[id_col] == player_id]
+            if not trad_row.empty:
+                trad_data = trad_row.iloc[0]
+                if player_type == "Hitter":
+                    rate_configs_t = HITTER_TRAD_STATS
+                    counting_configs_t = HITTER_TRAD_COUNTING
+                else:
+                    rate_configs_t = PITCHER_TRAD_STATS
+                    counting_configs_t = PITCHER_TRAD_COUNTING
+
+                # Rate stat cards
+                st.markdown('<div class="section-header" style="font-size:1rem; margin-top:1rem;">Rate Stats</div>',
+                            unsafe_allow_html=True)
+                rate_cols = st.columns(len(rate_configs_t))
+                for col, (label, col_name, _, fmt) in zip(rate_cols, rate_configs_t):
+                    val = trad_data.get(col_name)
+                    with col:
+                        st.markdown(
+                            _metric_card(label, _fmt_trad(val, fmt)),
+                            unsafe_allow_html=True,
+                        )
+
+                # Counting stat cards
+                st.markdown('<div class="section-header" style="font-size:1rem; margin-top:1rem;">Counting Stats</div>',
+                            unsafe_allow_html=True)
+                # Show counting stats in rows of 7
+                for i in range(0, len(counting_configs_t), 7):
+                    chunk = counting_configs_t[i:i + 7]
+                    c_cols = st.columns(len(chunk))
+                    for col, (label, col_name) in zip(c_cols, chunk):
+                        val = trad_data.get(col_name)
+                        if pd.notna(val):
+                            display_val = f"{val:.1f}" if col_name == "ip" else str(int(val))
+                        else:
+                            display_val = "--"
+                        with col:
+                            st.markdown(
+                                _metric_card(label, display_val),
+                                unsafe_allow_html=True,
+                            )
+            else:
+                st.info("No 2025 stats found for this player.")
+        else:
+            st.info("No traditional stats data found. Run precompute first.")
+        return  # Skip the projection view below
 
     # --- Comparison baseline toggle ---
     compare_to = st.radio(
@@ -4441,6 +4613,71 @@ def page_team_overview() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Traditional stat display configs
+# ---------------------------------------------------------------------------
+HITTER_TRAD_STATS = [
+    ("AVG", "avg", True, ".000"),
+    ("OBP", "obp", True, ".000"),
+    ("SLG", "slg", True, ".000"),
+    ("OPS", "ops", True, ".000"),
+    ("ISO", "iso", True, ".000"),
+    ("wOBA", "woba", True, ".000"),
+    ("BABIP", "babip", True, ".000"),
+]
+HITTER_TRAD_COUNTING = [
+    ("G", "games"), ("PA", "pa"), ("AB", "ab"), ("H", "hits"),
+    ("2B", "doubles"), ("3B", "triples"), ("HR", "hr"),
+    ("R", "runs"), ("RBI", "rbi"), ("BB", "bb"), ("K", "k"),
+    ("SB", "sb"), ("CS", "cs"),
+]
+PITCHER_TRAD_STATS = [
+    ("ERA", "era", False, "0.00"),
+    ("FIP", "fip", False, "0.00"),
+    ("WHIP", "whip", False, "0.00"),
+    ("K/9", "k_per_9", True, "0.00"),
+    ("BB/9", "bb_per_9", False, "0.00"),
+    ("HR/9", "hr_per_9", False, "0.00"),
+    ("K/BB", "k_per_bb", True, "0.00"),
+    ("GO/AO", "go_ao", True, "0.00"),
+]
+PITCHER_TRAD_COUNTING = [
+    ("G", "games"), ("GS", "starts"), ("W", "w"), ("L", "l"),
+    ("SV", "sv"), ("HLD", "hld"), ("IP", "ip"), ("BF", "bf"),
+    ("H", "hits_allowed"), ("ER", "er"), ("HR", "hr_allowed"),
+    ("K", "k"), ("BB", "bb"), ("HBP", "hbp"),
+]
+
+
+def _fmt_trad(val: float, fmt: str) -> str:
+    """Format a traditional stat value."""
+    if pd.isna(val):
+        return "--"
+    if fmt == ".000":
+        return f"{val:.3f}"
+    if fmt == "0.00":
+        return f"{val:.2f}"
+    return str(val)
+
+
+# ---------------------------------------------------------------------------
+# Page: Stats (2025 Traditional / Actual Stats)
+# ---------------------------------------------------------------------------
+def page_stats() -> None:
+    """2025 actual season stats leaderboard."""
+    st.markdown('<div class="section-header">2025 Stats</div>',
+                unsafe_allow_html=True)
+
+    player_type = st.radio(
+        "Player type",
+        ["Hitter", "Pitcher"],
+        horizontal=True,
+        key="stats_type",
+    )
+
+    _inline_stats_table(player_type, key_prefix="stats")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -4460,9 +4697,9 @@ def main() -> None:
         st.markdown("---")
         page = st.radio(
             "Navigate",
-            ["Today's Games", "Projections", "Player Profile", "Team Overview",
-             "Matchup Explorer", "Game K Simulator", "Game Browser",
-             "Preseason Snapshot"],
+            ["Today's Games", "Projections", "Stats", "Player Profile",
+             "Team Overview", "Matchup Explorer", "Game K Simulator",
+             "Game Browser", "Preseason Snapshot"],
             label_visibility="collapsed",
         )
         st.markdown("---")
@@ -4496,6 +4733,8 @@ def main() -> None:
         page_todays_games()
     elif page == "Projections":
         page_projections()
+    elif page == "Stats":
+        page_stats()
     elif page == "Player Profile":
         page_player_profile()
     elif page == "Team Overview":
