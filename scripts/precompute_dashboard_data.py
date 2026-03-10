@@ -388,6 +388,18 @@ def main() -> None:
     pitcher_game_logs.to_parquet(DASHBOARD_DIR / "pitcher_game_logs.parquet", index=False)
     logger.info("Saved pitcher game logs: %d rows", len(pitcher_game_logs))
 
+    # Game info (date, teams) — used by Game Browser enrichment
+    from src.data.db import read_sql as _read_sql_gi
+    game_info = _read_sql_gi("""
+        SELECT game_pk, game_date, season,
+               home_team_id, away_team_id,
+               home_team_name, away_team_name
+        FROM production.dim_game
+        WHERE game_type = 'R' AND season = :season
+    """, {"season": FROM_SEASON})
+    game_info.to_parquet(DASHBOARD_DIR / "game_info.parquet", index=False)
+    logger.info("Saved game info: %d games", len(game_info))
+
     # =================================================================
     # 5. Matchup profiles (arsenal, vulnerability, strength)
     # =================================================================

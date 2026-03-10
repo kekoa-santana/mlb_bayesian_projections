@@ -379,6 +379,15 @@ def load_counting(player_type: str) -> pd.DataFrame:
 
 
 @st.cache_data
+def load_game_info() -> pd.DataFrame:
+    """Load game info (date, teams) for game browser."""
+    path = DASHBOARD_DIR / "game_info.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data
 def load_player_teams() -> pd.DataFrame:
     """Load player-to-team abbreviation mapping."""
     path = DASHBOARD_DIR / "player_teams.parquet"
@@ -467,15 +476,15 @@ def _fmt_stat(val: float, key: str, decimals: int = 1) -> str:
 
 
 def _delta_html(val: float, higher_is_better: bool = True) -> str:
-    """Format a delta as colored HTML span."""
+    """Format a delta as colored HTML span (inline styles for compatibility)."""
     pct = val * 100
     improving = (pct > 0 and higher_is_better) or (pct < 0 and not higher_is_better)
     if abs(pct) < 0.05:
-        return f'<span class="delta-neutral">0.0pp</span>'
+        return f'<span style="color:{SLATE}; font-weight:600;">0.0pp</span>'
     elif improving:
-        return f'<span class="delta-pos">{pct:+.1f}pp</span>'
+        return f'<span style="color:{POSITIVE}; font-weight:600;">{pct:+.1f}pp</span>'
     else:
-        return f'<span class="delta-neg">{pct:+.1f}pp</span>'
+        return f'<span style="color:{NEGATIVE}; font-weight:600;">{pct:+.1f}pp</span>'
 
 
 def _metric_card(label: str, value: str, delta_html: str = "") -> str:
@@ -3412,18 +3421,9 @@ def page_game_browser() -> None:
     # Enrich game logs with date and opponent
     @st.cache_data
     def _enrich_game_logs(_game_logs: pd.DataFrame) -> pd.DataFrame:
-        from src.data.db import read_sql
-        game_pks = _game_logs["game_pk"].unique().tolist()
-        if not game_pks:
+        game_info = load_game_info()
+        if game_info.empty:
             return _game_logs
-        # Fetch game info in batches
-        pk_str = ",".join(str(int(pk)) for pk in game_pks)
-        game_info = read_sql(f"""
-            SELECT game_pk, game_date, home_team_id, away_team_id,
-                   home_team_name, away_team_name
-            FROM production.dim_game
-            WHERE game_pk IN ({pk_str})
-        """, {})
         return _game_logs.merge(game_info, on="game_pk", how="left")
 
     game_logs = _enrich_game_logs(game_logs)
