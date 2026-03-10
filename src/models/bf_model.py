@@ -8,6 +8,11 @@ Shrinkage formula:
     reliability = n / (n + k)       where k = sigma^2 / tau^2
     mu_pitcher  = rel * obs_mean + (1 - rel) * pop_mean
     sigma_pitcher = rel * obs_std + (1 - rel) * pop_within_std
+
+Pitches-per-PA adjustment (v1.7):
+    Efficient pitchers (low P/PA) face more batters for the same pitch budget.
+    implied_bf = avg_pitch_count / pitches_per_pa
+    mu_bf is adjusted by blending with implied_bf (weight = PPA_ADJ_WEIGHT).
 """
 from __future__ import annotations
 
@@ -25,13 +30,19 @@ DEFAULT_POP_BF_MU = 22.0
 DEFAULT_POP_WITHIN_STD = 3.4
 DEFAULT_SHRINKAGE_K = 2.4  # sigma^2 / tau^2 ≈ 11.56 / 4.84
 
+# Pitches-per-PA adjustment
+POP_MEAN_PPA = 3.91        # League avg P/PA for starters (2023-2025)
+PPA_ADJ_WEIGHT = 0.15      # Blend weight for P/PA implied BF adjustment
+
 
 def compute_pitcher_bf_priors(
     game_logs: pd.DataFrame,
+    pitcher_ppa: pd.DataFrame | None = None,
     pop_mu: float = DEFAULT_POP_BF_MU,
     pop_within_std: float = DEFAULT_POP_WITHIN_STD,
     shrinkage_k: float = DEFAULT_SHRINKAGE_K,
     min_starts: int = 5,
+    ppa_adj_weight: float = PPA_ADJ_WEIGHT,
 ) -> pd.DataFrame:
     """Compute shrinkage-estimated BF priors per pitcher-season.
 
@@ -40,6 +51,9 @@ def compute_pitcher_bf_priors(
     game_logs : pd.DataFrame
         Stacked game logs across seasons. Must have columns:
         pitcher_id, season, batters_faced, is_starter.
+    pitcher_ppa : pd.DataFrame, optional
+        Pitches-per-PA data. Must have columns: pitcher_id, pitches_per_pa.
+        If provided, adjusts mu_bf based on pitcher efficiency.
     pop_mu : float
         Population mean BF for starters.
     pop_within_std : float
@@ -48,13 +62,15 @@ def compute_pitcher_bf_priors(
         Shrinkage constant k = sigma^2 / tau^2.
     min_starts : int
         Pitchers below this get pure population prior.
+    ppa_adj_weight : float
+        Blend weight for the P/PA implied BF adjustment (0-1).
 
     Returns
     -------
     pd.DataFrame
         One row per (pitcher_id, season) with columns:
         pitcher_id, season, n_starts, raw_mean_bf, raw_std_bf,
-        mu_bf, sigma_bf, reliability.
+        mu_bf, sigma_bf, reliability, pitches_per_pa, ppa_adj.
     """
     # Filter to starters with BF >= 3 (minimum real appearance)
     starters = game_logs[
@@ -66,7 +82,7 @@ def compute_pitcher_bf_priors(
         logger.warning("No starter game logs found")
         return pd.DataFrame(columns=[
             "pitcher_id", "season", "n_starts", "raw_mean_bf", "raw_std_bf",
-            "mu_bf", "sigma_bf", "reliability",
+            "mu_bf", "sigma_bf", "reliability", "pitches_per_pa", "ppa_adj",
         ])
 
     # Per-pitcher-season aggregation
@@ -75,6 +91,15 @@ def compute_pitcher_bf_priors(
         raw_mean_bf=("batters_faced", "mean"),
         raw_std_bf=("batters_faced", "std"),
     ).reset_index()
+
+    # Also compute avg pitches per start for implied BF
+    if "number_of_pitches" in starters.columns:
+        pitch_agg = starters.groupby(["pitcher_id", "season"]).agg(
+            avg_pitches=("number_of_pitches", "mean"),
+        ).reset_index()
+        agg = agg.merge(pitch_agg, on=["pitcher_id", "season"], how="left")
+    else:
+        agg["avg_pitches"] = np.nan
 
     # Fill NaN std (single-start pitchers) with pop within-pitcher std
     agg["raw_std_bf"] = agg["raw_std_bf"].fillna(pop_within_std)
@@ -94,6 +119,38 @@ def compute_pitcher_bf_priors(
         agg["reliability"] * agg["raw_std_bf"]
         + (1 - agg["reliability"]) * pop_within_std
     )
+
+    # --- Pitches-per-PA adjustment ---
+    # Efficient pitchers (low P/PA) face more BF for the same pitch budget.
+    # Compute implied BF = avg_pitches / pitches_per_pa, then adjust mu_bf.
+    agg["pitches_per_pa"] = np.nan
+    agg["ppa_adj"] = 0.0
+
+    if pitcher_ppa is not None and not pitcher_ppa.empty:
+        ppa_map = pitcher_ppa.set_index("pitcher_id")["pitches_per_pa"].to_dict()
+        agg["pitches_per_pa"] = agg["pitcher_id"].map(ppa_map)
+
+        has_ppa = agg["pitches_per_pa"].notna() & agg["avg_pitches"].notna()
+        if has_ppa.any():
+            # Implied BF from this pitcher's pitch budget / their P/PA
+            implied_bf = agg.loc[has_ppa, "avg_pitches"] / agg.loc[has_ppa, "pitches_per_pa"]
+            # Baseline implied BF using population P/PA
+            baseline_implied_bf = agg.loc[has_ppa, "avg_pitches"] / POP_MEAN_PPA
+            # Adjustment = difference from what population P/PA would predict
+            ppa_delta = implied_bf - baseline_implied_bf
+            agg.loc[has_ppa, "ppa_adj"] = ppa_delta * ppa_adj_weight
+            agg.loc[has_ppa, "mu_bf"] = agg.loc[has_ppa, "mu_bf"] + agg.loc[has_ppa, "ppa_adj"]
+
+            logger.info(
+                "P/PA adjustment applied to %d pitchers (mean adj=%.2f BF, range=%.2f to %.2f)",
+                has_ppa.sum(),
+                agg.loc[has_ppa, "ppa_adj"].mean(),
+                agg.loc[has_ppa, "ppa_adj"].min(),
+                agg.loc[has_ppa, "ppa_adj"].max(),
+            )
+
+    # Drop intermediate column
+    agg.drop(columns=["avg_pitches"], inplace=True)
 
     logger.info(
         "BF priors: %d pitcher-seasons, mean reliability=%.3f",

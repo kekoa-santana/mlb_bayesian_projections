@@ -663,7 +663,8 @@ def get_pitcher_game_logs(season: int) -> pd.DataFrame:
     -------
     pd.DataFrame
         Columns: game_pk, pitcher_id, pitcher_name, pitch_hand, season,
-        strike_outs, batters_faced, innings_pitched, is_starter.
+        strike_outs, batters_faced, innings_pitched, number_of_pitches,
+        is_starter.
     """
     query = """
     SELECT
@@ -675,6 +676,7 @@ def get_pitcher_game_logs(season: int) -> pd.DataFrame:
         pb.strike_outs,
         pb.batters_faced,
         pb.innings_pitched,
+        pb.number_of_pitches,
         pb.is_starter
     FROM staging.pitching_boxscores pb
     JOIN production.dim_game dg   ON pb.game_pk = dg.game_pk
@@ -2020,3 +2022,211 @@ def get_pitcher_traditional_stats(season: int) -> pd.DataFrame:
     ).round(2)
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# 29. Hitter aggressiveness profile
+# ---------------------------------------------------------------------------
+def get_hitter_aggressiveness(season: int) -> pd.DataFrame:
+    """Per-batter approach / aggressiveness metrics for a season.
+
+    Combines pitch-level aggression indicators (first-pitch swing rate,
+    chase rate, two-strike discipline) with plate-appearance-level depth
+    (pitches per PA).
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, batter_name, season, pa,
+        first_pitch_swing_pct, first_pitch_contact_pct,
+        chase_rate, two_strike_chase_rate, two_strike_whiff_rate,
+        zone_swing_pct, pitches_per_pa.
+    """
+    query = """
+    WITH pa_counts AS (
+        SELECT
+            fpa.batter_id,
+            COUNT(DISTINCT fpa.pa_id) AS pa,
+            ROUND(AVG(fpa.last_pitch_number)::numeric, 2) AS pitches_per_pa
+        FROM production.fact_pa fpa
+        JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+        GROUP BY fpa.batter_id
+    ),
+    first_pitches AS (
+        SELECT
+            fp.batter_id,
+            COUNT(*)                        AS total_first,
+            SUM(fp.is_swing::int)           AS first_swings,
+            SUM(CASE WHEN fp.is_swing AND fp.is_bip THEN 1 ELSE 0 END) AS first_contact
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND fp.pitch_number = 1 AND fp.balls = 0 AND fp.strikes = 0
+        GROUP BY fp.batter_id
+    ),
+    chase AS (
+        SELECT
+            fp.batter_id,
+            COUNT(*)                AS ooz_pitches,
+            SUM(fp.is_swing::int)   AS ooz_swings
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND fp.zone IN (11, 12, 13, 14)
+        GROUP BY fp.batter_id
+    ),
+    two_strike AS (
+        SELECT
+            fp.batter_id,
+            SUM(CASE WHEN fp.zone IN (11, 12, 13, 14) THEN 1 ELSE 0 END)          AS ts_ooz_pitches,
+            SUM(CASE WHEN fp.zone IN (11, 12, 13, 14) AND fp.is_swing THEN 1 ELSE 0 END) AS ts_ooz_swings,
+            SUM(fp.is_swing::int)       AS ts_swings,
+            SUM(fp.is_whiff::int)       AS ts_whiffs
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND fp.strikes = 2
+        GROUP BY fp.batter_id
+    ),
+    zone_agg AS (
+        SELECT
+            fp.batter_id,
+            COUNT(*)                AS zone_pitches,
+            SUM(fp.is_swing::int)   AS zone_swings
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND fp.zone BETWEEN 1 AND 9
+        GROUP BY fp.batter_id
+    )
+    SELECT
+        pc.batter_id,
+        COALESCE(dp.player_name, 'Unknown') AS batter_name,
+        :season AS season,
+        pc.pa,
+        ROUND((fpch.first_swings::numeric / NULLIF(fpch.total_first, 0)), 3) AS first_pitch_swing_pct,
+        ROUND((fpch.first_contact::numeric / NULLIF(fpch.first_swings, 0)), 3) AS first_pitch_contact_pct,
+        ROUND((ch.ooz_swings::numeric / NULLIF(ch.ooz_pitches, 0)), 3) AS chase_rate,
+        ROUND((ts.ts_ooz_swings::numeric / NULLIF(ts.ts_ooz_pitches, 0)), 3) AS two_strike_chase_rate,
+        ROUND((ts.ts_whiffs::numeric / NULLIF(ts.ts_swings, 0)), 3) AS two_strike_whiff_rate,
+        ROUND((za.zone_swings::numeric / NULLIF(za.zone_pitches, 0)), 3) AS zone_swing_pct,
+        pc.pitches_per_pa
+    FROM pa_counts pc
+    LEFT JOIN production.dim_player dp ON pc.batter_id = dp.player_id
+    LEFT JOIN first_pitches fpch ON pc.batter_id = fpch.batter_id
+    LEFT JOIN chase ch ON pc.batter_id = ch.batter_id
+    LEFT JOIN two_strike ts ON pc.batter_id = ts.batter_id
+    LEFT JOIN zone_agg za ON pc.batter_id = za.batter_id
+    ORDER BY pc.pa DESC
+    """
+    logger.info("Fetching hitter aggressiveness for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# 30. Pitcher efficiency profile
+# ---------------------------------------------------------------------------
+def get_pitcher_efficiency(season: int) -> pd.DataFrame:
+    """Per-pitcher efficiency metrics for a season.
+
+    Combines first-pitch strike rate, zone rate, ahead-after-one rate,
+    putaway rate (K% on 2-strike counts), and pitches per PA.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, pitcher_name, pitch_hand, season, bf,
+        pitches_per_pa, first_strike_pct, zone_pct, ahead_after_1_pct,
+        putaway_rate.
+    """
+    query = """
+    WITH pa_counts AS (
+        SELECT
+            fpa.pitcher_id,
+            COUNT(DISTINCT fpa.pa_id) AS bf,
+            ROUND(AVG(fpa.last_pitch_number)::numeric, 2) AS pitches_per_pa
+        FROM production.fact_pa fpa
+        JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+        GROUP BY fpa.pitcher_id
+    ),
+    first_pitches AS (
+        SELECT
+            fp.pitcher_id,
+            COUNT(*)  AS total_first,
+            SUM(CASE WHEN fp.is_called_strike OR fp.is_whiff OR fp.is_foul
+                     THEN 1 ELSE 0 END) AS first_strikes
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND fp.pitch_number = 1 AND fp.balls = 0 AND fp.strikes = 0
+        GROUP BY fp.pitcher_id
+    ),
+    zone_agg AS (
+        SELECT
+            fp.pitcher_id,
+            COUNT(*)                                        AS total_with_zone,
+            SUM(CASE WHEN fp.zone BETWEEN 1 AND 9 THEN 1 ELSE 0 END) AS in_zone
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND fp.zone IS NOT NULL
+        GROUP BY fp.pitcher_id
+    ),
+    ahead_after_1 AS (
+        SELECT
+            fp.pitcher_id,
+            COUNT(DISTINCT fp.pa_id) AS total_pa,
+            COUNT(DISTINCT CASE WHEN fp.is_called_strike OR fp.is_whiff OR fp.is_foul
+                                THEN fp.pa_id END) AS ahead_pa
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND fp.pitch_number = 1 AND fp.balls = 0 AND fp.strikes = 0
+        GROUP BY fp.pitcher_id
+    ),
+    putaway AS (
+        SELECT
+            fp.pitcher_id,
+            COUNT(DISTINCT fp.pa_id) AS pa_reached_2strikes,
+            COUNT(DISTINCT CASE WHEN fpa.events IN ('strikeout', 'strikeout_double_play')
+                                THEN fp.pa_id END) AS pa_k
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        JOIN production.fact_pa fpa ON fp.pa_id = fpa.pa_id
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND fp.strikes = 2
+        GROUP BY fp.pitcher_id
+    )
+    SELECT
+        pc.pitcher_id,
+        COALESCE(dp.player_name, 'Unknown') AS pitcher_name,
+        dp.pitch_hand,
+        :season AS season,
+        pc.bf,
+        pc.pitches_per_pa,
+        ROUND((fpch.first_strikes::numeric / NULLIF(fpch.total_first, 0)), 3) AS first_strike_pct,
+        ROUND((za.in_zone::numeric / NULLIF(za.total_with_zone, 0)), 3) AS zone_pct,
+        ROUND((aa.ahead_pa::numeric / NULLIF(aa.total_pa, 0)), 3) AS ahead_after_1_pct,
+        ROUND((pu.pa_k::numeric / NULLIF(pu.pa_reached_2strikes, 0)), 3) AS putaway_rate
+    FROM pa_counts pc
+    LEFT JOIN production.dim_player dp ON pc.pitcher_id = dp.player_id
+    LEFT JOIN first_pitches fpch ON pc.pitcher_id = fpch.pitcher_id
+    LEFT JOIN zone_agg za ON pc.pitcher_id = za.pitcher_id
+    LEFT JOIN ahead_after_1 aa ON pc.pitcher_id = aa.pitcher_id
+    LEFT JOIN putaway pu ON pc.pitcher_id = pu.pitcher_id
+    ORDER BY pc.bf DESC
+    """
+    logger.info("Fetching pitcher efficiency for %d", season)
+    return read_sql(query, {"season": season})

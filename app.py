@@ -454,6 +454,22 @@ def load_traditional_stats(player_type: str) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+@st.cache_data
+def load_hitter_aggressiveness() -> pd.DataFrame:
+    path = DASHBOARD_DIR / "hitter_aggressiveness.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data
+def load_pitcher_efficiency() -> pd.DataFrame:
+    path = DASHBOARD_DIR / "pitcher_efficiency.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
 def load_update_metadata() -> dict:
     """Load update timestamp and stats."""
     path = DASHBOARD_DIR / "update_metadata.json"
@@ -2541,6 +2557,66 @@ def page_player_profile() -> None:
                 st.info("No 2025 stats found for this player.")
         else:
             st.info("No traditional stats data found. Run precompute first.")
+
+        # --- Approach & Efficiency cards ---
+        st.markdown(
+            '<div class="section-header" style="font-size:1rem; margin-top:1rem;">'
+            'Approach &amp; Efficiency</div>',
+            unsafe_allow_html=True,
+        )
+        if player_type == "Hitter":
+            _agg_df = load_hitter_aggressiveness()
+            if not _agg_df.empty:
+                _agg_row = _agg_df[_agg_df["batter_id"] == player_id]
+                if not _agg_row.empty:
+                    _ad = _agg_row.iloc[0]
+                    _agg_items = [
+                        ("FP Swing%", _ad.get("first_pitch_swing_pct"), True),
+                        ("Chase%", _ad.get("chase_rate"), True),
+                        ("2-Strike Chase%", _ad.get("two_strike_chase_rate"), True),
+                        ("2-Strike Whiff%", _ad.get("two_strike_whiff_rate"), True),
+                        ("Zone Swing%", _ad.get("zone_swing_pct"), True),
+                        ("P/PA", _ad.get("pitches_per_pa"), False),
+                    ]
+                    _a_cols = st.columns(len(_agg_items))
+                    for _ac, (_albl, _aval, _is_pct) in zip(_a_cols, _agg_items):
+                        if pd.notna(_aval):
+                            _disp = f"{_aval:.1%}" if _is_pct else f"{_aval:.1f}"
+                        else:
+                            _disp = "--"
+                        with _ac:
+                            st.markdown(
+                                _metric_card(_albl, _disp),
+                                unsafe_allow_html=True,
+                            )
+                else:
+                    st.caption("No aggressiveness data for this player.")
+        else:
+            _eff_df = load_pitcher_efficiency()
+            if not _eff_df.empty:
+                _eff_row = _eff_df[_eff_df["pitcher_id"] == player_id]
+                if not _eff_row.empty:
+                    _ed = _eff_row.iloc[0]
+                    _eff_items = [
+                        ("F-Strike%", _ed.get("first_strike_pct"), True),
+                        ("Zone%", _ed.get("zone_pct"), True),
+                        ("Putaway%", _ed.get("putaway_rate"), True),
+                        ("P/PA", _ed.get("pitches_per_pa"), False),
+                    ]
+                    _e_cols = st.columns(len(_eff_items))
+                    for _ec, (_elbl, _eval, _is_pct) in zip(_e_cols, _eff_items):
+                        if pd.notna(_eval):
+                            _disp = f"{_eval:.1%}" if _is_pct else f"{_eval:.1f}"
+                        else:
+                            _disp = "--"
+                        with _ec:
+                            st.markdown(
+                                _metric_card(_elbl, _disp),
+                                unsafe_allow_html=True,
+                            )
+                else:
+                    st.caption("No efficiency data for this player.")
+
         return  # Skip the projection view below
 
     # --- Comparison baseline toggle ---
@@ -2672,6 +2748,65 @@ def page_player_profile() -> None:
             {bullet_html}
         </div>
         """, unsafe_allow_html=True)
+
+    # --- Approach & Efficiency (on default projection view) ---
+    st.markdown(
+        '<div class="section-header" style="font-size:1rem; margin-top:1rem;">'
+        'Approach &amp; Efficiency</div>',
+        unsafe_allow_html=True,
+    )
+    if player_type == "Hitter":
+        _agg_df = load_hitter_aggressiveness()
+        if not _agg_df.empty:
+            _agg_row = _agg_df[_agg_df["batter_id"] == player_id]
+            if not _agg_row.empty:
+                _ad = _agg_row.iloc[0]
+                _agg_items = [
+                    ("FP Swing%", _ad.get("first_pitch_swing_pct"), True),
+                    ("Chase%", _ad.get("chase_rate"), True),
+                    ("2-Strike Chase%", _ad.get("two_strike_chase_rate"), True),
+                    ("2-Strike Whiff%", _ad.get("two_strike_whiff_rate"), True),
+                    ("Zone Swing%", _ad.get("zone_swing_pct"), True),
+                    ("P/PA", _ad.get("pitches_per_pa"), False),
+                ]
+                _a_cols = st.columns(len(_agg_items))
+                for _ac, (_albl, _aval, _is_pct) in zip(_a_cols, _agg_items):
+                    if pd.notna(_aval):
+                        _disp = f"{_aval:.1%}" if _is_pct else f"{_aval:.1f}"
+                    else:
+                        _disp = "--"
+                    with _ac:
+                        st.markdown(
+                            _metric_card(_albl, _disp),
+                            unsafe_allow_html=True,
+                        )
+            else:
+                st.caption("No aggressiveness data for this player.")
+    else:
+        _eff_df = load_pitcher_efficiency()
+        if not _eff_df.empty:
+            _eff_row = _eff_df[_eff_df["pitcher_id"] == player_id]
+            if not _eff_row.empty:
+                _ed = _eff_row.iloc[0]
+                _eff_items = [
+                    ("F-Strike%", _ed.get("first_strike_pct"), True),
+                    ("Zone%", _ed.get("zone_pct"), True),
+                    ("Putaway%", _ed.get("putaway_rate"), True),
+                    ("P/PA", _ed.get("pitches_per_pa"), False),
+                ]
+                _e_cols = st.columns(len(_eff_items))
+                for _ec, (_elbl, _eval, _is_pct) in zip(_e_cols, _eff_items):
+                    if pd.notna(_eval):
+                        _disp = f"{_eval:.1%}" if _is_pct else f"{_eval:.1f}"
+                    else:
+                        _disp = "--"
+                    with _ec:
+                        st.markdown(
+                            _metric_card(_elbl, _disp),
+                            unsafe_allow_html=True,
+                        )
+            else:
+                st.caption("No efficiency data for this player.")
 
     # --- 2025 Observed Percentiles ---
     obs_stat_configs = PITCHER_OBSERVED_STATS if player_type == "Pitcher" else HITTER_OBSERVED_STATS

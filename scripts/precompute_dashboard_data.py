@@ -38,9 +38,11 @@ from src.data.feature_eng import (
 from src.data.queries import (
     get_game_batter_ks,
     get_game_lineups,
+    get_hitter_aggressiveness,
     get_hitter_traditional_stats,
     get_park_factors,
     get_hitter_team_venue,
+    get_pitcher_efficiency,
     get_pitcher_game_logs,
     get_pitcher_traditional_stats,
     get_player_teams,
@@ -295,7 +297,28 @@ def main() -> None:
         game_logs_list.append(gl)
     game_logs = pd.concat(game_logs_list, ignore_index=True)
 
-    bf_priors = compute_pitcher_bf_priors(game_logs)
+    # Compute pitcher P/PA from game logs for the projection season
+    # (starters only, need BF > 0 to avoid div-by-zero)
+    _starter_logs = game_logs[
+        (game_logs["is_starter"] == True)  # noqa: E712
+        & (game_logs["batters_faced"] >= 3)
+        & (game_logs["number_of_pitches"].notna())
+        & (game_logs["number_of_pitches"] > 0)
+    ]
+    if not _starter_logs.empty:
+        _ppa = (
+            _starter_logs.groupby("pitcher_id")
+            .apply(
+                lambda g: g["number_of_pitches"].sum() / g["batters_faced"].sum(),
+                include_groups=False,
+            )
+            .reset_index(name="pitches_per_pa")
+        )
+        logger.info("Computed P/PA for %d pitchers (mean=%.2f)", len(_ppa), _ppa["pitches_per_pa"].mean())
+    else:
+        _ppa = None
+
+    bf_priors = compute_pitcher_bf_priors(game_logs, pitcher_ppa=_ppa)
     bf_priors.to_parquet(DASHBOARD_DIR / "bf_priors.parquet", index=False)
     logger.info("Saved BF priors: %d pitcher-seasons", len(bf_priors))
 
@@ -563,6 +586,20 @@ def main() -> None:
     logger.info("Saved pitcher traditional stats: %d players", len(pitcher_trad))
 
     # =================================================================
+    # 6b. Hitter aggressiveness & pitcher efficiency profiles
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Computing hitter aggressiveness profiles...")
+    hitter_agg = get_hitter_aggressiveness(FROM_SEASON)
+    hitter_agg.to_parquet(DASHBOARD_DIR / "hitter_aggressiveness.parquet", index=False)
+    logger.info("Saved hitter aggressiveness: %d players", len(hitter_agg))
+
+    logger.info("Computing pitcher efficiency profiles...")
+    pitcher_eff = get_pitcher_efficiency(FROM_SEASON)
+    pitcher_eff.to_parquet(DASHBOARD_DIR / "pitcher_efficiency.parquet", index=False)
+    logger.info("Saved pitcher efficiency: %d players", len(pitcher_eff))
+
+    # =================================================================
     # 7. Save preseason snapshot (frozen projections for end-of-season comparison)
     # =================================================================
     logger.info("=" * 60)
@@ -600,6 +637,8 @@ def main() -> None:
     logger.info("  Pitcher counting:    %d players", len(pitcher_counting))
     logger.info("  Hitter traditional:  %d players", len(hitter_trad))
     logger.info("  Pitcher traditional: %d players", len(pitcher_trad))
+    logger.info("  Hitter aggressiveness:%d players", len(hitter_agg))
+    logger.info("  Pitcher efficiency:  %d players", len(pitcher_eff))
     logger.info("  K%% samples:          %d pitchers", len(k_samples_dict))
     logger.info("  BF priors:           %d pitcher-seasons", len(bf_priors))
     logger.info("  Pitcher arsenal:     %d rows", len(pitcher_arsenal))
