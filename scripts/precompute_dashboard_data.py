@@ -185,9 +185,6 @@ def main() -> None:
         park_factors=park_factors,
         hitter_venues=hitter_venues,
     )
-    hitter_counting.to_parquet(DASHBOARD_DIR / "hitter_counting.parquet", index=False)
-    logger.info("Saved hitter counting projections: %d players", len(hitter_counting))
-
     # Pitcher counting stats
     pitcher_ext = build_multi_season_pitcher_extended(SEASONS, min_bf=1)
     pitcher_counting = project_pitcher_counting(
@@ -198,6 +195,43 @@ def main() -> None:
         min_bf=200,
         random_seed=42,
     )
+
+    # ── Injury adjustment: scale counting stats by games-available fraction ──
+    inj_path = DASHBOARD_DIR / "preseason_injuries.parquet"
+    if inj_path.exists():
+        inj_df = pd.read_parquet(inj_path)
+        inj_df = inj_df[inj_df["player_id"].notna() & (inj_df["est_missed_games"] > 0)]
+        inj_frac = dict(zip(
+            inj_df["player_id"].astype(int),
+            ((162 - inj_df["est_missed_games"].clip(upper=162)) / 162).values,
+        ))
+        logger.info("Applying injury adjustments to %d players", len(inj_frac))
+
+        # Columns to scale (all counting distribution columns)
+        hitter_scale_cols = [
+            c for c in hitter_counting.columns
+            if c.startswith("total_") or c in ("projected_pa_mean", "projected_games_mean")
+        ]
+        for pid, frac in inj_frac.items():
+            mask = hitter_counting["batter_id"] == pid
+            if mask.any():
+                hitter_counting.loc[mask, hitter_scale_cols] *= frac
+                logger.info("  Hitter %d: %.0f%% season", pid, frac * 100)
+
+        pitcher_scale_cols = [
+            c for c in pitcher_counting.columns
+            if c.startswith("total_") or c in ("projected_bf_mean", "projected_games_mean")
+        ]
+        for pid, frac in inj_frac.items():
+            mask = pitcher_counting["pitcher_id"] == pid
+            if mask.any():
+                pitcher_counting.loc[mask, pitcher_scale_cols] *= frac
+                logger.info("  Pitcher %d: %.0f%% season", pid, frac * 100)
+    else:
+        logger.info("No preseason injuries file found — skipping injury adjustments")
+
+    hitter_counting.to_parquet(DASHBOARD_DIR / "hitter_counting.parquet", index=False)
+    logger.info("Saved hitter counting projections: %d players", len(hitter_counting))
     pitcher_counting.to_parquet(DASHBOARD_DIR / "pitcher_counting.parquet", index=False)
     logger.info("Saved pitcher counting projections: %d players", len(pitcher_counting))
 
@@ -275,11 +309,63 @@ def main() -> None:
     logger.info("Saved weather effects: %d combinations", len(weather_effects))
 
     # =================================================================
-    # 4d. Player team mapping
+    # 4d. Player team mapping (2025 regular season + 2026 spring training override)
     # =================================================================
     logger.info("=" * 60)
     logger.info("Computing player-team mapping...")
     player_teams = get_player_teams(FROM_SEASON)
+
+    # Override with 2026 spring training teams for players who changed teams
+    try:
+        from src.data.db import read_sql as _read_sql
+        st_teams = _read_sql("""
+            WITH st_appearances AS (
+                SELECT bb.batter_id AS player_id, bb.team_id, COUNT(*) AS games
+                FROM staging.batting_boxscores bb
+                JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+                WHERE dg.season = :season AND dg.game_type = 'S'
+                GROUP BY bb.batter_id, bb.team_id
+                UNION ALL
+                SELECT pb.pitcher_id AS player_id, pb.team_id, COUNT(*) AS games
+                FROM staging.pitching_boxscores pb
+                JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+                WHERE dg.season = :season AND dg.game_type = 'S'
+                GROUP BY pb.pitcher_id, pb.team_id
+            ),
+            primary_st AS (
+                SELECT player_id, team_id,
+                       SUM(games) AS total_games,
+                       ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY SUM(games) DESC) AS rn
+                FROM st_appearances GROUP BY player_id, team_id
+            )
+            SELECT p.player_id,
+                   COALESCE(dt.abbreviation, '') AS team_abbr,
+                   COALESCE(dt.team_name, '') AS team_name
+            FROM primary_st p
+            LEFT JOIN production.dim_team dt ON p.team_id = dt.team_id
+            WHERE p.rn = 1
+        """, {"season": FROM_SEASON + 1})
+        if not st_teams.empty:
+            # Only override for players already in our projections
+            st_lookup = dict(zip(st_teams["player_id"], st_teams["team_abbr"]))
+            st_name_lookup = dict(zip(st_teams["player_id"], st_teams["team_name"]))
+            n_updated = 0
+            for idx, row in player_teams.iterrows():
+                pid = row["player_id"]
+                if pid in st_lookup and st_lookup[pid] and st_lookup[pid] != row["team_abbr"]:
+                    player_teams.at[idx, "team_abbr"] = st_lookup[pid]
+                    player_teams.at[idx, "team_name"] = st_name_lookup.get(pid, "")
+                    n_updated += 1
+            # Also add players who are in spring training but not in 2025 regular season
+            existing_pids = set(player_teams["player_id"])
+            new_rows = st_teams[~st_teams["player_id"].isin(existing_pids)]
+            if not new_rows.empty:
+                player_teams = pd.concat([player_teams, new_rows], ignore_index=True)
+            logger.info("Spring training override: %d team changes, %d new players",
+                        n_updated, len(new_rows))
+    except Exception as e:
+        logger.warning("Could not load spring training teams: %s", e)
+
     player_teams.to_parquet(DASHBOARD_DIR / "player_teams.parquet", index=False)
     logger.info("Saved player teams: %d players", len(player_teams))
 
