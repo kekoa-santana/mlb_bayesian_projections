@@ -3767,29 +3767,31 @@ def page_team_overview() -> None:
     identity_tags: list[tuple[str, str]] = []  # (label, color)
 
     if not team_hitters.empty and not h_proj.empty:
-        lg_hh = h_proj["hard_hit_pct"].dropna().mean()
-        lg_ev = h_proj["avg_exit_velo"].dropna().mean()
-        lg_whiff = h_proj["whiff_rate"].dropna().mean()
-        lg_zcon = h_proj["z_contact_pct"].dropna().mean()
-        team_hh = team_hitters["hard_hit_pct"].dropna().mean()
-        team_ev = team_hitters["avg_exit_velo"].dropna().mean()
-        team_whiff = team_hitters["whiff_rate"].dropna().mean()
-        team_zcon = team_hitters["z_contact_pct"].dropna().mean()
+        # Power vs contact tags (only if Statcast cols available)
+        _has_statcast = all(c in h_proj.columns for c in ("hard_hit_pct", "avg_exit_velo", "whiff_rate", "z_contact_pct"))
+        if _has_statcast:
+            lg_hh = h_proj["hard_hit_pct"].dropna().mean()
+            lg_ev = h_proj["avg_exit_velo"].dropna().mean()
+            lg_whiff = h_proj["whiff_rate"].dropna().mean()
+            lg_zcon = h_proj["z_contact_pct"].dropna().mean()
+            team_hh = team_hitters["hard_hit_pct"].dropna().mean()
+            team_ev = team_hitters["avg_exit_velo"].dropna().mean()
+            team_whiff = team_hitters["whiff_rate"].dropna().mean()
+            team_zcon = team_hitters["z_contact_pct"].dropna().mean()
 
-        # Power vs contact
-        power_score = (team_hh - lg_hh) / max(h_proj["hard_hit_pct"].dropna().std(), 0.001) \
-                    + (team_ev - lg_ev) / max(h_proj["avg_exit_velo"].dropna().std(), 0.001)
-        contact_score = (team_zcon - lg_zcon) / max(h_proj["z_contact_pct"].dropna().std(), 0.001) \
-                      + (lg_whiff - team_whiff) / max(h_proj["whiff_rate"].dropna().std(), 0.001)
+            power_score = (team_hh - lg_hh) / max(h_proj["hard_hit_pct"].dropna().std(), 0.001) \
+                        + (team_ev - lg_ev) / max(h_proj["avg_exit_velo"].dropna().std(), 0.001)
+            contact_score = (team_zcon - lg_zcon) / max(h_proj["z_contact_pct"].dropna().std(), 0.001) \
+                          + (lg_whiff - team_whiff) / max(h_proj["whiff_rate"].dropna().std(), 0.001)
 
-        if power_score > 1.0:
-            identity_tags.append(("Power Offense", GOLD))
-        elif power_score < -1.0:
-            identity_tags.append(("Low-Power Offense", SLATE))
-        if contact_score > 1.0:
-            identity_tags.append(("Contact Offense", SAGE))
-        elif contact_score < -1.0:
-            identity_tags.append(("Swing-and-Miss Offense", EMBER))
+            if power_score > 1.0:
+                identity_tags.append(("Power Offense", GOLD))
+            elif power_score < -1.0:
+                identity_tags.append(("Low-Power Offense", SLATE))
+            if contact_score > 1.0:
+                identity_tags.append(("Contact Offense", SAGE))
+            elif contact_score < -1.0:
+                identity_tags.append(("Swing-and-Miss Offense", EMBER))
 
         # Lineup handedness
         n_left = (team_hitters["batter_stand"] == "L").sum()
@@ -3919,15 +3921,15 @@ def page_team_overview() -> None:
             ("Avg EV", "avg_exit_velo", True),
             ("Hard-Hit%", "hard_hit_pct", True),
         ]:
-            if key not in team_hitters.columns:
+            if key not in team_hitters.columns or key not in h_proj.columns:
                 continue
             team_avg = team_hitters[key].dropna().mean()
             league_avg = h_proj[key].dropna().mean()
-            if league_avg == 0:
+            if pd.isna(team_avg) or pd.isna(league_avg) or league_avg == 0:
                 continue
             diff = team_avg - league_avg
             # For rates shown as percentages
-            if key in ("projected_k_rate", "projected_bb_rate", "whiff_rate", "chase_rate", "hard_hit_pct"):
+            if key in (_h_k_col, _h_bb_col, "whiff_rate", "chase_rate", "hard_hit_pct"):
                 diff_str = f"{diff * 100:+.1f}pp"
                 team_str = f"{team_avg * 100:.1f}%"
                 lg_str = f"{league_avg * 100:.1f}%"
@@ -3993,14 +3995,14 @@ def page_team_overview() -> None:
             ("Zone%", "zone_pct", True),
             ("GB%", "gb_pct", True),
         ]:
-            if key not in team_pitchers.columns:
+            if key not in team_pitchers.columns or key not in p_proj.columns:
                 continue
             team_avg = team_pitchers[key].dropna().mean()
             league_avg = p_proj[key].dropna().mean()
-            if league_avg == 0:
+            if pd.isna(team_avg) or pd.isna(league_avg) or league_avg == 0:
                 continue
             diff = team_avg - league_avg
-            if key in ("projected_k_rate", "projected_bb_rate", "whiff_rate", "zone_pct", "gb_pct"):
+            if key in (_p_k_col, _p_bb_col, "whiff_rate", "zone_pct", "gb_pct"):
                 diff_str = f"{diff * 100:+.1f}pp"
                 team_str = f"{team_avg * 100:.1f}%"
                 lg_str = f"{league_avg * 100:.1f}%"
