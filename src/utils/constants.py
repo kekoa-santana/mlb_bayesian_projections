@@ -129,6 +129,18 @@ ZONE_BOUNDARIES = {
     "plate_z_bot_avg": 1.5,    # average bottom of zone (use per-batter sz_bot when available)
 }
 
+# 5x5 zone grid for location visualization
+ZONE_GRID = {
+    "n_cols": 5,
+    "n_rows": 5,
+    "x_min": -1.33,     # left edge (extends past zone)
+    "x_max": 1.33,      # right edge
+    "z_min": 1.0,       # bottom edge (below avg zone bottom)
+    "z_max": 4.0,       # top edge (above avg zone top)
+    "x_step": 0.532,    # (1.33 - (-1.33)) / 5
+    "z_step": 0.6,      # (4.0 - 1.0) / 5
+}
+
 # ---------------------------------------------------------------------------
 # Batted-ball thresholds
 # ---------------------------------------------------------------------------

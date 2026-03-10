@@ -1633,3 +1633,152 @@ def get_game_lineups(season: int) -> pd.DataFrame:
     """
     logger.info("Fetching game lineups for %d", season)
     return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# Location grid queries (5x5 zone grid)
+# ---------------------------------------------------------------------------
+def get_pitcher_location_grid(season: int) -> pd.DataFrame:
+    """Pitch location grid for all qualified pitchers in a season.
+
+    Returns one row per (pitcher_id, pitch_type, batter_stand, grid_row, grid_col)
+    with pitch counts and outcome tallies in each 5x5 zone cell.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, pitcher_name, pitch_type, batter_stand,
+        grid_row, grid_col, pitches, swings, whiffs, called_strikes, bip.
+    """
+    query = """
+    WITH pitcher_filter AS (
+        SELECT fp.pitcher_id
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND fp.pitch_type IS NOT NULL
+        GROUP BY fp.pitcher_id
+        HAVING COUNT(*) >= 500
+    )
+    SELECT
+        fp.pitcher_id,
+        COALESCE(dp.player_name, 'Unknown') AS pitcher_name,
+        fp.pitch_type,
+        fp.batter_stand,
+        LEAST(GREATEST(FLOOR((fp.plate_x + 1.33) / 0.532)::int, 0), 4) AS grid_col,
+        LEAST(GREATEST(FLOOR((fp.plate_z - 1.0) / 0.6)::int, 0), 4) AS grid_row,
+        COUNT(*) AS pitches,
+        SUM(fp.is_swing::int) AS swings,
+        SUM(fp.is_whiff::int) AS whiffs,
+        SUM(fp.is_called_strike::int) AS called_strikes,
+        SUM(fp.is_bip::int) AS bip
+    FROM production.fact_pitch fp
+    JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+    JOIN pitcher_filter pf ON fp.pitcher_id = pf.pitcher_id
+    LEFT JOIN production.dim_player dp ON fp.pitcher_id = dp.player_id
+    WHERE dg.season = :season
+      AND dg.game_type = 'R'
+      AND fp.pitch_type IS NOT NULL
+      AND fp.plate_x IS NOT NULL AND fp.plate_z IS NOT NULL
+      AND CAST(fp.plate_x AS text) != 'NaN'
+      AND CAST(fp.plate_z AS text) != 'NaN'
+    GROUP BY fp.pitcher_id, dp.player_name, fp.pitch_type, fp.batter_stand,
+             grid_col, grid_row
+    ORDER BY fp.pitcher_id, fp.pitch_type, grid_row, grid_col
+    """
+    logger.info("Fetching pitcher location grid for %d", season)
+    return read_sql(query, {"season": season})
+
+
+def get_hitter_zone_grid(season: int) -> pd.DataFrame:
+    """Hitter zone grid with whiff and batted-ball metrics per cell.
+
+    Returns one row per (batter_id, batter_stand, grid_row, grid_col)
+    with pitch/swing/whiff counts and batted-ball quality metrics.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, batter_name, batter_stand, grid_row, grid_col,
+        pitches, swings, whiffs, called_strikes, bip, xwoba_sum, xwoba_count,
+        hard_hits, barrels.
+    """
+    query = """
+    WITH batter_filter AS (
+        SELECT fp.batter_id
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND fp.pitch_type IS NOT NULL
+        GROUP BY fp.batter_id
+        HAVING COUNT(*) >= 200
+    ),
+    pitch_grid AS (
+        SELECT
+            fp.batter_id,
+            fp.batter_stand,
+            fp.pa_id,
+            LEAST(GREATEST(FLOOR((fp.plate_x + 1.33) / 0.532)::int, 0), 4) AS grid_col,
+            LEAST(GREATEST(FLOOR((fp.plate_z - 1.0) / 0.6)::int, 0), 4) AS grid_row,
+            fp.is_swing,
+            fp.is_whiff,
+            fp.is_called_strike,
+            fp.is_bip
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        JOIN batter_filter bf ON fp.batter_id = bf.batter_id
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+          AND fp.pitch_type IS NOT NULL
+          AND fp.plate_x IS NOT NULL AND fp.plate_z IS NOT NULL
+          AND CAST(fp.plate_x AS text) != 'NaN'
+          AND CAST(fp.plate_z AS text) != 'NaN'
+    )
+    SELECT
+        pg.batter_id,
+        COALESCE(dp.player_name, 'Unknown') AS batter_name,
+        pg.batter_stand,
+        pg.grid_row,
+        pg.grid_col,
+        COUNT(*) AS pitches,
+        SUM(pg.is_swing::int) AS swings,
+        SUM(pg.is_whiff::int) AS whiffs,
+        SUM(pg.is_called_strike::int) AS called_strikes,
+        SUM(pg.is_bip::int) AS bip,
+        COALESCE(SUM(
+            CASE WHEN pg.is_bip AND sbb.xwoba IS NOT NULL
+                      AND CAST(sbb.xwoba AS text) != 'NaN'
+                 THEN sbb.xwoba ELSE 0 END
+        ), 0) AS xwoba_sum,
+        COALESCE(SUM(
+            CASE WHEN pg.is_bip AND sbb.xwoba IS NOT NULL
+                      AND CAST(sbb.xwoba AS text) != 'NaN'
+                 THEN 1 ELSE 0 END
+        ), 0) AS xwoba_count,
+        COALESCE(SUM(
+            CASE WHEN pg.is_bip AND sbb.launch_speed >= 95 THEN 1 ELSE 0 END
+        ), 0) AS hard_hits,
+        COALESCE(SUM(
+            CASE WHEN pg.is_bip AND sbb.launch_speed >= 98
+                      AND sbb.launch_angle BETWEEN 26 AND 30
+                 THEN 1 ELSE 0 END
+        ), 0) AS barrels
+    FROM pitch_grid pg
+    LEFT JOIN production.dim_player dp ON pg.batter_id = dp.player_id
+    LEFT JOIN production.sat_batted_balls sbb ON pg.pa_id = sbb.pa_id
+    GROUP BY pg.batter_id, dp.player_name, pg.batter_stand,
+             pg.grid_row, pg.grid_col
+    ORDER BY pg.batter_id, pg.grid_row, pg.grid_col
+    """
+    logger.info("Fetching hitter zone grid for %d", season)
+    return read_sql(query, {"season": season})

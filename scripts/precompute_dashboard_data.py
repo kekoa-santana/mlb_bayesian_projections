@@ -273,6 +273,15 @@ def main() -> None:
     )
     logger.info("Saved K%% posterior samples for %d pitchers", len(k_samples_dict))
 
+    # Save preseason K samples snapshot for in-season conjugate updating
+    snapshot_dir = DASHBOARD_DIR / "snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        snapshot_dir / "pitcher_k_samples_preseason.npz",
+        **k_samples_dict,
+    )
+    logger.info("Saved preseason K%% samples snapshot")
+
     # =================================================================
     # 4. BF priors
     # =================================================================
@@ -492,6 +501,51 @@ def main() -> None:
 
     career_str.to_parquet(DASHBOARD_DIR / "hitter_str_career.parquet", index=False)
     logger.info("Saved career hitter strength: %d rows", len(career_str))
+
+    # =================================================================
+    # 5b. Location grid data (pitcher heatmaps + hitter zone profiles)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Computing location grids for %d...", FROM_SEASON)
+
+    from src.data.queries import get_pitcher_location_grid, get_hitter_zone_grid
+
+    pitcher_loc = get_pitcher_location_grid(FROM_SEASON)
+    pitcher_loc.to_parquet(DASHBOARD_DIR / "pitcher_location_grid.parquet", index=False)
+    logger.info("Saved pitcher location grid: %d rows (%d pitchers)",
+                len(pitcher_loc), pitcher_loc["pitcher_id"].nunique())
+
+    hitter_zone = get_hitter_zone_grid(FROM_SEASON)
+    hitter_zone.to_parquet(DASHBOARD_DIR / "hitter_zone_grid.parquet", index=False)
+    logger.info("Saved hitter zone grid: %d rows (%d batters)",
+                len(hitter_zone), hitter_zone["batter_id"].nunique())
+
+    # Career-aggregated hitter zone grid (sum counts across all seasons)
+    zone_frames = []
+    for s in SEASONS:
+        try:
+            zf = get_hitter_zone_grid(s)
+            zone_frames.append(zf)
+        except Exception as e:
+            logger.warning("Hitter zone grid for %d failed: %s", s, e)
+    if zone_frames:
+        all_zones = pd.concat(zone_frames, ignore_index=True)
+        sum_cols = ["pitches", "swings", "whiffs", "called_strikes", "bip",
+                    "xwoba_sum", "xwoba_count", "hard_hits", "barrels"]
+        sum_cols = [c for c in sum_cols if c in all_zones.columns]
+        career_zones = all_zones.groupby(
+            ["batter_id", "batter_name", "batter_stand", "grid_row", "grid_col"]
+        )[sum_cols].sum().reset_index()
+        # Keep most recent name per batter
+        latest_names = all_zones.sort_values("pitches", ascending=False).drop_duplicates(
+            "batter_id"
+        )[["batter_id", "batter_name"]]
+        career_zones = career_zones.drop(columns=["batter_name"]).merge(
+            latest_names, on="batter_id", how="left"
+        )
+        career_zones.to_parquet(DASHBOARD_DIR / "hitter_zone_grid_career.parquet", index=False)
+        logger.info("Saved career hitter zone grid: %d rows (%d batters)",
+                    len(career_zones), career_zones["batter_id"].nunique())
 
     # =================================================================
     # 6. Save preseason snapshot (frozen projections for end-of-season comparison)

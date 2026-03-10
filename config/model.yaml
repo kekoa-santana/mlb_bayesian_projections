@@ -18,6 +18,14 @@ cache:
   directory: data/cached
   format: parquet
 
+in_season:
+  current_season: 2026
+  min_pa_for_update: 10
+  min_bf_for_update: 10
+  new_player_prior_strength: 50
+  n_k_samples: 8000
+  mlb_api_base: "https://statsapi.mlb.com/api/v1"
+
 game_k:
   n_mc_draws: 4000
   bf_min: 3

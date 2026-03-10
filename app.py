@@ -396,6 +396,65 @@ def load_player_teams() -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+@st.cache_data
+def load_pitcher_location_grid() -> pd.DataFrame:
+    """Load pitcher location grid data (5x5 zone cells)."""
+    path = DASHBOARD_DIR / "pitcher_location_grid.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data
+def load_hitter_zone_grid(career: bool = False) -> pd.DataFrame:
+    """Load hitter zone grid data (5x5 zone cells)."""
+    if career:
+        path = DASHBOARD_DIR / "hitter_zone_grid_career.parquet"
+        if path.exists():
+            return pd.read_parquet(path)
+    path = DASHBOARD_DIR / "hitter_zone_grid.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data
+def load_todays_games() -> pd.DataFrame:
+    """Load today's game schedule."""
+    path = DASHBOARD_DIR / "todays_games.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data
+def load_todays_sims() -> pd.DataFrame:
+    """Load today's K simulation results per pitcher."""
+    path = DASHBOARD_DIR / "todays_sims.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data
+def load_todays_lineups() -> pd.DataFrame:
+    """Load today's lineups."""
+    path = DASHBOARD_DIR / "todays_lineups.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+def load_update_metadata() -> dict:
+    """Load update timestamp and stats."""
+    path = DASHBOARD_DIR / "update_metadata.json"
+    if not path.exists():
+        return {}
+    import json
+    with open(path) as f:
+        return json.load(f)
+
+
 def _strip_accents(s: str) -> str:
     """Remove diacritical marks (é→e, ñ→n, ú→u, etc.)."""
     return "".join(
@@ -1815,6 +1874,196 @@ PITCHER_COUNTING_DISPLAY = [
 
 
 # ---------------------------------------------------------------------------
+# Page: Today's Games
+# ---------------------------------------------------------------------------
+def page_todays_games() -> None:
+    """Today's MLB games with matchup analysis and K prop projections."""
+    st.markdown('<div class="section-header">Today\'s Games</div>',
+                unsafe_allow_html=True)
+
+    meta = load_update_metadata()
+    schedule = load_todays_games()
+    sims = load_todays_sims()
+    lineups = load_todays_lineups()
+
+    if schedule.empty:
+        game_date = meta.get("game_date", "")
+        st.info(
+            f"No games loaded{f' for {game_date}' if game_date else ''}. "
+            "Run `python scripts/update_in_season.py` to fetch today's schedule."
+        )
+        return
+
+    game_date = schedule.iloc[0].get("game_date", "")
+    n_games = len(schedule)
+
+    # Header with date and update info
+    updated_str = ""
+    if meta.get("last_updated"):
+        try:
+            from datetime import datetime as _dt
+            ts = _dt.fromisoformat(meta["last_updated"])
+            updated_str = f" | Updated {ts.strftime('%I:%M %p')}"
+        except Exception:
+            pass
+
+    st.markdown(
+        f'<div style="color:{SLATE}; font-size:0.9rem; margin-bottom:1rem;">'
+        f'{game_date} | {n_games} games{updated_str}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Team filter
+    all_teams = sorted(set(
+        schedule["away_abbr"].dropna().tolist() +
+        schedule["home_abbr"].dropna().tolist()
+    ))
+    team_filter = st.selectbox(
+        "Filter by team",
+        ["All Teams"] + all_teams,
+        key="today_team_filter",
+    )
+
+    if team_filter != "All Teams":
+        schedule = schedule[
+            (schedule["away_abbr"] == team_filter) |
+            (schedule["home_abbr"] == team_filter)
+        ]
+
+    # Build game cards
+    for _, game in schedule.iterrows():
+        gpk = game["game_pk"]
+        away_abbr = game.get("away_abbr", "?")
+        home_abbr = game.get("home_abbr", "?")
+        away_name = game.get("away_team_name", away_abbr)
+        home_name = game.get("home_team_name", home_abbr)
+        game_time = game.get("game_time", "")
+        status = game.get("status", "")
+
+        # Get sims for this game's pitchers
+        game_sims = sims[sims["game_pk"] == gpk] if not sims.empty else pd.DataFrame()
+        away_sim = game_sims[game_sims["side"] == "away"].iloc[0] if not game_sims.empty and (game_sims["side"] == "away").any() else None
+        home_sim = game_sims[game_sims["side"] == "home"].iloc[0] if not game_sims.empty and (game_sims["side"] == "home").any() else None
+
+        # Game card header
+        status_str = f" — {status}" if status and "Scheduled" not in status else ""
+        st.markdown(
+            f'<div style="background:{DARK_CARD}; border:1px solid {DARK_BORDER}; '
+            f'border-radius:8px; padding:1rem 1.5rem; margin-bottom:1rem;">'
+            f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.8rem;">'
+            f'<span style="color:{GOLD}; font-size:1.1rem; font-weight:700;">'
+            f'{away_abbr} @ {home_abbr}</span>'
+            f'<span style="color:{SLATE}; font-size:0.85rem;">{game_time}{status_str}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Two columns: away pitcher / home pitcher
+        col_a, col_h = st.columns(2)
+
+        for col, sim, side_label, pitcher_name_field in [
+            (col_a, away_sim, f"{away_abbr} SP", "away_pitcher_name"),
+            (col_h, home_sim, f"{home_abbr} SP", "home_pitcher_name"),
+        ]:
+            with col:
+                pp_name = game.get(pitcher_name_field, "TBD")
+                if not pp_name:
+                    pp_name = "TBD"
+
+                if sim is not None:
+                    k_rate_pct = sim["projected_k_rate"] * 100
+                    exp_k = sim["expected_k"]
+                    has_lineup = sim.get("has_lineup", False)
+                    lineup_tag = "" if has_lineup else " (no lineup)"
+
+                    # P(over) for key lines
+                    p_lines = []
+                    for line_col in ["p_over_5_5", "p_over_6_5", "p_over_7_5"]:
+                        if line_col in sim.index and pd.notna(sim.get(line_col)):
+                            line_val = line_col.replace("p_over_", "").replace("_", ".")
+                            p = sim[line_col] * 100
+                            color = POSITIVE if p > 55 else NEGATIVE if p < 45 else SLATE
+                            p_lines.append(
+                                f'<span style="color:{color};">'
+                                f'O{line_val}: {p:.0f}%</span>'
+                            )
+
+                    p_line_html = " | ".join(p_lines) if p_lines else ""
+
+                    st.markdown(
+                        f'<div style="font-size:0.95rem; font-weight:600; color:{CREAM};">'
+                        f'{side_label}: {pp_name}</div>'
+                        f'<div style="font-size:0.8rem; color:{SLATE}; margin-top:2px;">'
+                        f'K%: {k_rate_pct:.1f}% | E[K]: {exp_k:.1f}{lineup_tag}</div>'
+                        f'<div style="font-size:0.8rem; margin-top:2px;">{p_line_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div style="font-size:0.95rem; font-weight:600; color:{CREAM};">'
+                        f'{side_label}: {pp_name}</div>'
+                        f'<div style="font-size:0.8rem; color:{SLATE};">No projection available</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        # Close card div
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # Expandable lineup details
+        if not lineups.empty:
+            game_lu = lineups[lineups["game_pk"] == gpk]
+            if not game_lu.empty:
+                with st.expander(f"Lineup Details — {away_abbr} @ {home_abbr}"):
+                    for sim, side, opp_label in [
+                        (away_sim, "away", home_abbr),
+                        (home_sim, "home", away_abbr),
+                    ]:
+                        if sim is None:
+                            continue
+
+                        pitcher_name = sim["pitcher_name"]
+                        opp_team_id = game.get(f"{'home' if side == 'away' else 'away'}_team_id")
+                        opp_lu = game_lu[game_lu["team_id"] == opp_team_id].sort_values("batting_order")
+
+                        if opp_lu.empty:
+                            continue
+
+                        st.markdown(
+                            f'<div style="color:{GOLD}; font-size:0.9rem; font-weight:600; '
+                            f'margin:0.5rem 0 0.3rem 0;">'
+                            f'{pitcher_name} vs {opp_label} Lineup</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        lu_rows = []
+                        for _, brow in opp_lu.head(9).iterrows():
+                            lu_rows.append({
+                                "#": int(brow["batting_order"]),
+                                "Batter": brow.get("batter_name", "Unknown"),
+                            })
+
+                        if lu_rows:
+                            st.dataframe(
+                                pd.DataFrame(lu_rows),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=350,
+                            )
+
+    # Summary footer
+    if not sims.empty:
+        st.markdown("---")
+        st.markdown(
+            f'<div style="color:{SLATE}; font-size:0.8rem;">'
+            f'{len(sims)} pitchers simulated | '
+            f'{sims["has_lineup"].sum()} with lineup data | '
+            f'10,000 Monte Carlo draws per pitcher</div>',
+            unsafe_allow_html=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Page: Projections
 # ---------------------------------------------------------------------------
 def page_projections() -> None:
@@ -2108,18 +2357,19 @@ def page_player_profile() -> None:
             f'</div>'
         )
 
-    st.markdown(f"""
-    <div class="brand-header">
-        <div>
-            <div class="brand-title">{selected_name}</div>
-            <div class="brand-subtitle">{' | '.join(header_parts)} | 2026 Projection</div>
-            {injury_html}
-        </div>
-        <div style="color:{comp_color}; font-size:1.2rem; font-weight:600;">
-            Composite: {composite:+.2f}
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    header_html = (
+        f'<div class="brand-header">'
+        f'<div>'
+        f'<div class="brand-title">{selected_name}</div>'
+        f'<div class="brand-subtitle">{" | ".join(header_parts)} | 2026 Projection</div>'
+        f'{injury_html}'
+        f'</div>'
+        f'<div style="color:{comp_color}; font-size:1.2rem; font-weight:600;">'
+        f'Composite: {composite:+.2f}'
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(header_html, unsafe_allow_html=True)
 
     # --- Comparison baseline toggle ---
     compare_to = st.radio(
@@ -2341,6 +2591,29 @@ def page_player_profile() -> None:
                         "CSW% = called strikes + whiffs / pitches.",
                         unsafe_allow_html=True,
                     )
+
+        # --- Pitcher Location Heatmap ---
+        ploc_df = load_pitcher_location_grid()
+        if not ploc_df.empty:
+            p_loc = ploc_df[ploc_df["pitcher_id"] == player_id]
+            if not p_loc.empty:
+                st.markdown('<div class="section-header">Pitch Location Profile</div>',
+                            unsafe_allow_html=True)
+                from src.viz.zone_charts import plot_pitcher_location_heatmap
+
+                loc_stand = st.radio(
+                    "Batter handedness",
+                    ["All", "vs LHH", "vs RHH"],
+                    horizontal=True,
+                    key="profile_pitcher_loc_stand",
+                )
+                stand_filter = {"vs LHH": "L", "vs RHH": "R"}.get(loc_stand)
+                fig_loc = plot_pitcher_location_heatmap(
+                    p_loc, pitcher_name=selected_name, batter_stand=stand_filter,
+                )
+                st.pyplot(fig_loc, use_container_width=True)
+                plt.close(fig_loc)
+                st.caption("Pitch count shown per cell. Catcher's perspective.")
     else:
         vuln_df = load_hitter_vulnerability(career=True)
         if not vuln_df.empty:
@@ -2390,6 +2663,46 @@ def page_player_profile() -> None:
                         "Bar opacity reflects sample confidence.",
                         unsafe_allow_html=True,
                     )
+
+        # --- Hitter Zone Grid ---
+        hzone_df = load_hitter_zone_grid(career=True)
+        if not hzone_df.empty:
+            h_zone = hzone_df[hzone_df["batter_id"] == player_id]
+            if not h_zone.empty:
+                st.markdown('<div class="section-header">Zone Profile (Career)</div>',
+                            unsafe_allow_html=True)
+                from src.viz.zone_charts import plot_hitter_zone_grid
+
+                zone_col1, zone_col2 = st.columns(2)
+                # Determine platoon stand for zone charts (match pitch-type profile)
+                zone_stand = None
+                if is_switch:
+                    if platoon_side.startswith("vs RHP"):
+                        zone_stand = "L"
+                    elif platoon_side.startswith("vs LHP"):
+                        zone_stand = "R"
+                    # else Combined → zone_stand = None
+
+                with zone_col1:
+                    fig_whiff = plot_hitter_zone_grid(
+                        h_zone, metric="whiff_rate",
+                        batter_name=selected_name, batter_stand=zone_stand,
+                    )
+                    st.pyplot(fig_whiff, use_container_width=True)
+                    plt.close(fig_whiff)
+                with zone_col2:
+                    fig_xwoba = plot_hitter_zone_grid(
+                        h_zone, metric="xwoba",
+                        batter_name=selected_name, batter_stand=zone_stand,
+                    )
+                    st.pyplot(fig_xwoba, use_container_width=True)
+                    plt.close(fig_xwoba)
+                st.caption(
+                    f"Left: whiff vulnerability (<span style='color:{EMBER};'>orange</span> = exploitable). "
+                    f"Right: damage on contact (<span style='color:{SAGE};'>green</span> = hitter strength). "
+                    "Catcher's perspective. Cells with insufficient data dimmed.",
+                    unsafe_allow_html=True,
+                )
 
     # --- Posterior KDE (for pitchers with K% samples) ---
     k_samples = load_k_samples()
@@ -2663,7 +2976,7 @@ def page_game_k_sim() -> None:
 
         lineup_mode = st.radio(
             "Lineup source",
-            ["League Average (no lineup)", "Pick from 2025 games", "Manual (9 hitters)"],
+            ["League Average (no lineup)", "Manual (9 hitters)"],
             horizontal=True,
             key="gamek_lineup_mode",
         )
@@ -2673,102 +2986,7 @@ def page_game_k_sim() -> None:
             for pt, vals in _LEAGUE_AVG.items()
         }
 
-        if lineup_mode == "Pick from 2025 games":
-            # Load 2025 lineups and find games this pitcher started
-            lineups_path = DASHBOARD_DIR / "game_lineups.parquet"
-            gl_path = DASHBOARD_DIR / "pitcher_game_logs.parquet"
-            bk_path = DASHBOARD_DIR / "game_batter_ks.parquet"
-
-            if lineups_path.exists() and gl_path.exists() and bk_path.exists():
-                all_lineups = pd.read_parquet(lineups_path)
-                all_gl = pd.read_parquet(gl_path)
-                all_bk = pd.read_parquet(bk_path)
-
-                # Enrich with game date
-                from src.data.db import read_sql as _read_sql
-                game_pks = all_gl[all_gl["pitcher_id"] == pitcher_id]["game_pk"].unique()
-                if len(game_pks) > 0:
-                    pk_str = ",".join(str(int(pk)) for pk in game_pks)
-                    game_info = _read_sql(f"""
-                        SELECT game_pk, game_date, home_team_id, home_team_name, away_team_name
-                        FROM production.dim_game WHERE game_pk IN ({pk_str})
-                    """, {})
-
-                    pitcher_starts = all_gl[
-                        (all_gl["pitcher_id"] == pitcher_id) & (all_gl["is_starter"] == True)  # noqa
-                    ].merge(game_info, on="game_pk", how="left").sort_values("game_date", ascending=False)
-
-                    if not pitcher_starts.empty:
-                        # Build game labels
-                        game_labels = {}
-                        for _, gr in pitcher_starts.iterrows():
-                            gpk = int(gr["game_pk"])
-                            dt = str(gr.get("game_date", ""))[:10]
-                            ks = int(gr["strike_outs"]) if pd.notna(gr.get("strike_outs")) else 0
-
-                            # Find opponent via batter_ks overlap
-                            bk = all_bk[
-                                (all_bk["game_pk"] == gpk) & (all_bk["pitcher_id"] == pitcher_id)
-                            ]
-                            faced = set(bk["batter_id"].tolist())
-                            lu = all_lineups[all_lineups["game_pk"] == gpk]
-                            opp = ""
-                            for tid in lu["team_id"].unique():
-                                if set(lu[lu["team_id"] == tid]["player_id"].tolist()) & faced:
-                                    htid = gr.get("home_team_id")
-                                    opp = gr.get("home_team_name", "") if tid == htid else gr.get("away_team_name", "")
-                                    break
-                            game_labels[f"{dt} vs {opp} ({ks} K)"] = gpk
-
-                        selected_game = st.selectbox(
-                            "Select a 2025 game",
-                            list(game_labels.keys()),
-                            key="gamek_lineup_game",
-                        )
-                        sel_gpk = game_labels[selected_game]
-
-                        # Get opposing lineup
-                        bk_game = all_bk[
-                            (all_bk["game_pk"] == sel_gpk) & (all_bk["pitcher_id"] == pitcher_id)
-                        ]
-                        faced_ids = set(bk_game["batter_id"].tolist())
-                        game_lu = all_lineups[all_lineups["game_pk"] == sel_gpk]
-
-                        opp_lineup = None
-                        for tid in game_lu["team_id"].unique():
-                            tl = game_lu[game_lu["team_id"] == tid].sort_values("batting_order")
-                            if set(tl["player_id"].tolist()) & faced_ids:
-                                opp_lineup = tl
-                                break
-
-                        if opp_lineup is not None and len(opp_lineup) == 9:
-                            batter_ids = opp_lineup["player_id"].tolist()
-                            lifts = np.zeros(9)
-                            details = []
-                            for i, bid in enumerate(batter_ids):
-                                m = _score_matchup(
-                                    pitcher_id, int(bid), arsenal_df, vuln_df, baselines_pt,
-                                )
-                                lift = m.get("matchup_k_logit_lift", 0.0)
-                                if np.isnan(lift):
-                                    lift = 0.0
-                                lifts[i] = lift
-                                m["batter_name"] = opp_lineup.iloc[i].get("batter_name", "Unknown")
-                                m["batting_order"] = int(opp_lineup.iloc[i]["batting_order"])
-                                details.append(m)
-
-                            lineup_lifts = lifts
-                            per_batter_details = details
-                        else:
-                            st.info("Lineup incomplete for this game — using league average.")
-                    else:
-                        st.info("No 2025 starts found for this pitcher.")
-                else:
-                    st.info("No 2025 game logs found for this pitcher.")
-            else:
-                st.info("Game browser data not available — run precompute first.")
-
-        elif lineup_mode == "Manual (9 hitters)":
+        if lineup_mode == "Manual (9 hitters)":
             if not hitter_proj.empty:
                 # Build hitter options with teams
                 h_options = {}
@@ -3083,22 +3301,19 @@ def page_matchup_explorer() -> None:
     switch_tag = " (switch)" if is_switch else ""
     hand_str = f"{pitcher_label} vs {hitter_label}{switch_tag}"
 
-    st.markdown(f"""
-    <div class="brand-header">
-        <div>
-            <div class="brand-title">{selected_pitcher} vs {selected_hitter}</div>
-            <div class="brand-subtitle">{hand_str} | Career pitch-type profiles</div>
-        </div>
-        <div style="text-align:right;">
-            <div style="color:{edge_color}; font-size:1.1rem; font-weight:600;">
-                {edge_label}
-            </div>
-            <div style="color:{SLATE}; font-size:0.85rem;">
-                K Lift: {lift:+.3f} logit
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    matchup_header_html = (
+        f'<div class="brand-header">'
+        f'<div>'
+        f'<div class="brand-title">{selected_pitcher} vs {selected_hitter}</div>'
+        f'<div class="brand-subtitle">{hand_str} | Career pitch-type profiles</div>'
+        f'</div>'
+        f'<div style="text-align:right;">'
+        f'<div style="color:{edge_color}; font-size:1.1rem; font-weight:600;">{edge_label}</div>'
+        f'<div style="color:{SLATE}; font-size:0.85rem;">K Lift: {lift:+.3f} logit</div>'
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(matchup_header_html, unsafe_allow_html=True)
 
     # --- Summary metrics ---
     mwhiff = matchup["matchup_whiff_rate"]
@@ -3158,6 +3373,43 @@ def page_matchup_explorer() -> None:
                 "H Chase% = hitter's chase rate | H xwOBA = xwOBA on contact | "
                 f"Edge: green = pitcher advantage, red = hitter advantage.{platoon_note}"
             )
+
+    # --- Location Matchup Overlay ---
+    ploc_df = load_pitcher_location_grid()
+    hzone_df = load_hitter_zone_grid(career=True)
+    if not ploc_df.empty and not hzone_df.empty:
+        p_loc = ploc_df[ploc_df["pitcher_id"] == pitcher_id]
+        h_zone = hzone_df[hzone_df["batter_id"] == batter_id]
+        if not p_loc.empty and not h_zone.empty:
+            from src.viz.zone_charts import plot_matchup_overlay
+
+            st.markdown('<div class="section-header">Location Matchup</div>',
+                        unsafe_allow_html=True)
+            st.caption(
+                f"Gold dots = where the pitcher throws each pitch. "
+                f'Background = hitter whiff vulnerability '
+                f'(<span style="color:{EMBER};">orange</span> = exploitable, '
+                f'<span style="color:{SAGE};">green</span> = strong). '
+                f"Catcher's perspective.",
+                unsafe_allow_html=True,
+            )
+
+            # Show top pitch types by usage
+            pt_totals = p_loc.groupby("pitch_type")["pitches"].sum().sort_values(ascending=False)
+            top_pts = pt_totals.head(4).index.tolist()
+
+            stand_for_overlay = hitter_hand if hitter_hand in ("L", "R") else None
+
+            overlay_cols = st.columns(min(len(top_pts), 4))
+            for i, pt in enumerate(top_pts):
+                with overlay_cols[i]:
+                    fig_ov = plot_matchup_overlay(
+                        p_loc, h_zone, pitch_type=pt,
+                        pitcher_name=selected_pitcher, hitter_name=selected_hitter,
+                        batter_stand=stand_for_overlay,
+                    )
+                    st.pyplot(fig_ov, use_container_width=True)
+                    plt.close(fig_ov)
 
     # --- Side-by-side profile tables ---
     st.markdown('<div class="section-header">Individual Profiles</div>',
@@ -3384,15 +3636,15 @@ def page_preseason_snapshot() -> None:
 # Page: Game Browser (Historical Lineup Matchup Viewer)
 # ---------------------------------------------------------------------------
 def page_game_browser() -> None:
-    """Browse historical games with lineup matchup scores and actual outcomes."""
+    """Browse historical games grouped by game_pk with team and pitcher selectors."""
     from src.models.matchup import score_matchup
     from src.utils.constants import LEAGUE_AVG_BY_PITCH_TYPE
 
     st.markdown('<div class="section-header">Game Browser</div>',
                 unsafe_allow_html=True)
     st.caption(
-        "Select a pitcher and game to see the opposing lineup, matchup scores, "
-        "and actual strikeout outcomes. Demonstrates matchup model accuracy."
+        "Browse 2025 games by team. Select a game, then view each pitcher's "
+        "matchup breakdown against the opposing lineup."
     )
 
     # Load data
@@ -3411,14 +3663,14 @@ def page_game_browser() -> None:
     all_lineups = pd.read_parquet(lineups_path)
     all_batter_ks = pd.read_parquet(batter_ks_path)
 
-    # Load matchup profiles (career-aggregated for robustness)
+    # Load matchup profiles
     arsenal_df = load_pitcher_arsenal()
     vuln_df = load_hitter_vulnerability(career=True)
     if arsenal_df.empty or vuln_df.empty:
         st.warning("Matchup profile data not found.")
         return
 
-    # Enrich game logs with date and opponent
+    # Enrich game logs with date and teams
     @st.cache_data
     def _enrich_game_logs(_game_logs: pd.DataFrame) -> pd.DataFrame:
         game_info = load_game_info()
@@ -3428,90 +3680,96 @@ def page_game_browser() -> None:
 
     game_logs = _enrich_game_logs(game_logs)
 
-    # Filter to starters with K% posterior samples (modeled pitchers only)
-    k_samples_dict = load_k_samples()
-    modeled_ids = {int(k) for k in k_samples_dict.keys()} if k_samples_dict else set()
-
-    starters = game_logs[
-        (game_logs["is_starter"] == True) &  # noqa: E712
-        (game_logs["pitcher_id"].isin(modeled_ids))
-    ].copy()
-    if starters.empty:
-        st.warning("No modeled starting pitchers found.")
+    if "game_date" not in game_logs.columns:
+        st.warning("Game info not available. Re-run precompute.")
         return
 
-    # --- Pitcher selector ---
     team_lookup = _get_team_lookup()
 
-    # Build pitcher display names
-    pitcher_info = starters.groupby("pitcher_id").agg(
-        pitcher_name=("pitcher_name", "first"),
-        games=("game_pk", "nunique"),
-    ).reset_index().sort_values("pitcher_name")
+    # --- Build game-level summary ---
+    # Each game has home_team_name / away_team_name from game_info
+    # Collect all unique teams from game_logs
+    all_team_names = set()
+    if "home_team_name" in game_logs.columns:
+        all_team_names.update(game_logs["home_team_name"].dropna().unique())
+    if "away_team_name" in game_logs.columns:
+        all_team_names.update(game_logs["away_team_name"].dropna().unique())
+    all_team_names = sorted(t for t in all_team_names if t)
 
-    pitcher_options = {}
-    for _, row in pitcher_info.iterrows():
-        pid = int(row["pitcher_id"])
-        pname = row["pitcher_name"]
-        team = team_lookup.get(pid, "")
-        dname = f"{pname} ({team})" if team else pname
-        pitcher_options[dname] = pid
-
-    selected_pitcher_display = st.selectbox(
-        "Select Pitcher",
-        sorted(pitcher_options.keys()),
-        key="gb_pitcher",
-    )
-    pitcher_id = pitcher_options[selected_pitcher_display]
-
-    # --- Game selector ---
-    pitcher_games = starters[starters["pitcher_id"] == pitcher_id].sort_values(
-        "game_date", ascending=False
+    # Team filter
+    selected_team = st.selectbox(
+        "Select team", all_team_names, key="gb_team"
     )
 
-    if pitcher_games.empty:
-        st.info("No games found for this pitcher.")
+    # Filter games where selected team participated
+    team_games = game_logs[
+        (game_logs["home_team_name"] == selected_team) |
+        (game_logs["away_team_name"] == selected_team)
+    ].copy()
+
+    if team_games.empty:
+        st.info("No games found for this team.")
         return
 
-    # Pre-compute opposing team for each game using batter_ks overlap
-    # (reliable: uses who actually faced the pitcher)
-    def _find_opponent(gpk: int, g_row: pd.Series) -> str:
-        """Determine opponent team name for a given game."""
-        bk = all_batter_ks[
-            (all_batter_ks["game_pk"] == gpk) &
-            (all_batter_ks["pitcher_id"] == pitcher_id)
-        ]
-        faced = set(bk["batter_id"].tolist())
-        lu = all_lineups[all_lineups["game_pk"] == gpk]
-        home_tid = g_row.get("home_team_id")
-        home_name = g_row.get("home_team_name", "")
-        away_name = g_row.get("away_team_name", "")
-        for tid in lu["team_id"].unique():
-            team_batters = set(lu[lu["team_id"] == tid]["player_id"].tolist())
-            if team_batters & faced:
-                return home_name if tid == home_tid else away_name
-        return f"{away_name} / {home_name}"
+    # Build game list grouped by game_pk
+    game_summary = (
+        team_games.groupby("game_pk")
+        .agg(
+            game_date=("game_date", "first"),
+            home_team_name=("home_team_name", "first"),
+            away_team_name=("away_team_name", "first"),
+        )
+        .reset_index()
+        .sort_values("game_date", ascending=False)
+    )
 
-    # Build game display strings
+    # Game selector
     game_options = {}
-    for _, g in pitcher_games.iterrows():
+    for _, g in game_summary.iterrows():
         gpk = int(g["game_pk"])
-        date_str = str(g.get("game_date", ""))[:10]
-        ks = int(g["strike_outs"]) if pd.notna(g.get("strike_outs")) else 0
-        ip = g.get("innings_pitched", 0)
-        opp = _find_opponent(gpk, g)
-        label = f"{date_str} — vs {opp} — {ks} K, {ip} IP"
+        date_str = str(g["game_date"])[:10]
+        home = g["home_team_name"] or "?"
+        away = g["away_team_name"] or "?"
+        label = f"{date_str} — {away} @ {home}"
         game_options[label] = gpk
 
     selected_game_label = st.selectbox(
-        "Select Game",
-        list(game_options.keys()),
-        key="gb_game",
+        "Select Game", list(game_options.keys()), key="gb_game",
     )
     selected_gpk = game_options[selected_game_label]
 
+    # --- Pitcher selector within this game ---
+    game_pitchers = game_logs[game_logs["game_pk"] == selected_gpk].copy()
+    if game_pitchers.empty:
+        st.info("No pitcher data for this game.")
+        return
+
+    # Get home/away info for this game
+    game_meta = game_summary[game_summary["game_pk"] == selected_gpk].iloc[0]
+    home_name = game_meta["home_team_name"] or "Home"
+    away_name = game_meta["away_team_name"] or "Away"
+
+    # Build pitcher options with role indicator (starter/reliever) and team
+    pitcher_opts = {}
+    for _, pr in game_pitchers.sort_values(
+        ["is_starter", "pitcher_name"], ascending=[False, True]
+    ).iterrows():
+        pid = int(pr["pitcher_id"])
+        pname = pr["pitcher_name"]
+        team = team_lookup.get(pid, "")
+        role = "SP" if pr.get("is_starter") else "RP"
+        ks = int(pr["strike_outs"]) if pd.notna(pr.get("strike_outs")) else 0
+        ip = pr.get("innings_pitched", 0)
+        dname = f"{pname} ({team}, {role}) — {ks} K, {ip} IP" if team else f"{pname} ({role}) — {ks} K, {ip} IP"
+        pitcher_opts[dname] = pid
+
+    selected_pitcher_display = st.selectbox(
+        "Select Pitcher", list(pitcher_opts.keys()), key="gb_pitcher",
+    )
+    pitcher_id = pitcher_opts[selected_pitcher_display]
+
     # --- Identify the opposing lineup ---
-    game_row = pitcher_games[pitcher_games["game_pk"] == selected_gpk].iloc[0]
+    game_row = game_pitchers[game_pitchers["pitcher_id"] == pitcher_id].iloc[0]
     game_lineups_this = all_lineups[all_lineups["game_pk"] == selected_gpk]
 
     if game_lineups_this.empty:
@@ -3525,8 +3783,6 @@ def page_game_browser() -> None:
     ]
     faced_batters = set(bk_game["batter_id"].tolist())
     home_tid = game_row.get("home_team_id")
-    home_name = game_row.get("home_team_name", "")
-    away_name = game_row.get("away_team_name", "")
 
     opposing_lineup = None
     opponent_name = ""
@@ -3541,23 +3797,19 @@ def page_game_browser() -> None:
             break
 
     if opposing_lineup is None or opposing_lineup.empty:
-        st.warning("Could not determine opposing lineup for this game.")
+        st.warning("Could not determine opposing lineup for this pitcher.")
         return
 
     # --- Compute matchup scores and get actual Ks ---
-    actual_ks_game = all_batter_ks[
-        (all_batter_ks["game_pk"] == selected_gpk) &
-        (all_batter_ks["pitcher_id"] == pitcher_id)
-    ]
+    actual_ks_game = bk_game
     actual_k_map = dict(zip(actual_ks_game["batter_id"], actual_ks_game["k"]))
     actual_pa_map = dict(zip(actual_ks_game["batter_id"], actual_ks_game["pa"]))
 
-    # Build baselines
-    baselines_pt = {}
-    for pt in LEAGUE_AVG_BY_PITCH_TYPE:
-        baselines_pt[pt] = {"whiff_rate": LEAGUE_AVG_BY_PITCH_TYPE[pt].get("whiff_rate", 0.25)}
+    baselines_pt = {
+        pt: {"whiff_rate": vals.get("whiff_rate", 0.25)}
+        for pt, vals in LEAGUE_AVG_BY_PITCH_TYPE.items()
+    }
 
-    # Score each batter matchup
     display_rows = []
     total_actual_k = int(game_row.get("strike_outs", 0))
     total_matchup_lift = 0.0
@@ -3569,7 +3821,6 @@ def page_game_browser() -> None:
         order = int(brow["batting_order"])
         bteam = team_lookup.get(bid, "")
 
-        # Matchup score
         matchup = score_matchup(
             pitcher_id=pitcher_id,
             batter_id=bid,
@@ -3605,24 +3856,26 @@ def page_game_browser() -> None:
         display_rows.append(row)
 
     # --- Display results ---
-    # Game summary header
-    date_str = str(game_row.get("game_date", ""))[:10]
+    date_str = str(game_meta["game_date"])[:10]
     ip = game_row.get("innings_pitched", 0)
     bf = int(game_row.get("batters_faced", 0)) if pd.notna(game_row.get("batters_faced")) else 0
     avg_lift = total_matchup_lift / n_scored if n_scored > 0 else 0.0
+    pitcher_name = game_row.get("pitcher_name", "Unknown")
+    pitcher_team = team_lookup.get(pitcher_id, "")
 
-    st.markdown(f"""
-    <div class="brand-header">
-        <div>
-            <div class="brand-title">{selected_pitcher_display}</div>
-            <div class="brand-subtitle">{date_str} vs {opponent_name} | {ip} IP, {bf} BF</div>
-        </div>
-        <div style="font-size:1.2rem; font-weight:600;">
-            <span style="color:{GOLD};">{total_actual_k} K</span>
-            <span style="color:{SLATE};"> | Avg Lift: {avg_lift:+.3f}</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    gb_header_html = (
+        f'<div class="brand-header">'
+        f'<div>'
+        f'<div class="brand-title">{pitcher_name}{f" ({pitcher_team})" if pitcher_team else ""}</div>'
+        f'<div class="brand-subtitle">{date_str} — {away_name} @ {home_name} | {ip} IP, {bf} BF</div>'
+        f'</div>'
+        f'<div style="font-size:1.2rem; font-weight:600;">'
+        f'<span style="color:{GOLD};">{total_actual_k} K</span>'
+        f'<span style="color:{SLATE};"> | Avg Lift: {avg_lift:+.3f}</span>'
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(gb_header_html, unsafe_allow_html=True)
 
     # Lineup table
     display_df = pd.DataFrame(display_rows)
@@ -3637,7 +3890,6 @@ def page_game_browser() -> None:
     lineup_pa = sum(r["PA"] for r in display_rows)
     k_rate_actual = lineup_ks / lineup_pa if lineup_pa > 0 else 0
 
-    # Color-code the lift interpretation
     if avg_lift > 0.05:
         lift_color = POSITIVE
         lift_word = "favorable"
@@ -3728,17 +3980,16 @@ def page_team_overview() -> None:
     n_injured = len(_inj_full[
         (_inj_full["team_abbr"] == selected_team) & (_inj_full["est_missed_games"] > 0)
     ]) if not _inj_full.empty else 0
-    st.markdown(f"""
-    <div class="brand-header">
-        <div>
-            <div class="brand-title">{selected_team}</div>
-            <div class="brand-subtitle">{len(team_pitchers)} pitchers | {len(team_hitters)} hitters | {n_injured} injured</div>
-        </div>
-        <div style="color:{SLATE}; font-size:0.9rem;">
-            2026 Season
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    team_header_html = (
+        f'<div class="brand-header">'
+        f'<div>'
+        f'<div class="brand-title">{selected_team}</div>'
+        f'<div class="brand-subtitle">{len(team_pitchers)} pitchers | {len(team_hitters)} hitters | {n_injured} injured</div>'
+        f'</div>'
+        f'<div style="color:{SLATE}; font-size:0.9rem;">2026 Season</div>'
+        f'</div>'
+    )
+    st.markdown(team_header_html, unsafe_allow_html=True)
 
     # View toggle: Projections vs 2025 Priors
     view_mode = st.radio(
@@ -4209,16 +4460,26 @@ def main() -> None:
         st.markdown("---")
         page = st.radio(
             "Navigate",
-            ["Projections", "Player Profile", "Team Overview",
+            ["Today's Games", "Projections", "Player Profile", "Team Overview",
              "Matchup Explorer", "Game K Simulator", "Game Browser",
              "Preseason Snapshot"],
             label_visibility="collapsed",
         )
         st.markdown("---")
+        # Update timestamp
+        meta = load_update_metadata()
+        updated_str = ""
+        if meta.get("last_updated"):
+            try:
+                from datetime import datetime as _dt
+                ts = _dt.fromisoformat(meta["last_updated"])
+                updated_str = f"<br>Updated: {ts.strftime('%b %d, %I:%M %p')}"
+            except Exception:
+                pass
         st.markdown(
             f'<div style="color:{SLATE}; font-size:0.75rem; text-align:center;">'
-            f'v1.5 | 2026 Season<br>'
-            f'Trained on 2018-2025</div>',
+            f'v1.6 | 2026 Season<br>'
+            f'Trained on 2018-2025{updated_str}</div>',
             unsafe_allow_html=True,
         )
 
@@ -4231,7 +4492,9 @@ def main() -> None:
         )
         return
 
-    if page == "Projections":
+    if page == "Today's Games":
+        page_todays_games()
+    elif page == "Projections":
         page_projections()
     elif page == "Player Profile":
         page_player_profile()
