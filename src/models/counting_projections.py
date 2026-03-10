@@ -110,6 +110,8 @@ def project_hitter_counting(
     n_draws: int = 4000,
     min_pa: int = 200,
     random_seed: int = 42,
+    park_factors: pd.DataFrame | None = None,
+    hitter_venues: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Project counting stats for all hitters.
 
@@ -128,6 +130,12 @@ def project_hitter_counting(
     min_pa : int
         Minimum PA in from_season to include.
     random_seed : int
+    park_factors : pd.DataFrame, optional
+        HR park factors from queries.get_park_factors.
+        Columns: venue_id, batter_stand, hr_pf.
+    hitter_venues : pd.DataFrame, optional
+        Hitter-to-venue mapping from queries.get_hitter_team_venue.
+        Columns: batter_id, team_id, team_name, venue_id.
 
     Returns
     -------
@@ -152,6 +160,39 @@ def project_hitter_counting(
     # Population means for shrinkage rates
     pop_hr_rate = float(season_df["hr_rate"].mean())
     pop_sb_rate = float(season_df["sb_per_game"].mean()) if "sb_per_game" in season_df.columns else 0.3
+
+    # Build park factor lookup: (batter_id) -> hr_pf
+    # HR park factor adjusts for ~half the games played at home
+    pf_lookup: dict[int, float] = {}
+    if park_factors is not None and hitter_venues is not None and not park_factors.empty:
+        # Build venue→{stand: pf} lookup
+        venue_pf: dict[tuple[int, str], float] = {}
+        for _, pf_row in park_factors.iterrows():
+            venue_pf[(int(pf_row["venue_id"]), pf_row["batter_stand"])] = float(pf_row["hr_pf"])
+
+        for _, hv_row in hitter_venues.iterrows():
+            bid = int(hv_row["batter_id"])
+            vid = int(hv_row["venue_id"])
+            stand = str(hv_row.get("bat_side", "R"))
+
+            if stand == "S":
+                # Switch hitter: average L and R park factors
+                pf_l = venue_pf.get((vid, "L"), 1.0)
+                pf_r = venue_pf.get((vid, "R"), 1.0)
+                raw_pf = (pf_l + pf_r) / 2
+            else:
+                raw_pf = venue_pf.get((vid, stand), 1.0)
+
+            # Half-weight: ~half games at home, half on the road (road = neutral ~1.0)
+            pf_lookup[bid] = 0.5 * raw_pf + 0.5 * 1.0
+
+        logger.info(
+            "Park factors applied: %d hitters, mean PF=%.3f, range=[%.3f, %.3f]",
+            len(pf_lookup),
+            np.mean(list(pf_lookup.values())) if pf_lookup else 1.0,
+            min(pf_lookup.values()) if pf_lookup else 1.0,
+            max(pf_lookup.values()) if pf_lookup else 1.0,
+        )
 
     results = []
     for _, player in season_df.iterrows():
@@ -237,6 +278,10 @@ def project_hitter_counting(
                 rate_samples = rng.normal(mean_r, std_r, size=n_draws)
                 rate_samples = np.clip(rate_samples, 0, 1)
 
+            # Apply park factor to HR rate
+            if cfg.name == "total_hr" and bid in pf_lookup:
+                rate_samples = rate_samples * pf_lookup[bid]
+
             # Multiply rate x opportunity
             if cfg.opportunity == "pa":
                 count_samples = np.round(rate_samples * pa_samples).astype(int)
@@ -249,6 +294,10 @@ def project_hitter_counting(
             summary = _compute_stat_summary(count_samples)
             for k, v in summary.items():
                 row[f"{stat_name}_{k}"] = v
+
+            # Store park factor for HR
+            if cfg.name == "total_hr":
+                row["hr_park_factor"] = pf_lookup.get(bid, 1.0)
 
             # Store actual for backtest comparison
             if cfg.name == "total_k":

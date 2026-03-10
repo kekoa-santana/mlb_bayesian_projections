@@ -139,7 +139,7 @@ Built on a PostgreSQL database with comprehensive MLB data (2018-2025):
 
 ## Roadmap
 
-### v1.0 -- Season Projections & Dashboard (Current)
+### v1.0 -- Season Projections & Dashboard
 - Multi-stat Bayesian projections for hitters (K%, BB%, HR/PA, xwOBA) and pitchers (K%, BB%, HR/BF)
 - Pitch-type matchup model with archetype clustering
 - Game-level K posterior simulator
@@ -156,17 +156,18 @@ Built on a PostgreSQL database with comprehensive MLB data (2018-2025):
 - Pitcher vs. hitter pitch-type breakdown visualizations
 - Arsenal and vulnerability profile charts
 
-### v1.3 -- Season Counting Stat Projections (was v1.2)
-- Combine K% posteriors with season-level workload projections to produce full-season K totals (e.g., "projected 158-204 Ks with 95% confidence")
-- Extend to wins, IP, and other counting stats
-- More tangible output format for non-technical audiences
+### v1.3 -- Season Counting Stat Projections
+- Bayesian rate posteriors × playing time distributions → full-season counting stat projections
+- Hitter: K, BB, HR totals (beats Marcel 5-17% MAE). Pitcher: K, BB, Outs totals (beats Marcel 10-18% MAE)
+- PA/BF shrinkage models with age regression, 2020 adjustment, Marcel-style weighting
+- Dashboard integration with 2025 vs 2026 comparison and delta display
 
 ### v1.4 -- Game Context Integration
-- **Park factors** -- HR park adjustments by batter handedness into HR and xwOBA projections
-- **Umpire tendencies** -- Home plate umpire K-rate adjustments into the Game K model
-- **Weather** -- Temperature and wind effects on batted ball outcomes
+- **Park factors** -- HR park adjustments by batter handedness (3yr smoothed, half-weighted for home/road split) into HR counting projections. Switch hitter L/R averaging.
+- **Umpire tendencies** -- HP umpire K-rate adjustments (multi-season shrinkage, 102 umpires) as logit-scale lift in Game K model. Dashboard umpire selector.
+- **Weather** -- Temperature bucket × wind category → K-rate and HR-rate multipliers from 14.9K outdoor games. Cold + wind in = +4% K-rate; hot + wind out = +17% HR-rate. Dashboard temp/wind/dome controls in Game K Simulator.
 
-### v1.5 -- Lineup-Aware Game Simulator
+### v1.5 -- Lineup-Aware Game Simulator (Current)
 - Real lineup data feeds the Game K simulator instead of league-average assumptions
 - Per-batter matchup adjustments using Layer 2 profiles
 - Batting order position weighting for plate appearance probability

@@ -106,3 +106,144 @@ class TestComputeKOverProbsMonotonic:
         k_samples = np.array([3, 4, 5, 6, 7])
         result = compute_k_over_probs(k_samples, lines=[4.5, 5.5, 6.5])
         assert len(result) == 3
+
+
+class TestUmpireKLogitLift:
+    def test_positive_umpire_lift_increases_ks(self) -> None:
+        """Umpire with high K-rate tendency should increase expected Ks."""
+        k_rate_samples = np.full(5000, 0.22)
+        baseline = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            umpire_k_logit_lift=0.0,
+            n_draws=5000, random_seed=42,
+        )
+        high_k_ump = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            umpire_k_logit_lift=0.15,  # ~2pp above avg
+            n_draws=5000, random_seed=42,
+        )
+        assert high_k_ump.mean() > baseline.mean()
+
+    def test_negative_umpire_lift_decreases_ks(self) -> None:
+        """Umpire with low K-rate tendency should decrease expected Ks."""
+        k_rate_samples = np.full(5000, 0.22)
+        baseline = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            umpire_k_logit_lift=0.0,
+            n_draws=5000, random_seed=42,
+        )
+        low_k_ump = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            umpire_k_logit_lift=-0.15,  # ~2pp below avg
+            n_draws=5000, random_seed=42,
+        )
+        assert low_k_ump.mean() < baseline.mean()
+
+    def test_zero_lift_matches_baseline(self) -> None:
+        """umpire_k_logit_lift=0 should match no-umpire baseline."""
+        k_rate_samples = np.full(2000, 0.25)
+        with_zero = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=23.0, bf_sigma=3.5,
+            umpire_k_logit_lift=0.0,
+            n_draws=2000, random_seed=42,
+        )
+        without = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=23.0, bf_sigma=3.5,
+            n_draws=2000, random_seed=42,
+        )
+        assert np.array_equal(with_zero, without)
+
+    def test_umpire_combines_with_matchup(self) -> None:
+        """Umpire lift stacks with matchup lifts."""
+        k_rate_samples = np.full(5000, 0.22)
+        matchup_only = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            lineup_matchup_lifts=np.full(9, 0.3),
+            umpire_k_logit_lift=0.0,
+            n_draws=5000, random_seed=42,
+        )
+        matchup_plus_ump = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            lineup_matchup_lifts=np.full(9, 0.3),
+            umpire_k_logit_lift=0.15,
+            n_draws=5000, random_seed=42,
+        )
+        assert matchup_plus_ump.mean() > matchup_only.mean()
+
+
+class TestWeatherKLogitLift:
+    def test_cold_weather_increases_ks(self) -> None:
+        """Cold weather (positive K lift) should increase expected Ks."""
+        k_rate_samples = np.full(5000, 0.22)
+        baseline = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            weather_k_logit_lift=0.0,
+            n_draws=5000, random_seed=42,
+        )
+        cold = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            weather_k_logit_lift=0.05,  # cold weather boost
+            n_draws=5000, random_seed=42,
+        )
+        assert cold.mean() > baseline.mean()
+
+    def test_hot_weather_decreases_ks(self) -> None:
+        """Hot weather (negative K lift) should decrease expected Ks."""
+        k_rate_samples = np.full(5000, 0.22)
+        baseline = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            weather_k_logit_lift=0.0,
+            n_draws=5000, random_seed=42,
+        )
+        hot = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            weather_k_logit_lift=-0.05,  # hot weather suppression
+            n_draws=5000, random_seed=42,
+        )
+        assert hot.mean() < baseline.mean()
+
+    def test_all_adjustments_stack(self) -> None:
+        """Umpire + weather + matchup all stack additively on logit scale."""
+        k_rate_samples = np.full(5000, 0.22)
+        baseline = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            n_draws=5000, random_seed=42,
+        )
+        all_positive = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            lineup_matchup_lifts=np.full(9, 0.2),
+            umpire_k_logit_lift=0.10,
+            weather_k_logit_lift=0.05,
+            n_draws=5000, random_seed=42,
+        )
+        assert all_positive.mean() > baseline.mean()
+
+    def test_dome_neutral(self) -> None:
+        """weather_k_logit_lift=0 (dome) should match baseline exactly."""
+        k_rate_samples = np.full(2000, 0.25)
+        with_zero = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=23.0, bf_sigma=3.5,
+            weather_k_logit_lift=0.0,
+            n_draws=2000, random_seed=42,
+        )
+        without = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=23.0, bf_sigma=3.5,
+            n_draws=2000, random_seed=42,
+        )
+        assert np.array_equal(with_zero, without)

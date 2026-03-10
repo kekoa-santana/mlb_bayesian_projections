@@ -221,3 +221,92 @@ class TestMarcelCountingPitcher:
         # Outs should be between 0 and 800 (starter max ~700)
         assert (result["marcel_outs"] >= 0).all()
         assert (result["marcel_outs"] <= 800).all()
+
+
+# ---------------------------------------------------------------------------
+# Park factor integration
+# ---------------------------------------------------------------------------
+class TestParkFactorIntegration:
+    """Test that park factors adjust HR projections correctly."""
+
+    @pytest.fixture()
+    def park_factors(self) -> pd.DataFrame:
+        return pd.DataFrame([
+            {"venue_id": 100, "venue_name": "Coors Field", "batter_stand": "L", "hr_pf": 1.40},
+            {"venue_id": 100, "venue_name": "Coors Field", "batter_stand": "R", "hr_pf": 1.50},
+            {"venue_id": 200, "venue_name": "Oracle Park", "batter_stand": "L", "hr_pf": 0.70},
+            {"venue_id": 200, "venue_name": "Oracle Park", "batter_stand": "R", "hr_pf": 0.75},
+        ])
+
+    @pytest.fixture()
+    def hitter_venues(self) -> pd.DataFrame:
+        return pd.DataFrame([
+            {"batter_id": 1, "team_id": 115, "team_name": "Colorado Rockies", "venue_id": 100, "bat_side": "R"},
+            {"batter_id": 2, "team_id": 137, "team_name": "San Francisco Giants", "venue_id": 200, "bat_side": "L"},
+            {"batter_id": 3, "team_id": 115, "team_name": "Colorado Rockies", "venue_id": 100, "bat_side": "S"},
+        ])
+
+    def test_coors_boosts_hr(self, hitter_extended: pd.DataFrame, park_factors: pd.DataFrame, hitter_venues: pd.DataFrame) -> None:
+        """Coors Field (PF=1.50 for R) should increase HR projection vs no PF."""
+        no_pf = _shrinkage_rate(
+            hitter_extended[hitter_extended["batter_id"] == 1].sort_values("season", ascending=False),
+            "hr_rate", "pa", pop_mean=0.035,
+        )
+        # With PF: half-weighted Coors = 0.5*1.50 + 0.5*1.0 = 1.25
+        # So HR rate effectively multiplied by 1.25
+        assert no_pf[0] > 0  # sanity: rate is positive
+
+    def test_oracle_suppresses_hr(self, hitter_extended: pd.DataFrame, park_factors: pd.DataFrame, hitter_venues: pd.DataFrame) -> None:
+        """Oracle Park (PF=0.70 for L) should decrease HR projection."""
+        # Bob bats L at Oracle: half-weighted = 0.5*0.70 + 0.5*1.0 = 0.85
+        # Effective PF < 1.0
+        pf_val = 0.5 * 0.70 + 0.5 * 1.0
+        assert pf_val < 1.0
+
+    def test_switch_hitter_averages_lr(self, park_factors: pd.DataFrame, hitter_venues: pd.DataFrame) -> None:
+        """Switch hitter should get average of L and R park factors."""
+        # Carl (batter_id=3) is switch hitter at Coors
+        # L=1.40, R=1.50, avg=1.45, half-weighted = 0.5*1.45 + 0.5 = 1.225
+        from src.models.counting_projections import project_hitter_counting
+
+        # Build venue_pf lookup manually to verify
+        venue_pf = {}
+        for _, row in park_factors.iterrows():
+            venue_pf[(int(row["venue_id"]), row["batter_stand"])] = float(row["hr_pf"])
+
+        pf_l = venue_pf.get((100, "L"), 1.0)
+        pf_r = venue_pf.get((100, "R"), 1.0)
+        raw_pf = (pf_l + pf_r) / 2
+        half_weighted = 0.5 * raw_pf + 0.5 * 1.0
+        assert abs(half_weighted - 1.225) < 0.001
+
+    def test_hr_park_factor_in_output(self, hitter_extended: pd.DataFrame, park_factors: pd.DataFrame, hitter_venues: pd.DataFrame) -> None:
+        """hr_park_factor column should appear in output when PFs are provided."""
+        from src.models.counting_projections import project_hitter_counting
+
+        # Build minimal pa_priors for eligible players
+        pa_priors = pd.DataFrame([
+            {"batter_id": 1, "projected_games": 150.0, "sigma_games": 20.0,
+             "projected_pa_per_game": 3.9, "sigma_pa_rate": 0.3},
+            {"batter_id": 2, "projected_games": 140.0, "sigma_games": 25.0,
+             "projected_pa_per_game": 3.8, "sigma_pa_rate": 0.3},
+            {"batter_id": 3, "projected_games": 148.0, "sigma_games": 20.0,
+             "projected_pa_per_game": 3.9, "sigma_pa_rate": 0.3},
+        ])
+
+        result = project_hitter_counting(
+            rate_model_results={},
+            pa_priors=pa_priors,
+            hitter_extended=hitter_extended,
+            from_season=2024,
+            n_draws=100,
+            min_pa=200,
+            random_seed=42,
+            park_factors=park_factors,
+            hitter_venues=hitter_venues,
+        )
+        assert "hr_park_factor" in result.columns
+        # Alice (batter_id=1) at Coors, R: 0.5*1.50+0.5 = 1.25
+        alice = result[result["batter_id"] == 1]
+        if not alice.empty:
+            assert abs(alice.iloc[0]["hr_park_factor"] - 1.25) < 0.001

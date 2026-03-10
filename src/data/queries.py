@@ -1266,3 +1266,370 @@ def get_pitcher_season_totals_extended(season: int) -> pd.DataFrame:
     df["outs_per_bf"] = (df["outs"] / df["batters_faced"].replace(0, float("nan"))).round(4)
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# 19. Park factors (HR by batter handedness)
+# ---------------------------------------------------------------------------
+def get_park_factors(season: int) -> pd.DataFrame:
+    """HR park factors by venue and batter handedness.
+
+    Uses 3-year smoothed park factor (more stable than single-season).
+    Falls back to single-season if 3yr is missing.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: venue_id, venue_name, batter_stand, hr_pf.
+    """
+    query = """
+    SELECT
+        venue_id,
+        venue_name,
+        batter_stand,
+        COALESCE(hr_pf_3yr, hr_pf_season, 1.0) AS hr_pf
+    FROM production.dim_park_factor
+    WHERE season = :season
+    ORDER BY venue_id, batter_stand
+    """
+    logger.info("Fetching park factors for %d", season)
+    return read_sql(query, {"season": season})
+
+
+def get_hitter_team_venue(season: int) -> pd.DataFrame:
+    """Map each hitter to their primary team and home venue for a season.
+
+    Uses batting boxscores to find the team where each hitter played the
+    most games, then maps that team to its home venue via dim_game.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, team_id, team_name, venue_id, bat_side.
+    """
+    query = """
+    WITH batter_teams AS (
+        SELECT
+            bb.batter_id,
+            bb.team_id,
+            bb.team_name,
+            COUNT(*) AS games,
+            ROW_NUMBER() OVER (
+                PARTITION BY bb.batter_id ORDER BY COUNT(*) DESC
+            ) AS rn
+        FROM staging.batting_boxscores bb
+        JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+        GROUP BY bb.batter_id, bb.team_id, bb.team_name
+    ),
+    team_venue AS (
+        SELECT
+            home_team_id AS team_id,
+            venue_id,
+            ROW_NUMBER() OVER (
+                PARTITION BY home_team_id ORDER BY COUNT(*) DESC
+            ) AS rn
+        FROM production.dim_game
+        WHERE season = :season
+          AND game_type = 'R'
+        GROUP BY home_team_id, venue_id
+    )
+    SELECT
+        bt.batter_id,
+        bt.team_id,
+        bt.team_name,
+        tv.venue_id,
+        COALESCE(dp.bat_side, 'R') AS bat_side
+    FROM batter_teams bt
+    JOIN team_venue tv ON bt.team_id = tv.team_id AND tv.rn = 1
+    LEFT JOIN production.dim_player dp ON bt.batter_id = dp.player_id
+    WHERE bt.rn = 1
+    ORDER BY bt.batter_id
+    """
+    logger.info("Fetching hitter team-venue mapping for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# 20. Umpire K-rate tendencies (derived from pitch/PA data)
+# ---------------------------------------------------------------------------
+def get_umpire_k_tendencies(
+    seasons: list[int] | None = None,
+    min_games: int = 30,
+) -> pd.DataFrame:
+    """Compute per-umpire K-rate tendencies with shrinkage toward league mean.
+
+    Uses multi-season PA-level data joined to dim_umpire to compute each
+    HP umpire's K-rate, then shrinks toward the league mean based on games
+    umpired (more games = more trust in the observed rate).
+
+    Parameters
+    ----------
+    seasons : list[int], optional
+        Seasons to include. Defaults to 2021-2025 (5 recent seasons).
+    min_games : int
+        Minimum games umpired to be included.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: hp_umpire_name, games, total_pa, k_rate, league_k_rate,
+        k_rate_shrunk, k_logit_lift.
+    """
+    if seasons is None:
+        seasons = list(range(2021, 2026))
+
+    season_list = ",".join(str(int(s)) for s in seasons)
+    query = f"""
+    WITH ump_stats AS (
+        SELECT
+            du.hp_umpire_name,
+            COUNT(DISTINCT du.game_pk) AS games,
+            COUNT(fpa.pa_id) AS total_pa,
+            SUM(CASE WHEN fpa.events IN ('strikeout','strikeout_double_play')
+                     THEN 1 ELSE 0 END) AS total_k
+        FROM production.dim_umpire du
+        JOIN production.dim_game dg ON du.game_pk = dg.game_pk
+        JOIN production.fact_pa fpa ON du.game_pk = fpa.game_pk
+        WHERE dg.game_type = 'R'
+          AND dg.season IN ({season_list})
+          AND fpa.events IS NOT NULL
+        GROUP BY du.hp_umpire_name
+        HAVING COUNT(DISTINCT du.game_pk) >= {int(min_games)}
+    )
+    SELECT
+        hp_umpire_name,
+        games,
+        total_pa,
+        total_k,
+        ROUND((total_k::numeric / NULLIF(total_pa, 0)), 5) AS k_rate
+    FROM ump_stats
+    ORDER BY games DESC
+    """
+    logger.info("Fetching umpire K tendencies for seasons %s (min_games=%d)",
+                seasons, min_games)
+    df = read_sql(query, {})
+
+    if df.empty:
+        return df
+
+    # League average K-rate across all umpires (weighted by PA)
+    league_k_rate = float(df["total_k"].sum() / df["total_pa"].sum())
+    df["league_k_rate"] = league_k_rate
+
+    # Shrinkage: trust umpires with more games
+    # k = 80 games (~1 full season) as the shrinkage constant
+    shrinkage_k = 80.0
+    df["reliability"] = df["games"] / (df["games"] + shrinkage_k)
+    df["k_rate_shrunk"] = (
+        df["reliability"] * df["k_rate"]
+        + (1 - df["reliability"]) * league_k_rate
+    )
+
+    # Convert to logit-scale lift relative to league average
+    import numpy as _np
+    from scipy.special import logit as _logit
+    _clip = lambda x: _np.clip(x, 1e-6, 1 - 1e-6)
+    df["k_logit_lift"] = (
+        _logit(_clip(df["k_rate_shrunk"].values))
+        - _logit(_clip(league_k_rate))
+    ).round(4)
+
+    df = df.drop(columns=["reliability"])
+    logger.info("Umpire tendencies: %d umpires, league K%%=%.4f, lift range=[%.4f, %.4f]",
+                len(df), league_k_rate,
+                df["k_logit_lift"].min(), df["k_logit_lift"].max())
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 21. Weather effects on K and HR rates
+# ---------------------------------------------------------------------------
+def get_weather_effects(
+    seasons: list[int] | None = None,
+) -> pd.DataFrame:
+    """Compute weather-adjusted K and HR rate multipliers.
+
+    Groups outdoor games by temperature bucket and wind category, computes
+    K-rate and HR-rate for each combination, and expresses as a multiplier
+    relative to the overall outdoor average.
+
+    Parameters
+    ----------
+    seasons : list[int], optional
+        Seasons to include. Defaults to 2018-2025.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: temp_bucket, wind_category, games, k_rate, hr_rate,
+        k_multiplier, hr_multiplier.
+    """
+    if seasons is None:
+        seasons = list(range(2018, 2026))
+
+    season_list = ",".join(str(int(s)) for s in seasons)
+    query = f"""
+    WITH game_stats AS (
+        SELECT
+            fpa.game_pk,
+            COUNT(*) AS pa,
+            SUM(CASE WHEN fpa.events IN ('strikeout','strikeout_double_play')
+                     THEN 1 ELSE 0 END) AS k,
+            SUM(CASE WHEN fpa.events = 'home_run' THEN 1 ELSE 0 END) AS hr
+        FROM production.fact_pa fpa
+        JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
+        WHERE dg.game_type = 'R'
+          AND dg.season IN ({season_list})
+          AND fpa.events IS NOT NULL
+        GROUP BY fpa.game_pk
+    )
+    SELECT
+        CASE
+            WHEN dw.temperature < 55 THEN 'cold'
+            WHEN dw.temperature BETWEEN 55 AND 69 THEN 'cool'
+            WHEN dw.temperature BETWEEN 70 AND 84 THEN 'warm'
+            ELSE 'hot'
+        END AS temp_bucket,
+        dw.wind_category,
+        COUNT(*) AS games,
+        SUM(gs.pa) AS total_pa,
+        SUM(gs.k) AS total_k,
+        SUM(gs.hr) AS total_hr
+    FROM game_stats gs
+    JOIN production.dim_weather dw ON gs.game_pk = dw.game_pk
+    WHERE NOT dw.is_dome
+    GROUP BY 1, dw.wind_category
+    HAVING COUNT(*) >= 50
+    ORDER BY 1, dw.wind_category
+    """
+    logger.info("Fetching weather effects for seasons %s", seasons)
+    df = read_sql(query, {})
+
+    if df.empty:
+        return df
+
+    df["k_rate"] = (df["total_k"] / df["total_pa"]).round(5)
+    df["hr_rate"] = (df["total_hr"] / df["total_pa"]).round(5)
+
+    # Overall outdoor averages
+    overall_k = float(df["total_k"].sum() / df["total_pa"].sum())
+    overall_hr = float(df["total_hr"].sum() / df["total_pa"].sum())
+
+    df["k_multiplier"] = (df["k_rate"] / overall_k).round(4)
+    df["hr_multiplier"] = (df["hr_rate"] / overall_hr).round(4)
+    df["overall_k_rate"] = overall_k
+    df["overall_hr_rate"] = overall_hr
+
+    df = df.drop(columns=["total_pa", "total_k", "total_hr"])
+
+    logger.info("Weather effects: %d combinations, K mult range=[%.3f, %.3f], HR mult range=[%.3f, %.3f]",
+                len(df),
+                df["k_multiplier"].min(), df["k_multiplier"].max(),
+                df["hr_multiplier"].min(), df["hr_multiplier"].max())
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 22. Player team mapping (player_id → team abbreviation)
+# ---------------------------------------------------------------------------
+def get_player_teams(season: int) -> pd.DataFrame:
+    """Map each player to their primary team abbreviation for a given season.
+
+    Uses batting + pitching boxscores to find the team each player appeared
+    with most often, then joins to dim_team for the abbreviation.
+
+    Parameters
+    ----------
+    season : int
+        Season to look up.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: player_id, team_abbr, team_name.
+    """
+    query = """
+    WITH player_team_games AS (
+        -- Hitter appearances
+        SELECT bb.batter_id AS player_id, bb.team_id,
+               COUNT(*) AS games
+        FROM staging.batting_boxscores bb
+        JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+        GROUP BY bb.batter_id, bb.team_id
+
+        UNION ALL
+
+        -- Pitcher appearances
+        SELECT pb.pitcher_id AS player_id, pb.team_id,
+               COUNT(*) AS games
+        FROM staging.pitching_boxscores pb
+        JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+        GROUP BY pb.pitcher_id, pb.team_id
+    ),
+    primary_team AS (
+        SELECT player_id, team_id,
+               SUM(games) AS total_games,
+               ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY SUM(games) DESC) AS rn
+        FROM player_team_games
+        GROUP BY player_id, team_id
+    )
+    SELECT pt.player_id,
+           COALESCE(dt.abbreviation, '') AS team_abbr,
+           COALESCE(dt.team_name, '') AS team_name
+    FROM primary_team pt
+    LEFT JOIN production.dim_team dt ON pt.team_id = dt.team_id
+    WHERE pt.rn = 1
+    ORDER BY pt.player_id
+    """
+    logger.info("Fetching player-team mapping for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# 23. Game lineups from fact_lineup
+# ---------------------------------------------------------------------------
+def get_game_lineups(season: int) -> pd.DataFrame:
+    """Fetch starting lineups (batting order 1-9) for every regular-season game.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: game_pk, player_id, batting_order, team_id, batter_name.
+    """
+    query = """
+    SELECT
+        fl.game_pk,
+        fl.player_id,
+        fl.batting_order,
+        fl.team_id,
+        COALESCE(dp.player_name, 'Unknown') AS batter_name
+    FROM production.fact_lineup fl
+    JOIN production.dim_game dg ON fl.game_pk = dg.game_pk
+    LEFT JOIN production.dim_player dp ON fl.player_id = dp.player_id
+    WHERE dg.season = :season
+      AND dg.game_type = 'R'
+      AND fl.batting_order BETWEEN 1 AND 9
+      AND fl.is_starter = true
+    ORDER BY fl.game_pk, fl.batting_order
+    """
+    logger.info("Fetching game lineups for %d", season)
+    return read_sql(query, {"season": season})

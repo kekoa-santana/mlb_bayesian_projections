@@ -37,6 +37,8 @@ def simulate_game_ks(
     bf_mu: float,
     bf_sigma: float,
     lineup_matchup_lifts: np.ndarray | None = None,
+    umpire_k_logit_lift: float = 0.0,
+    weather_k_logit_lift: float = 0.0,
     n_draws: int = 4000,
     bf_min: int = 3,
     bf_max: int = 35,
@@ -56,6 +58,12 @@ def simulate_game_ks(
         Shape (9,) logit-scale lifts per batting order slot.
         Positive = batter more vulnerable → more Ks.
         None = no matchup adjustment (baseline mode).
+    umpire_k_logit_lift : float
+        Logit-scale shift for HP umpire K-rate tendency.
+        Positive = umpire calls more Ks than average.
+    weather_k_logit_lift : float
+        Logit-scale shift for weather effect on K-rate.
+        Positive = weather conditions increase Ks (e.g. cold).
     n_draws : int
         Number of Monte Carlo draws.
     bf_min : int
@@ -89,8 +97,8 @@ def simulate_game_ks(
     if lineup_matchup_lifts is None:
         lineup_matchup_lifts = np.zeros(9)
 
-    # Convert pitcher K% to logit scale
-    k_logit = _safe_logit(k_rate_draws)
+    # Convert pitcher K% to logit scale and apply umpire + weather adjustments
+    k_logit = _safe_logit(k_rate_draws) + umpire_k_logit_lift + weather_k_logit_lift
 
     # Vectorize by grouping draws with same BF value
     k_totals = np.zeros(n_draws, dtype=int)
@@ -290,6 +298,8 @@ def predict_game(
     pitcher_arsenal: pd.DataFrame | None = None,
     hitter_vuln: pd.DataFrame | None = None,
     baselines_pt: dict[str, dict[str, float]] | None = None,
+    umpire_k_logit_lift: float = 0.0,
+    weather_k_logit_lift: float = 0.0,
     n_draws: int = 4000,
     random_seed: int = 42,
     bf_min: int = 3,
@@ -315,6 +325,10 @@ def predict_game(
         Hitter vulnerability profiles. Required if lineup given.
     baselines_pt : dict or None
         League baselines per pitch type. Required if lineup given.
+    umpire_k_logit_lift : float
+        Logit-scale shift for HP umpire K-rate tendency (0.0 = neutral).
+    weather_k_logit_lift : float
+        Logit-scale shift for weather effect on K-rate (0.0 = neutral).
     n_draws : int
         Monte Carlo draws.
     random_seed : int
@@ -326,7 +340,8 @@ def predict_game(
     -------
     dict
         Keys: k_samples, k_over_probs, expected_k, std_k,
-        bf_mu, bf_sigma, lineup_matchup_lifts, per_batter_details.
+        bf_mu, bf_sigma, lineup_matchup_lifts, per_batter_details,
+        umpire_k_logit_lift, weather_k_logit_lift.
     """
     # BF distribution
     bf_info = get_bf_distribution(pitcher_id, season, bf_priors)
@@ -349,6 +364,8 @@ def predict_game(
         bf_mu=bf_mu,
         bf_sigma=bf_sigma,
         lineup_matchup_lifts=lineup_lifts,
+        umpire_k_logit_lift=umpire_k_logit_lift,
+        weather_k_logit_lift=weather_k_logit_lift,
         n_draws=n_draws,
         bf_min=bf_min,
         bf_max=bf_max,
@@ -366,6 +383,8 @@ def predict_game(
         "bf_sigma": bf_sigma,
         "lineup_matchup_lifts": lineup_lifts,
         "per_batter_details": per_batter_details,
+        "umpire_k_logit_lift": umpire_k_logit_lift,
+        "weather_k_logit_lift": weather_k_logit_lift,
     }
 
 
@@ -377,6 +396,9 @@ def predict_game_batch(
     hitter_vuln: pd.DataFrame | None = None,
     baselines_pt: dict[str, dict[str, float]] | None = None,
     game_batter_ks: pd.DataFrame | None = None,
+    game_lineups: pd.DataFrame | None = None,
+    umpire_lifts: dict[int, float] | None = None,
+    weather_lifts: dict[int, float] | None = None,
     n_draws: int = 4000,
     bf_min: int = 3,
     bf_max: int = 35,
@@ -399,8 +421,15 @@ def predict_game_batch(
     baselines_pt : dict or None
         League baselines per pitch type.
     game_batter_ks : pd.DataFrame or None
-        Per (game_pk, pitcher_id, batter_id) PA/K. Used to reconstruct
-        actual lineups for matchup scoring.
+        Per (game_pk, pitcher_id, batter_id) PA/K. Fallback for lineup
+        reconstruction when game_lineups not available.
+    game_lineups : pd.DataFrame or None
+        Real starting lineups from fact_lineup. Columns: game_pk,
+        player_id, batting_order, team_id. Preferred over game_batter_ks.
+    umpire_lifts : dict[int, float] or None
+        Mapping of game_pk → umpire K logit lift.
+    weather_lifts : dict[int, float] or None
+        Mapping of game_pk → weather K logit lift.
     n_draws : int
         Monte Carlo draws per game.
     bf_min, bf_max : int
@@ -411,10 +440,17 @@ def predict_game_batch(
     pd.DataFrame
         One row per game with: game_pk, pitcher_id, season, actual_k,
         actual_bf, expected_k, std_k, p_over_X_5 columns,
-        pitcher_k_rate_mean, bf_mu, n_matched_batters.
+        pitcher_k_rate_mean, bf_mu, n_matched_batters,
+        umpire_k_logit_lift, weather_k_logit_lift.
     """
     records = []
     n_games = len(game_records)
+
+    # Pre-index game_lineups by game_pk for fast lookup
+    _lineup_index: dict[int, pd.DataFrame] = {}
+    if game_lineups is not None and not game_lineups.empty:
+        for gpk, grp in game_lineups.groupby("game_pk"):
+            _lineup_index[int(gpk)] = grp
 
     for i, (_, game) in enumerate(game_records.iterrows()):
         pitcher_id = int(game["pitcher_id"])
@@ -428,10 +464,32 @@ def predict_game_batch(
 
         k_rate_samples = pitcher_posteriors[pitcher_id]
 
-        # Try to reconstruct lineup from game_batter_ks
+        # --- Lineup: prefer real lineups, fall back to game_batter_ks ---
         lineup_ids = None
         n_matched = 0
-        if game_batter_ks is not None:
+
+        if game_pk in _lineup_index:
+            # Real lineups: find the opposing team (the team whose batters
+            # faced this pitcher, identified via game_batter_ks overlap)
+            lu = _lineup_index[game_pk]
+            if game_batter_ks is not None:
+                faced = set(
+                    game_batter_ks[
+                        (game_batter_ks["game_pk"] == game_pk)
+                        & (game_batter_ks["pitcher_id"] == pitcher_id)
+                    ]["batter_id"].tolist()
+                )
+                for tid in lu["team_id"].unique():
+                    team_lu = lu[lu["team_id"] == tid].sort_values("batting_order")
+                    if set(team_lu["player_id"].tolist()) & faced:
+                        batter_ids = team_lu["player_id"].tolist()
+                        n_matched = len(batter_ids)
+                        if n_matched >= 9:
+                            lineup_ids = batter_ids[:9]
+                        break
+
+        if lineup_ids is None and game_batter_ks is not None:
+            # Fallback: reconstruct from game_batter_ks
             game_batters = game_batter_ks[
                 (game_batter_ks["game_pk"] == game_pk)
                 & (game_batter_ks["pitcher_id"] == pitcher_id)
@@ -441,8 +499,16 @@ def predict_game_batch(
             if n_matched >= 9:
                 lineup_ids = batter_ids[:9]
             elif n_matched > 0:
-                # Pad to 9 by repeating
                 lineup_ids = (batter_ids * ((9 // len(batter_ids)) + 1))[:9]
+
+        # --- Game context lifts ---
+        ump_lift = 0.0
+        if umpire_lifts is not None:
+            ump_lift = umpire_lifts.get(game_pk, 0.0)
+
+        wx_lift = 0.0
+        if weather_lifts is not None:
+            wx_lift = weather_lifts.get(game_pk, 0.0)
 
         result = predict_game(
             pitcher_id=pitcher_id,
@@ -453,6 +519,8 @@ def predict_game_batch(
             pitcher_arsenal=pitcher_arsenal,
             hitter_vuln=hitter_vuln,
             baselines_pt=baselines_pt,
+            umpire_k_logit_lift=ump_lift,
+            weather_k_logit_lift=wx_lift,
             n_draws=n_draws,
             random_seed=42 + i,
             bf_min=bf_min,
@@ -470,6 +538,8 @@ def predict_game_batch(
             "pitcher_k_rate_mean": float(np.mean(k_rate_samples)),
             "bf_mu": result["bf_mu"],
             "n_matched_batters": n_matched,
+            "umpire_k_logit_lift": ump_lift,
+            "weather_k_logit_lift": wx_lift,
         }
 
         # Add P(over) columns

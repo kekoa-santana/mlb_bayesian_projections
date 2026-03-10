@@ -35,7 +35,16 @@ from src.data.feature_eng import (
     get_hitter_vulnerability,
     get_pitcher_arsenal,
 )
-from src.data.queries import get_pitcher_game_logs
+from src.data.queries import (
+    get_game_batter_ks,
+    get_game_lineups,
+    get_park_factors,
+    get_hitter_team_venue,
+    get_pitcher_game_logs,
+    get_player_teams,
+    get_umpire_k_tendencies,
+    get_weather_effects,
+)
 from src.models.bf_model import compute_pitcher_bf_priors
 from src.models.counting_projections import (
     project_hitter_counting,
@@ -148,11 +157,23 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("Computing counting stat projections...")
 
-    # Hitter counting stats
+    # Hitter counting stats (with park factor adjustment for HR)
     hitter_ext = build_multi_season_hitter_extended(SEASONS, min_pa=1)
     pa_priors = compute_hitter_pa_priors(
         hitter_ext, from_season=FROM_SEASON, min_pa=100,
     )
+
+    # Load park factors for HR adjustment
+    logger.info("Loading park factors for HR adjustment...")
+    park_factors = get_park_factors(FROM_SEASON)
+    hitter_venues = get_hitter_team_venue(FROM_SEASON)
+    logger.info("Park factors: %d venue-hand combos, %d hitter-venue mappings",
+                len(park_factors), len(hitter_venues))
+
+    # Save park factor data for dashboard display
+    hitter_venues.to_parquet(DASHBOARD_DIR / "hitter_venues.parquet", index=False)
+    park_factors.to_parquet(DASHBOARD_DIR / "park_factors.parquet", index=False)
+
     hitter_counting = project_hitter_counting(
         rate_model_results=hitter_results,
         pa_priors=pa_priors,
@@ -161,6 +182,8 @@ def main() -> None:
         n_draws=4000,
         min_pa=200,
         random_seed=42,
+        park_factors=park_factors,
+        hitter_venues=hitter_venues,
     )
     hitter_counting.to_parquet(DASHBOARD_DIR / "hitter_counting.parquet", index=False)
     logger.info("Saved hitter counting projections: %d players", len(hitter_counting))
@@ -230,6 +253,54 @@ def main() -> None:
     bf_priors = compute_pitcher_bf_priors(game_logs)
     bf_priors.to_parquet(DASHBOARD_DIR / "bf_priors.parquet", index=False)
     logger.info("Saved BF priors: %d pitcher-seasons", len(bf_priors))
+
+    # =================================================================
+    # 4b. Umpire K-rate tendencies
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Computing umpire K-rate tendencies...")
+    umpire_tendencies = get_umpire_k_tendencies(
+        seasons=list(range(2021, 2026)), min_games=30,
+    )
+    umpire_tendencies.to_parquet(DASHBOARD_DIR / "umpire_tendencies.parquet", index=False)
+    logger.info("Saved umpire tendencies: %d umpires", len(umpire_tendencies))
+
+    # =================================================================
+    # 4c. Weather effects on K and HR rates
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Computing weather effects...")
+    weather_effects = get_weather_effects(seasons=SEASONS)
+    weather_effects.to_parquet(DASHBOARD_DIR / "weather_effects.parquet", index=False)
+    logger.info("Saved weather effects: %d combinations", len(weather_effects))
+
+    # =================================================================
+    # 4d. Player team mapping
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Computing player-team mapping...")
+    player_teams = get_player_teams(FROM_SEASON)
+    player_teams.to_parquet(DASHBOARD_DIR / "player_teams.parquet", index=False)
+    logger.info("Saved player teams: %d players", len(player_teams))
+
+    # =================================================================
+    # 4e. Game browser data (lineups + batter Ks for historical games)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Computing game browser data for %d...", FROM_SEASON)
+    game_lineups = get_game_lineups(FROM_SEASON)
+    game_lineups.to_parquet(DASHBOARD_DIR / "game_lineups.parquet", index=False)
+    logger.info("Saved game lineups: %d rows (%d games)",
+                len(game_lineups), game_lineups["game_pk"].nunique())
+
+    game_batter_ks = get_game_batter_ks(FROM_SEASON)
+    game_batter_ks.to_parquet(DASHBOARD_DIR / "game_batter_ks.parquet", index=False)
+    logger.info("Saved game batter Ks: %d rows", len(game_batter_ks))
+
+    # Pitcher game logs (used by Game Browser for game selection)
+    pitcher_game_logs = get_pitcher_game_logs(FROM_SEASON)
+    pitcher_game_logs.to_parquet(DASHBOARD_DIR / "pitcher_game_logs.parquet", index=False)
+    logger.info("Saved pitcher game logs: %d rows", len(pitcher_game_logs))
 
     # =================================================================
     # 5. Matchup profiles (arsenal, vulnerability, strength)

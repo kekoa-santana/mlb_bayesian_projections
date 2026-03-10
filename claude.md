@@ -234,6 +234,11 @@ Every model must be evaluated with:
 19. [x] Counting stat projections: `src/models/pa_model.py` (PA shrinkage), `src/models/counting_projections.py` (rate × playing time Monte Carlo). Hitters: K, BB, HR (beat Marcel 14-17%, 9-17%, 5-11%). Pitchers: K, BB, Outs (beat Marcel 10-18%, 2-13%, 13-16%). Dashboard integrated.
 20. [ ] Fix SB projections — Bayes loses to Marcel (era adjustment too blunt). Retune SB_ERA_FACTOR or use cross-validated era factor, or fall back to Marcel for SB.
 
+### Phase 6: v1.4 — Game Context Integration
+21. [x] Park factors — HR park adjustments by batter handedness into HR counting projections. `queries.get_park_factors()` + `queries.get_hitter_team_venue()`, half-weighted PF (50% home, 50% neutral), switch hitter L/R averaging, dashboard display in header + scouting report
+22. [x] Umpire tendencies — `queries.get_umpire_k_tendencies()` (multi-season shrinkage, k=80 games), logit-scale lift in `simulate_game_ks()` and `predict_game()`, dashboard Game K Simulator umpire selector with K-rate delta display
+23. [x] Weather effects — `queries.get_weather_effects()` (temp bucket × wind category → K/HR multipliers from 2018-2025 outdoor games). Logit-scale K lift in `simulate_game_ks()`, dashboard temp/wind/dome controls in Game K Simulator with K-rate and HR-rate impact display
+
 ### Projection Target
 - **Full seasons available:** 2018–2025
 - **Projection target:** 2026 season (train on 2018-2025, project forward)
@@ -257,7 +262,7 @@ Only features that add incremental value beyond what the hierarchical Bayesian m
 ### Skip (low incremental value for this architecture)
 - **Aging curve delta** — the random walk IS the aging adjustment. Computing a population aging curve to derive deltas feeds derived noise into the model.
 - **Pitch sequencing entropy** — thin evidence of predictive power at season level. Observed whiff/chase rates already capture the downstream effect.
-- **Park/environment normalization** — minimal effect on K predictions (primary target). Revisit only if expanding to HR/xwOBA targets.
+- **Park/environment normalization** — HR park factors now integrated (v1.4). K park effects skipped (too small, 0.95-1.05 range).
 - **Player similarity embeddings** — hierarchical model already borrows strength across players via population prior. Nearest-neighbor comps are better for content than projections.
 
 ## Key Findings

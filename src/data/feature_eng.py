@@ -13,6 +13,7 @@ import pandas as pd
 
 from src.data.queries import (
     get_game_batter_ks,
+    get_game_lineups,
     get_hitter_observed_profile,
     get_hitter_pitch_type_profile,
     get_hitter_season_totals_extended,
@@ -593,6 +594,31 @@ def get_cached_game_batter_ks(
     """
     return _load_or_build(
         "game_batter_ks", season, get_game_batter_ks, force_rebuild
+    )
+
+
+# ---------------------------------------------------------------------------
+# Game lineups (cached)
+# ---------------------------------------------------------------------------
+def get_cached_game_lineups(
+    season: int, force_rebuild: bool = False
+) -> pd.DataFrame:
+    """Starting lineups (batting order 1-9) with Parquet caching.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+    force_rebuild : bool
+        If True, re-query and rebuild the cache.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: game_pk, player_id, batting_order, team_id, batter_name.
+    """
+    return _load_or_build(
+        "game_lineups", season, get_game_lineups, force_rebuild
     )
 
 

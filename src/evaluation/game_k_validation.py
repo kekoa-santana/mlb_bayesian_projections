@@ -22,9 +22,14 @@ from sklearn.metrics import brier_score_loss
 from src.data.feature_eng import (
     build_multi_season_pitcher_k_data,
     get_cached_game_batter_ks,
+    get_cached_game_lineups,
     get_cached_pitcher_game_logs,
     get_hitter_vulnerability,
     get_pitcher_arsenal,
+)
+from src.data.queries import (
+    get_umpire_k_tendencies,
+    get_weather_effects,
 )
 from src.models.bf_model import compute_pitcher_bf_priors
 from src.models.game_k_model import (
@@ -39,6 +44,118 @@ from src.models.pitcher_k_rate_model import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _build_umpire_lift_lookup(
+    train_seasons: list[int],
+    test_season: int,
+) -> dict[int, float]:
+    """Build game_pk → umpire K logit lift for the test season.
+
+    Computes umpire tendencies from training seasons, then maps each
+    test-season game to its HP umpire's logit lift.
+
+    Returns
+    -------
+    dict[int, float]
+        {game_pk: umpire_k_logit_lift}.
+    """
+    from src.data.db import read_sql
+
+    ump_tendencies = get_umpire_k_tendencies(
+        seasons=train_seasons, min_games=30,
+    )
+    if ump_tendencies.empty:
+        return {}
+
+    # Build name → lift lookup
+    ump_lift_map = dict(zip(
+        ump_tendencies["hp_umpire_name"],
+        ump_tendencies["k_logit_lift"],
+    ))
+
+    # Get umpire assignments for test season
+    ump_assignments = read_sql(f"""
+        SELECT du.game_pk, du.hp_umpire_name
+        FROM production.dim_umpire du
+        JOIN production.dim_game dg ON du.game_pk = dg.game_pk
+        WHERE dg.season = {int(test_season)}
+          AND dg.game_type = 'R'
+    """, {})
+
+    result: dict[int, float] = {}
+    for _, row in ump_assignments.iterrows():
+        gpk = int(row["game_pk"])
+        name = row["hp_umpire_name"]
+        lift = ump_lift_map.get(name, 0.0)
+        if pd.notna(lift):
+            result[gpk] = float(lift)
+    logger.info("Umpire lifts: %d games mapped (%.1f%% non-zero)",
+                len(result),
+                100 * sum(1 for v in result.values() if abs(v) > 0.001) / max(len(result), 1))
+    return result
+
+
+def _build_weather_lift_lookup(
+    train_seasons: list[int],
+    test_season: int,
+) -> dict[int, float]:
+    """Build game_pk → weather K logit lift for the test season.
+
+    Computes weather multipliers from training seasons, converts to logit
+    lifts, then maps each test-season outdoor game to its weather lift.
+
+    Returns
+    -------
+    dict[int, float]
+        {game_pk: weather_k_logit_lift}.
+    """
+    from scipy.special import logit as _logit_fn
+    from src.data.db import read_sql
+
+    wx_effects = get_weather_effects(seasons=train_seasons)
+    if wx_effects.empty:
+        return {}
+
+    # Build (temp_bucket, wind_category) → k_multiplier lookup
+    overall_k = float(wx_effects.iloc[0]["overall_k_rate"])
+    wx_map: dict[tuple[str, str], float] = {}
+    for _, row in wx_effects.iterrows():
+        k_mult = float(row["k_multiplier"])
+        adj_k = overall_k * k_mult
+        lift = float(
+            _logit_fn(np.clip(adj_k, 1e-6, 1 - 1e-6))
+            - _logit_fn(np.clip(overall_k, 1e-6, 1 - 1e-6))
+        )
+        wx_map[(row["temp_bucket"], row["wind_category"])] = lift
+
+    # Get weather for test season games (temp_bucket derived from temperature)
+    weather_data = read_sql(f"""
+        SELECT dw.game_pk, dw.is_dome, dw.wind_category,
+            CASE
+                WHEN dw.temperature < 55 THEN 'cold'
+                WHEN dw.temperature BETWEEN 55 AND 69 THEN 'cool'
+                WHEN dw.temperature BETWEEN 70 AND 84 THEN 'warm'
+                ELSE 'hot'
+            END AS temp_bucket
+        FROM production.dim_weather dw
+        JOIN production.dim_game dg ON dw.game_pk = dg.game_pk
+        WHERE dg.season = {int(test_season)}
+          AND dg.game_type = 'R'
+    """, {})
+
+    result: dict[int, float] = {}
+    for _, row in weather_data.iterrows():
+        gpk = int(row["game_pk"])
+        if row.get("is_dome"):
+            result[gpk] = 0.0
+        else:
+            key = (row.get("temp_bucket", ""), row.get("wind_category", ""))
+            result[gpk] = wx_map.get(key, 0.0)
+    logger.info("Weather lifts: %d games mapped (%.1f%% non-zero)",
+                len(result),
+                100 * sum(1 for v in result.values() if abs(v) > 0.001) / max(len(result), 1))
+    return result
 
 
 def _build_baselines_pt(
@@ -172,6 +289,15 @@ def build_game_k_predictions(
     # Lineup identity from test season is OK (lineups are public pre-game)
     game_batter_ks = get_cached_game_batter_ks(test_season)
 
+    # 5b. Real starting lineups from fact_lineup (preferred over batter_ks)
+    game_lineups = get_cached_game_lineups(test_season)
+    logger.info("Loaded %d lineup rows for test season %d",
+                len(game_lineups), test_season)
+
+    # 5c. Umpire and weather lifts (trained on training seasons only)
+    umpire_lifts = _build_umpire_lift_lookup(train_seasons, test_season)
+    weather_lifts = _build_weather_lift_lookup(train_seasons, test_season)
+
     # 6. Batch predict
     predictions = predict_game_batch(
         game_records=test_game_logs,
@@ -181,6 +307,9 @@ def build_game_k_predictions(
         hitter_vuln=hitter_vuln,
         baselines_pt=baselines_pt,
         game_batter_ks=game_batter_ks,
+        game_lineups=game_lineups,
+        umpire_lifts=umpire_lifts,
+        weather_lifts=weather_lifts,
         n_draws=n_mc_draws,
     )
 
