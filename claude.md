@@ -3,6 +3,12 @@
 ## Project Overview
 A hierarchical Bayesian projection system for MLB player performance, with a game-level pitcher-batter matchup model that powers both front-office-grade analytics and betting-actionable K prop predictions. Built by The Data Diamond (Koa).
 
+**This is the projection engine.** Model training, backtesting, feature engineering, and precomputation live here. The Streamlit dashboard has been split into a separate repo (`tdd-dashboard`).
+
+## Related Repos
+- **Dashboard:** `E:/data_analytics/tdd-dashboard/` — Streamlit app, daily updates, live game coverage
+- **Theme package:** `tdd_theme` — shared brand colors/utilities (pip-installed)
+
 ## Tech Stack
 - **Language:** Python 3.11+
 - **Bayesian Modeling:** PyMC 5.x, ArviZ for diagnostics
@@ -38,21 +44,25 @@ player_profiles/
 ├── src/
 │   ├── data/
 │   │   ├── db.py                # SQLAlchemy engine + read_sql helper
-│   │   ├── queries.py           # 13 query functions (season totals, profiles, game logs, etc.)
+│   │   ├── queries.py           # Query functions (season totals, profiles, game logs, trad stats, etc.)
 │   │   ├── feature_eng.py       # Vulnerability/strength profiles + caching
 │   │   ├── league_baselines.py  # Per (pitch_type/archetype, batter_stand) baselines
 │   │   ├── pitch_archetypes.py  # KMeans k=8 pitch shape clustering
+│   │   ├── schedule.py          # MLB Stats API schedule/lineup fetcher
 │   │   └── data_qa.py           # Data quality / sanity reports
 │   ├── models/
 │   │   ├── k_rate_model.py          # Hitter K% hierarchical Bayesian (PyMC)
 │   │   ├── pitcher_k_rate_model.py  # Pitcher K% hierarchical Bayesian
-│   │   ├── hitter_model.py          # Generalized hitter model (K%, BB%, HR/PA, xwOBA)
-│   │   ├── pitcher_model.py         # Generalized pitcher model (K%, BB%, HR/BF)
+│   │   ├── hitter_model.py          # Generalized hitter model (K%, BB%)
+│   │   ├── pitcher_model.py         # Generalized pitcher model (K%, BB%)
 │   │   ├── hitter_projections.py    # Composite hitter projections + breakout scoring
 │   │   ├── pitcher_projections.py   # Composite pitcher projections + breakout scoring
+│   │   ├── pa_model.py              # PA/BF shrinkage priors for playing time
+│   │   ├── counting_projections.py  # Rate × playing time Monte Carlo counting stats
 │   │   ├── matchup.py               # Pitch-type & archetype matchup scoring
 │   │   ├── bf_model.py              # Batters-faced workload model
-│   │   └── game_k_model.py          # Game-level K posterior (Layer 3)
+│   │   ├── game_k_model.py          # Game-level K posterior (Layer 3)
+│   │   └── in_season_updater.py     # Beta-Binomial conjugate updating
 │   ├── utils/
 │   │   └── constants.py         # Pitch maps, whiff defs, zone boundaries, league avgs
 │   ├── evaluation/
@@ -63,113 +73,112 @@ player_profiles/
 │   │   └── game_k_validation.py     # Full game-level K backtest
 │   └── viz/
 │       ├── theme.py                 # The Data Diamond brand theme
+│       ├── zone_charts.py           # Pitcher location + hitter zone heatmaps
 │       ├── projections.py           # K% mover cards, individual pitcher cards
 │       └── composite_cards.py       # Composite breakout/regression cards
 ├── scripts/
-│   ├── backfill_dim_player.py       # One-time dim_player rebuild
-│   ├── run_season_backtest.py       # K%-only backtest runner
-│   ├── run_hitter_backtest.py       # Multi-stat hitter backtest runner
-│   ├── run_pitcher_backtest.py      # Multi-stat pitcher backtest runner
+│   ├── precompute_dashboard_data.py   # Generates all dashboard parquets/npz
+│   ├── update_in_season.py            # Daily conjugate update pipeline
+│   ├── run_season_backtest.py         # K%-only backtest runner
+│   ├── run_hitter_backtest.py         # Multi-stat hitter backtest runner
+│   ├── run_pitcher_backtest.py        # Multi-stat pitcher backtest runner
+│   ├── run_counting_backtest.py       # Counting stat backtest runner
+│   ├── run_game_k_backtest.py         # Game-level K backtest runner
 │   ├── generate_preseason_content.py  # 2026 K% mover cards
-│   └── generate_composite_cards.py    # Composite breakout/regression cards
-├── data/cached/                 # Parquet cache (~60 files, all seasons)
+│   ├── generate_composite_cards.py    # Composite breakout/regression cards
+│   ├── build_preseason_injuries.py    # Preseason injury data
+│   ├── apply_injury_adjustments.py    # Adjust counting projections for injuries
+│   ├── backfill_dim_player.py         # One-time dim_player rebuild
+│   ├── cross_year_corr.py             # Year-to-year correlation analysis
+│   ├── full_eda.py                    # Exploratory data analysis
+│   └── yty_correlation.py            # Year-to-year correlation utilities
+├── app.py                       # Streamlit dashboard (LEGACY — migrated to tdd-dashboard)
+├── data/
+│   ├── cached/                  # Parquet cache (~60 files, all seasons)
+│   └── dashboard/               # Pre-computed dashboard data (OUTPUT → consumed by tdd-dashboard)
 ├── tests/                       # 17 test files, 119 test functions
 ├── notebooks/
 ├── outputs/                     # Backtest CSVs + content PNGs
 ├── docs/
 │   ├── style_guide.md
-│   └── advanced_projection_features.md
+│   ├── advanced_projection_features.md
+│   └── failed_hypotheses.md
 └── pyproject.toml
 ```
+
+## Dashboard Relationship
+
+This repo produces pre-computed data that the dashboard consumes:
+
+```
+player_profiles/                         tdd-dashboard/
+  precompute_dashboard_data.py             data/dashboard/*.parquet
+         |                                          |
+         +--------> copy parquets --------->        |
+                                              app.py (reads parquets)
+                                              update_in_season.py (conjugate updates)
+```
+
+### Workflow:
+1. Run `python scripts/precompute_dashboard_data.py` here to generate ~43 parquets + npz
+2. Copy `data/dashboard/` to `tdd-dashboard/data/dashboard/`
+3. Dashboard reads parquets — no dependency on this repo at runtime
+
+### Files shared with dashboard (`tdd-dashboard/lib/`):
+These are copied (not linked) to the dashboard repo. Sync when function signatures change:
+- `src/utils/constants.py` → `lib/constants.py`
+- `src/viz/theme.py` → `lib/theme.py`
+- `src/models/matchup.py` → `lib/matchup.py`
+- `src/models/bf_model.py` → `lib/bf_model.py`
+- `src/models/game_k_model.py` → `lib/game_k_model.py`
+- `src/viz/zone_charts.py` → `lib/zone_charts.py`
+- `src/models/in_season_updater.py` → `lib/in_season_updater.py`
+- `src/data/schedule.py` → `lib/schedule.py`
+- `src/data/db.py` → `lib/db.py` (subset)
+
+**To sync:** copy file, replace `from src.` with `from lib.` in imports.
 
 ## Architecture: Three-Layer System
 
 ### Layer 1: Season-Level Bayesian Projections (PyMC)
 **Purpose:** Estimate true-talent rates for pitchers and hitters with proper uncertainty.
 
-**Target stats (hitters):** K%, BB%, HR/PA, xwOBA
-**Target stats (pitchers):** K%, BB%, HR/BF
+**Target stats (hitters):** K%, BB%
+**Target stats (pitchers):** K%, BB%
+**Observed stats used as priors:** xwOBA, HR/PA, barrel rate, hard-hit rate, sprint speed, whiff rate, chase rate, etc.
 
 **Model structure:**
 - Hierarchical partial pooling across players (shrink small samples toward population)
 - Gaussian random walk for year-to-year talent evolution
-- Aging curve as population-level covariate (polynomial or spline in age)
-- Statcast skill indicators as informative priors (exit velo, barrel rate, whiff rate inform the talent prior beyond just observed outcomes)
+- Age-bucket population priors (3 buckets) × Statcast skill tier (4 tiers)
 - Binomial/Beta observation model for rate stats
+- LogNormal sigma_season with floor for forward projection uncertainty
 - Output: Full posterior distributions per player per stat, not just point estimates
 
 ### Layer 2: Pitch-Type Matchup Model
-**Purpose:** Quantify how a pitcher's arsenal maps onto a hitter's vulnerabilities AND strengths.
+**Purpose:** Quantify how a pitcher's arsenal maps onto a hitter's vulnerabilities.
 
-**Hitter vulnerability profile (per batter, per pitch type):**
-- Whiff rate (swings & misses / total swings)
-- Chase rate (swings at pitches outside zone / pitches outside zone)
-- CSW% (called strikes + whiffs / total pitches)
-- These are partially pooled via the Bayesian model to handle small samples
+**Method:** Log-odds additive scoring with reliability-weighted fallback chains:
+1. Direct pitch-type match (reliability = min(swings, 50) / 50)
+2. Pitch-family fallback (reliability × 0.5)
+3. League baseline (reliability = 0)
 
-**Hitter strength profile (per batter, per pitch type):**
-- Barrel rate on contact
-- xwOBA on contact
-- Hard-hit rate (exit velo >= 95 mph)
-- Pull% and spray angle distribution (shows WHERE they crush it)
-- These feed content (hitter strength cards) and can inform pitcher avoidance strategy
-
-**Pitcher arsenal profile (per pitcher, per pitch type):**
-- Usage rate
-- Pitch-level whiff rate
-- Pitch-level barrel rate against
-- Typical location heatmap (zone distribution)
-
-**Matchup calculation:**
-```
-For each (pitcher, batter) pair:
-    For each pitch_type in pitcher.arsenal:
-        k_contribution = pitcher.usage[pt] * hitter.whiff_vuln[pt] * pitcher.whiff_quality[pt]
-        damage_risk = pitcher.usage[pt] * hitter.strength[pt] * (1 - pitcher.whiff_quality[pt])
-    matchup_k_score = sum(k_contributions) vs baseline
-    matchup_damage_score = sum(damage_risks) vs baseline
-```
-
-**Sample size handling:** Hierarchical partial pooling. Pitch types with few observations shrink toward:
-1. The hitter's overall whiff/damage tendency
-2. The population average for that pitch type
-3. Correlated pitch types (sliders inform cutters, changeups inform splitters)
+Both pitch_type and pitch_archetype (KMeans k=8) scoring available.
 
 ### Layer 3: Game-Level K Prediction
-**Purpose:** Produce a full posterior distribution over a pitcher's K total for a specific game.
+**Purpose:** Produce full posterior over pitcher's K total for a specific game.
 
-**Inputs:**
-- Pitcher's true-talent K% (from Layer 1 posterior)
-- Each lineup batter's pitch-type vulnerability profile (from Layer 2)
-- Projected innings / pitch count (from historical workload patterns in boxscores)
-- Park factor (minor adjustment)
-- Handedness composition of lineup vs pitcher
-
-**Output:**
-- Posterior distribution over total Ks
-- P(over X.5) for direct comparison to sportsbook lines
-- Matchup-specific K probabilities per batter (for hitter K prop bets)
+**Inputs:** K% posterior (Layer 1) + matchup lifts (Layer 2) + BF distribution + umpire/weather adjustments
+**Output:** P(over X.5) for K prop lines, posterior distribution over total Ks
 
 ## Key Design Principles
 
-1. **Bayesian everything.** Use posterior distributions, not point estimates. Uncertainty quantification is the differentiator for front offices AND for bet sizing (Kelly criterion needs probability estimates).
-
-2. **Partial pooling over arbitrary filters.** Never use hard minimum PA cutoffs to filter data. Let the hierarchical model shrink small samples toward priors. This uses ALL available data.
-
-3. **Statcast informs priors, not just features.** A hitter's barrel rate and exit velo should inform the PRIOR on their xwOBA talent, not just be a feature in a regression. This is the edge over public projection systems.
-
-4. **Separation of concerns.** Season projections, matchup profiles, and game predictions are separate modules that compose together. Each is independently testable and valuable.
-
-5. **Cache aggressively.** Pitch-level queries are expensive. Feature-engineered tables should be cached as Parquet files with clear date stamps. Rebuild only when new data arrives.
-
-6. **Branding consistency.** All visualizations use The Data Diamond color palette:
-   - Gold: #C8A96E (primary accent, highlights)
-   - Teal: #4FC3C8 (secondary accent, positive/improvement)
-   - Slate: #7B8FA6 (neutral, axes, secondary text)
-   - Cream: #F5F2EE (light background)
-   - Dark: #0F1117 (dark background, primary text on light)
-   - Font: Clean sans-serif, no clutter
-   - Every chart gets a "The Data Diamond" watermark
+1. **Bayesian everything.** Use posterior distributions, not point estimates. Uncertainty quantification is the differentiator.
+2. **Partial pooling over arbitrary filters.** Never use hard minimum PA cutoffs. Let the hierarchical model shrink small samples toward priors.
+3. **Statcast informs priors, not just features.** Barrel rate and exit velo inform the PRIOR on talent, not just features in a regression.
+4. **Separation of concerns.** Season projections, matchup profiles, and game predictions are separate modules that compose together.
+5. **Cache aggressively.** Pitch-level queries are expensive. Feature-engineered tables cached as Parquet with clear date stamps.
+6. **Branding consistency.** All visualizations use The Data Diamond color palette via `tdd_theme`.
 
 ## Coding Standards
 
@@ -192,78 +201,70 @@ Every model must be evaluated with:
 
 ## Common Pitfalls to Avoid
 
-- **Do NOT use `description` field for whiff detection without checking all values.** Statcast's `description` column has many possible values (swinging_strike, swinging_strike_blocked, foul_tip, etc.). Define whiff/chase/called_strike mappings explicitly in `constants.py`.
-- **Do NOT treat pitch_type as static.** Pitchers add/drop pitches across seasons. The model must handle pitchers whose arsenal changes.
-- **Do NOT ignore platoon splits.** Build L/R handedness into matchup profiles from the start.
-- **Do NOT run PyMC on the full dataset during development.** Sample on a subset of players first, verify convergence (r_hat, ESS, divergences), then scale up.
+- **Do NOT use `description` field for whiff detection without checking all values.** Use pre-computed boolean flags (`is_whiff`, `is_swing`, etc.) or the explicit mappings in `constants.py`.
+- **Do NOT treat pitch_type as static.** Pitchers add/drop pitches across seasons.
+- **Do NOT ignore platoon splits.** Build L/R handedness into matchup profiles.
+- **Do NOT run PyMC on the full dataset during development.** Sample on a subset first, verify convergence (r_hat, ESS, divergences), then scale up.
 - **Do NOT forget to regress.** Raw observed rates are not true talent. The entire point of the Bayesian model is regression to the mean with proper uncertainty.
 
-## Implementation Checklist
+## Implementation Status
 
-### Phase 1: Data Foundation
-1. [x] Verify database connection and inspect schema
-2. [x] Build and cache pitch-type aggregation tables (hitter and pitcher profiles)
-3. [x] Data QA sanity reports (denominator consistency, row count validation, anomaly flags)
-4. [x] League baselines v2: `src/data/league_baselines.py` — per (pitch_type, batter_stand) and (pitch_archetype, batter_stand), multi-season pooled with volume weighting, fallback chain lookup
-5. [x] Pitch archetype clustering: `src/data/pitch_archetypes.py` — KMeans k=8 on 5 shape features, pooled multi-season fit, LHP normalization, per-season assignment with caching
+### Phase 1: Data Foundation — COMPLETE
+1. [x] Database connection + schema inspection
+2. [x] Pitch-type aggregation tables (hitter/pitcher profiles) with caching
+3. [x] Data QA sanity reports
+4. [x] League baselines v2 — per (pitch_type, batter_stand) and (pitch_archetype, batter_stand)
+5. [x] Pitch archetype clustering — KMeans k=8, 5 shape features
 
-### Phase 2: Layer 1 — Season Talent Models
-6. [x] Hitter K% hierarchical Bayesian model (PyMC, binomial, random walk, Statcast covariates)
-7. [x] Add **platoon split** (batter_stand) as hierarchical factor to hitter K% model
-8. [x] Pitcher K% model (mirror hitter model using `pitcher_season_totals`; separate whiff skill vs contact suppression as covariates)
-9. [x] Add **starter/reliever role** flag to pitcher model (derive from IP/game in boxscores)
-10. [x] Walk-forward backtest (`scripts/run_season_backtest.py`, results in `outputs/`):
-    - Hitter: beats Marcel 2/3 folds (MAE +5.1%, +3.0%, -2.0%), 95% coverage 86-89%
-    - Pitcher: Bayes loses to Marcel on MAE/RMSE but wins on Brier (calibration edge: 0.171-0.209 vs 0.205-0.251)
-    - All folds converge (r_hat < 1.05, 0 divergences)
+### Phase 2: Layer 1 — Season Talent Models — COMPLETE
+6. [x] Hitter K% hierarchical Bayesian model (platoon splits, Statcast skill tier priors)
+7. [x] Pitcher K% model (starter/reliever role covariate)
+8. [x] Generalized hitter model (K%, BB%) + composite projections
+9. [x] Generalized pitcher model (K%, BB%) + composite projections
+10. [x] Walk-forward backtests — all beat Marcel on Brier, coverage 84-94%
 
-### Phase 3: Layer 2 — Matchup Model
-11. [x] Matchup scoring module: both pitch_type AND pitch_archetype scoring (`matchup.py`), log-odds additive method, reliability-weighted fallback chains
-12. [x] Validate matchup lift over "no-matchup" baseline on game Ks
+### Phase 3: Layer 2 — Matchup Model — COMPLETE
+11. [x] Matchup scoring: pitch_type + pitch_archetype, log-odds additive, fallback chains
+12. [x] Matchup validation: lift over no-matchup baseline on game Ks
 
-### Phase 4: Layer 3 — Game K Posterior
-13. [x] Workload / BF distribution model (predict BF by role, team, season)
-14. [x] Game K posterior: combine K% posterior + matchup adjustment + BF distribution
-15. [x] Produce P(over X.5) and calibration — walk-forward backtest (11,517 games): RMSE=2.280, Brier=0.1872, calibration 50/80/90% = 48/79/89%
+### Phase 4: Layer 3 — Game K Posterior — COMPLETE
+13. [x] BF distribution model (shrinkage estimator, P/PA adjustment)
+14. [x] Game K posterior (Monte Carlo, matchup + umpire + weather adjustments)
+15. [x] Walk-forward backtest: 11,517 games, RMSE=2.280, Brier=0.1872
 
-### Phase 5: Expansion & Content
-16. [x] Expand hitter targets: BB%, HR/PA, xwOBA — generalized hitter model (`src/models/hitter_model.py`), composite projections (`src/models/hitter_projections.py`), age-bucket priors, LogNormal sigma_season + floor, backtest: K%/BB% beat Marcel MAE 2/3, all stats beat Brier, coverage 84-94%
-16b. [x] Expand pitcher targets: K%, BB%, HR/BF — generalized pitcher model (`src/models/pitcher_model.py`), composite projections (`src/models/pitcher_projections.py`), age-bucket priors, starter/reliever covariate, backtest: HR/BF beats Marcel MAE all 3, all stats beat Brier, coverage 88-93%
-17. [ ] Betting edge finder and tracker (Kelly sizing)
-18. [x] Content visualizations: `src/viz/theme.py`, `src/viz/projections.py`, `scripts/generate_preseason_content.py`, `docs/style_guide.md` — pitcher/hitter K% mover cards + individual pitcher cards generated for 2026
-19. [x] Counting stat projections: `src/models/pa_model.py` (PA shrinkage), `src/models/counting_projections.py` (rate × playing time Monte Carlo). Hitters: K, BB, HR (beat Marcel 14-17%, 9-17%, 5-11%). Pitchers: K, BB, Outs (beat Marcel 10-18%, 2-13%, 13-16%). Dashboard integrated.
-20. [ ] Fix SB projections — Bayes loses to Marcel (era adjustment too blunt). Retune SB_ERA_FACTOR or use cross-validated era factor, or fall back to Marcel for SB.
+### Phase 5: Expansion — COMPLETE
+16. [x] Counting stat projections (rate × playing time Monte Carlo)
+17. [x] Content visualizations (K% movers, composite breakout/regression cards)
+18. [x] In-season conjugate updating (Beta-Binomial)
+19. [x] Park factors, umpire tendencies, weather effects
 
-### Phase 6: v1.4 — Game Context Integration
-21. [x] Park factors — HR park adjustments by batter handedness into HR counting projections. `queries.get_park_factors()` + `queries.get_hitter_team_venue()`, half-weighted PF (50% home, 50% neutral), switch hitter L/R averaging, dashboard display in header + scouting report
-22. [x] Umpire tendencies — `queries.get_umpire_k_tendencies()` (multi-season shrinkage, k=80 games), logit-scale lift in `simulate_game_ks()` and `predict_game()`, dashboard Game K Simulator umpire selector with K-rate delta display
-23. [x] Weather effects — `queries.get_weather_effects()` (temp bucket × wind category → K/HR multipliers from 2018-2025 outdoor games). Logit-scale K lift in `simulate_game_ks()`, dashboard temp/wind/dome controls in Game K Simulator with K-rate and HR-rate impact display
+### Phase 6: Dashboard — MIGRATED TO tdd-dashboard
+20. [x] Dashboard split complete — `tdd-dashboard/` repo with `lib/` synced modules
+21. [x] `precompute_dashboard_data.py` generates all 43+ parquets/npz for dashboard
 
-### Projection Target
+### Remaining
+- [ ] Betting edge finder and tracker (Kelly sizing)
+- [ ] Fix SB projections (Bayes loses to Marcel — era adjustment too blunt)
+
+## Projection Target
 - **Full seasons available:** 2018–2025
 - **Projection target:** 2026 season (train on 2018-2025, project forward)
 - Pre-season content uses 2025 posteriors projected into 2026
 
 ## Advanced Feature Triage
 
-Features from `docs/advanced_projection_features.md` evaluated for signal vs complexity.
-Only features that add incremental value beyond what the hierarchical Bayesian model already provides are prioritized.
-
-### Build (integrated into checklist above)
-- **Pitch archetype clustering** (Phase 1, step 5) — clusters pitches by shape (velo, movement, spin, extension) rather than just pitch_type label. Feeds league baselines, Layer 2 matchup model, and content. High value.
-- **Contact suppression vs whiff skill separation** (Phase 2, step 8) — already implicit in pitcher profiles (whiff_rate vs barrel_rate_against). Make explicit as separate covariates in pitcher K% model.
-- **Role adjustment** (Phase 2, step 9) — starter/reliever distinction. Critical for workload model and prevents overestimating reliever talent.
-
 ### Defer (real signal, but handled by model structure or needed later)
-- **Stabilized contact quality** (rolling xwOBA windows, variance) — partial pooling + multi-season random walk already captures this. Revisit for in-season updating.
-- **Plate discipline stability** (chase rate deltas) — already computed per pitch type. Rolling stability metrics add value for in-season, not season-level.
-- **Velocity trend acceleration** — real signal for in-season and injury risk. Not needed for season-level projections where random walk handles year-to-year shifts.
+- **Stabilized contact quality** — partial pooling + random walk already captures this. Revisit for in-season.
+- **Plate discipline stability** — already computed per pitch type. Revisit for in-season.
+- **Velocity trend acceleration** — real signal for in-season and injury risk.
 
 ### Skip (low incremental value for this architecture)
-- **Aging curve delta** — the random walk IS the aging adjustment. Computing a population aging curve to derive deltas feeds derived noise into the model.
-- **Pitch sequencing entropy** — thin evidence of predictive power at season level. Observed whiff/chase rates already capture the downstream effect.
-- **Park/environment normalization** — HR park factors now integrated (v1.4). K park effects skipped (too small, 0.95-1.05 range).
-- **Player similarity embeddings** — hierarchical model already borrows strength across players via population prior. Nearest-neighbor comps are better for content than projections.
+- **Aging curve delta** — the random walk IS the aging adjustment.
+- **Pitch sequencing entropy** — thin evidence at season level.
+- **Player similarity embeddings** — hierarchical model already borrows strength.
 
 ## Key Findings
 - The sat_batted_balls.xwoba column has IEEE NaN float values (not SQL NULL), which poison PostgreSQL's AVG(). All queries use CASE WHEN xwoba != 'NaN' to handle this.
+- Hitter K% and BB% are the only stats stable enough for Bayesian projection (r=0.795, 0.706 YoY). xwOBA and HR/PA used as observed/informative priors only.
+- Pitcher HR/BF (r=0.267) too noisy to project — replaced by GB% (r=0.619) as batted-ball indicator.
+- All queries filter `game_type = 'R'` (regular season only) — no spring training/postseason leakage.

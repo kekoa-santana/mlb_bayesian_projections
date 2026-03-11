@@ -600,6 +600,111 @@ def main() -> None:
     logger.info("Saved pitcher efficiency: %d players", len(pitcher_eff))
 
     # =================================================================
+    # 6c. Multi-season data (concat all seasons for season selector)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Building multi-season datasets (2018-2025)...")
+
+    # Copy full_stats parquets to dashboard dir (already have all seasons)
+    import shutil
+    for fname in ["hitter_full_stats.parquet", "pitcher_full_stats.parquet"]:
+        src = PROJECT_ROOT / "data" / "cached" / fname
+        if src.exists():
+            shutil.copy2(src, DASHBOARD_DIR / fname)
+            _fs = pd.read_parquet(DASHBOARD_DIR / fname)
+            logger.info("Copied %s: %d rows", fname, len(_fs))
+        else:
+            logger.warning("Missing %s — run feature_eng first", fname)
+
+    # Multi-season traditional stats
+    trad_frames_h, trad_frames_p = [], []
+    for s in SEASONS:
+        try:
+            trad_frames_h.append(get_hitter_traditional_stats(s))
+        except Exception as e:
+            logger.warning("Hitter trad stats %d failed: %s", s, e)
+        try:
+            trad_frames_p.append(get_pitcher_traditional_stats(s))
+        except Exception as e:
+            logger.warning("Pitcher trad stats %d failed: %s", s, e)
+    if trad_frames_h:
+        all_hitter_trad = pd.concat(trad_frames_h, ignore_index=True)
+        all_hitter_trad.to_parquet(DASHBOARD_DIR / "hitter_traditional_all.parquet", index=False)
+        logger.info("Saved hitter_traditional_all: %d rows", len(all_hitter_trad))
+    if trad_frames_p:
+        all_pitcher_trad = pd.concat(trad_frames_p, ignore_index=True)
+        all_pitcher_trad.to_parquet(DASHBOARD_DIR / "pitcher_traditional_all.parquet", index=False)
+        logger.info("Saved pitcher_traditional_all: %d rows", len(all_pitcher_trad))
+
+    # Multi-season aggressiveness + efficiency
+    agg_frames, eff_frames = [], []
+    for s in SEASONS:
+        try:
+            agg_frames.append(get_hitter_aggressiveness(s))
+        except Exception as e:
+            logger.warning("Hitter aggressiveness %d failed: %s", s, e)
+        try:
+            eff_frames.append(get_pitcher_efficiency(s))
+        except Exception as e:
+            logger.warning("Pitcher efficiency %d failed: %s", s, e)
+    if agg_frames:
+        all_agg = pd.concat(agg_frames, ignore_index=True)
+        all_agg.to_parquet(DASHBOARD_DIR / "hitter_aggressiveness_all.parquet", index=False)
+        logger.info("Saved hitter_aggressiveness_all: %d rows", len(all_agg))
+    if eff_frames:
+        all_eff = pd.concat(eff_frames, ignore_index=True)
+        all_eff.to_parquet(DASHBOARD_DIR / "pitcher_efficiency_all.parquet", index=False)
+        logger.info("Saved pitcher_efficiency_all: %d rows", len(all_eff))
+
+    # Multi-season arsenal (already loaded per-season during career vuln)
+    arsenal_frames = []
+    for s in SEASONS:
+        try:
+            arsenal_frames.append(get_pitcher_arsenal(s))
+        except Exception as e:
+            logger.warning("Pitcher arsenal %d failed: %s", s, e)
+    if arsenal_frames:
+        all_arsenal = pd.concat(arsenal_frames, ignore_index=True)
+        all_arsenal.to_parquet(DASHBOARD_DIR / "pitcher_arsenal_all.parquet", index=False)
+        logger.info("Saved pitcher_arsenal_all: %d rows", len(all_arsenal))
+
+    # Multi-season vuln + strength (concat the frames already loaded for career)
+    if vuln_frames:
+        all_vuln_seasons = pd.concat(vuln_frames, ignore_index=True)
+        all_vuln_seasons.to_parquet(DASHBOARD_DIR / "hitter_vuln_all.parquet", index=False)
+        logger.info("Saved hitter_vuln_all: %d rows", len(all_vuln_seasons))
+    if str_frames:
+        all_str_seasons = pd.concat(str_frames, ignore_index=True)
+        all_str_seasons.to_parquet(DASHBOARD_DIR / "hitter_str_all.parquet", index=False)
+        logger.info("Saved hitter_str_all: %d rows", len(all_str_seasons))
+
+    # Multi-season location grids (add season column since queries don't include it)
+    pitcher_loc_frames, hitter_zone_frames = [], []
+    for s in SEASONS:
+        try:
+            _pl = get_pitcher_location_grid(s)
+            _pl["season"] = s
+            pitcher_loc_frames.append(_pl)
+        except Exception as e:
+            logger.warning("Pitcher location grid %d failed: %s", s, e)
+        try:
+            _hz = get_hitter_zone_grid(s)
+            _hz["season"] = s
+            hitter_zone_frames.append(_hz)
+        except Exception as e:
+            logger.warning("Hitter zone grid %d failed: %s", s, e)
+    if pitcher_loc_frames:
+        all_pitcher_loc = pd.concat(pitcher_loc_frames, ignore_index=True)
+        all_pitcher_loc.to_parquet(DASHBOARD_DIR / "pitcher_location_grid_all.parquet", index=False)
+        logger.info("Saved pitcher_location_grid_all: %d rows", len(all_pitcher_loc))
+    if hitter_zone_frames:
+        all_hitter_zone = pd.concat(hitter_zone_frames, ignore_index=True)
+        all_hitter_zone.to_parquet(DASHBOARD_DIR / "hitter_zone_grid_all.parquet", index=False)
+        logger.info("Saved hitter_zone_grid_all: %d rows", len(all_hitter_zone))
+
+    logger.info("Multi-season datasets complete.")
+
+    # =================================================================
     # 7. Save preseason snapshot (frozen projections for end-of-season comparison)
     # =================================================================
     logger.info("=" * 60)
@@ -644,6 +749,7 @@ def main() -> None:
     logger.info("  Pitcher arsenal:     %d rows", len(pitcher_arsenal))
     logger.info("  Hitter vulnerability:%d rows", len(hitter_vuln))
     logger.info("  Hitter strength:     %d rows", len(hitter_str))
+    logger.info("  Multi-season files:  hitter/pitcher trad_all, agg_all, eff_all, arsenal_all, vuln_all, str_all, loc_all, zone_all, full_stats")
     logger.info("  Output dir:          %s", DASHBOARD_DIR)
 
 
