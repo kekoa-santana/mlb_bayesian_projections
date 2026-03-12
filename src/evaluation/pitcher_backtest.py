@@ -2,7 +2,8 @@
 Walk-forward backtesting for the generalized pitcher projection model.
 
 Supports all stats in PITCHER_STAT_CONFIGS (K%, BB%, HR/BF).
-Evaluates Bayesian projections vs Marcel baseline across folds.
+Evaluates Bayesian projections vs Marcel baseline across folds,
+with CRPS, PPC diagnostics, and Bayes-Marcel ensemble.
 """
 from __future__ import annotations
 
@@ -15,6 +16,16 @@ from scipy.stats import beta as beta_dist
 from sklearn.metrics import brier_score_loss
 
 from src.data.feature_eng import build_multi_season_pitcher_data
+from src.evaluation.ensemble import (
+    apply_ensemble,
+    compute_ensemble_metrics,
+    fit_ensemble_weight,
+)
+from src.evaluation.metrics import (
+    compute_crps_single,
+    compute_ppc_pvalues,
+    summarize_ppc_calibration,
+)
 from src.models.pitcher_model import (
     PITCHER_STAT_CONFIGS,
     check_convergence,
@@ -131,7 +142,8 @@ def walk_forward_pitcher_stat_backtest(
     Returns
     -------
     dict
-        Evaluation metrics, comparison DataFrame, convergence info.
+        Evaluation metrics, comparison DataFrame, convergence info,
+        proj_samples, and ppc_summary.
     """
     cfg = PITCHER_STAT_CONFIGS[stat]
     logger.info("Pitcher walk-forward %s: train=%s, test=%d",
@@ -162,10 +174,11 @@ def walk_forward_pitcher_stat_backtest(
 
     # Forward-project from last training season
     last_train = max(train_seasons)
-    proj_means = {}
-    proj_sds = {}
-    proj_lo = {}
-    proj_hi = {}
+    proj_means: dict[int, float] = {}
+    proj_sds: dict[int, float] = {}
+    proj_lo: dict[int, float] = {}
+    proj_hi: dict[int, float] = {}
+    proj_samples: dict[int, np.ndarray] = {}
 
     for pitcher_id in common:
         try:
@@ -177,6 +190,7 @@ def walk_forward_pitcher_stat_backtest(
             proj_sds[pitcher_id] = float(np.std(samples))
             proj_lo[pitcher_id] = float(np.percentile(samples, 2.5))
             proj_hi[pitcher_id] = float(np.percentile(samples, 97.5))
+            proj_samples[pitcher_id] = samples
         except ValueError:
             continue
 
@@ -216,15 +230,14 @@ def walk_forward_pitcher_stat_backtest(
     mae_imp = (marcel_mae - bayes_mae) / marcel_mae * 100 if marcel_mae > 0 else 0
     rmse_imp = (marcel_rmse - bayes_rmse) / marcel_rmse * 100 if marcel_rmse > 0 else 0
 
-    # Brier score
+    # Brier score — reuse stored samples
     league_avg = cfg.league_avg
     actual_above = (actual > league_avg).astype(float)
-
-    bayes_prob_above = np.array([float(np.mean(
-        extract_rate_samples(trace, data, pid, last_train,
-                             project_forward=True, random_seed=random_seed)
-        > league_avg
-    )) if pid in proj_means else 0.5 for pid in comp["pitcher_id"]])
+    bayes_prob_above = np.array([
+        float(np.mean(proj_samples[pid] > league_avg))
+        if pid in proj_samples else 0.5
+        for pid in comp["pitcher_id"]
+    ])
 
     strength = np.maximum(comp["weighted_bf"].values.astype(float), 1.0)
     alpha = 1.0 + (marcel_pred * strength)
@@ -234,11 +247,54 @@ def walk_forward_pitcher_stat_backtest(
     bayes_brier = float(brier_score_loss(actual_above, bayes_prob_above))
     marcel_brier = float(brier_score_loss(actual_above, marcel_prob_above))
 
+    # CRPS: Bayes via stored samples, Marcel via Beta sampling
+    rng = np.random.default_rng(random_seed + 1)
+    bayes_crps_vals = []
+    marcel_crps_vals = []
+    for _, row in comp.iterrows():
+        pid = int(row["pitcher_id"])
+        act = float(row[f"actual_{stat}"])
+
+        if pid in proj_samples:
+            bayes_crps_vals.append(compute_crps_single(act, proj_samples[pid]))
+
+        m_rate = float(row[f"marcel_{stat}"])
+        w_bf = float(row["weighted_bf"])
+        a = 1.0 + m_rate * max(w_bf, 1.0)
+        b = 1.0 + (1.0 - m_rate) * max(w_bf, 1.0)
+        marcel_draws = rng.beta(a, b, size=4000)
+        marcel_crps_vals.append(compute_crps_single(act, marcel_draws))
+
+    bayes_crps = float(np.mean(bayes_crps_vals)) if bayes_crps_vals else np.nan
+    marcel_crps = float(np.mean(marcel_crps_vals)) if marcel_crps_vals else np.nan
+
+    # PPC: posterior predictive check
+    ppc_summary: dict[str, Any] = {}
+    try:
+        if hasattr(trace, "posterior_predictive") and "obs" in trace.posterior_predictive:
+            ppc_obs = trace.posterior_predictive["obs"].values
+            n_chains, n_draws_per, n_obs = ppc_obs.shape
+            ppc_flat = ppc_obs.reshape(n_chains * n_draws_per, n_obs)
+
+            observed_for_ppc = data["counts"]
+            pvalues = compute_ppc_pvalues(ppc_flat, observed_for_ppc)
+            ppc_summary = summarize_ppc_calibration(pvalues)
+            logger.info(
+                "pitcher %s PPC: KS stat=%.3f (p=%.3f), outliers=%.1f%%",
+                stat, ppc_summary["ks_stat"], ppc_summary["ks_pvalue"],
+                ppc_summary["pct_outliers"],
+            )
+    except Exception as e:
+        logger.warning("PPC computation failed for pitcher %s: %s", stat, e)
+
     logger.info(
         "pitcher %s: Bayes MAE=%.4f, Marcel MAE=%.4f (%.1f%%)",
         stat, bayes_mae, marcel_mae, mae_imp,
     )
     logger.info("pitcher %s: 95%% CI coverage: %.1f%%", stat, coverage_95 * 100)
+    logger.info(
+        "pitcher %s: CRPS Bayes=%.4f, Marcel=%.4f", stat, bayes_crps, marcel_crps,
+    )
 
     return {
         "stat": stat,
@@ -253,8 +309,12 @@ def walk_forward_pitcher_stat_backtest(
         "coverage_95": coverage_95,
         "bayes_brier": bayes_brier,
         "marcel_brier": marcel_brier,
+        "bayes_crps": bayes_crps,
+        "marcel_crps": marcel_crps,
         "convergence": conv,
         "comparison_df": comp,
+        "proj_samples": proj_samples,
+        "ppc_summary": ppc_summary,
     }
 
 
@@ -267,6 +327,9 @@ def run_pitcher_backtest(
     **sampling_kwargs: Any,
 ) -> pd.DataFrame:
     """Run walk-forward backtesting across stats and folds.
+
+    Includes expanding-window ensemble: fold 1 uses w=0.5, later folds
+    fit w on residuals from prior folds (no leakage).
 
     Parameters
     ----------
@@ -293,6 +356,10 @@ def run_pitcher_backtest(
 
     results = []
     for stat in stats:
+        cfg = PITCHER_STAT_CONFIGS[stat]
+
+        # First pass: run all folds, store full result dicts
+        fold_results: list[dict[str, Any]] = []
         for fold in folds:
             logger.info(
                 "=== pitcher %s: train=%s -> test=%d ===",
@@ -304,6 +371,41 @@ def run_pitcher_backtest(
                 stat=stat,
                 **sampling_kwargs,
             )
+            fold_results.append(metrics)
+
+        # Second pass: expanding-window ensemble
+        for i, (fold, metrics) in enumerate(zip(folds, fold_results)):
+            comp = metrics["comparison_df"]
+            proj_samps = metrics["proj_samples"]
+
+            if i == 0:
+                w = 0.5
+            else:
+                prior_actuals = []
+                prior_bayes = []
+                prior_marcel = []
+                for j in range(i):
+                    prior_comp = fold_results[j]["comparison_df"]
+                    prior_actuals.append(prior_comp[f"actual_{stat}"].values)
+                    prior_bayes.append(prior_comp[f"bayes_{stat}"].values)
+                    prior_marcel.append(prior_comp[f"marcel_{stat}"].values)
+                w = fit_ensemble_weight(
+                    np.concatenate(prior_actuals),
+                    np.concatenate(prior_bayes),
+                    np.concatenate(prior_marcel),
+                )
+
+            comp_ens = apply_ensemble(comp, w, stat)
+            ens_metrics = compute_ensemble_metrics(
+                comp_ens, stat, cfg.league_avg, proj_samps, id_col="pitcher_id",
+            )
+
+            logger.info(
+                "pitcher %s fold %d: ensemble w=%.2f, MAE=%.4f (Bayes=%.4f, Marcel=%.4f)",
+                stat, i + 1, w, ens_metrics["ensemble_mae"],
+                metrics["bayes_mae"], metrics["marcel_mae"],
+            )
+
             results.append({
                 "stat": stat,
                 "test_season": metrics["test_season"],
@@ -317,6 +419,13 @@ def run_pitcher_backtest(
                 "coverage_95": metrics["coverage_95"],
                 "bayes_brier": metrics["bayes_brier"],
                 "marcel_brier": metrics["marcel_brier"],
+                "bayes_crps": metrics["bayes_crps"],
+                "marcel_crps": metrics["marcel_crps"],
+                "ensemble_w": w,
+                "ensemble_mae": ens_metrics["ensemble_mae"],
+                "ensemble_rmse": ens_metrics["ensemble_rmse"],
+                "ensemble_brier": ens_metrics["ensemble_brier"],
+                "ensemble_coverage_95": ens_metrics["ensemble_coverage_95"],
                 "converged": metrics["convergence"]["converged"],
             })
 

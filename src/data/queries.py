@@ -258,7 +258,7 @@ def get_pitcher_arsenal_profile(season: int) -> pd.DataFrame:
 # 4. Season totals (player season lines)
 # ---------------------------------------------------------------------------
 def get_season_totals(season: int) -> pd.DataFrame:
-    """Per-player season lines: PA, K, BB, barrel%, xwOBA, etc.
+    """Per-player season lines: PA, K, BB, barrel%, xwOBA, wOBA, etc.
 
     Combines plate-appearance events with batted-ball quality metrics.
 
@@ -266,7 +266,8 @@ def get_season_totals(season: int) -> pd.DataFrame:
     -------
     pd.DataFrame
         Columns: batter_id, batter_name, batter_stand, season, pa, k, bb,
-        hits, hr, xwoba_avg, barrel_pct, hard_hit_pct, k_rate, bb_rate.
+        ibb, hbp, sf, hits, hr, xwoba_avg, barrel_pct, hard_hit_pct,
+        k_rate, bb_rate, woba.
     """
     query = """
     WITH stand_agg AS (
@@ -294,6 +295,12 @@ def get_season_totals(season: int) -> pd.DataFrame:
                      THEN 1 ELSE 0 END)                             AS k,
             SUM(CASE WHEN fpa.events IN ('walk','intent_walk')
                      THEN 1 ELSE 0 END)                             AS bb,
+            SUM(CASE WHEN fpa.events = 'intent_walk'
+                     THEN 1 ELSE 0 END)                             AS ibb,
+            SUM(CASE WHEN fpa.events = 'hit_by_pitch'
+                     THEN 1 ELSE 0 END)                             AS hbp,
+            SUM(CASE WHEN fpa.events IN ('sac_fly','sac_fly_double_play')
+                     THEN 1 ELSE 0 END)                             AS sf,
             SUM(CASE WHEN fpa.events IN ('single','double','triple','home_run')
                      THEN 1 ELSE 0 END)                             AS hits,
             SUM(CASE WHEN fpa.events = 'home_run'
@@ -311,18 +318,20 @@ def get_season_totals(season: int) -> pd.DataFrame:
         SELECT
             fpa.batter_id,
             COUNT(*)                                                 AS bip,
-            AVG(CASE WHEN sbb.xwoba != 'NaN' THEN sbb.xwoba END)                                           AS xwoba_avg,
+            AVG(CASE WHEN sbb.xwoba != 'NaN' THEN sbb.xwoba END)   AS xwoba_avg,
             SUM(CASE WHEN sbb.launch_speed >= 98
                       AND sbb.launch_angle BETWEEN 26 AND 30
                       THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0)
                                                                      AS barrel_pct,
             SUM(CASE WHEN sbb.hard_hit THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0)
-                                                                     AS hard_hit_pct
+                                                                     AS hard_hit_pct,
+            SUM(sbb.woba_value)                                      AS woba_bip_sum
         FROM production.fact_pa fpa
         JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
         JOIN production.sat_batted_balls sbb ON fpa.pa_id = sbb.pa_id
         WHERE dg.season = :season
           AND dg.game_type = 'R'
+          AND sbb.woba_value IS NOT NULL
         GROUP BY fpa.batter_id
     )
     SELECT
@@ -333,11 +342,15 @@ def get_season_totals(season: int) -> pd.DataFrame:
         pa.pa,
         pa.k,
         pa.bb,
+        pa.ibb,
+        pa.hbp,
+        pa.sf,
         pa.hits,
         pa.hr,
         ROUND(ba.xwoba_avg::numeric, 3)     AS xwoba_avg,
         ROUND(ba.barrel_pct::numeric, 4)     AS barrel_pct,
         ROUND(ba.hard_hit_pct::numeric, 4)   AS hard_hit_pct,
+        ba.woba_bip_sum,
         ROUND((pa.k::numeric / pa.pa), 4)    AS k_rate,
         ROUND((pa.bb::numeric / pa.pa), 4)   AS bb_rate
     FROM pa_agg pa
@@ -346,7 +359,24 @@ def get_season_totals(season: int) -> pd.DataFrame:
     ORDER BY pa.pa DESC
     """
     logger.info("Fetching season totals for %d", season)
-    return read_sql(query, {"season": season})
+    df = read_sql(query, {"season": season})
+
+    # Compute wOBA: BIP contribution + non-BIP weights (uBB=0.69, HBP=0.72)
+    woba_bb_weight = 0.69
+    woba_hbp_weight = 0.72
+    non_ibb_bb = df["bb"] - df["ibb"]
+    woba_num = (
+        df["woba_bip_sum"].fillna(0)
+        + non_ibb_bb * woba_bb_weight
+        + df["hbp"] * woba_hbp_weight
+    )
+    woba_den = (df["pa"] - df["ibb"]).replace(0, float("nan"))
+    df["woba"] = (woba_num / woba_den).round(3)
+
+    # Drop intermediate column
+    df.drop(columns=["woba_bip_sum"], inplace=True)
+
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +797,12 @@ def get_season_totals_with_age(season: int) -> pd.DataFrame:
                      THEN 1 ELSE 0 END)                             AS k,
             SUM(CASE WHEN fpa.events IN ('walk','intent_walk')
                      THEN 1 ELSE 0 END)                             AS bb,
+            SUM(CASE WHEN fpa.events = 'intent_walk'
+                     THEN 1 ELSE 0 END)                             AS ibb,
+            SUM(CASE WHEN fpa.events = 'hit_by_pitch'
+                     THEN 1 ELSE 0 END)                             AS hbp,
+            SUM(CASE WHEN fpa.events IN ('sac_fly','sac_fly_double_play')
+                     THEN 1 ELSE 0 END)                             AS sf,
             SUM(CASE WHEN fpa.events IN ('single','double','triple','home_run')
                      THEN 1 ELSE 0 END)                             AS hits,
             SUM(CASE WHEN fpa.events = 'home_run'
@@ -791,12 +827,14 @@ def get_season_totals_with_age(season: int) -> pd.DataFrame:
                       THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0)
                                                                      AS barrel_pct,
             SUM(CASE WHEN sbb.hard_hit THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0)
-                                                                     AS hard_hit_pct
+                                                                     AS hard_hit_pct,
+            SUM(sbb.woba_value)                                      AS woba_bip_sum
         FROM production.fact_pa fpa
         JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
         JOIN production.sat_batted_balls sbb ON fpa.pa_id = sbb.pa_id
         WHERE dg.season = :season
           AND dg.game_type = 'R'
+          AND sbb.woba_value IS NOT NULL
         GROUP BY fpa.batter_id
     )
     SELECT
@@ -809,11 +847,15 @@ def get_season_totals_with_age(season: int) -> pd.DataFrame:
         pa.pa,
         pa.k,
         pa.bb,
+        pa.ibb,
+        pa.hbp,
+        pa.sf,
         pa.hits,
         pa.hr,
         ROUND(ba.xwoba_avg::numeric, 3)     AS xwoba_avg,
         ROUND(ba.barrel_pct::numeric, 4)     AS barrel_pct,
         ROUND(ba.hard_hit_pct::numeric, 4)   AS hard_hit_pct,
+        ba.woba_bip_sum,
         ROUND((pa.k::numeric / pa.pa), 4)    AS k_rate,
         ROUND((pa.bb::numeric / pa.pa), 4)   AS bb_rate,
         ROUND((pa.hr::numeric / pa.pa), 4)   AS hr_rate
@@ -824,6 +866,21 @@ def get_season_totals_with_age(season: int) -> pd.DataFrame:
     """
     logger.info("Fetching season totals with age for %d", season)
     df = read_sql(query, {"season": season})
+
+    # Compute wOBA: BIP contribution + non-BIP weights (uBB=0.69, HBP=0.72)
+    woba_bb_weight = 0.69
+    woba_hbp_weight = 0.72
+    non_ibb_bb = df["bb"] - df["ibb"]
+    woba_num = (
+        df["woba_bip_sum"].fillna(0)
+        + non_ibb_bb * woba_bb_weight
+        + df["hbp"] * woba_hbp_weight
+    )
+    woba_den = (df["pa"] - df["ibb"]).replace(0, float("nan"))
+    df["woba"] = (woba_num / woba_den).round(3)
+
+    # Drop intermediate column
+    df.drop(columns=["woba_bip_sum"], inplace=True)
 
     # Compute age_bucket: 0=young(<=25), 1=prime(26-30), 2=veteran(31+)
     df["age_bucket"] = pd.cut(
@@ -2322,3 +2379,127 @@ def get_game_batter_stats(season: int) -> pd.DataFrame:
     """
     logger.info("Fetching game batter stats for %d", season)
     return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# MiLB data queries
+# ---------------------------------------------------------------------------
+def get_milb_batter_season_totals(season: int) -> pd.DataFrame:
+    """Aggregate MiLB batting game logs into season totals per player per level.
+
+    Parameters
+    ----------
+    season : int
+        MiLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (player_id, level) with counting stats and rates.
+    """
+    query = """
+    SELECT
+        batter_id      AS player_id,
+        batter_name    AS player_name,
+        level,
+        sport_id,
+        season,
+        SUM(plate_appearances) AS pa,
+        SUM(at_bats)           AS ab,
+        SUM(hits)              AS h,
+        SUM(doubles)           AS "2b",
+        SUM(triples)           AS "3b",
+        SUM(home_runs)         AS hr,
+        SUM(strikeouts)        AS k,
+        SUM(walks)             AS bb,
+        SUM(hit_by_pitch)      AS hbp,
+        SUM(sb)                AS sb,
+        SUM(caught_stealing)   AS cs,
+        SUM(total_bases)       AS tb,
+        SUM(runs)              AS r,
+        SUM(rbi)               AS rbi,
+        COUNT(DISTINCT game_pk) AS games
+    FROM staging.milb_batting_game_logs
+    WHERE season = :season
+      AND level IN ('AAA', 'AA', 'A+', 'A')
+    GROUP BY batter_id, batter_name, level, sport_id, season
+    ORDER BY SUM(plate_appearances) DESC
+    """
+    logger.info("Fetching MiLB batter season totals for %d", season)
+    return read_sql(query, {"season": season})
+
+
+def get_milb_pitcher_season_totals(season: int) -> pd.DataFrame:
+    """Aggregate MiLB pitching game logs into season totals per player per level.
+
+    Parameters
+    ----------
+    season : int
+        MiLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (player_id, level) with counting stats and rates.
+    """
+    query = """
+    SELECT
+        pitcher_id      AS player_id,
+        pitcher_name    AS player_name,
+        level,
+        sport_id,
+        season,
+        SUM(batters_faced)    AS bf,
+        SUM(strike_outs)      AS k,
+        SUM(walks)            AS bb,
+        SUM(hits)             AS h,
+        SUM(home_runs)        AS hr,
+        SUM(earned_runs)      AS er,
+        SUM(runs)             AS r,
+        SUM(innings_pitched)  AS ip,
+        SUM(number_of_pitches) AS pitches,
+        SUM(wins)             AS w,
+        SUM(losses)           AS l,
+        SUM(saves)            AS sv,
+        SUM(holds)            AS hld,
+        COUNT(DISTINCT game_pk) AS games,
+        SUM(CASE WHEN is_starter THEN 1 ELSE 0 END) AS games_started
+    FROM staging.milb_pitching_game_logs
+    WHERE season = :season
+      AND level IN ('AAA', 'AA', 'A+', 'A')
+    GROUP BY pitcher_id, pitcher_name, level, sport_id, season
+    ORDER BY SUM(batters_faced) DESC
+    """
+    logger.info("Fetching MiLB pitcher season totals for %d", season)
+    return read_sql(query, {"season": season})
+
+
+def get_prospect_info() -> pd.DataFrame:
+    """Fetch enriched prospect metadata from dim_prospects.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: player_id, full_name, primary_position, bat_side, pitch_hand,
+        birth_date, current_age, parent_org_name, level, mlb_debut_date,
+        draft_year, season
+    """
+    query = """
+    SELECT
+        player_id,
+        full_name,
+        primary_position,
+        bat_side,
+        pitch_hand,
+        birth_date,
+        current_age,
+        parent_org_name,
+        level,
+        mlb_debut_date,
+        draft_year,
+        season
+    FROM production.dim_prospects
+    ORDER BY player_id, season
+    """
+    logger.info("Fetching prospect info from dim_prospects")
+    return read_sql(query)

@@ -713,8 +713,8 @@ def build_multi_season_hitter_data(
     -------
     pd.DataFrame
         Columns: batter_id, batter_name, batter_stand, season, age,
-        age_bucket, pa, k, bb, hits, hr, xwoba_avg, barrel_pct,
-        hard_hit_pct, k_rate, bb_rate, hr_rate.
+        age_bucket, pa, k, bb, ibb, hbp, sf, hits, hr, xwoba_avg,
+        barrel_pct, hard_hit_pct, k_rate, bb_rate, hr_rate, woba.
     """
     frames = []
     for s in seasons:
@@ -1126,3 +1126,112 @@ def get_cached_game_batter_stats(
     return _load_or_build(
         "game_batter_stats", season, get_game_batter_stats, force_rebuild
     )
+
+
+# ---------------------------------------------------------------------------
+# MiLB season totals (cached)
+# ---------------------------------------------------------------------------
+def get_cached_milb_batter_season_totals(
+    season: int, force_rebuild: bool = False
+) -> pd.DataFrame:
+    """MiLB batter season totals with Parquet caching."""
+    from src.data.queries import get_milb_batter_season_totals
+    return _load_or_build(
+        "milb_batter_season_totals", season, get_milb_batter_season_totals,
+        force_rebuild,
+    )
+
+
+def get_cached_milb_pitcher_season_totals(
+    season: int, force_rebuild: bool = False
+) -> pd.DataFrame:
+    """MiLB pitcher season totals with Parquet caching."""
+    from src.data.queries import get_milb_pitcher_season_totals
+    return _load_or_build(
+        "milb_pitcher_season_totals", season, get_milb_pitcher_season_totals,
+        force_rebuild,
+    )
+
+
+def build_milb_translated_data(
+    seasons: list[int] | None = None,
+    force_rebuild: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build translated MiLB season aggregates for all seasons.
+
+    Computes translation factors from overlap data, aggregates raw MiLB
+    stats per player-season-level, applies factors, and adds age context.
+
+    Parameters
+    ----------
+    seasons : list[int], optional
+        Seasons to process. Defaults to 2018-2025.
+    force_rebuild : bool
+        If True, recompute even if cached.
+
+    Returns
+    -------
+    tuple[pd.DataFrame, pd.DataFrame]
+        (translated_batters, translated_pitchers)
+    """
+    from src.data.milb_translation import (
+        add_age_context,
+        derive_batter_translation_factors,
+        derive_pitcher_translation_factors,
+        translate_batter_season,
+        translate_pitcher_season,
+    )
+    from src.data.queries import get_prospect_info
+
+    if seasons is None:
+        seasons = list(range(2018, 2026))
+
+    bat_cache = CACHE_DIR / "milb_translated_batters.parquet"
+    pit_cache = CACHE_DIR / "milb_translated_pitchers.parquet"
+
+    if bat_cache.exists() and pit_cache.exists() and not force_rebuild:
+        logger.info("Loading cached MiLB translated data")
+        return pd.read_parquet(bat_cache), pd.read_parquet(pit_cache)
+
+    # Derive factors
+    logger.info("Deriving batter translation factors")
+    bat_factors = derive_batter_translation_factors()
+    logger.info("Deriving pitcher translation factors")
+    pit_factors = derive_pitcher_translation_factors()
+
+    # Cache factors
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    bat_factors.to_parquet(CACHE_DIR / "milb_batter_factors.parquet", index=False)
+    pit_factors.to_parquet(CACHE_DIR / "milb_pitcher_factors.parquet", index=False)
+
+    # Aggregate and translate each season
+    bat_frames = []
+    pit_frames = []
+    for season in seasons:
+        bdf = get_cached_milb_batter_season_totals(season, force_rebuild)
+        if len(bdf) > 0:
+            bat_frames.append(translate_batter_season(bdf, bat_factors))
+
+        pdf = get_cached_milb_pitcher_season_totals(season, force_rebuild)
+        if len(pdf) > 0:
+            pit_frames.append(translate_pitcher_season(pdf, pit_factors))
+
+    translated_bat = pd.concat(bat_frames, ignore_index=True) if bat_frames else pd.DataFrame()
+    translated_pit = pd.concat(pit_frames, ignore_index=True) if pit_frames else pd.DataFrame()
+
+    # Add age context
+    prospect_info = get_prospect_info()
+    if len(translated_bat) > 0:
+        translated_bat = add_age_context(translated_bat, prospect_info)
+    if len(translated_pit) > 0:
+        translated_pit = add_age_context(translated_pit, prospect_info)
+
+    # Cache
+    translated_bat.to_parquet(bat_cache, index=False)
+    translated_pit.to_parquet(pit_cache, index=False)
+    logger.info(
+        "Cached MiLB translated data: %d batters, %d pitchers",
+        len(translated_bat), len(translated_pit),
+    )
+
+    return translated_bat, translated_pit

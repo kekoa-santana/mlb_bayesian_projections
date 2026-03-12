@@ -812,6 +812,28 @@ def main() -> None:
     logger.info("Multi-season datasets complete.")
 
     # =================================================================
+    # 6d. MiLB translated prospect data
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Copying MiLB translated prospect data...")
+
+    milb_files = {
+        "milb_translated_batters.parquet": "MiLB translated batters",
+        "milb_translated_pitchers.parquet": "MiLB translated pitchers",
+        "milb_batter_factors.parquet": "MiLB batter translation factors",
+        "milb_pitcher_factors.parquet": "MiLB pitcher translation factors",
+    }
+    cached_dir = PROJECT_ROOT / "data" / "cached"
+    for fname, label in milb_files.items():
+        src_path = cached_dir / fname
+        if src_path.exists():
+            shutil.copy2(src_path, DASHBOARD_DIR / fname)
+            _df = pd.read_parquet(src_path)
+            logger.info("Copied %s: %d rows", label, len(_df))
+        else:
+            logger.warning("Missing %s — run build_milb_translations.py first", fname)
+
+    # =================================================================
     # 7. Save preseason snapshot (frozen projections for end-of-season comparison)
     # =================================================================
     logger.info("=" * 60)
@@ -863,6 +885,7 @@ def main() -> None:
     logger.info("  Pitcher arsenal:     %d rows", len(pitcher_arsenal))
     logger.info("  Hitter vulnerability:%d rows", len(hitter_vuln))
     logger.info("  Hitter strength:     %d rows", len(hitter_str))
+    logger.info("  MiLB prospects:      milb_translated_batters, milb_translated_pitchers, factors")
     logger.info("  Multi-season files:  hitter/pitcher trad_all, agg_all, eff_all, arsenal_all, vuln_all, str_all, loc_all, zone_all, full_stats")
     logger.info("  Output dir:          %s", DASHBOARD_DIR)
 

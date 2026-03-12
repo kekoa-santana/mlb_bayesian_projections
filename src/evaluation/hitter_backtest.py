@@ -1,8 +1,9 @@
 """
 Walk-forward backtesting for the generalized hitter projection model.
 
-Supports all stats in STAT_CONFIGS (K%, BB%, HR/PA, xwOBA).
-Evaluates Bayesian projections vs Marcel baseline across folds.
+Supports all stats in STAT_CONFIGS (K%, BB%, HR/PA, wOBA, xwOBA).
+Evaluates Bayesian projections vs Marcel baseline across folds,
+with CRPS, PPC diagnostics, and Bayes-Marcel ensemble.
 """
 from __future__ import annotations
 
@@ -15,6 +16,16 @@ from scipy.stats import beta as beta_dist
 from sklearn.metrics import brier_score_loss
 
 from src.data.feature_eng import build_multi_season_hitter_data
+from src.evaluation.ensemble import (
+    apply_ensemble,
+    compute_ensemble_metrics,
+    fit_ensemble_weight,
+)
+from src.evaluation.metrics import (
+    compute_crps_single,
+    compute_ppc_pvalues,
+    summarize_ppc_calibration,
+)
 from src.models.hitter_model import (
     STAT_CONFIGS,
     check_convergence,
@@ -67,7 +78,7 @@ def marcel_hitter(
             league_avg = df_history[cfg.rate_col].mean()
 
     # Regression PA constant — more stable stats need less regression
-    regression_pa = {"k_rate": 1200, "bb_rate": 1200, "hr_rate": 1500, "xwoba": 1200}
+    regression_pa = {"k_rate": 1200, "bb_rate": 1200, "hr_rate": 1500, "xwoba": 1200, "woba": 1200}
     reg_pa = regression_pa.get(stat, 1200)
 
     records = []
@@ -140,7 +151,8 @@ def walk_forward_stat_backtest(
     Returns
     -------
     dict
-        Evaluation metrics, comparison DataFrame, convergence info.
+        Evaluation metrics, comparison DataFrame, convergence info,
+        proj_samples, and ppc_summary.
     """
     cfg = STAT_CONFIGS[stat]
     logger.info("Walk-forward %s: train=%s, test=%d", stat, train_seasons, test_season)
@@ -171,10 +183,11 @@ def walk_forward_stat_backtest(
 
     # Extract forward-projected posteriors from last training season
     last_train = max(train_seasons)
-    proj_means = {}
-    proj_sds = {}
-    proj_lo = {}
-    proj_hi = {}
+    proj_means: dict[int, float] = {}
+    proj_sds: dict[int, float] = {}
+    proj_lo: dict[int, float] = {}
+    proj_hi: dict[int, float] = {}
+    proj_samples: dict[int, np.ndarray] = {}
 
     for batter_id in common:
         try:
@@ -186,6 +199,7 @@ def walk_forward_stat_backtest(
             proj_sds[batter_id] = float(np.std(samples))
             proj_lo[batter_id] = float(np.percentile(samples, 2.5))
             proj_hi[batter_id] = float(np.percentile(samples, 97.5))
+            proj_samples[batter_id] = samples
         except ValueError:
             continue
 
@@ -225,14 +239,14 @@ def walk_forward_stat_backtest(
     mae_imp = (marcel_mae - bayes_mae) / marcel_mae * 100 if marcel_mae > 0 else 0
     rmse_imp = (marcel_rmse - bayes_rmse) / marcel_rmse * 100 if marcel_rmse > 0 else 0
 
-    # Brier score (above league average?)
+    # Brier score (above league average?) — reuse stored samples
     league_avg = cfg.league_avg
     actual_above = (actual > league_avg).astype(float)
-    bayes_prob_above = np.array([float(np.mean(
-        extract_rate_samples(trace, data, bid, last_train,
-                             project_forward=True, random_seed=random_seed)
-        > league_avg
-    )) if bid in proj_means else 0.5 for bid in comp["batter_id"]])
+    bayes_prob_above = np.array([
+        float(np.mean(proj_samples[bid] > league_avg))
+        if bid in proj_samples else 0.5
+        for bid in comp["batter_id"]
+    ])
 
     # Marcel Brier via beta approximation
     strength = np.maximum(comp["weighted_pa"].values.astype(float), 1.0)
@@ -246,12 +260,66 @@ def walk_forward_stat_backtest(
     bayes_brier = float(brier_score_loss(actual_above, bayes_prob_above))
     marcel_brier = float(brier_score_loss(actual_above, marcel_prob_above))
 
+    # CRPS: Bayes via stored samples, Marcel via Beta sampling
+    rng = np.random.default_rng(random_seed + 1)
+    bayes_crps_vals = []
+    marcel_crps_vals = []
+    for _, row in comp.iterrows():
+        bid = int(row["batter_id"])
+        act = float(row[f"actual_{stat}"])
+
+        # Bayes CRPS
+        if bid in proj_samples:
+            bayes_crps_vals.append(compute_crps_single(act, proj_samples[bid]))
+
+        # Marcel CRPS via Beta(alpha, beta) draws
+        m_rate = float(row[f"marcel_{stat}"])
+        w_pa = float(row["weighted_pa"])
+        if cfg.likelihood == "binomial":
+            a = 1.0 + m_rate * max(w_pa, 1.0)
+            b = 1.0 + (1.0 - m_rate) * max(w_pa, 1.0)
+            marcel_draws = rng.beta(a, b, size=4000)
+        else:
+            # Normal approximation for continuous stats
+            marcel_draws = rng.normal(m_rate, max(0.01, abs(m_rate) * 0.1), size=4000)
+        marcel_crps_vals.append(compute_crps_single(act, marcel_draws))
+
+    bayes_crps = float(np.mean(bayes_crps_vals)) if bayes_crps_vals else np.nan
+    marcel_crps = float(np.mean(marcel_crps_vals)) if marcel_crps_vals else np.nan
+
+    # PPC: posterior predictive check
+    ppc_summary: dict[str, Any] = {}
+    try:
+        if hasattr(trace, "posterior_predictive") and "obs" in trace.posterior_predictive:
+            ppc_obs = trace.posterior_predictive["obs"].values  # (chains, draws, n_obs)
+            n_chains, n_draws_per, n_obs = ppc_obs.shape
+            ppc_flat = ppc_obs.reshape(n_chains * n_draws_per, n_obs)
+
+            # Observed data for PPC comparison
+            if cfg.likelihood == "binomial":
+                observed_for_ppc = data["counts"]
+            else:
+                observed_for_ppc = data["y_obs"]
+
+            pvalues = compute_ppc_pvalues(ppc_flat, observed_for_ppc)
+            ppc_summary = summarize_ppc_calibration(pvalues)
+            logger.info(
+                "%s PPC: KS stat=%.3f (p=%.3f), outliers=%.1f%%",
+                stat, ppc_summary["ks_stat"], ppc_summary["ks_pvalue"],
+                ppc_summary["pct_outliers"],
+            )
+    except Exception as e:
+        logger.warning("PPC computation failed for %s: %s", stat, e)
+
     logger.info(
         "%s: Bayes MAE=%.4f, Marcel MAE=%.4f (improvement: %.1f%%)",
         stat, bayes_mae, marcel_mae, mae_imp,
     )
     logger.info(
         "%s: 95%% CI coverage: %.1f%%", stat, coverage_95 * 100,
+    )
+    logger.info(
+        "%s: CRPS Bayes=%.4f, Marcel=%.4f", stat, bayes_crps, marcel_crps,
     )
 
     return {
@@ -267,8 +335,12 @@ def walk_forward_stat_backtest(
         "coverage_95": coverage_95,
         "bayes_brier": bayes_brier,
         "marcel_brier": marcel_brier,
+        "bayes_crps": bayes_crps,
+        "marcel_crps": marcel_crps,
         "convergence": conv,
         "comparison_df": comp,
+        "proj_samples": proj_samples,
+        "ppc_summary": ppc_summary,
     }
 
 
@@ -281,6 +353,9 @@ def run_hitter_backtest(
     **sampling_kwargs: Any,
 ) -> pd.DataFrame:
     """Run walk-forward backtesting across stats and folds.
+
+    Includes expanding-window ensemble: fold 1 uses w=0.5, later folds
+    fit w on residuals from prior folds (no leakage).
 
     Parameters
     ----------
@@ -297,7 +372,8 @@ def run_hitter_backtest(
         Summary metrics across all stats and folds.
     """
     if stats is None:
-        stats = list(STAT_CONFIGS.keys())
+        # xwOBA is an input/prior (informs wOBA), not a projection target
+        stats = [s for s in STAT_CONFIGS if s != "xwoba"]
     if folds is None:
         folds = [
             {"train_seasons": [2018, 2019, 2020, 2021, 2022], "test_season": 2023},
@@ -307,6 +383,10 @@ def run_hitter_backtest(
 
     results = []
     for stat in stats:
+        cfg = STAT_CONFIGS[stat]
+
+        # First pass: run all folds, store full result dicts
+        fold_results: list[dict[str, Any]] = []
         for fold in folds:
             logger.info(
                 "=== %s: train=%s → test=%d ===",
@@ -318,6 +398,44 @@ def run_hitter_backtest(
                 stat=stat,
                 **sampling_kwargs,
             )
+            fold_results.append(metrics)
+
+        # Second pass: expanding-window ensemble
+        for i, (fold, metrics) in enumerate(zip(folds, fold_results)):
+            comp = metrics["comparison_df"]
+            proj_samps = metrics["proj_samples"]
+
+            # Fit ensemble weight from prior folds (no leakage)
+            if i == 0:
+                w = 0.5  # no prior data
+            else:
+                # Pool residuals from all prior folds
+                prior_actuals = []
+                prior_bayes = []
+                prior_marcel = []
+                for j in range(i):
+                    prior_comp = fold_results[j]["comparison_df"]
+                    prior_actuals.append(prior_comp[f"actual_{stat}"].values)
+                    prior_bayes.append(prior_comp[f"bayes_{stat}"].values)
+                    prior_marcel.append(prior_comp[f"marcel_{stat}"].values)
+                w = fit_ensemble_weight(
+                    np.concatenate(prior_actuals),
+                    np.concatenate(prior_bayes),
+                    np.concatenate(prior_marcel),
+                )
+
+            # Apply ensemble
+            comp_ens = apply_ensemble(comp, w, stat)
+            ens_metrics = compute_ensemble_metrics(
+                comp_ens, stat, cfg.league_avg, proj_samps, id_col="batter_id",
+            )
+
+            logger.info(
+                "%s fold %d: ensemble w=%.2f, MAE=%.4f (Bayes=%.4f, Marcel=%.4f)",
+                stat, i + 1, w, ens_metrics["ensemble_mae"],
+                metrics["bayes_mae"], metrics["marcel_mae"],
+            )
+
             results.append({
                 "stat": stat,
                 "test_season": metrics["test_season"],
@@ -331,6 +449,13 @@ def run_hitter_backtest(
                 "coverage_95": metrics["coverage_95"],
                 "bayes_brier": metrics["bayes_brier"],
                 "marcel_brier": metrics["marcel_brier"],
+                "bayes_crps": metrics["bayes_crps"],
+                "marcel_crps": metrics["marcel_crps"],
+                "ensemble_w": w,
+                "ensemble_mae": ens_metrics["ensemble_mae"],
+                "ensemble_rmse": ens_metrics["ensemble_rmse"],
+                "ensemble_brier": ens_metrics["ensemble_brier"],
+                "ensemble_coverage_95": ens_metrics["ensemble_coverage_95"],
                 "converged": metrics["convergence"]["converged"],
             })
 

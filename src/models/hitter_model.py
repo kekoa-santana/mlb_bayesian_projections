@@ -128,6 +128,24 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         sigma_season_floor=0.025,
         sigma_obs_prior=0.10,
     ),
+    "woba": StatConfig(
+        name="woba",
+        count_col="woba",
+        trials_col="pa",  # used as weight, not binomial n
+        rate_col="woba",
+        likelihood="normal",
+        league_avg=LEAGUE_AVG_OVERALL["woba"],
+        covariates=[
+            ("xwoba_avg", 0.0, 0.3, "xwOBA → wOBA"),
+            ("barrel_pct", 0.0, 0.2, "barrel% → wOBA"),
+        ],
+        sigma_player_prior=0.5,
+        # wOBA is noisier than xwOBA (r≈0.45 vs 0.75 YoY)
+        # Natural-scale yr-to-yr SD ≈ 0.050
+        sigma_season_mu=0.040,
+        sigma_season_floor=0.030,
+        sigma_obs_prior=0.10,
+    ),
 }
 
 

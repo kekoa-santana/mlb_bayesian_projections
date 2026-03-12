@@ -11,6 +11,7 @@ import logging
 import numpy as np
 from scipy.optimize import minimize_scalar
 from scipy.special import expit, logit
+from scipy.stats import kstest
 
 logger = logging.getLogger(__name__)
 
@@ -214,3 +215,75 @@ def compute_temperature(
 
     result = minimize_scalar(neg_log_likelihood, bounds=(0.1, 10.0), method="bounded")
     return float(result.x)
+
+
+def compute_ppc_pvalues(
+    trace_ppc: np.ndarray,
+    observed: np.ndarray,
+) -> np.ndarray:
+    """Compute posterior predictive p-values per observation.
+
+    Parameters
+    ----------
+    trace_ppc : np.ndarray
+        Posterior predictive samples, shape (n_draws, n_obs).
+        Flattened from chains × draws.
+    observed : np.ndarray
+        Actual observed values, shape (n_obs,).
+
+    Returns
+    -------
+    np.ndarray
+        P-values, shape (n_obs,). Under a well-calibrated model,
+        these should be Uniform(0, 1).
+    """
+    observed = np.asarray(observed)
+    trace_ppc = np.asarray(trace_ppc)
+    # p_value[i] = fraction of draws >= observed[i]
+    return np.mean(trace_ppc >= observed[np.newaxis, :], axis=0)
+
+
+def summarize_ppc_calibration(
+    pvalues: np.ndarray,
+    alpha: float = 0.05,
+) -> dict[str, float | int | bool]:
+    """Summarize PPC calibration from p-values.
+
+    Parameters
+    ----------
+    pvalues : np.ndarray
+        Per-observation p-values from ``compute_ppc_pvalues``.
+    alpha : float
+        Significance level for KS test.
+
+    Returns
+    -------
+    dict
+        ks_stat, ks_pvalue, n_outliers_low, n_outliers_high,
+        pct_outliers, uniform_consistent.
+    """
+    pvalues = np.asarray(pvalues)
+    n = len(pvalues)
+    if n == 0:
+        return {
+            "ks_stat": np.nan,
+            "ks_pvalue": np.nan,
+            "n_outliers_low": 0,
+            "n_outliers_high": 0,
+            "pct_outliers": np.nan,
+            "uniform_consistent": False,
+        }
+
+    ks_result = kstest(pvalues, "uniform")
+    n_low = int(np.sum(pvalues < 0.025))
+    n_high = int(np.sum(pvalues > 0.975))
+    pct = (n_low + n_high) / n * 100
+
+    return {
+        "ks_stat": float(ks_result.statistic),
+        "ks_pvalue": float(ks_result.pvalue),
+        "n_outliers_low": n_low,
+        "n_outliers_high": n_high,
+        "pct_outliers": float(pct),
+        "uniform_consistent": bool(ks_result.pvalue >= alpha),
+    }

@@ -244,6 +244,7 @@ LEAGUE_AVG_OVERALL: dict[str, float] = {
     "bb_rate": 0.083,
     "barrel_rate": 0.068,
     "xwoba": 0.315,
+    "woba": 0.315,
     "whiff_rate": 0.25,
     "chase_rate": 0.30,
     "csw_pct": 0.29,
