@@ -36,7 +36,7 @@ from src.models.pitcher_model import (
 logger = logging.getLogger(__name__)
 
 # Only project stable stats with the Bayesian model
-ALL_STATS = ["k_rate", "bb_rate"]
+ALL_STATS = ["k_rate", "bb_rate", "hr_per_bf"]
 
 # --------------------------------------------------------------------------
 # Composite dimension weights and components

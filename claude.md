@@ -6,7 +6,7 @@ A hierarchical Bayesian projection system for MLB player performance, with a gam
 **This is the projection engine.** Model training, backtesting, feature engineering, and precomputation live here. The Streamlit dashboard has been split into a separate repo (`tdd-dashboard`).
 
 ## Related Repos
-- **Dashboard:** `E:/data_analytics/tdd-dashboard/` — Streamlit app, daily updates, live game coverage
+- **Dashboard:** `C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/` — Streamlit app, daily updates, live game coverage
 - **Theme package:** `tdd_theme` — shared brand colors/utilities (pip-installed)
 
 ## Tech Stack
@@ -73,7 +73,6 @@ player_profiles/
 │   │   └── game_k_validation.py     # Full game-level K backtest
 │   └── viz/
 │       ├── theme.py                 # The Data Diamond brand theme
-│       ├── zone_charts.py           # Pitcher location + hitter zone heatmaps
 │       ├── projections.py           # K% mover cards, individual pitcher cards
 │       └── composite_cards.py       # Composite breakout/regression cards
 ├── scripts/
@@ -92,10 +91,8 @@ player_profiles/
 │   ├── cross_year_corr.py             # Year-to-year correlation analysis
 │   ├── full_eda.py                    # Exploratory data analysis
 │   └── yty_correlation.py            # Year-to-year correlation utilities
-├── app.py                       # Streamlit dashboard (LEGACY — migrated to tdd-dashboard)
 ├── data/
-│   ├── cached/                  # Parquet cache (~60 files, all seasons)
-│   └── dashboard/               # Pre-computed dashboard data (OUTPUT → consumed by tdd-dashboard)
+│   └── cached/                  # Parquet cache (~60 files, all seasons)
 ├── tests/                       # 17 test files, 119 test functions
 ├── notebooks/
 ├── outputs/                     # Backtest CSVs + content PNGs
@@ -112,17 +109,14 @@ This repo produces pre-computed data that the dashboard consumes:
 
 ```
 player_profiles/                         tdd-dashboard/
-  precompute_dashboard_data.py             data/dashboard/*.parquet
-         |                                          |
-         +--------> copy parquets --------->        |
+  precompute_dashboard_data.py ──────►     data/dashboard/*.parquet
                                               app.py (reads parquets)
                                               update_in_season.py (conjugate updates)
 ```
 
 ### Workflow:
-1. Run `python scripts/precompute_dashboard_data.py` here to generate ~43 parquets + npz
-2. Copy `data/dashboard/` to `tdd-dashboard/data/dashboard/`
-3. Dashboard reads parquets — no dependency on this repo at runtime
+1. Run `python scripts/precompute_dashboard_data.py` — writes directly to `tdd-dashboard/data/dashboard/`
+2. Dashboard reads parquets — no dependency on this repo at runtime
 
 ### Files shared with dashboard (`tdd-dashboard/lib/`):
 These are copied (not linked) to the dashboard repo. Sync when function signatures change:
@@ -131,7 +125,6 @@ These are copied (not linked) to the dashboard repo. Sync when function signatur
 - `src/models/matchup.py` → `lib/matchup.py`
 - `src/models/bf_model.py` → `lib/bf_model.py`
 - `src/models/game_k_model.py` → `lib/game_k_model.py`
-- `src/viz/zone_charts.py` → `lib/zone_charts.py`
 - `src/models/in_season_updater.py` → `lib/in_season_updater.py`
 - `src/data/schedule.py` → `lib/schedule.py`
 - `src/data/db.py` → `lib/db.py` (subset)

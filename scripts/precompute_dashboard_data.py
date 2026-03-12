@@ -4,7 +4,7 @@ Pre-compute all data needed by the Streamlit dashboard.
 
 Fits composite hitter + pitcher models (K% and BB% only), enriches with
 observed profiles, extracts posterior K% samples, computes BF priors,
-and saves everything to data/dashboard/.
+and saves everything to tdd-dashboard/data/dashboard/.
 
 Usage
 -----
@@ -23,6 +23,9 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# Dashboard repo location — precompute writes directly to tdd-dashboard
+DASHBOARD_REPO = Path(r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard")
 
 from src.data.feature_eng import (
     build_multi_season_hitter_extended,
@@ -79,7 +82,7 @@ logger = logging.getLogger("precompute")
 
 SEASONS = list(range(2018, 2026))
 FROM_SEASON = 2025
-DASHBOARD_DIR = PROJECT_ROOT / "data" / "dashboard"
+DASHBOARD_DIR = DASHBOARD_REPO / "data" / "dashboard"
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,6 +92,48 @@ def parse_args() -> argparse.Namespace:
         help="Fewer MCMC draws for fast iteration",
     )
     return parser.parse_args()
+
+
+def precompute_backtest_summaries() -> None:
+    """Copy backtest results to dashboard directory and compute confidence tiers."""
+    import shutil
+    from src.evaluation.confidence_tiers import assign_confidence_tiers, tiers_to_dataframe
+
+    outputs_dir = PROJECT_ROOT / "outputs"
+    dashboard_dir = DASHBOARD_DIR
+
+    # Copy game prop backtest summary if it exists
+    summary_path = outputs_dir / "game_prop_backtest_summary.parquet"
+    if summary_path.exists():
+        dest = dashboard_dir / "backtest_game_prop_summary.parquet"
+        shutil.copy2(summary_path, dest)
+        logger.info("Copied game prop backtest summary to %s", dest)
+
+        # Compute confidence tiers
+        summary = pd.read_parquet(summary_path)
+        tiers = assign_confidence_tiers(summary)
+        tiers_df = tiers_to_dataframe(tiers)
+        tier_path = dashboard_dir / "backtest_confidence_tiers.parquet"
+        tiers_df.to_parquet(tier_path, index=False)
+        logger.info("Saved confidence tiers to %s (%d props)", tier_path, len(tiers_df))
+    else:
+        logger.info("No game prop backtest summary found at %s — skipping tier computation", summary_path)
+
+    # Copy calibration data if available
+    for pred_file in outputs_dir.glob("game_prop_predictions_*.parquet"):
+        dest = dashboard_dir / pred_file.name
+        shutil.copy2(pred_file, dest)
+        logger.info("Copied %s to dashboard", pred_file.name)
+
+    # Copy existing season backtest CSVs as standardized parquets
+    for csv_file in outputs_dir.glob("*backtest*.csv"):
+        try:
+            df = pd.read_csv(csv_file)
+            dest = dashboard_dir / f"backtest_{csv_file.stem}.parquet"
+            df.to_parquet(dest, index=False)
+            logger.info("Converted %s to parquet", csv_file.name)
+        except Exception as e:
+            logger.warning("Failed to convert %s: %s", csv_file.name, e)
 
 
 def main() -> None:
@@ -559,7 +604,7 @@ def main() -> None:
                     "xwoba_sum", "xwoba_count", "hard_hits", "barrels"]
         sum_cols = [c for c in sum_cols if c in all_zones.columns]
         career_zones = all_zones.groupby(
-            ["batter_id", "batter_name", "batter_stand", "grid_row", "grid_col"]
+            ["batter_id", "batter_name", "batter_stand", "pitch_type", "grid_row", "grid_col"]
         )[sum_cols].sum().reset_index()
         # Keep most recent name per batter
         latest_names = all_zones.sort_values("pitches", ascending=False).drop_duplicates(
@@ -571,6 +616,68 @@ def main() -> None:
         career_zones.to_parquet(DASHBOARD_DIR / "hitter_zone_grid_career.parquet", index=False)
         logger.info("Saved career hitter zone grid: %d rows (%d batters)",
                     len(career_zones), career_zones["batter_id"].nunique())
+
+    # =================================================================
+    # 5c. Archetype-based matchup profiles
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Computing archetype-based matchup data for %d...", FROM_SEASON)
+
+    try:
+        from src.data.pitch_archetypes import (
+            get_pitch_archetype_offerings,
+            get_pitch_archetype_clusters,
+        )
+        from src.data.league_baselines import get_baselines_by_archetype_stand
+
+        pitcher_offerings = get_pitch_archetype_offerings(FROM_SEASON)
+        pitcher_offerings.to_parquet(DASHBOARD_DIR / "pitcher_offerings.parquet", index=False)
+        logger.info("Saved pitcher offerings with archetypes: %d rows", len(pitcher_offerings))
+
+        cluster_metadata = get_pitch_archetype_clusters()
+        cluster_metadata.to_parquet(DASHBOARD_DIR / "pitcher_cluster_metadata.parquet", index=False)
+        logger.info("Saved pitcher cluster metadata: %d archetypes", len(cluster_metadata))
+
+        baselines_arch = get_baselines_by_archetype_stand(FROM_SEASON)
+        baselines_arch.to_parquet(DASHBOARD_DIR / "baselines_arch.parquet", index=False)
+        logger.info("Saved league baselines by archetype: %d rows", len(baselines_arch))
+    except Exception as e:
+        logger.warning("Archetype pitcher data failed: %s", e)
+
+    try:
+        from src.data.feature_eng import get_hitter_vulnerability_by_archetype
+
+        hitter_vuln_arch = get_hitter_vulnerability_by_archetype(FROM_SEASON)
+        hitter_vuln_arch.to_parquet(DASHBOARD_DIR / "hitter_vuln_arch.parquet", index=False)
+        logger.info("Saved hitter vulnerability by archetype: %d rows", len(hitter_vuln_arch))
+
+        # Career-aggregated archetype vulnerability
+        arch_frames = []
+        for s in SEASONS:
+            try:
+                df = get_hitter_vulnerability_by_archetype(s)
+                arch_frames.append(df)
+            except Exception as e:
+                logger.warning("Archetype vuln for %d failed: %s", s, e)
+        if arch_frames:
+            all_arch = pd.concat(arch_frames, ignore_index=True)
+            sum_cols = ["swings", "whiffs", "out_of_zone_pitches", "chase_swings", "csw"]
+            sum_cols = [c for c in sum_cols if c in all_arch.columns]
+            career_arch = all_arch.groupby(
+                ["batter_id", "pitch_archetype"]
+            )[sum_cols].sum().reset_index()
+            if "swings" in career_arch.columns:
+                career_arch["whiff_rate"] = (
+                    career_arch["whiffs"] / career_arch["swings"].clip(lower=1)
+                )
+            if "out_of_zone_pitches" in career_arch.columns:
+                career_arch["chase_rate"] = (
+                    career_arch["chase_swings"] / career_arch["out_of_zone_pitches"].clip(lower=1)
+                )
+            career_arch.to_parquet(DASHBOARD_DIR / "hitter_vuln_arch_career.parquet", index=False)
+            logger.info("Saved career hitter archetype vulnerability: %d rows", len(career_arch))
+    except Exception as e:
+        logger.warning("Archetype hitter data failed: %s", e)
 
     # =================================================================
     # 6. Traditional / actual stats (2025 season from boxscores + Statcast)
@@ -730,6 +837,13 @@ def main() -> None:
     # Remove snapshot columns from live projections (they stay in the snapshot files)
     hitter_proj.drop(columns=["snapshot_date", "target_season"], inplace=True)
     pitcher_proj.drop(columns=["snapshot_date", "target_season"], inplace=True)
+
+    # =================================================================
+    # 8. Backtest summaries (copy outputs → dashboard, compute confidence tiers)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Processing backtest summaries...")
+    precompute_backtest_summaries()
 
     # =================================================================
     # Summary

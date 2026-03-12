@@ -252,3 +252,174 @@ def draw_bf_samples(
     )
 
     return np.clip(np.round(samples), bf_min, bf_max).astype(int)
+
+
+# ---------------------------------------------------------------------------
+# Batter PA distribution model
+# ---------------------------------------------------------------------------
+
+# Batter PA population defaults (validated against 2022-2025 batting boxscores)
+DEFAULT_POP_PA_MU = 3.9          # Population mean PA per game
+DEFAULT_POP_PA_WITHIN_STD = 0.9  # Within-batter game-to-game std
+DEFAULT_PA_SHRINKAGE_K = 3.0     # Shrinkage constant (more conservative than BF)
+
+
+def compute_batter_pa_priors(
+    game_logs: pd.DataFrame,
+    pop_mu: float = DEFAULT_POP_PA_MU,
+    pop_within_std: float = DEFAULT_POP_PA_WITHIN_STD,
+    shrinkage_k: float = DEFAULT_PA_SHRINKAGE_K,
+    min_games: int = 10,
+) -> pd.DataFrame:
+    """Compute shrinkage-estimated PA priors per batter-season.
+
+    Parameters
+    ----------
+    game_logs : pd.DataFrame
+        Batter game logs. Must have columns:
+        batter_id, season, plate_appearances.
+        (From get_batter_game_logs or get_cached_batter_game_logs)
+    pop_mu : float
+        Population mean PA per game.
+    pop_within_std : float
+        Population within-batter game-to-game std.
+    shrinkage_k : float
+        Shrinkage constant.
+    min_games : int
+        Batters below this get pure population prior.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (batter_id, season) with columns:
+        batter_id, season, n_games, raw_mean_pa, raw_std_pa,
+        mu_pa, sigma_pa, reliability.
+    """
+    # Filter to games with at least 1 PA
+    valid = game_logs[game_logs["plate_appearances"] >= 1].copy()
+
+    if valid.empty:
+        logger.warning("No batter game logs found")
+        return pd.DataFrame(columns=[
+            "batter_id", "season", "n_games", "raw_mean_pa", "raw_std_pa",
+            "mu_pa", "sigma_pa", "reliability",
+        ])
+
+    # Per-batter-season aggregation
+    agg = valid.groupby(["batter_id", "season"]).agg(
+        n_games=("plate_appearances", "count"),
+        raw_mean_pa=("plate_appearances", "mean"),
+        raw_std_pa=("plate_appearances", "std"),
+    ).reset_index()
+
+    # Fill NaN std (single-game batters) with population within-batter std
+    agg["raw_std_pa"] = agg["raw_std_pa"].fillna(pop_within_std)
+
+    # Shrinkage
+    agg["reliability"] = agg["n_games"] / (agg["n_games"] + shrinkage_k)
+
+    # Below min_games: reliability = 0 (pure population prior)
+    below_min = agg["n_games"] < min_games
+    agg.loc[below_min, "reliability"] = 0.0
+
+    agg["mu_pa"] = (
+        agg["reliability"] * agg["raw_mean_pa"]
+        + (1 - agg["reliability"]) * pop_mu
+    )
+    agg["sigma_pa"] = (
+        agg["reliability"] * agg["raw_std_pa"]
+        + (1 - agg["reliability"]) * pop_within_std
+    )
+
+    logger.info(
+        "PA priors: %d batter-seasons, mean reliability=%.3f",
+        len(agg), agg["reliability"].mean(),
+    )
+    return agg
+
+
+def get_pa_distribution(
+    batter_id: int,
+    season: int,
+    pa_priors: pd.DataFrame,
+    pop_mu: float = DEFAULT_POP_PA_MU,
+    pop_within_std: float = DEFAULT_POP_PA_WITHIN_STD,
+) -> dict[str, Any]:
+    """Look up PA distribution parameters for a batter.
+
+    Parameters
+    ----------
+    batter_id : int
+        MLB batter ID.
+    season : int
+        Season to look up.
+    pa_priors : pd.DataFrame
+        Output of ``compute_batter_pa_priors``.
+    pop_mu : float
+        Fallback population mean.
+    pop_within_std : float
+        Fallback population std.
+
+    Returns
+    -------
+    dict
+        Keys: mu_pa, sigma_pa, reliability, dist_type.
+    """
+    mask = (pa_priors["batter_id"] == batter_id) & (pa_priors["season"] == season)
+    rows = pa_priors[mask]
+
+    if rows.empty:
+        return {
+            "mu_pa": pop_mu,
+            "sigma_pa": pop_within_std,
+            "reliability": 0.0,
+            "dist_type": "population_fallback",
+        }
+
+    row = rows.iloc[0]
+    return {
+        "mu_pa": float(row["mu_pa"]),
+        "sigma_pa": float(row["sigma_pa"]),
+        "reliability": float(row["reliability"]),
+        "dist_type": "shrinkage",
+    }
+
+
+def draw_pa_samples(
+    mu_pa: float,
+    sigma_pa: float,
+    n_draws: int,
+    pa_min: int = 1,
+    pa_max: int = 7,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Draw integer PA samples from a truncated normal.
+
+    Parameters
+    ----------
+    mu_pa : float
+        Mean PA per game.
+    sigma_pa : float
+        Std PA per game.
+    n_draws : int
+        Number of samples to draw.
+    pa_min : int
+        Minimum PA (inclusive).
+    pa_max : int
+        Maximum PA (inclusive).
+    rng : numpy Generator, optional
+        For reproducibility. If None, uses default.
+
+    Returns
+    -------
+    np.ndarray
+        Integer PA values, shape (n_draws,).
+    """
+    return draw_bf_samples(
+        mu_bf=mu_pa,
+        sigma_bf=sigma_pa,
+        n_draws=n_draws,
+        bf_min=pa_min,
+        bf_max=pa_max,
+        rng=rng,
+    )

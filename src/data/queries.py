@@ -664,7 +664,7 @@ def get_pitcher_game_logs(season: int) -> pd.DataFrame:
     pd.DataFrame
         Columns: game_pk, pitcher_id, pitcher_name, pitch_hand, season,
         strike_outs, batters_faced, innings_pitched, number_of_pitches,
-        is_starter.
+        is_starter, walks, hits, home_runs, outs, earned_runs.
     """
     query = """
     SELECT
@@ -677,7 +677,12 @@ def get_pitcher_game_logs(season: int) -> pd.DataFrame:
         pb.batters_faced,
         pb.innings_pitched,
         pb.number_of_pitches,
-        pb.is_starter
+        pb.is_starter,
+        pb.walks,
+        pb.hits,
+        pb.home_runs,
+        pb.outs,
+        pb.earned_runs
     FROM staging.pitching_boxscores pb
     JOIN production.dim_game dg   ON pb.game_pk = dg.game_pk
     LEFT JOIN production.dim_player dp ON pb.pitcher_id = dp.player_id
@@ -1732,6 +1737,7 @@ def get_hitter_zone_grid(season: int) -> pd.DataFrame:
             fp.pa_id,
             LEAST(GREATEST(FLOOR((fp.plate_x + 1.33) / 0.532)::int, 0), 4) AS grid_col,
             LEAST(GREATEST(FLOOR((fp.plate_z - 1.0) / 0.6)::int, 0), 4) AS grid_row,
+            fp.pitch_type,
             fp.is_swing,
             fp.is_whiff,
             fp.is_called_strike,
@@ -1750,6 +1756,7 @@ def get_hitter_zone_grid(season: int) -> pd.DataFrame:
         pg.batter_id,
         COALESCE(dp.player_name, 'Unknown') AS batter_name,
         pg.batter_stand,
+        pg.pitch_type,
         pg.grid_row,
         pg.grid_col,
         COUNT(*) AS pitches,
@@ -1779,8 +1786,8 @@ def get_hitter_zone_grid(season: int) -> pd.DataFrame:
     LEFT JOIN production.dim_player dp ON pg.batter_id = dp.player_id
     LEFT JOIN production.sat_batted_balls sbb ON pg.pa_id = sbb.pa_id
     GROUP BY pg.batter_id, dp.player_name, pg.batter_stand,
-             pg.grid_row, pg.grid_col
-    ORDER BY pg.batter_id, pg.grid_row, pg.grid_col
+             pg.pitch_type, pg.grid_row, pg.grid_col
+    ORDER BY pg.batter_id, pg.pitch_type, pg.grid_row, pg.grid_col
     """
     logger.info("Fetching hitter zone grid for %d", season)
     return read_sql(query, {"season": season})
@@ -2229,4 +2236,89 @@ def get_pitcher_efficiency(season: int) -> pd.DataFrame:
     ORDER BY pc.bf DESC
     """
     logger.info("Fetching pitcher efficiency for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# Batter game logs (per-game boxscore lines)
+# ---------------------------------------------------------------------------
+def get_batter_game_logs(season: int) -> pd.DataFrame:
+    """Per-game batter lines from staging boxscores.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: game_pk, batter_id, batter_name, season,
+        strikeouts, walks, hits, home_runs, plate_appearances,
+        at_bats, team_id.
+    """
+    query = """
+    SELECT
+        bb.game_pk,
+        bb.batter_id,
+        bb.batter_name,
+        dg.season,
+        bb.strikeouts,
+        bb.walks,
+        bb.hits,
+        bb.home_runs,
+        bb.plate_appearances,
+        bb.at_bats,
+        bb.team_id
+    FROM staging.batting_boxscores bb
+    JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+    WHERE dg.season = :season
+      AND dg.game_type = 'R'
+    ORDER BY bb.game_pk, bb.batter_id
+    """
+    logger.info("Fetching batter game logs for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# Game-level batter stats (per pitcher-batter within a game) — extended
+# ---------------------------------------------------------------------------
+def get_game_batter_stats(season: int) -> pd.DataFrame:
+    """Per (game_pk, pitcher_id, batter_id) PA and outcome counts.
+
+    Extends get_game_batter_ks() with walks, hits, and home runs.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: game_pk, pitcher_id, batter_id, pa, k, bb, h, hr.
+    """
+    query = """
+    SELECT
+        fpa.game_pk,
+        fpa.pitcher_id,
+        fpa.batter_id,
+        COUNT(*) AS pa,
+        SUM(CASE WHEN fpa.events IN ('strikeout', 'strikeout_double_play')
+                 THEN 1 ELSE 0 END) AS k,
+        SUM(CASE WHEN fpa.events = 'walk'
+                 THEN 1 ELSE 0 END) AS bb,
+        SUM(CASE WHEN fpa.events IN ('single', 'double', 'triple', 'home_run')
+                 THEN 1 ELSE 0 END) AS h,
+        SUM(CASE WHEN fpa.events = 'home_run'
+                 THEN 1 ELSE 0 END) AS hr
+    FROM production.fact_pa fpa
+    JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
+    WHERE dg.season = :season
+      AND dg.game_type = 'R'
+      AND fpa.events IS NOT NULL
+    GROUP BY fpa.game_pk, fpa.pitcher_id, fpa.batter_id
+    ORDER BY fpa.game_pk, fpa.pitcher_id, fpa.batter_id
+    """
+    logger.info("Fetching game batter stats for %d", season)
     return read_sql(query, {"season": season})

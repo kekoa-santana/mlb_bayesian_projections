@@ -633,3 +633,558 @@ def compute_game_matchup_k_rate_by_archetype(
     return compute_game_matchup_k_rate(
         pitcher_baseline_k_rate, game_batter_pa, matchup_scores
     )
+
+
+# ===================================================================
+# BB and HR matchup scoring
+# ===================================================================
+
+# ---------------------------------------------------------------------------
+# Hitter chase-rate fallback chain (for BB matchup)
+# ---------------------------------------------------------------------------
+def _get_hitter_chase_with_fallback(
+    hitter_vuln: pd.DataFrame,
+    batter_id: int,
+    pitch_type: str,
+    league_chase: float,
+) -> tuple[float, float]:
+    """Look up a hitter's chase rate for a pitch type with fallback.
+
+    Same fallback chain as ``_get_hitter_whiff_with_fallback`` but uses
+    ``chase_rate`` (chase_swings / out_of_zone_pitches).
+
+    Fallback chain
+    --------------
+    1. Direct match on (batter_id, pitch_type) — reliability =
+       min(out_of_zone_pitches, 50) / 50, blended toward league baseline.
+    2. Pitch-family fallback — weighted average of same-family pitch types,
+       reliability scaled by 0.5.
+    3. League baseline — hitter_delta = 0 (average chase tendency).
+
+    Parameters
+    ----------
+    hitter_vuln : pd.DataFrame
+        Hitter vulnerability profiles with columns: batter_id, pitch_type,
+        out_of_zone_pitches, chase_swings, chase_rate, pitch_family.
+    batter_id : int
+        Batter MLB ID.
+    pitch_type : str
+        Pitch type abbreviation (e.g. "FF", "SL").
+    league_chase : float
+        League-average chase rate for this pitch type.
+
+    Returns
+    -------
+    tuple[float, float]
+        (chase_rate, reliability) where reliability is in [0, 1].
+    """
+    batter_rows = hitter_vuln[hitter_vuln["batter_id"] == batter_id]
+
+    # Level 1: direct match
+    direct = batter_rows[batter_rows["pitch_type"] == pitch_type]
+    if len(direct) > 0:
+        row = direct.iloc[0]
+        ooz = row.get("out_of_zone_pitches", 0)
+        if pd.notna(ooz) and ooz > 0:
+            raw_chase = row.get("chase_rate", np.nan)
+            if pd.notna(raw_chase):
+                reliability = min(float(ooz), _RELIABILITY_N) / _RELIABILITY_N
+                blended = reliability * raw_chase + (1.0 - reliability) * league_chase
+                return float(blended), reliability
+
+    # Level 2: family fallback
+    target_family = PITCH_TO_FAMILY.get(pitch_type)
+    if target_family is not None and len(batter_rows) > 0:
+        family_rows = batter_rows[
+            batter_rows["pitch_family"] == target_family
+        ]
+        if len(family_rows) > 0:
+            valid = family_rows.dropna(subset=["chase_rate"])
+            valid = valid[valid.get("out_of_zone_pitches", valid.get("swings", pd.Series(dtype=float))) > 0]
+            if len(valid) > 0:
+                total_ooz = valid["out_of_zone_pitches"].sum()
+                if total_ooz > 0:
+                    weighted_chase = (
+                        (valid["chase_rate"] * valid["out_of_zone_pitches"]).sum()
+                        / total_ooz
+                    )
+                    raw_reliability = min(float(total_ooz), _RELIABILITY_N) / _RELIABILITY_N
+                    reliability = raw_reliability * 0.5  # discount for indirect match
+                    blended = reliability * weighted_chase + (1.0 - reliability) * league_chase
+                    return float(blended), reliability
+
+    # Level 3: league baseline
+    return league_chase, 0.0
+
+
+# ---------------------------------------------------------------------------
+# BB matchup scoring
+# ---------------------------------------------------------------------------
+def score_matchup_bb(
+    pitcher_id: int,
+    batter_id: int,
+    pitcher_arsenal: pd.DataFrame,
+    hitter_vuln: pd.DataFrame,
+    baselines_pt: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    """Score a pitcher-batter matchup for walk (BB) tendency.
+
+    Uses the same log-odds additive framework as ``score_matchup`` but
+    with chase rate instead of whiff rate.  The lift is **inverted**:
+    a hitter who chases *less* than league average will draw *more*
+    walks, producing a positive ``matchup_bb_logit_lift``.
+
+    Parameters
+    ----------
+    pitcher_id : int
+        Pitcher MLB ID.
+    batter_id : int
+        Batter MLB ID.
+    pitcher_arsenal : pd.DataFrame
+        Pitcher arsenal profiles (pitcher_id, pitch_type, pitches,
+        usage_pct, chase_rate or derivable fields).
+    hitter_vuln : pd.DataFrame
+        Hitter vulnerability profiles (batter_id, pitch_type,
+        out_of_zone_pitches, chase_swings, chase_rate, pitch_family).
+    baselines_pt : dict[str, dict[str, float]]
+        League-average baselines keyed by pitch_type with at least
+        "chase_rate" key.
+
+    Returns
+    -------
+    dict
+        Keys: pitcher_id, batter_id, matchup_chase_rate,
+        baseline_chase_rate, matchup_bb_logit_lift, n_pitch_types,
+        avg_reliability.
+    """
+    p_arsenal = pitcher_arsenal[pitcher_arsenal["pitcher_id"] == pitcher_id].copy()
+    p_arsenal = p_arsenal[p_arsenal["pitches"] >= _MIN_PITCHES].copy()
+
+    if len(p_arsenal) == 0:
+        return {
+            "pitcher_id": pitcher_id,
+            "batter_id": batter_id,
+            "matchup_chase_rate": np.nan,
+            "baseline_chase_rate": np.nan,
+            "matchup_bb_logit_lift": 0.0,
+            "n_pitch_types": 0,
+            "avg_reliability": 0.0,
+        }
+
+    # Renormalize usage
+    total_usage = p_arsenal["usage_pct"].sum()
+    if total_usage > 0:
+        p_arsenal["usage_norm"] = p_arsenal["usage_pct"] / total_usage
+    else:
+        p_arsenal["usage_norm"] = 1.0 / len(p_arsenal)
+
+    matchup_chase = 0.0
+    baseline_chase = 0.0
+    reliabilities = []
+
+    for _, row in p_arsenal.iterrows():
+        pt = row["pitch_type"]
+        usage = row["usage_norm"]
+
+        # Pitcher's chase-inducing rate (if available)
+        pitcher_chase = row.get("chase_rate", np.nan)
+
+        # League baseline for this pitch type
+        league_chase = baselines_pt.get(pt, {}).get("chase_rate", 0.30)
+
+        if pd.isna(pitcher_chase):
+            pitcher_chase = league_chase
+
+        # Hitter chase with fallback
+        hitter_chase, reliability = _get_hitter_chase_with_fallback(
+            hitter_vuln, batter_id, pt, league_chase
+        )
+        reliabilities.append(reliability)
+
+        # Log-odds additive method (same math as whiff)
+        league_logit = _logit(league_chase)
+        pitcher_delta = _logit(pitcher_chase) - league_logit
+        hitter_delta = _logit(hitter_chase) - league_logit
+        matchup_logit = league_logit + pitcher_delta + hitter_delta
+        matchup_chase_pt = float(_inv_logit(matchup_logit))
+
+        matchup_chase += usage * matchup_chase_pt
+        baseline_chase += usage * pitcher_chase
+
+    # Lift: INVERTED — lower chase rate → more walks
+    # Negative chase lift means hitter chases less → positive BB lift
+    chase_logit_lift = float(_logit(matchup_chase) - _logit(baseline_chase))
+    matchup_bb_logit_lift = -chase_logit_lift
+
+    return {
+        "pitcher_id": pitcher_id,
+        "batter_id": batter_id,
+        "matchup_chase_rate": matchup_chase,
+        "baseline_chase_rate": baseline_chase,
+        "matchup_bb_logit_lift": matchup_bb_logit_lift,
+        "n_pitch_types": len(p_arsenal),
+        "avg_reliability": float(np.mean(reliabilities)) if reliabilities else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hitter barrel-rate fallback chain (for HR matchup)
+# ---------------------------------------------------------------------------
+def _get_hitter_barrel_with_fallback(
+    hitter_vuln: pd.DataFrame,
+    batter_id: int,
+    pitch_type: str,
+    league_barrel: float,
+) -> tuple[float, float]:
+    """Look up a hitter's barrel rate for a pitch type with fallback.
+
+    Barrel rate is computed as barrels_proxy / bip.
+
+    Fallback chain
+    --------------
+    1. Direct match on (batter_id, pitch_type) — reliability =
+       min(bip, 50) / 50, blended toward league baseline.
+    2. Pitch-family fallback — weighted average of same-family pitch types,
+       reliability scaled by 0.5.
+    3. League baseline — hitter_delta = 0 (average barrel tendency).
+
+    Parameters
+    ----------
+    hitter_vuln : pd.DataFrame
+        Hitter vulnerability profiles with columns: batter_id, pitch_type,
+        bip, barrels_proxy, pitch_family.
+    batter_id : int
+        Batter MLB ID.
+    pitch_type : str
+        Pitch type abbreviation (e.g. "FF", "SL").
+    league_barrel : float
+        League-average barrel rate for this pitch type.
+
+    Returns
+    -------
+    tuple[float, float]
+        (barrel_rate, reliability) where reliability is in [0, 1].
+    """
+    batter_rows = hitter_vuln[hitter_vuln["batter_id"] == batter_id]
+
+    # Level 1: direct match
+    direct = batter_rows[batter_rows["pitch_type"] == pitch_type]
+    if len(direct) > 0:
+        row = direct.iloc[0]
+        bip = row.get("bip", 0)
+        if pd.notna(bip) and bip > 0:
+            barrels = row.get("barrels_proxy", 0)
+            if pd.notna(barrels):
+                raw_barrel = float(barrels) / float(bip)
+                reliability = min(float(bip), _RELIABILITY_N) / _RELIABILITY_N
+                blended = reliability * raw_barrel + (1.0 - reliability) * league_barrel
+                return float(blended), reliability
+
+    # Level 2: family fallback
+    target_family = PITCH_TO_FAMILY.get(pitch_type)
+    if target_family is not None and len(batter_rows) > 0:
+        family_rows = batter_rows[
+            batter_rows["pitch_family"] == target_family
+        ]
+        if len(family_rows) > 0:
+            valid = family_rows.dropna(subset=["bip", "barrels_proxy"])
+            valid = valid[valid["bip"] > 0]
+            if len(valid) > 0:
+                total_bip = valid["bip"].sum()
+                total_barrels = valid["barrels_proxy"].sum()
+                weighted_barrel = float(total_barrels) / float(total_bip)
+                raw_reliability = min(float(total_bip), _RELIABILITY_N) / _RELIABILITY_N
+                reliability = raw_reliability * 0.5  # discount for indirect match
+                blended = reliability * weighted_barrel + (1.0 - reliability) * league_barrel
+                return float(blended), reliability
+
+    # Level 3: league baseline
+    return league_barrel, 0.0
+
+
+# ---------------------------------------------------------------------------
+# HR matchup scoring
+# ---------------------------------------------------------------------------
+def score_matchup_hr(
+    pitcher_id: int,
+    batter_id: int,
+    pitcher_arsenal: pd.DataFrame,
+    hitter_vuln: pd.DataFrame,
+    baselines_pt: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    """Score a pitcher-batter matchup for HR tendency.
+
+    Uses the same log-odds additive framework as ``score_matchup`` but
+    with barrel rate instead of whiff rate.  High barrel rate = more HR.
+
+    Parameters
+    ----------
+    pitcher_id : int
+        Pitcher MLB ID.
+    batter_id : int
+        Batter MLB ID.
+    pitcher_arsenal : pd.DataFrame
+        Pitcher arsenal profiles (pitcher_id, pitch_type, pitches,
+        usage_pct, bip, barrels_proxy).
+    hitter_vuln : pd.DataFrame
+        Hitter vulnerability profiles (batter_id, pitch_type, bip,
+        barrels_proxy, pitch_family).
+    baselines_pt : dict[str, dict[str, float]]
+        League-average baselines keyed by pitch_type with at least
+        "barrel_rate" key.
+
+    Returns
+    -------
+    dict
+        Keys: pitcher_id, batter_id, matchup_barrel_rate,
+        baseline_barrel_rate, matchup_hr_logit_lift, n_pitch_types,
+        avg_reliability.
+    """
+    p_arsenal = pitcher_arsenal[pitcher_arsenal["pitcher_id"] == pitcher_id].copy()
+    p_arsenal = p_arsenal[p_arsenal["pitches"] >= _MIN_PITCHES].copy()
+
+    if len(p_arsenal) == 0:
+        return {
+            "pitcher_id": pitcher_id,
+            "batter_id": batter_id,
+            "matchup_barrel_rate": np.nan,
+            "baseline_barrel_rate": np.nan,
+            "matchup_hr_logit_lift": 0.0,
+            "n_pitch_types": 0,
+            "avg_reliability": 0.0,
+        }
+
+    # Renormalize usage
+    total_usage = p_arsenal["usage_pct"].sum()
+    if total_usage > 0:
+        p_arsenal["usage_norm"] = p_arsenal["usage_pct"] / total_usage
+    else:
+        p_arsenal["usage_norm"] = 1.0 / len(p_arsenal)
+
+    matchup_barrel = 0.0
+    baseline_barrel = 0.0
+    reliabilities = []
+
+    for _, row in p_arsenal.iterrows():
+        pt = row["pitch_type"]
+        usage = row["usage_norm"]
+
+        # Pitcher's barrel rate
+        p_bip = row.get("bip", 0)
+        p_barrels = row.get("barrels_proxy", 0)
+        if pd.notna(p_bip) and p_bip > 0 and pd.notna(p_barrels):
+            pitcher_barrel = float(p_barrels) / float(p_bip)
+        else:
+            pitcher_barrel = np.nan
+
+        # League baseline for this pitch type
+        league_barrel = baselines_pt.get(pt, {}).get("barrel_rate", 0.06)
+
+        if pd.isna(pitcher_barrel):
+            pitcher_barrel = league_barrel
+
+        # Hitter barrel with fallback
+        hitter_barrel, reliability = _get_hitter_barrel_with_fallback(
+            hitter_vuln, batter_id, pt, league_barrel
+        )
+        reliabilities.append(reliability)
+
+        # Log-odds additive method
+        league_logit = _logit(league_barrel)
+        pitcher_delta = _logit(pitcher_barrel) - league_logit
+        hitter_delta = _logit(hitter_barrel) - league_logit
+        matchup_logit = league_logit + pitcher_delta + hitter_delta
+        matchup_barrel_pt = float(_inv_logit(matchup_logit))
+
+        matchup_barrel += usage * matchup_barrel_pt
+        baseline_barrel += usage * pitcher_barrel
+
+    # Lift: positive = more barrels = more HR
+    matchup_hr_logit_lift = float(_logit(matchup_barrel) - _logit(baseline_barrel))
+
+    return {
+        "pitcher_id": pitcher_id,
+        "batter_id": batter_id,
+        "matchup_barrel_rate": matchup_barrel,
+        "baseline_barrel_rate": baseline_barrel,
+        "matchup_hr_logit_lift": matchup_hr_logit_lift,
+        "n_pitch_types": len(p_arsenal),
+        "avg_reliability": float(np.mean(reliabilities)) if reliabilities else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+def score_matchup_for_stat(
+    stat_name: str,
+    pitcher_id: int,
+    batter_id: int,
+    pitcher_arsenal: pd.DataFrame,
+    hitter_vuln: pd.DataFrame,
+    baselines_pt: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    """Dispatch matchup scoring based on stat type.
+
+    Parameters
+    ----------
+    stat_name : str
+        One of 'k' (whiff-based), 'bb' (chase-based), 'hr' (barrel-based).
+        Any other value returns lift = 0 (no matchup adjustment).
+    pitcher_id : int
+        Pitcher MLB ID.
+    batter_id : int
+        Batter MLB ID.
+    pitcher_arsenal : pd.DataFrame
+        Pitcher arsenal profiles.
+    hitter_vuln : pd.DataFrame
+        Hitter vulnerability profiles.
+    baselines_pt : dict[str, dict[str, float]]
+        League-average baselines keyed by pitch_type.
+
+    Returns
+    -------
+    dict
+        Matchup result dict.  The lift key varies by stat:
+        'matchup_k_logit_lift', 'matchup_bb_logit_lift',
+        'matchup_hr_logit_lift', or a generic 'matchup_logit_lift' = 0.
+    """
+    stat = stat_name.lower().strip()
+
+    if stat == "k":
+        return score_matchup(
+            pitcher_id, batter_id, pitcher_arsenal, hitter_vuln, baselines_pt
+        )
+    elif stat == "bb":
+        return score_matchup_bb(
+            pitcher_id, batter_id, pitcher_arsenal, hitter_vuln, baselines_pt
+        )
+    elif stat == "hr":
+        return score_matchup_hr(
+            pitcher_id, batter_id, pitcher_arsenal, hitter_vuln, baselines_pt
+        )
+    else:
+        # No matchup adjustment for other stats (hits, outs, etc.)
+        return {
+            "pitcher_id": pitcher_id,
+            "batter_id": batter_id,
+            "matchup_logit_lift": 0.0,
+            "n_pitch_types": 0,
+            "avg_reliability": 0.0,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap uncertainty wrapper
+# ---------------------------------------------------------------------------
+def score_matchup_with_uncertainty(
+    stat_name: str,
+    pitcher_id: int,
+    batter_id: int,
+    pitcher_arsenal: pd.DataFrame,
+    hitter_vuln: pd.DataFrame,
+    baselines_pt: dict[str, dict[str, float]],
+    n_draws: int = 200,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Bootstrap matchup uncertainty by resampling rates from Beta posterior.
+
+    For each draw, resample the hitter's per-pitch-type rates from
+    Beta(successes + 0.5, trials - successes + 0.5) (Jeffreys prior).
+    Small samples naturally produce wide distributions — replaces
+    reliability weighting with proper uncertainty propagation.
+
+    Parameters
+    ----------
+    stat_name : str
+        One of 'k', 'bb', 'hr'.
+    pitcher_id : int
+        Pitcher MLB ID.
+    batter_id : int
+        Batter MLB ID.
+    pitcher_arsenal : pd.DataFrame
+        Pitcher arsenal profiles.
+    hitter_vuln : pd.DataFrame
+        Hitter vulnerability profiles.
+    baselines_pt : dict[str, dict[str, float]]
+        League-average baselines keyed by pitch_type.
+    n_draws : int
+        Number of Monte Carlo draws (default 200).
+    rng : np.random.Generator or None
+        Random number generator for reproducibility.
+
+    Returns
+    -------
+    np.ndarray
+        Array of logit lifts, shape (n_draws,).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    stat = stat_name.lower().strip()
+
+    # Determine which rate columns to resample based on stat type
+    if stat == "k":
+        success_col = "whiffs"
+        trials_col = "swings"
+        rate_col = "whiff_rate"
+        lift_key = "matchup_k_logit_lift"
+        scorer = score_matchup
+    elif stat == "bb":
+        success_col = "chase_swings"
+        trials_col = "out_of_zone_pitches"
+        rate_col = "chase_rate"
+        lift_key = "matchup_bb_logit_lift"
+        scorer = score_matchup_bb
+    elif stat == "hr":
+        success_col = "barrels_proxy"
+        trials_col = "bip"
+        rate_col = None  # barrel_rate computed on the fly
+        lift_key = "matchup_hr_logit_lift"
+        scorer = score_matchup_hr
+    else:
+        return np.zeros(n_draws)
+
+    # Get batter rows to resample
+    batter_rows = hitter_vuln[hitter_vuln["batter_id"] == batter_id].copy()
+    if len(batter_rows) == 0:
+        # No hitter data — all draws get the same zero-information lift
+        result = scorer(
+            pitcher_id, batter_id, pitcher_arsenal, hitter_vuln, baselines_pt
+        )
+        return np.full(n_draws, result.get(lift_key, 0.0))
+
+    lifts = np.empty(n_draws)
+
+    for i in range(n_draws):
+        # Resample hitter rates from Beta posterior (Jeffreys prior)
+        resampled = batter_rows.copy()
+
+        successes = resampled[success_col].fillna(0).values.astype(float)
+        trials = resampled[trials_col].fillna(0).values.astype(float)
+
+        # Beta(successes + 0.5, trials - successes + 0.5) — Jeffreys prior
+        alpha = successes + 0.5
+        beta_param = np.maximum(trials - successes + 0.5, 0.5)
+        sampled_rates = rng.beta(alpha, beta_param)
+
+        if stat == "hr":
+            # For HR, barrel_rate is barrels_proxy / bip — we store the
+            # resampled rate in barrels_proxy and set bip = 1 so the
+            # scorer computes barrel_rate = barrels_proxy / bip correctly.
+            resampled = resampled.copy()
+            resampled["barrels_proxy"] = sampled_rates
+            resampled["bip"] = 1.0
+        else:
+            resampled[rate_col] = sampled_rates
+
+        # Build a modified hitter_vuln with only this batter resampled
+        other_batters = hitter_vuln[hitter_vuln["batter_id"] != batter_id]
+        vuln_draw = pd.concat([other_batters, resampled], ignore_index=True)
+
+        result = scorer(
+            pitcher_id, batter_id, pitcher_arsenal, vuln_draw, baselines_pt
+        )
+        lifts[i] = result.get(lift_key, 0.0)
+
+    return lifts

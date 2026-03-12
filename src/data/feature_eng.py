@@ -12,7 +12,9 @@ import numpy as np
 import pandas as pd
 
 from src.data.queries import (
+    get_batter_game_logs,
     get_game_batter_ks,
+    get_game_batter_stats,
     get_game_lineups,
     get_hitter_observed_profile,
     get_hitter_pitch_type_profile,
@@ -1100,3 +1102,27 @@ def build_multi_season_pitcher_extended(
         len(combined), seasons,
     )
     return combined
+
+
+# ---------------------------------------------------------------------------
+# Batter game logs (cached)
+# ---------------------------------------------------------------------------
+def get_cached_batter_game_logs(
+    season: int, force_rebuild: bool = False
+) -> pd.DataFrame:
+    """Batter game logs with Parquet caching."""
+    return _load_or_build(
+        "batter_game_logs", season, get_batter_game_logs, force_rebuild
+    )
+
+
+# ---------------------------------------------------------------------------
+# Game-level batter stats (cached) — extends game_batter_ks with BB/H/HR
+# ---------------------------------------------------------------------------
+def get_cached_game_batter_stats(
+    season: int, force_rebuild: bool = False
+) -> pd.DataFrame:
+    """Per (game, pitcher, batter) PA and K/BB/H/HR counts with caching."""
+    return _load_or_build(
+        "game_batter_stats", season, get_game_batter_stats, force_rebuild
+    )
