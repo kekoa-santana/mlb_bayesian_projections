@@ -1,6 +1,6 @@
 # MLB Fantasy ETL — Full Schema Reference
 
-> Generated 2026-03-11. Database: `mlb_fantasy` on `localhost:5433`.
+> Generated 2026-03-13. Database: `mlb_fantasy` on `localhost:5433`.
 
 ---
 
@@ -32,8 +32,10 @@
 | **staging** | pitching_boxscores | ~173k | (pitcher_id, game_pk, team_id) |
 | **staging** | milb_batting_game_logs | — | (batter_id, game_pk, team_id) |
 | **staging** | milb_pitching_game_logs | — | (pitcher_id, game_pk, team_id) |
+| **staging** | live_pitches | 0 | (game_pk, at_bat_index, pitch_number) |
+| **staging** | live_batted_balls | 0 | (game_pk, at_bat_index) |
 | **production** | dim_game | 19,555 | game_pk |
-| **production** | dim_player | 3,300 | player_id |
+| **production** | dim_player | 3,290 | player_id |
 | **production** | dim_team | 30 | — |
 | **production** | dim_prospects | 57,924 | (player_id, season) |
 | **production** | dim_transaction | 417,644 | transaction_id |
@@ -41,14 +43,14 @@
 | **production** | dim_umpire | 19,553 | game_pk |
 | **production** | dim_weather | 19,523 | game_pk |
 | **production** | dim_model_run | 0 | run_id (UUID) |
-| **production** | fact_pa | 1,402,470 | pa_id (BIGSERIAL); UK: (game_pk, game_counter) |
-| **production** | fact_pitch | 5,408,524 | pitch_id (BIGSERIAL); UK: (game_pk, game_counter, pitch_number) |
-| **production** | sat_pitch_shape | 5,471,203 | pitch_id |
+| **production** | fact_pa | 1,402,858 | pa_id (BIGSERIAL); UK: (game_pk, game_counter) |
+| **production** | fact_pitch | 5,449,981 | pitch_id (BIGSERIAL); UK: (game_pk, game_counter, pitch_number) |
+| **production** | sat_pitch_shape | 5,449,981 | pitch_id |
 | **production** | sat_batted_balls | 946,068 | pitch_id |
 | **production** | fact_lineup | 458,657 | (game_pk, player_id) |
 | **production** | fact_game_totals | 38,994 | (game_pk, team_id) |
 | **production** | fact_player_game_mlb | 571,829 | (player_id, game_pk, player_role) |
-| **production** | fact_milb_player_game | 2,056,578 | (player_id, game_pk, player_role) |
+| **production** | fact_milb_player_game | 2,056,586 | (player_id, game_pk, player_role) |
 | **production** | fact_player_form_rolling | 571,829 | (player_id, game_pk, player_role) |
 | **production** | fact_streak_indicator | 571,829 | (player_id, game_pk, player_role) |
 | **production** | fact_platoon_splits | 25,280 | (player_id, season, player_role, platoon_side) |
@@ -573,6 +575,75 @@ Cleaned and typed versions of raw data. Statcast tables are loaded from parquet 
 | source | TEXT | YES |
 | ingested_at | TIMESTAMP | YES |
 | load_id | UUID | YES |
+
+### staging.live_pitches
+**PK**: `(game_pk, at_bat_index, pitch_number)` — Live game feed pitch data (schema only, 0 rows).
+
+| Column | Type | Nullable |
+|--------|------|----------|
+| game_pk | BIGINT | NO |
+| at_bat_index | INT | NO |
+| pitch_number | SMALLINT | NO |
+| game_date | DATE | NO |
+| pitcher_id | BIGINT | NO |
+| batter_id | BIGINT | NO |
+| inning | SMALLINT | YES |
+| half_inning | TEXT | YES |
+| pitch_type | TEXT | YES |
+| pitch_name | TEXT | YES |
+| release_speed | REAL | YES |
+| spin_rate | REAL | YES |
+| pfx_x | REAL | YES |
+| pfx_z | REAL | YES |
+| plate_x | REAL | YES |
+| plate_z | REAL | YES |
+| zone | SMALLINT | YES |
+| sz_top | REAL | YES |
+| sz_bot | REAL | YES |
+| call_code | VARCHAR | YES |
+| call_description | TEXT | YES |
+| is_whiff | BOOLEAN | YES |
+| is_called_strike | BOOLEAN | YES |
+| is_swing | BOOLEAN | YES |
+| is_bip | BOOLEAN | YES |
+| is_foul | BOOLEAN | YES |
+| balls | SMALLINT | YES |
+| strikes | SMALLINT | YES |
+| outs_when_up | SMALLINT | YES |
+| bat_side | VARCHAR | YES |
+| pitch_hand | VARCHAR | YES |
+| launch_speed | REAL | YES |
+| launch_angle | REAL | YES |
+| hit_distance | REAL | YES |
+| event_type | TEXT | YES |
+| event | TEXT | YES |
+| created_at | TIMESTAMPTZ | YES |
+
+### staging.live_batted_balls
+**PK**: `(game_pk, at_bat_index)` — Live game feed batted ball data (schema only, 0 rows).
+
+| Column | Type | Nullable |
+|--------|------|----------|
+| game_pk | BIGINT | NO |
+| at_bat_index | INT | NO |
+| game_date | DATE | NO |
+| batter_id | BIGINT | NO |
+| pitcher_id | BIGINT | NO |
+| batter_name | TEXT | YES |
+| pitcher_name | TEXT | YES |
+| team_id | INT | YES |
+| inning | SMALLINT | YES |
+| half_inning | TEXT | YES |
+| launch_speed | REAL | YES |
+| launch_angle | REAL | YES |
+| hit_distance | REAL | YES |
+| event_type | TEXT | YES |
+| event | TEXT | YES |
+| pitch_speed | REAL | YES |
+| pitch_type | TEXT | YES |
+| bat_side | VARCHAR | YES |
+| pitch_hand | VARCHAR | YES |
+| created_at | TIMESTAMPTZ | YES |
 
 ---
 
