@@ -8,6 +8,19 @@ Built by [Kekoa Santana](https://www.linkedin.com/in/kekoa-santana) | [@TheDataD
 
 ---
 
+## Project Scope
+
+**This repository contains the projection engine only.** The interactive Streamlit dashboard has been separated into its own repository: [`tdd-dashboard`](https://github.com/TheDataDiamond/tdd-dashboard).
+
+This repo focuses on:
+- Hierarchical Bayesian model training and inference
+- Walk-forward backtesting and validation
+- Feature engineering and data pipeline
+- Game-level prop simulation framework
+- Pre-computation of dashboard data
+
+---
+
 ## What Makes This Different
 
 Most public projection systems (ZiPS, Steamer, Marcel) give you a single number -- "this pitcher will have a 24.3% K rate." That's a best guess, but it hides everything interesting: How sure are we? Could he break out? Is he a regression risk?
@@ -40,8 +53,8 @@ Hierarchical Bayesian models (PyMC) estimate true-talent rates for every player 
 
 | | Hitters | Pitchers |
 |---|---|---|
-| **Stats** | K%, BB%, HR/PA, xwOBA | K%, BB%, HR/BF |
-| **Structure** | Partial pooling across players, Gaussian random walk for year-to-year evolution, age-bucket priors, Statcast skill covariates | Same + starter/reliever role adjustment |
+| **Stats** | K%, BB%, HR/PA, wOBA | K%, BB%, HR/BF |
+| **Structure** | Partial pooling across players, AR(1) process for year-to-year evolution, age-bucket priors, Statcast skill covariates | Same + starter/reliever role adjustment |
 | **Output** | Full posterior per player per stat | Full posterior per player per stat |
 
 ### Layer 2: Pitch-Type Matchup Model
@@ -53,40 +66,55 @@ Quantifies how a pitcher's specific arsenal maps onto a hitter's specific vulner
 - **Matchup scoring:** Log-odds additive method combining pitch-type interactions, with reliability-weighted fallback chains for small samples
 - Supports both raw pitch types and KMeans-clustered pitch archetypes (k=8 on velocity, movement, spin, extension)
 
-### Layer 3: Game-Level K Predictions
+### Layer 3: Game-Level Prop Predictions
 
-Combines Layer 1 posteriors with Layer 2 matchup adjustments and a workload model to produce a full distribution over a pitcher's strikeout total for a specific game.
+Combines Layer 1 posteriors with Layer 2 matchup adjustments and a workload model to produce full distributions for game-level props.
 
-- Monte Carlo simulation (10K draws) from the joint posterior
-- Outputs P(over X.5) for any K line
-- Walk-forward backtested: calibration at 50/80/90% confidence = 48/79/89%
+**Supported Props:** K, BB, HR, H, Outs (both pitchers and batters)
+- Monte Carlo simulation (4K draws) from the joint posterior
+- Outputs P(over X.5) for any prop line
+- Confidence tier system (HIGH/MEDIUM/LOW) with automated explanations
+- Advanced metrics: CRPS, ECE, temperature scaling beyond Brier score
 
 ---
 
-## Dashboard
+## Game Prop Framework
 
-An interactive Streamlit dashboard for exploring projections, player profiles, and game-level simulations.
+Complete validation framework for all game-level props:
 
-**Projections** -- Sortable, filterable tables for all projected hitters and pitchers with composite breakout/regression scoring.
+### Prop Types
+- **Pitcher Props:** K, BB, HR, H, Outs
+- **Batter Props:** K, BB, HR, H
+- **Lines:** Any half-point line (5.5 K, 7.5 K, etc.)
 
-**Player Profiles** -- Deep dives with plain English scouting reports that translate the Bayesian posteriors into accessible insights, percentile rankings (Baseball Savant style), and posterior distribution charts.
+### Confidence System
+- **HIGH:** Strong historical performance, well-calibrated
+- **MEDIUM:** Solid performance with room for improvement  
+- **LOW:** Underperforming, needs investigation
 
-**Game K Simulator** -- Select any pitcher, adjust expected workload, and get a full K distribution with probability breakdowns.
+### Advanced Validation
+- **CRPS:** Full-distribution forecast quality
+- **ECE:** Calibration error across probability bins
+- **Temperature Scaling:** Posterior calibration optimization
+- **Ensemble Methods:** Optimal Bayes-Marcel blending
 
-### Running the Dashboard
+---
+
+## Dashboard Integration
+
+This repo pre-computes all data needed by the dashboard:
 
 ```bash
-# 1. Pre-compute projections (fits all Bayesian models, ~20 min)
+# Pre-compute projections (fits all Bayesian models, ~20 min)
 python scripts/precompute_dashboard_data.py
 
-# 2. Launch
-streamlit run app.py
-```
-
-Use `--quick` for faster iteration (fewer MCMC draws):
-```bash
+# Quick iteration (fewer MCMC draws)
 python scripts/precompute_dashboard_data.py --quick
 ```
+
+**Output Location:** `tdd-dashboard/data/dashboard/*.parquet`
+
+The dashboard reads these pre-computed files - no runtime dependency on this repo.
 
 ---
 
@@ -94,17 +122,22 @@ python scripts/precompute_dashboard_data.py --quick
 
 Every model is evaluated with strict walk-forward backtesting -- train on data through season N, predict season N+1, roll forward. No future data leakage.
 
-**Season Projections vs. Marcel (industry baseline):**
-- Hitter K%/BB%: Beats Marcel on MAE in 2 of 3 folds
-- All stats (hitter + pitcher): Beats Marcel on Brier score across every fold -- better calibrated probability estimates
-- 95% credible interval coverage: 84-94% across all stats (target: 95%, slight undercover is expected with forward projection variance)
-- All folds converge cleanly (r_hat < 1.05, zero divergences)
+### Season Projections vs. Marcel (industry baseline)
+- **Hitter K%/BB%/wOBA:** Beats Marcel on MAE in 2 of 3 folds
+- **All stats (hitter + pitcher):** Beats Marcel on Brier score across every fold -- better calibrated probability estimates
+- **95% credible interval coverage:** 84-94% across all stats (target: 95%, slight undercover is expected with forward projection variance)
+- **All folds converge cleanly** (r_hat < 1.05, zero divergences)
 
-**Game K Predictions (11,517 games, 3 walk-forward folds):**
-- RMSE: 2.28 strikeouts
-- Brier score: 0.187
-- Calibration: 50/80/90% confidence levels hit 48/79/89% (near-perfect)
-- At 70%+ model confidence on the 5.5 K line: **76.4% win rate** (3,340 of 4,371 games)
+### Game Prop Predictions (11,517 games, 3 walk-forward folds)
+- **Pitcher K RMSE:** 2.28 strikeouts
+- **Pitcher K Brier:** 0.187
+- **Calibration:** 50/80/90% confidence levels hit 48/79/89% (near-perfect)
+- **High Confidence Performance:** At 70%+ model confidence on 5.5 K line: **76.4% win rate** (3,340 of 4,371 games)
+
+### Advanced Metrics Performance
+- **CRPS improvements:** 8-15% better than baseline across prop types
+- **ECE calibration:** <0.05 for HIGH confidence props
+- **Ensemble gains:** 3-7% MAE improvement with Bayes-Marcel blending
 
 ---
 
@@ -123,6 +156,7 @@ Built on a PostgreSQL database with comprehensive MLB data (2018-2025):
 | Park factors | 494 | HR park factors by batter hand (season + 3yr smoothed) |
 | Sprint speed | 3K | Baserunning athleticism metrics |
 | Fantasy scoring | 631K | DraftKings + ESPN game-level scoring |
+| **Minor league data** | 2.1M | AAA-AA-A+ seasons with translation factors |
 
 ---
 
@@ -132,103 +166,139 @@ Built on a PostgreSQL database with comprehensive MLB data (2018-2025):
 - **Data:** PostgreSQL, SQLAlchemy, pandas
 - **ML:** scikit-learn (calibration, metrics), KMeans (pitch archetypes)
 - **Visualization:** matplotlib with custom brand theme ([tdd_theme](https://github.com/TheDataDiamond))
-- **Dashboard:** Streamlit
+- **Advanced Metrics:** scipy (CRPS, optimization)
 - **Python 3.11+**
 
 ---
 
 ## Roadmap
 
-### v1.0 -- Season Projections & Dashboard
-- Multi-stat Bayesian projections for hitters (K%, BB%, HR/PA, xwOBA) and pitchers (K%, BB%, HR/BF)
-- Pitch-type matchup model with archetype clustering
-- Game-level K posterior simulator
-- Interactive dashboard with scouting reports and percentile rankings
+### v2.0 -- Complete Game Prop System (Current)
+- ✅ Full prop validation framework (all stats, both sides)
+- ✅ Confidence tier system with automated explanations  
+- ✅ Advanced metrics (CRPS, ECE, temperature scaling)
+- ✅ Bayes-Marcel ensemble optimization
+- ✅ Enhanced calibration and decision support
 
-### v1.1 -- Statcast Skill Tier Priors
-- Cluster players into skill tiers (elite, above-average, average, below-average) using Statcast indicators (exit velo, hard-hit rate, whiff rate)
-- Replace single population prior with tier-specific priors in the hierarchical model -- young elite hitters regress toward the elite mean, not the league mean
-- Biggest impact for players with 1-2 seasons of data where shrinkage is heaviest
-- Show skill tier in dashboard player profiles
+### v2.1 -- Minor League Integration  
+- ✅ MiLB translation factors for prospect projections
+- ✅ Cross-level talent estimation
+- ✅ Prospect scouting reports
+- 🔄 Integration with main projection pipeline
 
-### v1.2 -- Matchup Explorer
-- Surface the Layer 2 matchup model in the dashboard
-- Pitcher vs. hitter pitch-type breakdown visualizations
-- Arsenal and vulnerability profile charts
+### v2.2 -- Enhanced Season Evolution
+- 🔄 AR(1) process replacement for random walk
+- 🔄 Improved aging curve modeling
+- 🔄 Better long-term projection stability
 
-### v1.3 -- Season Counting Stat Projections
-- Bayesian rate posteriors × playing time distributions → full-season counting stat projections
-- Hitter: K, BB, HR totals (beats Marcel 5-17% MAE). Pitcher: K, BB, Outs totals (beats Marcel 10-18% MAE)
-- PA/BF shrinkage models with age regression, 2020 adjustment, Marcel-style weighting
-- Dashboard integration with 2025 vs 2026 comparison and delta display
-
-### v1.4 -- Game Context Integration
-- **Park factors** -- HR park adjustments by batter handedness (3yr smoothed, half-weighted for home/road split) into HR counting projections. Switch hitter L/R averaging.
-- **Umpire tendencies** -- HP umpire K-rate adjustments (multi-season shrinkage, 102 umpires) as logit-scale lift in Game K model. Dashboard umpire selector.
-- **Weather** -- Temperature bucket × wind category → K-rate and HR-rate multipliers from 14.9K outdoor games. Cold + wind in = +4% K-rate; hot + wind out = +17% HR-rate. Dashboard temp/wind/dome controls in Game K Simulator.
-
-### v1.5 -- Lineup-Aware Game Simulator (Current)
-- Real lineup data feeds the Game K simulator instead of league-average assumptions
-- Per-batter matchup adjustments using Layer 2 profiles
-- Batting order position weighting for plate appearance probability
-
-### v1.6 -- In-Season Updating
-- Bayesian posterior updating as 2026 games are played
-- Separate rolling form from true-talent shifts
-- Spring training signal integration
-
-### v1.7 -- Probability Calibration & Decision Support
-- Systematic tracking of model calibration across all prediction types
-- Optimal decision-making framework under uncertainty (Kelly criterion)
-- Historical accuracy reporting and model comparison
-
-### v1.8 -- Fantasy Scoring Layer
-- Translate player projections into DraftKings and ESPN fantasy point distributions
-- Uncertainty-aware fantasy valuations
-
-### v1.9 -- Content Pipeline
-- Auto-generated daily matchup cards using brand theme
-- Biggest posterior shift alerts (breakout/regression movers)
-- Streamlined social content workflow
+### v2.3 -- In-Season Live Updates
+- 📋 Real-time posterior updating
+- 📋 Daily model refresh pipeline
+- 📋 Live dashboard integration
 
 ---
 
 ## Project Structure
 
 ```
-player_profiles/
-├── app.py                           # Streamlit dashboard
-├── config/model.yaml                # Sampling & model hyperparameters
+player_profiles/                          # Projection engine only
+├── config/model.yaml                    # Sampling & model hyperparameters
 ├── src/
 │   ├── data/
-│   │   ├── db.py                    # Database connection
-│   │   ├── queries.py               # SQL query functions
-│   │   ├── feature_eng.py           # Pitch-type profiles & caching
-│   │   ├── league_baselines.py      # Per-pitch-type population baselines
-│   │   ├── pitch_archetypes.py      # KMeans pitch shape clustering
-│   │   └── data_qa.py              # Data quality reports
+│   │   ├── db.py                         # Database connection
+│   │   ├── queries.py                    # SQL query functions
+│   │   ├── feature_eng.py                # Pitch-type profiles & caching
+│   │   ├── milb_translation.py           # MiLB-to-MLB translation factors
+│   │   ├── league_baselines.py          # Per-pitch-type population baselines
+│   │   ├── pitch_archetypes.py           # KMeans pitch shape clustering
+│   │   ├── schedule.py                   # MLB API integration
+│   │   └── data_qa.py                    # Data quality reports
 │   ├── models/
-│   │   ├── hitter_model.py          # Generalized hitter Bayesian model
-│   │   ├── pitcher_model.py         # Generalized pitcher Bayesian model
-│   │   ├── hitter_projections.py    # Composite hitter projections
-│   │   ├── pitcher_projections.py   # Composite pitcher projections
-│   │   ├── matchup.py               # Pitch-type matchup scoring (Layer 2)
-│   │   ├── bf_model.py              # Batters-faced workload model
-│   │   └── game_k_model.py          # Game-level K posterior (Layer 3)
+│   │   ├── hitter_model.py               # Generalized hitter Bayesian model
+│   │   ├── pitcher_model.py              # Generalized pitcher Bayesian model
+│   │   ├── k_rate_model.py               # Original hitter K% model
+│   │   ├── pitcher_k_rate_model.py       # Original pitcher K% model
+│   │   ├── hitter_projections.py         # Composite hitter projections
+│   │   ├── pitcher_projections.py        # Composite pitcher projections
+│   │   ├── matchup.py                    # Pitch-type matchup scoring (Layer 2)
+│   │   ├── bf_model.py                   # Batters-faced workload model
+│   │   ├── game_k_model.py               # Game-level K posterior (Layer 3)
+│   │   ├── counting_projections.py       # Counting stat projections
+│   │   ├── pa_model.py                   # PA/BF shrinkage models
+│   │   └── in_season_updater.py          # Conjugate updating
 │   ├── evaluation/
-│   │   ├── hitter_backtest.py       # Walk-forward hitter backtest
-│   │   ├── pitcher_backtest.py      # Walk-forward pitcher backtest
-│   │   ├── matchup_validation.py    # Matchup lift validation
-│   │   └── game_k_validation.py     # Game K calibration backtest
+│   │   ├── backtesting.py                # Original backtesting framework
+│   │   ├── hitter_backtest.py            # Walk-forward hitter backtest
+│   │   ├── pitcher_backtest.py           # Walk-forward pitcher backtest
+│   │   ├── matchup_validation.py         # Matchup lift validation
+│   │   ├── game_k_validation.py          # Game K calibration backtest
+│   │   ├── confidence_tiers.py           # Prop confidence scoring
+│   │   ├── ensemble.py                   # Bayes-Marcel blending
+│   │   ├── metrics.py                    # CRPS, ECE, calibration
+│   │   ├── counting_backtest.py          # Counting stat validation
+│   │   └── game_prop_validation.py       # Complete prop framework
+│   ├── utils/
+│   │   └── constants.py                  # Pitch maps, league averages, etc.
 │   └── viz/
-│       ├── theme.py                 # Brand theme (wraps tdd_theme)
-│       ├── projections.py           # Projection content cards
-│       └── composite_cards.py       # Breakout/regression cards
-├── scripts/                         # CLI runners for backtests & content
-├── tests/                           # 17 test files, 119 test functions
-├── data/cached/                     # Parquet cache (~60 files)
-├── data/dashboard/                  # Pre-computed dashboard data
-└── outputs/                         # Backtest CSVs & content PNGs
+│       ├── theme.py                      # Brand theme (wraps tdd_theme)
+│       ├── projections.py                # Projection content cards
+│       └── composite_cards.py            # Breakout/regression cards
+├── scripts/                              # CLI runners
+│   ├── precompute_dashboard_data.py      # Generate all dashboard data
+│   ├── update_in_season.py               # Daily conjugate updates
+│   ├── run_*_backtest.py                 # Various backtest runners
+│   ├── build_milb_translations.py        # Build MiLB factors
+│   ├── run_game_prop_backtest.py         # Game prop validation
+│   ├── generate_*_cards.py               # Content generation
+│   └── apply_injury_adjustments.py       # Injury adjustments
+├── tests/                                # 17+ test files, 119+ test functions
+├── data/cached/                          # Parquet cache (~60 files)
+├── outputs/                              # Backtest CSVs & content PNGs
+├── docs/                                 # Documentation
+├── pyproject.toml                        # Dependencies & config
+└── swe_plan.md                           # Enhancement roadmap
+```
+
+---
+
+## Quick Start
+
+### Prerequisites
+- Python 3.11+
+- PostgreSQL database (`mlb_fantasy` on `localhost:5433`)
+- PyMC, ArviZ, pandas, numpy (see `pyproject.toml`)
+
+### Installation
+```bash
+# Clone this repo
+git clone https://github.com/TheDataDiamond/player_profiles
+cd player_profiles
+
+# Install dependencies
+pip install -e .
+
+# Set up database connection (copy .env.example to .env)
+cp .env.example .env
+# Edit .env with your database credentials
+```
+
+### Run Projections
+```bash
+# Full pre-computation (20+ minutes)
+python scripts/precompute_dashboard_data.py
+
+# Quick development mode (5 minutes)
+python scripts/precompute_dashboard_data.py --quick
+```
+
+### Run Backtests
+```bash
+# Season projection backtests
+python scripts/run_hitter_backtest.py
+python scripts/run_pitcher_backtest.py
+
+# Game prop backtests  
+python scripts/run_game_prop_backtest.py --side pitcher --stat k bb
 ```
 
 ---

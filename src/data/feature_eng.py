@@ -721,6 +721,21 @@ def build_multi_season_hitter_data(
         df = get_cached_season_totals_with_age(s, force_rebuild=False)
         if min_pa > 1:
             df = df[df["pa"] >= min_pa]
+
+        # Merge approach metrics (whiff_rate, chase_rate, z_contact_pct, fb_pct)
+        try:
+            obs = get_cached_hitter_observed_profile(s)
+            merge_cols = ["batter_id"]
+            for col in ["whiff_rate", "chase_rate", "z_contact_pct", "fb_pct"]:
+                if col in obs.columns:
+                    merge_cols.append(col)
+            df = df.merge(obs[merge_cols], on="batter_id", how="left")
+        except Exception:
+            logger.warning("No hitter observed profile for %d, skipping merge", s)
+            for col in ["whiff_rate", "chase_rate", "z_contact_pct", "fb_pct"]:
+                if col not in df.columns:
+                    df[col] = np.nan
+
         frames.append(df)
 
     combined = pd.concat(frames, ignore_index=True)
@@ -914,6 +929,20 @@ def build_multi_season_pitcher_data(
             on="pitcher_id",
             how="left",
         )
+
+        # Merge observed profile (zone_pct, gb_pct, avg_velo)
+        try:
+            obs = get_cached_pitcher_observed_profile(s)
+            merge_cols = ["pitcher_id"]
+            for col in ["zone_pct", "gb_pct", "avg_velo"]:
+                if col in obs.columns:
+                    merge_cols.append(col)
+            merged = merged.merge(obs[merge_cols], on="pitcher_id", how="left")
+        except Exception:
+            logger.warning("No pitcher observed profile for %d, skipping merge", s)
+            for col in ["zone_pct", "gb_pct", "avg_velo"]:
+                if col not in merged.columns:
+                    merged[col] = np.nan
 
         # Derive starter/reliever role
         merged["is_starter"] = (

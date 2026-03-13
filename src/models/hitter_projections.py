@@ -39,7 +39,7 @@ from src.models.hitter_model import (
 logger = logging.getLogger(__name__)
 
 # Only project stable stats with the Bayesian model
-ALL_STATS = ["k_rate", "bb_rate", "hr_rate", "woba"]
+ALL_STATS = ["k_rate", "bb_rate", "gb_rate", "fb_rate", "hr_per_fb"]
 
 # --------------------------------------------------------------------------
 # Composite dimension weights and components

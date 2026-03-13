@@ -8,8 +8,8 @@ Supports multiple target stats with appropriate likelihoods:
 All share the same model structure:
 - Age-bucket population priors (young/prime/veteran)
 - Player-level random intercepts (non-centered)
-- Season random walk for talent evolution
-- Statcast covariates (barrel_pct, hard_hit_pct)
+- AR(1) season process for talent evolution
+- Stat-specific covariates (approach metrics, batted ball metrics)
 - Full posterior distributions per player per season
 
 Age buckets: 0=young(<=25), 1=prime(26-30), 2=veteran(31+)
@@ -73,8 +73,8 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         likelihood="binomial",
         league_avg=LEAGUE_AVG_OVERALL["k_rate"],
         covariates=[
-            ("barrel_pct", 0.0, 0.2, "barrel% → K%"),
-            ("hard_hit_pct", 0.0, 0.2, "hard_hit% → K%"),
+            ("chase_rate", 0.0, 0.2, "chase% → K%"),
+            ("whiff_rate", 0.0, 0.2, "whiff% → K%"),
         ],
         # empirical logit-scale yr-to-yr SD ≈ 0.24
         sigma_season_mu=0.20,
@@ -88,63 +88,55 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         likelihood="binomial",
         league_avg=LEAGUE_AVG_OVERALL["bb_rate"],
         covariates=[
-            ("barrel_pct", 0.0, 0.2, "barrel% → BB%"),
-            ("hard_hit_pct", 0.0, 0.2, "hard_hit% → BB%"),
+            ("chase_rate", 0.0, 0.2, "chase% → BB%"),
+            ("z_contact_pct", 0.0, 0.2, "z_contact% → BB%"),
         ],
         # empirical logit-scale yr-to-yr SD ≈ 0.33
         sigma_season_mu=0.25,
         sigma_season_floor=0.20,
     ),
-    "hr_rate": StatConfig(
-        name="hr_rate",
-        count_col="hr",
-        trials_col="pa",
-        rate_col="hr_rate",
+    "gb_rate": StatConfig(
+        name="gb_rate",
+        count_col="gb",
+        trials_col="bip_with_la",
+        rate_col="gb_rate",
         likelihood="binomial",
-        league_avg=0.033,  # ~3.3% HR/PA league avg
-        covariates=[
-            ("barrel_pct", 0.0, 0.3, "barrel% → HR/PA"),
-            ("hard_hit_pct", 0.0, 0.2, "hard_hit% → HR/PA"),
-        ],
-        sigma_player_prior=0.8,
-        # empirical logit-scale yr-to-yr SD ≈ 0.54 — HR power is volatile
-        sigma_season_mu=0.40,
-        sigma_season_floor=0.35,
+        league_avg=LEAGUE_AVG_OVERALL["gb_rate"],
+        # No covariates — GB% is stable enough (r=0.73) for hierarchical
+        # structure + AR(1) to handle. LA-based covariates would be circular.
+        covariates=[],
+        # empirical logit-scale yr-to-yr SD ≈ 0.20
+        sigma_season_mu=0.18,
+        sigma_season_floor=0.14,
     ),
-    "xwoba": StatConfig(
-        name="xwoba",
-        count_col="xwoba_avg",
-        trials_col="pa",  # used as weight, not binomial n
-        rate_col="xwoba_avg",
-        likelihood="normal",
-        league_avg=LEAGUE_AVG_OVERALL["xwoba"],
-        covariates=[
-            ("barrel_pct", 0.0, 0.3, "barrel% → xwOBA"),
-            ("hard_hit_pct", 0.0, 0.3, "hard_hit% → xwOBA"),
-        ],
-        sigma_player_prior=0.5,
-        # empirical natural-scale yr-to-yr SD ≈ 0.042
-        sigma_season_mu=0.035,
-        sigma_season_floor=0.025,
-        sigma_obs_prior=0.10,
+    "fb_rate": StatConfig(
+        name="fb_rate",
+        count_col="fb",
+        trials_col="bip_with_la",
+        rate_col="fb_rate",
+        likelihood="binomial",
+        league_avg=LEAGUE_AVG_OVERALL["fb_rate"],
+        # No covariates — same rationale as GB%
+        covariates=[],
+        # empirical logit-scale yr-to-yr SD ≈ 0.22
+        sigma_season_mu=0.18,
+        sigma_season_floor=0.14,
     ),
-    "woba": StatConfig(
-        name="woba",
-        count_col="woba",
-        trials_col="pa",  # used as weight, not binomial n
-        rate_col="woba",
-        likelihood="normal",
-        league_avg=LEAGUE_AVG_OVERALL["woba"],
-        covariates=[
-            ("xwoba_avg", 0.0, 0.3, "xwOBA → wOBA"),
-            ("barrel_pct", 0.0, 0.2, "barrel% → wOBA"),
-        ],
+    "hr_per_fb": StatConfig(
+        name="hr_per_fb",
+        count_col="hr_fb",
+        trials_col="fb",
+        rate_col="hr_per_fb",
+        likelihood="binomial",
+        league_avg=LEAGUE_AVG_OVERALL["hr_per_fb"],
+        # No covariates: barrel_pct (r=0.39 YoY) too unstable, and both
+        # barrel_pct + hard_hit_pct are collinear with each other and
+        # partially circular with HR/FB — caused ESS collapse in 2/3 folds.
+        covariates=[],
         sigma_player_prior=0.5,
-        # wOBA is noisier than xwOBA (r≈0.45 vs 0.75 YoY)
-        # Natural-scale yr-to-yr SD ≈ 0.050
-        sigma_season_mu=0.040,
-        sigma_season_floor=0.030,
-        sigma_obs_prior=0.10,
+        # empirical logit-scale yr-to-yr SD ≈ 0.45 — HR/FB is volatile
+        sigma_season_mu=0.35,
+        sigma_season_floor=0.28,
     ),
 }
 
@@ -252,7 +244,7 @@ def build_hitter_model(
     ---------------
     - Age-bucket population means on logit/natural scale
     - Player-level random intercepts (non-centered)
-    - Season random walk for talent evolution
+    - AR(1) season process for talent evolution
     - Statcast covariates shift the linear predictor
     - Binomial or Normal likelihood depending on stat type
 
@@ -309,7 +301,7 @@ def build_hitter_model(
             mu_pop[age_bucket, skill_tier] + sigma_player * alpha_raw,
         )
 
-        # --- Season random walk ---
+        # --- AR(1) season process ---
         # LogNormal prior resists collapsing to zero; centered on empirical
         # year-to-year volatility (logit scale for binomial, natural for normal)
         sigma_season = pm.LogNormal(
@@ -317,20 +309,23 @@ def build_hitter_model(
             mu=np.log(cfg.sigma_season_mu),
             sigma=0.5,
         )
+        rho = pm.Beta("rho", alpha=8, beta=2)  # high persistence prior (~0.8)
 
         if n_seasons > 1:
             innovation = pm.Normal(
                 "innovation", mu=0, sigma=1,
-                shape=(n_players, n_seasons - 1),
+                shape=(n_players, n_seasons),
             )
-            cum_innov = pt.concatenate(
-                [
-                    pt.zeros((n_players, 1)),
-                    pt.cumsum(sigma_season * innovation, axis=1),
-                ],
-                axis=1,
+            # Build AR(1) process iteratively
+            season_0 = (sigma_season * innovation[:, 0]).dimshuffle(0, "x")
+            ar_components = [season_0]
+            for t in range(1, n_seasons):
+                prev = ar_components[-1][:, -1]
+                cur = rho * prev + sigma_season * innovation[:, t]
+                ar_components.append(cur.dimshuffle(0, "x"))
+            season_effect = pm.Deterministic(
+                "season_effect", pt.concatenate(ar_components, axis=1)
             )
-            season_effect = pm.Deterministic("season_effect", cum_innov)
         else:
             season_effect = pt.zeros((n_players, 1))
 
@@ -536,16 +531,42 @@ def extract_rate_samples(
         else:
             sigma_draws = sigma_samples
 
+        # Get rho for AR(1) dampening
+        if "rho" in trace.posterior:
+            rho_samples = trace.posterior["rho"].values.flatten()
+            if len(rho_samples) != len(samples):
+                rho_draws = rng.choice(rho_samples, size=len(samples), replace=True)
+            else:
+                rho_draws = rho_samples
+        else:
+            rho_draws = np.ones(len(samples))  # fallback: pure random walk
+
+        # Extract alpha (player intercept) to compute season effect
+        alpha_post = trace.posterior["alpha"].values
+        alpha_flat = alpha_post.reshape(-1, alpha_post.shape[-1])
+        pidx = data["player_map"][batter_id]
+        alpha_draws = alpha_flat[:, pidx]
+        if len(alpha_draws) != len(samples):
+            alpha_draws = rng.choice(alpha_draws, size=len(samples), replace=True)
+
+        innovation = rng.normal(0, sigma_draws)
+
         if cfg.likelihood == "binomial":
-            # Project on logit scale
+            # Project on logit scale with AR(1)
+            # Treat logit(rate) - alpha as the total deviation (season_effect
+            # + covariate contributions).  Applying rho to the whole deviation
+            # implicitly regresses both the season effect and covariates,
+            # which is correct — covariate values also regress toward the mean.
             eps = np.clip(samples, 1e-6, 1 - 1e-6)
             logit_samples = np.log(eps / (1 - eps))
-            innovation = rng.normal(0, sigma_draws)
-            samples = 1.0 / (1.0 + np.exp(-(logit_samples + innovation)))
+            deviation_last = logit_samples - alpha_draws
+            new_deviation = rho_draws * deviation_last + innovation
+            samples = 1.0 / (1.0 + np.exp(-(alpha_draws + new_deviation)))
         else:
-            # Project on natural scale
-            innovation = rng.normal(0, sigma_draws)
-            samples = samples + innovation
+            # Project on natural scale with AR(1)
+            deviation_last = samples - alpha_draws
+            new_deviation = rho_draws * deviation_last + innovation
+            samples = alpha_draws + new_deviation
 
     return samples
 
@@ -566,6 +587,8 @@ def check_convergence(trace: az.InferenceData, stat: str) -> dict[str, Any]:
     """
     cfg = STAT_CONFIGS[stat]
     var_names = ["mu_pop", "sigma_player", "sigma_season"]
+    if "rho" in trace.posterior:
+        var_names.append("rho")
     for col_name, _, _, _ in cfg.covariates:
         var_names.append(f"beta_{col_name}")
     if cfg.likelihood == "normal":

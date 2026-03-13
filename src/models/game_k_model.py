@@ -193,8 +193,8 @@ def extract_pitcher_k_rate_samples(
     season : int
         Season whose posterior to extract.
     project_forward : bool
-        If True, add sigma_season innovation noise to simulate
-        one step of the random walk (for out-of-sample prediction).
+        If True, add AR(1) forward projection noise (for out-of-sample
+        prediction). Uses rho dampening on the season effect.
     random_seed : int
         For reproducibility of forward projection noise.
 
@@ -234,10 +234,34 @@ def extract_pitcher_k_rate_samples(
             sigma_draws = rng.choice(sigma_samples, size=len(samples), replace=True)
         else:
             sigma_draws = sigma_samples
-        # Add random walk innovation on logit scale
+
+        # Get rho for AR(1) dampening
+        if "rho" in trace.posterior:
+            rho_samples = trace.posterior["rho"].values.flatten()
+            if len(rho_samples) != len(samples):
+                rho_draws = rng.choice(rho_samples, size=len(samples), replace=True)
+            else:
+                rho_draws = rho_samples
+        else:
+            rho_draws = np.ones(len(samples))  # fallback: pure random walk
+
+        # AR(1) forward projection on logit scale
         logit_samples = _safe_logit(samples)
         innovation = rng.normal(0, sigma_draws)
-        samples = expit(logit_samples + innovation)
+
+        # Extract alpha to compute season effect
+        alpha_post = trace.posterior["alpha"].values
+        alpha_flat = alpha_post.reshape(-1, alpha_post.shape[-1])
+        pidx = data["player_map"][pitcher_id]
+        alpha_draws = alpha_flat[:, pidx]
+        if len(alpha_draws) != len(samples):
+            alpha_draws = rng.choice(alpha_draws, size=len(samples), replace=True)
+
+        # season_effect_last = logit(rate) - alpha
+        season_effect_last = logit_samples - alpha_draws
+        # AR(1) forward: new_effect = rho * last_effect + innovation
+        new_effect = rho_draws * season_effect_last + innovation
+        samples = expit(alpha_draws + new_effect)
 
     return samples
 

@@ -48,6 +48,7 @@ player_profiles/
 │   │   ├── feature_eng.py       # Vulnerability/strength profiles + caching
 │   │   ├── league_baselines.py  # Per (pitch_type/archetype, batter_stand) baselines
 │   │   ├── pitch_archetypes.py  # KMeans k=8 pitch shape clustering
+│   │   ├── milb_translation.py  # MiLB-to-MLB translation factors
 │   │   ├── schedule.py          # MLB Stats API schedule/lineup fetcher
 │   │   └── data_qa.py           # Data quality / sanity reports
 │   ├── models/
@@ -70,7 +71,12 @@ player_profiles/
 │   │   ├── hitter_backtest.py       # Generalized hitter walk-forward backtest
 │   │   ├── pitcher_backtest.py      # Generalized pitcher walk-forward backtest
 │   │   ├── matchup_validation.py    # In-season matchup lift validation
-│   │   └── game_k_validation.py     # Full game-level K backtest
+│   │   ├── game_k_validation.py     # Full game-level K backtest
+│   │   ├── confidence_tiers.py      # Prop confidence scoring system
+│   │   ├── ensemble.py              # Bayes-Marcel ensemble blending
+│   │   ├── metrics.py               # CRPS, ECE, temperature scaling
+│   │   ├── counting_backtest.py     # Counting stat validation
+│   │   └── game_prop_validation.py  # Complete game prop framework
 │   └── viz/
 │       ├── theme.py                 # The Data Diamond brand theme
 │       ├── projections.py           # K% mover cards, individual pitcher cards
@@ -83,9 +89,11 @@ player_profiles/
 │   ├── run_pitcher_backtest.py        # Multi-stat pitcher backtest runner
 │   ├── run_counting_backtest.py       # Counting stat backtest runner
 │   ├── run_game_k_backtest.py         # Game-level K backtest runner
+│   ├── run_game_prop_backtest.py      # Game prop validation runner
 │   ├── generate_preseason_content.py  # 2026 K% mover cards
 │   ├── generate_composite_cards.py    # Composite breakout/regression cards
 │   ├── build_preseason_injuries.py    # Preseason injury data
+│   ├── build_milb_translations.py     # Build MiLB translation factors
 │   ├── apply_injury_adjustments.py    # Adjust counting projections for injuries
 │   ├── backfill_dim_player.py         # One-time dim_player rebuild
 │   ├── cross_year_corr.py             # Year-to-year correlation analysis
@@ -136,13 +144,13 @@ These are copied (not linked) to the dashboard repo. Sync when function signatur
 ### Layer 1: Season-Level Bayesian Projections (PyMC)
 **Purpose:** Estimate true-talent rates for pitchers and hitters with proper uncertainty.
 
-**Target stats (hitters):** K%, BB%
+**Target stats (hitters):** K%, BB%, wOBA
 **Target stats (pitchers):** K%, BB%
-**Observed stats used as priors:** xwOBA, HR/PA, barrel rate, hard-hit rate, sprint speed, whiff rate, chase rate, etc.
+**Observed stats used as priors:** wOBA, HR/PA, barrel rate, hard-hit rate, sprint speed, whiff rate, chase rate, etc.
 
 **Model structure:**
 - Hierarchical partial pooling across players (shrink small samples toward population)
-- Gaussian random walk for year-to-year talent evolution
+- AR(1) process for year-to-year talent evolution (mean-reverting, rho ~ Beta(8,2))
 - Age-bucket population priors (3 buckets) × Statcast skill tier (4 tiers)
 - Binomial/Beta observation model for rate stats
 - LogNormal sigma_season with floor for forward projection uncertainty
@@ -163,6 +171,44 @@ Both pitch_type and pitch_archetype (KMeans k=8) scoring available.
 
 **Inputs:** K% posterior (Layer 1) + matchup lifts (Layer 2) + BF distribution + umpire/weather adjustments
 **Output:** P(over X.5) for K prop lines, posterior distribution over total Ks
+
+## Game Prop Framework
+
+Complete validation system for game-level props:
+
+### Supported Props
+- **Pitcher Props:** K, BB, HR, H, Outs
+- **Batter Props:** K, BB, HR, H
+- **Lines:** Any half-point line (5.5 K, 7.5 K, etc.)
+
+### Confidence System
+- **HIGH:** Strong historical performance, well-calibrated
+- **MEDIUM:** Solid performance with room for improvement
+- **LOW:** Underperforming, needs investigation
+
+### Advanced Validation
+- **CRPS:** Full-distribution forecast quality
+- **ECE:** Calibration error across probability bins
+- **Temperature Scaling:** Posterior calibration optimization
+- **Ensemble Methods:** Optimal Bayes-Marcel blending
+
+### Key Files Added Recently
+```
+src/evaluation/
+├── confidence_tiers.py     # Prop confidence scoring
+├── ensemble.py             # Bayes-Marcel blending
+├── metrics.py              # CRPS, ECE, calibration
+├── counting_backtest.py    # Counting stat validation
+└── game_prop_validation.py # Complete prop framework
+
+src/data/
+├── milb_translation.py      # MiLB-to-MLB factors
+└── schedule.py              # MLB API integration
+
+scripts/
+├── run_game_prop_backtest.py # Game prop validation
+└── build_milb_translations.py # Build translation factors
+```
 
 ## Key Design Principles
 
@@ -235,9 +281,24 @@ Every model must be evaluated with:
 20. [x] Dashboard split complete — `tdd-dashboard/` repo with `lib/` synced modules
 21. [x] `precompute_dashboard_data.py` generates all 43+ parquets/npz for dashboard
 
+### Phase 7: Advanced Validation & Game Props — COMPLETE
+22. [x] Game prop validation framework (all stats, both sides)
+23. [x] Confidence tier system with automated explanations
+24. [x] Advanced metrics (CRPS, ECE, temperature scaling)
+25. [x] Bayes-Marcel ensemble optimization
+26. [x] Counting stat backtests (hitter + pitcher)
+27. [x] Minor league translation system
+
+### Phase 8: Model Enhancement — IN PROGRESS
+28. [ ] AR(1) process replacement for random walk
+29. [ ] wOBA projection (replacing xwOBA)
+30. [ ] Enhanced season evolution modeling
+
 ### Remaining
 - [ ] Betting edge finder and tracker (Kelly sizing)
 - [ ] Fix SB projections (Bayes loses to Marcel — era adjustment too blunt)
+- [ ] Complete AR(1) process implementation
+- [ ] wOBA model integration
 
 ## Projection Target
 - **Full seasons available:** 2018–2025
@@ -252,12 +313,38 @@ Every model must be evaluated with:
 - **Velocity trend acceleration** — real signal for in-season and injury risk.
 
 ### Skip (low incremental value for this architecture)
-- **Aging curve delta** — the random walk IS the aging adjustment.
+- **Aging curve delta** — the AR(1) process IS the aging adjustment.
 - **Pitch sequencing entropy** — thin evidence at season level.
 - **Player similarity embeddings** — hierarchical model already borrows strength.
 
 ## Key Findings
 - The sat_batted_balls.xwoba column has IEEE NaN float values (not SQL NULL), which poison PostgreSQL's AVG(). All queries use CASE WHEN xwoba != 'NaN' to handle this.
-- Hitter K% and BB% are the only stats stable enough for Bayesian projection (r=0.795, 0.706 YoY). xwOBA and HR/PA used as observed/informative priors only.
+- Hitter K% and BB% are the only stats stable enough for Bayesian projection (r=0.795, 0.706 YoY). wOBA and HR/PA used as observed/informative priors only.
 - Pitcher HR/BF (r=0.267) too noisy to project — replaced by GB% (r=0.619) as batted-ball indicator.
 - All queries filter `game_type = 'R'` (regular season only) — no spring training/postseason leakage.
+- **Counting stat performance:** Bayes beats Marcel on pitcher K (13.3% MAE improvement), BB (6.2% improvement), and Outs (15.4% improvement) with proper calibration.
+- **Game prop framework:** Complete validation system with confidence tiers and advanced metrics beyond Brier score.
+
+## AI Assistant Best Practices
+
+### When Analyzing Code
+1. **Always verify file existence** before referencing functions
+2. **Check actual parameter names** in function signatures  
+3. **Use grep_search** for finding function usage patterns
+4. **Read the actual implementation** before suggesting changes
+5. **Check model convergence** (r_hat < 1.05, ESS > 400, zero divergences)
+
+### When Making Recommendations  
+1. **Prioritize minimal changes** that address root causes
+2. **Explain the "why"** behind each suggestion
+3. **Consider the Bayesian framework** constraints
+4. **Test assumptions** against actual data when possible
+5. **Validate against backtest results** - Bayes should beat Marcel
+
+### Common Context Needed
+- Database schema verification (use psql commands)
+- Model convergence diagnostics (r_hat, ESS, divergences)
+- Backtest performance metrics (MAE improvement vs Marcel)
+- Current season targets (2026)
+- Counting stat validation results
+- Game prop confidence tier assignments

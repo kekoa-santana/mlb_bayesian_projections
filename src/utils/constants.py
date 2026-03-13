@@ -249,6 +249,10 @@ LEAGUE_AVG_OVERALL: dict[str, float] = {
     "chase_rate": 0.30,
     "csw_pct": 0.29,
     "hard_hit_rate": 0.33,
+    # Batted ball type rates (2022-2024 pooled, LA-based)
+    "gb_rate": 0.446,   # ground ball: LA < 10°
+    "fb_rate": 0.321,   # fly ball: LA > 25°
+    "hr_per_fb": 0.098, # HR per fly ball
 }
 
 # ---------------------------------------------------------------------------

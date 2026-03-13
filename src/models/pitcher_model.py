@@ -8,15 +8,15 @@ Supports multiple target stats with appropriate likelihoods:
 All share the same model structure:
 - Age-bucket population priors (young/prime/veteran)
 - Player-level random intercepts (non-centered)
-- Season random walk for talent evolution
+- AR(1) season process for talent evolution
 - Starter/reliever role covariate
 - Full posterior distributions per player per season
 
 Age buckets: 0=young(<=25), 1=prime(26-30), 2=veteran(31+)
 
-Note: Statcast covariates (whiff_rate, barrel_rate) are intentionally
-excluded — whiff_rate r=0.71 with K% collapses sigma_player. The
-hierarchical structure + random walk provide the calibration edge.
+Covariates tested for K%: whiff_rate (r=0.822), avg_velo (r=0.336),
+and both combined. None improve MAE vs Marcel — partial pooling already
+captures the signal. See docs/failed_hypotheses.md for details.
 """
 from __future__ import annotations
 
@@ -48,6 +48,12 @@ class PitcherStatConfig:
     rate_col: str          # pre-computed rate (e.g. "k_rate")
     likelihood: str        # "binomial"
     league_avg: float
+    # Covariate config: list of (col_name, prior_mu, prior_sigma, direction_label)
+    covariates: list[tuple[str, float, float, str]] = None
+    # Recency weighting: weight = decay^(max_season - season)
+    # decay=0.8 → 1.0, 0.8, 0.64, 0.51, 0.41 (≈ Marcel 5/4/3)
+    # decay=1.0 → no weighting (all seasons equal)
+    season_decay: float = 1.0
     # sigma_season prior: LogNormal(mu, 0.5)
     sigma_season_mu: float = 0.15
     sigma_season_floor: float = 0.0
@@ -64,6 +70,8 @@ PITCHER_STAT_CONFIGS: dict[str, PitcherStatConfig] = {
         rate_col="k_rate",
         likelihood="binomial",
         league_avg=LEAGUE_AVG_OVERALL["k_rate"],
+        covariates=[],
+        season_decay=1.0,  # no decay (tested 0.6, 0.8 — neither improves MAE)
         sigma_season_mu=0.22,
         sigma_season_floor=0.18,
     ),
@@ -74,6 +82,9 @@ PITCHER_STAT_CONFIGS: dict[str, PitcherStatConfig] = {
         rate_col="bb_rate",
         likelihood="binomial",
         league_avg=LEAGUE_AVG_OVERALL["bb_rate"],
+        covariates=[
+            ("zone_pct", 0.0, 0.2, "zone% → BB%"),
+        ],
         sigma_season_mu=0.28,
         sigma_season_floor=0.22,
     ),
@@ -84,6 +95,9 @@ PITCHER_STAT_CONFIGS: dict[str, PitcherStatConfig] = {
         rate_col="hr_per_bf",
         likelihood="binomial",
         league_avg=0.030,  # ~3.0% HR/BF league avg
+        covariates=[
+            ("gb_pct", 0.0, 0.2, "gb% → HR/BF"),
+        ],
         sigma_player_prior=0.8,
         sigma_season_mu=0.40,
         sigma_season_floor=0.35,
@@ -141,6 +155,40 @@ def prepare_pitcher_data(
                         "skill_tier", 1,
                     ))
 
+    # Z-score covariates
+    cov_arrays = {}
+    if cfg.covariates:
+        for col_name, _, _, _ in cfg.covariates:
+            if col_name not in df.columns:
+                df[col_name] = np.nan
+            vals = df[col_name].values.astype(float)
+            vals = np.nan_to_num(vals, nan=0.0)
+            mu, sd = vals.mean(), vals.std()
+            if np.isclose(sd, 0.0):
+                cov_arrays[col_name] = np.zeros_like(vals)
+            else:
+                cov_arrays[col_name] = (vals - mu) / sd
+
+    # --- Recency weighting via effective sample size ---
+    raw_trials = df[cfg.trials_col].values.astype(float)
+    raw_counts = df[cfg.count_col].values.astype(float)
+
+    if cfg.season_decay < 1.0:
+        max_season_idx = df["season_idx"].max()
+        recency = max_season_idx - df["season_idx"].values
+        weights = cfg.season_decay ** recency
+        eff_trials = np.round(raw_trials * weights).astype(int)
+        eff_counts = np.round(raw_counts * weights).astype(int)
+        # Ensure counts <= trials after rounding
+        eff_counts = np.minimum(eff_counts, eff_trials)
+        logger.info(
+            "Season decay=%.2f: weights range [%.3f, %.3f] over %d seasons",
+            cfg.season_decay, weights.min(), weights.max(), n_seasons,
+        )
+    else:
+        eff_trials = raw_trials.astype(int)
+        eff_counts = raw_counts.astype(int)
+
     result: dict[str, Any] = {
         "player_idx": df["player_idx"].values.astype(int),
         "season_idx": df["season_idx"].values.astype(int),
@@ -151,10 +199,11 @@ def prepare_pitcher_data(
         "min_season": min_season,
         "player_age_bucket": player_age_bucket,
         "player_skill_tier": player_skill_tier,
+        "covariates": cov_arrays,
         "stat": stat,
         "df": df,
-        "trials": df[cfg.trials_col].values.astype(int),
-        "counts": df[cfg.count_col].values.astype(int),
+        "trials": eff_trials,
+        "counts": eff_counts,
     }
 
     if "is_starter" in df.columns:
@@ -173,7 +222,7 @@ def build_pitcher_model(
     ---------------
     - Age-bucket population means on logit scale
     - Player-level random intercepts (non-centered)
-    - Season random walk for talent evolution
+    - AR(1) season process for talent evolution
     - Starter/reliever role shift (optional)
     - Binomial likelihood: count ~ Binomial(BF, inv_logit(theta))
 
@@ -214,6 +263,14 @@ def build_pitcher_model(
 
         sigma_player = pm.HalfNormal("sigma_player", sigma=cfg.sigma_player_prior)
 
+        # --- Covariate effects ---
+        betas = {}
+        if cfg.covariates:
+            for col_name, prior_mu, prior_sigma, label in cfg.covariates:
+                betas[col_name] = pm.Normal(
+                    f"beta_{col_name}", mu=prior_mu, sigma=prior_sigma
+                )
+
         # --- Player-level intercepts (non-centered) ---
         alpha_raw = pm.Normal("alpha_raw", mu=0, sigma=1, shape=n_players)
         alpha = pm.Deterministic(
@@ -221,26 +278,29 @@ def build_pitcher_model(
             mu_pop[age_bucket, skill_tier] + sigma_player * alpha_raw,
         )
 
-        # --- Season random walk ---
+        # --- AR(1) season process ---
         sigma_season = pm.LogNormal(
             "sigma_season",
             mu=np.log(cfg.sigma_season_mu),
             sigma=0.5,
         )
+        rho = pm.Beta("rho", alpha=8, beta=2)  # high persistence prior (~0.8)
 
         if n_seasons > 1:
             innovation = pm.Normal(
                 "innovation", mu=0, sigma=1,
-                shape=(n_players, n_seasons - 1),
+                shape=(n_players, n_seasons),
             )
-            cum_innov = pt.concatenate(
-                [
-                    pt.zeros((n_players, 1)),
-                    pt.cumsum(sigma_season * innovation, axis=1),
-                ],
-                axis=1,
+            # Build AR(1) process iteratively
+            season_0 = (sigma_season * innovation[:, 0]).dimshuffle(0, "x")
+            ar_components = [season_0]
+            for t in range(1, n_seasons):
+                prev = ar_components[-1][:, -1]
+                cur = rho * prev + sigma_season * innovation[:, t]
+                ar_components.append(cur.dimshuffle(0, "x"))
+            season_effect = pm.Deterministic(
+                "season_effect", pt.concatenate(ar_components, axis=1)
             )
-            season_effect = pm.Deterministic("season_effect", cum_innov)
         else:
             season_effect = pt.zeros((n_players, 1))
 
@@ -249,6 +309,11 @@ def build_pitcher_model(
             alpha[player_idx]
             + season_effect[player_idx, season_idx]
         )
+
+        # Add covariate effects
+        if cfg.covariates:
+            for col_name, _, _, _ in cfg.covariates:
+                theta = theta + betas[col_name] * data["covariates"][col_name]
 
         # --- Starter/reliever role effect ---
         if has_role:
@@ -432,11 +497,38 @@ def extract_rate_samples(
         else:
             sigma_draws = sigma_samples
 
-        # Project on logit scale
+        # Get rho for AR(1) dampening
+        if "rho" in trace.posterior:
+            rho_samples = trace.posterior["rho"].values.flatten()
+            if len(rho_samples) != len(samples):
+                rho_draws = rng.choice(rho_samples, size=len(samples), replace=True)
+            else:
+                rho_draws = rho_samples
+        else:
+            rho_draws = np.ones(len(samples))  # fallback: pure random walk
+
+        # Project on logit scale with AR(1): next = rho * current_effect + innovation
+        # The season_effect at the last observed season is already in the samples,
+        # so we apply rho dampening + new innovation
         eps = np.clip(samples, 1e-6, 1 - 1e-6)
         logit_samples = np.log(eps / (1 - eps))
         innovation = rng.normal(0, sigma_draws)
-        samples = 1.0 / (1.0 + np.exp(-(logit_samples + innovation)))
+
+        # Extract alpha (player intercept) to compute season effect
+        alpha_post = trace.posterior["alpha"].values
+        alpha_flat = alpha_post.reshape(-1, alpha_post.shape[-1])
+        pidx = data["player_map"][pitcher_id]
+        alpha_draws = alpha_flat[:, pidx]
+        if len(alpha_draws) != len(samples):
+            alpha_draws = rng.choice(alpha_draws, size=len(samples), replace=True)
+
+        # Treat logit(rate) - alpha as the total deviation (season_effect
+        # + covariate contributions).  Applying rho to the whole deviation
+        # implicitly regresses both the season effect and covariates,
+        # which is correct — covariate values also regress toward the mean.
+        deviation_last = logit_samples - alpha_draws
+        new_deviation = rho_draws * deviation_last + innovation
+        samples = 1.0 / (1.0 + np.exp(-(alpha_draws + new_deviation)))
 
     return samples
 
@@ -453,7 +545,15 @@ def check_convergence(trace: az.InferenceData, stat: str) -> dict[str, Any]:
     -------
     dict
     """
+    cfg = PITCHER_STAT_CONFIGS[stat]
     var_names = ["mu_pop", "sigma_player", "sigma_season"]
+    if "rho" in trace.posterior:
+        var_names.append("rho")
+    if cfg.covariates:
+        for col_name, _, _, _ in cfg.covariates:
+            beta_name = f"beta_{col_name}"
+            if beta_name in trace.posterior:
+                var_names.append(beta_name)
     if "beta_starter" in trace.posterior:
         var_names.append("beta_starter")
 

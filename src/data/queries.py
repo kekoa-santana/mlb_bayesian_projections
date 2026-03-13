@@ -828,7 +828,19 @@ def get_season_totals_with_age(season: int) -> pd.DataFrame:
                                                                      AS barrel_pct,
             SUM(CASE WHEN sbb.hard_hit THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0)
                                                                      AS hard_hit_pct,
-            SUM(sbb.woba_value)                                      AS woba_bip_sum
+            SUM(sbb.woba_value)                                      AS woba_bip_sum,
+            -- Batted ball type counts (for projection models)
+            SUM(CASE WHEN sbb.launch_angle != 'NaN' AND sbb.launch_angle < 10
+                     THEN 1 ELSE 0 END)                             AS gb,
+            SUM(CASE WHEN sbb.launch_angle != 'NaN' AND sbb.launch_angle > 25
+                     THEN 1 ELSE 0 END)                             AS fb,
+            SUM(CASE WHEN sbb.launch_angle != 'NaN'
+                     THEN 1 ELSE 0 END)                             AS bip_with_la,
+            -- HR on fly balls
+            SUM(CASE WHEN fpa.events = 'home_run'
+                      AND sbb.launch_angle != 'NaN'
+                      AND sbb.launch_angle > 25
+                     THEN 1 ELSE 0 END)                             AS hr_fb
         FROM production.fact_pa fpa
         JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
         JOIN production.sat_batted_balls sbb ON fpa.pa_id = sbb.pa_id
@@ -856,9 +868,17 @@ def get_season_totals_with_age(season: int) -> pd.DataFrame:
         ROUND(ba.barrel_pct::numeric, 4)     AS barrel_pct,
         ROUND(ba.hard_hit_pct::numeric, 4)   AS hard_hit_pct,
         ba.woba_bip_sum,
+        ba.bip,
+        ba.gb,
+        ba.fb,
+        ba.bip_with_la,
+        ba.hr_fb,
         ROUND((pa.k::numeric / pa.pa), 4)    AS k_rate,
         ROUND((pa.bb::numeric / pa.pa), 4)   AS bb_rate,
-        ROUND((pa.hr::numeric / pa.pa), 4)   AS hr_rate
+        ROUND((pa.hr::numeric / pa.pa), 4)   AS hr_rate,
+        ROUND((ba.gb::numeric / NULLIF(ba.bip_with_la, 0)), 4)   AS gb_rate,
+        ROUND((ba.fb::numeric / NULLIF(ba.bip_with_la, 0)), 4)   AS fb_rate,
+        ROUND((ba.hr_fb::numeric / NULLIF(ba.fb, 0)), 4)         AS hr_per_fb
     FROM pa_agg pa
     LEFT JOIN batted_agg ba ON pa.batter_id = ba.batter_id
     WHERE pa.pa >= 1

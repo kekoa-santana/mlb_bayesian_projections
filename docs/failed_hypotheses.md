@@ -2,7 +2,7 @@
 
 A comprehensive record of every feature, covariate, projection target, and modeling approach that was tested, triaged, or abandoned during the development of the Data Diamond MLB Bayesian Projection System. This document exists so we do not re-test ideas that have already been evaluated, and so the reasoning behind each decision is preserved.
 
-Last updated: 2026-03-10
+Last updated: 2026-03-13
 
 ---
 
@@ -10,12 +10,17 @@ Last updated: 2026-03-10
 
 Features that were tested (or rigorously evaluated via EDA) and found to add zero or negative incremental value to the projection system.
 
-### 1a. Pitcher whiff_rate as estimated covariate
+### 1a. Pitcher K% Statcast covariates (whiff_rate, avg_velo)
 
-- **Hypothesis:** Whiff rate (r=0.71 with K%) should be a strong informative covariate in the pitcher K% hierarchical Bayesian model, helping separate true strikeout skill from noise.
-- **What happened:** At ANY level (observation, player-level prior), ANY parameterization (centered, non-centered), ANY prior width (sigma 0.05 to 0.30), estimating beta_whiff collapsed a variance component in the PyMC model. Player-level covariates produced sigma_player ESS of 37-86 (needs >400). Observation-level covariates produced sigma_season ESS of 33. The correlation is so high (r=0.71) that whiff_rate is essentially a definitional proxy for K%, and the sampler cannot distinguish between "this pitcher has high whiff skill" and "this pitcher has high K talent" — they are the same latent variable.
-- **Fixed-coefficient fallback:** Tried fixing beta_whiff at 0.00, 0.05, 0.08, and 0.12 rather than estimating it. All four values gave nearly identical MAE. The covariate adds no information beyond what the hierarchical structure already captures.
-- **Decision:** Pitcher model uses NO estimated Statcast covariates. The model's edge over Marcel comes from calibration (Brier scores), not point-estimate accuracy.
+- **Hypothesis:** Whiff rate (r=0.822 with K%) and/or avg_velo (r=0.336, YoY r=0.908) should improve pitcher K% projections, similar to how whiff_rate + chase_rate improve hitter K%.
+- **Round 1 (random walk, wide priors):** At ANY level (observation, player-level prior), ANY parameterization (centered, non-centered), ANY prior width (sigma 0.05 to 0.30), estimating beta_whiff collapsed a variance component. Player-level covariates: sigma_player ESS of 37-86 (needs >400). Observation-level: sigma_season ESS of 33. Fixed-coefficient fallback (beta_whiff at 0.00-0.12) gave identical MAE.
+- **Round 2 (AR(1), tight priors, 2026-03-13):** Retested under AR(1) model with tight priors (sigma=0.10-0.15) and reduced sigma_player_prior (0.4). Three configurations tested:
+  - **whiff_rate + avg_velo** (sigma=0.15 each): avg MAE improvement -1.4%, ESS 53-138
+  - **whiff_rate only** (sigma=0.10): avg MAE improvement -2.3%, ESS 91-127
+  - **avg_velo only** (sigma=0.15): avg MAE improvement -2.7%, ESS 136-153
+  - All three worse than no-covariate baseline AND worse than Marcel
+- **Why it fails:** The hierarchical structure (age-bucket x skill-tier population means + partial pooling) already absorbs the whiff/velo signal through the observed K rate itself. Adding explicit covariates doesn't provide incremental information — it just competes with the variance components.
+- **Decision:** Pitcher K% model uses NO Statcast covariates. The model's edge over Marcel comes from calibration (Brier scores), not point-estimate accuracy. This is a confirmed structural limitation, not a fixable bug.
 
 ### 1b. Pitcher first-strike% as covariate
 

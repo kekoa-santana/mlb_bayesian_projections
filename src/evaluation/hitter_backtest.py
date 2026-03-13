@@ -78,7 +78,10 @@ def marcel_hitter(
             league_avg = df_history[cfg.rate_col].mean()
 
     # Regression PA constant — more stable stats need less regression
-    regression_pa = {"k_rate": 1200, "bb_rate": 1200, "hr_rate": 1500, "xwoba": 1200, "woba": 1200}
+    regression_pa = {
+        "k_rate": 1200, "bb_rate": 1200,
+        "gb_rate": 800, "fb_rate": 800, "hr_per_fb": 1500,
+    }
     reg_pa = regression_pa.get(stat, 1200)
 
     records = []
@@ -372,8 +375,7 @@ def run_hitter_backtest(
         Summary metrics across all stats and folds.
     """
     if stats is None:
-        # xwOBA is an input/prior (informs wOBA), not a projection target
-        stats = [s for s in STAT_CONFIGS if s != "xwoba"]
+        stats = list(STAT_CONFIGS.keys())
     if folds is None:
         folds = [
             {"train_seasons": [2018, 2019, 2020, 2021, 2022], "test_season": 2023},

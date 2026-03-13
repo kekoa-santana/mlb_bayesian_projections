@@ -6,7 +6,7 @@ per-pitcher K% posterior samples, and by content generation scripts.
 For multi-stat composite projections (K%, BB%, HR/BF), see
 ``pitcher_model.py`` and ``pitcher_projections.py`` instead.
 
-Uses hierarchical partial pooling + random walk for talent evolution.
+Uses hierarchical partial pooling + AR(1) process for talent evolution.
 Whiff/barrel covariates are intentionally excluded from the model:
 whiff_rate correlates r=0.71 with K%, which collapses sigma_player
 regardless of parameterization (observation-level, player-level,
@@ -136,7 +136,7 @@ def build_pitcher_k_rate_model(
     ---------------
     - Population mean K% on logit scale ~ Normal(logit(0.224), 0.3)
     - Player-level random intercepts (non-centered)
-    - Season random walk for talent evolution
+    - AR(1) season process for talent evolution
     - Starter/reliever role flag (optional)
     - Binomial likelihood: K ~ Binomial(BF, inv_logit(theta))
 
@@ -181,22 +181,25 @@ def build_pitcher_k_rate_model(
             mu_pop + sigma_player * alpha_raw,
         )
 
-        # --- Season-to-season innovation (random walk) ---
+        # --- AR(1) season process ---
         sigma_season = pm.HalfNormal("sigma_season", sigma=0.2)
+        rho = pm.Beta("rho", alpha=8, beta=2)  # high persistence prior (~0.8)
 
         if n_seasons > 1:
             innovation = pm.Normal(
                 "innovation", mu=0, sigma=1,
-                shape=(n_players, n_seasons - 1),
+                shape=(n_players, n_seasons),
             )
-            cum_innov = pt.concatenate(
-                [
-                    pt.zeros((n_players, 1)),
-                    pt.cumsum(sigma_season * innovation, axis=1),
-                ],
-                axis=1,
+            # Build AR(1) process iteratively
+            season_0 = (sigma_season * innovation[:, 0]).dimshuffle(0, "x")
+            ar_components = [season_0]
+            for t in range(1, n_seasons):
+                prev = ar_components[-1][:, -1]
+                cur = rho * prev + sigma_season * innovation[:, t]
+                ar_components.append(cur.dimshuffle(0, "x"))
+            season_effect = pm.Deterministic(
+                "season_effect", pt.concatenate(ar_components, axis=1)
             )
-            season_effect = pm.Deterministic("season_effect", cum_innov)
         else:
             season_effect = pt.zeros((n_players, 1))
 
@@ -341,6 +344,8 @@ def check_pitcher_convergence(trace: az.InferenceData) -> dict[str, Any]:
         Summary with r_hat, ESS, and divergence counts.
     """
     var_names = ["mu_pop", "sigma_player", "sigma_season"]
+    if "rho" in trace.posterior:
+        var_names.append("rho")
     if "beta_starter" in trace.posterior:
         var_names.append("beta_starter")
     summary = az.summary(trace, var_names=var_names)
