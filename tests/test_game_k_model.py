@@ -4,8 +4,11 @@ import pandas as pd
 import pytest
 
 from src.models.game_k_model import (
+    _LEAGUE_TTO_LOGIT_LIFTS,
+    build_tto_logit_lifts,
     compute_k_over_probs,
     simulate_game_ks,
+    simulate_game_stat,
 )
 
 
@@ -247,3 +250,172 @@ class TestWeatherKLogitLift:
             n_draws=2000, random_seed=42,
         )
         assert np.array_equal(with_zero, without)
+
+
+# ---------------------------------------------------------------------------
+# TTO (Times-Through-Order) adjustment tests
+# ---------------------------------------------------------------------------
+class TestTTOLogitLiftsConstants:
+    def test_league_tto_k_lifts_direction(self) -> None:
+        """TTO1 should be positive (higher K), TTO3 negative (lower K)."""
+        k_lifts = _LEAGUE_TTO_LOGIT_LIFTS["k"]
+        assert k_lifts[0] > 0, "TTO1 K lift should be positive"
+        assert k_lifts[1] < 0, "TTO2 K lift should be negative"
+        assert k_lifts[2] < 0, "TTO3 K lift should be negative"
+        assert k_lifts[2] < k_lifts[1], "TTO3 K lift should be more negative than TTO2"
+
+    def test_league_tto_hr_lifts_direction(self) -> None:
+        """HR rate increases through the order (familiarity)."""
+        hr_lifts = _LEAGUE_TTO_LOGIT_LIFTS["hr"]
+        assert hr_lifts[0] < 0, "TTO1 HR lift should be negative"
+        assert hr_lifts[2] > 0, "TTO3 HR lift should be positive"
+
+
+class TestBuildTTOLogitLifts:
+    def test_none_profiles_returns_league_avg(self) -> None:
+        """With no profile data, fall back to league-average lifts."""
+        lifts = build_tto_logit_lifts(None, pitcher_id=12345, season=2024)
+        np.testing.assert_array_almost_equal(
+            lifts, _LEAGUE_TTO_LOGIT_LIFTS["k"], decimal=5,
+        )
+
+    def test_empty_df_returns_league_avg(self) -> None:
+        """Empty DataFrame also falls back to league average."""
+        lifts = build_tto_logit_lifts(
+            pd.DataFrame(), pitcher_id=12345, season=2024,
+        )
+        np.testing.assert_array_almost_equal(
+            lifts, _LEAGUE_TTO_LOGIT_LIFTS["k"], decimal=5,
+        )
+
+    def test_pitcher_specific_profile(self) -> None:
+        """When pitcher data exists, lifts blend toward pitcher-specific values."""
+        tto_df = pd.DataFrame({
+            "pitcher_id": [999] * 3,
+            "season": [2024] * 3,
+            "tto": [1, 2, 3],
+            "k_rate": [0.30, 0.20, 0.15],
+            "bb_rate": [0.08, 0.08, 0.08],
+            "hr_rate": [0.03, 0.03, 0.03],
+            "overall_k_rate": [0.25, 0.25, 0.25],
+            "overall_bb_rate": [0.08, 0.08, 0.08],
+            "overall_hr_rate": [0.03, 0.03, 0.03],
+            "pa_count": [200, 150, 100],
+        })
+        lifts = build_tto_logit_lifts(tto_df, pitcher_id=999, season=2024)
+        assert lifts[0] > 0
+        assert lifts[2] < 0
+        assert lifts[2] < lifts[1]
+
+    def test_unknown_stat_returns_zeros(self) -> None:
+        """Unknown stat name returns zero lifts."""
+        lifts = build_tto_logit_lifts(None, pitcher_id=12345, season=2024,
+                                       stat_name="unknown")
+        np.testing.assert_array_equal(lifts, np.zeros(3))
+
+
+class TestSimulateGameKsWithTTO:
+    def test_tto_none_backward_compatible(self) -> None:
+        """tto_logit_lifts=None should match the no-TTO baseline exactly."""
+        k_rate_samples = np.full(2000, 0.25)
+        baseline = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=23.0, bf_sigma=3.5,
+            tto_logit_lifts=None,
+            n_draws=2000, random_seed=42,
+        )
+        no_tto = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=23.0, bf_sigma=3.5,
+            n_draws=2000, random_seed=42,
+        )
+        assert np.array_equal(baseline, no_tto)
+
+    def test_tto_changes_expected_ks(self) -> None:
+        """TTO adjustment should change expected Ks vs flat rate."""
+        k_rate_samples = np.full(10000, 0.22)
+        flat = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=25.0, bf_sigma=3.0,
+            tto_logit_lifts=None,
+            n_draws=10000, random_seed=42,
+        )
+        with_tto = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=25.0, bf_sigma=3.0,
+            tto_logit_lifts=_LEAGUE_TTO_LOGIT_LIFTS["k"],
+            n_draws=10000, random_seed=42,
+        )
+        assert flat.mean() != with_tto.mean()
+
+    def test_tto_stacks_with_other_lifts(self) -> None:
+        """TTO lifts stack with umpire and matchup lifts."""
+        k_rate_samples = np.full(5000, 0.22)
+        tto_only = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            tto_logit_lifts=_LEAGUE_TTO_LOGIT_LIFTS["k"],
+            n_draws=5000, random_seed=42,
+        )
+        tto_plus_ump = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=22.0, bf_sigma=4.0,
+            tto_logit_lifts=_LEAGUE_TTO_LOGIT_LIFTS["k"],
+            umpire_k_logit_lift=0.15,
+            n_draws=5000, random_seed=42,
+        )
+        assert tto_plus_ump.mean() > tto_only.mean()
+
+    def test_extreme_tto_penalty_lowers_ks(self) -> None:
+        """Extreme TTO penalty across all TTOs should dramatically lower Ks."""
+        k_rate_samples = np.full(5000, 0.25)
+        baseline = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=23.0, bf_sigma=3.5,
+            tto_logit_lifts=None,
+            n_draws=5000, random_seed=42,
+        )
+        penalized = simulate_game_ks(
+            pitcher_k_rate_samples=k_rate_samples,
+            bf_mu=23.0, bf_sigma=3.5,
+            tto_logit_lifts=np.array([-0.5, -0.5, -0.5]),
+            n_draws=5000, random_seed=42,
+        )
+        assert penalized.mean() < baseline.mean()
+
+
+class TestSimulateGameStatWithTTO:
+    def test_tto_none_backward_compatible(self) -> None:
+        """simulate_game_stat with tto=None matches old behavior."""
+        rate_samples = np.full(2000, 0.22)
+        baseline = simulate_game_stat(
+            rate_samples=rate_samples,
+            opp_mu=23.0, opp_sigma=3.5,
+            tto_logit_lifts=None,
+            n_draws=2000, random_seed=42,
+        )
+        no_tto = simulate_game_stat(
+            rate_samples=rate_samples,
+            opp_mu=23.0, opp_sigma=3.5,
+            n_draws=2000, random_seed=42,
+        )
+        assert np.array_equal(baseline, no_tto)
+
+    def test_batter_mode_ignores_tto(self) -> None:
+        """In batter mode (n_slots=1), TTO lifts are ignored."""
+        rate_samples = np.full(2000, 0.22)
+        with_tto = simulate_game_stat(
+            rate_samples=rate_samples,
+            opp_mu=4.0, opp_sigma=0.8,
+            tto_logit_lifts=_LEAGUE_TTO_LOGIT_LIFTS["k"],
+            n_slots=1,
+            n_draws=2000, random_seed=42,
+        )
+        without_tto = simulate_game_stat(
+            rate_samples=rate_samples,
+            opp_mu=4.0, opp_sigma=0.8,
+            tto_logit_lifts=None,
+            n_slots=1,
+            n_draws=2000, random_seed=42,
+        )
+        assert np.array_equal(with_tto, without_tto)

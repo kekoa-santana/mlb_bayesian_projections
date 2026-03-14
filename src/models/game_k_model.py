@@ -1473,6 +1473,7 @@ def predict_game_batch_stat(
     context_lifts: dict[int, float] | None = None,
     lineup_proneness_lifts: dict[int, float] | None = None,
     park_factors: dict[int, float] | None = None,
+    catcher_framing_lifts: dict[tuple[int, int], float] | None = None,
     model_type: str = "binomial",
     default_lines: list[float] | None = None,
     actual_col: str = "strike_outs",
@@ -1514,6 +1515,10 @@ def predict_game_batch_stat(
         Pre-computed from aggregate lineup K/BB/HR-proneness.
     park_factors : dict[int, float] or None
         Mapping of game_pk → park factor (multiplicative, Poisson only).
+    catcher_framing_lifts : dict[tuple[int, int], float] or None
+        Mapping of (game_pk, pitcher_id) → catcher framing logit lift.
+        This is separate from context_lifts because two pitchers in the
+        same game have different catchers. Only used for K and BB stats.
     model_type : str
         'binomial' or 'poisson'.
     default_lines : list[float] or None
@@ -1532,7 +1537,7 @@ def predict_game_batch_stat(
         actual_{stat_name}, actual_bf, expected_{stat_name},
         std_{stat_name}, p_over_X_5 columns, pitcher_rate_mean,
         bf_mu, n_matched_batters, context_logit_lift,
-        lineup_proneness_lift, park_factor.
+        lineup_proneness_lift, catcher_framing_lift, park_factor.
     """
     sn = stat_name.lower()
     records: list[dict[str, Any]] = []
@@ -1603,6 +1608,14 @@ def predict_game_batch_stat(
         if lineup_proneness_lifts is not None:
             lp_lift = lineup_proneness_lifts.get(game_pk, 0.0)
 
+        # Catcher framing lift (per pitcher, since each team has its own catcher)
+        framing_lift = 0.0
+        if catcher_framing_lifts is not None:
+            framing_lift = catcher_framing_lifts.get((game_pk, pitcher_id), 0.0)
+
+        # Add framing lift to context (it's logit-additive like umpire/weather)
+        total_ctx = ctx_lift + framing_lift
+
         result = predict_game_stat(
             stat_name=stat_name,
             pitcher_id=pitcher_id,
@@ -1613,7 +1626,7 @@ def predict_game_batch_stat(
             pitcher_arsenal=pitcher_arsenal,
             hitter_vuln=hitter_vuln,
             baselines_pt=baselines_pt,
-            context_logit_lift=ctx_lift,
+            context_logit_lift=total_ctx,
             lineup_proneness_lift=lp_lift,
             park_factor=pf,
             model_type=model_type,
@@ -1634,8 +1647,9 @@ def predict_game_batch_stat(
             "pitcher_rate_mean": float(np.mean(rate_samples)),
             "bf_mu": result["bf_mu"],
             "n_matched_batters": n_matched,
-            "context_logit_lift": ctx_lift,
+            "context_logit_lift": total_ctx,
             "lineup_proneness_lift": lp_lift,
+            "catcher_framing_lift": framing_lift,
             "park_factor": pf,
         }
 
@@ -1656,3 +1670,176 @@ def predict_game_batch_stat(
         "Batch prediction complete for %s: %d games", stat_name, len(records)
     )
     return pd.DataFrame(records)
+
+
+# ---------------------------------------------------------------------------
+# Catcher framing lift
+# ---------------------------------------------------------------------------
+
+# Weight applied to raw framing logit lift before adding to context.
+# Framing affects called strikes, which are only a fraction of K/BB outcomes.
+_FRAMING_WEIGHT: float = 0.3
+
+
+def get_catcher_framing_lift(
+    catcher_id: int,
+    season: int,
+    framing_data: pd.DataFrame,
+    weight: float = _FRAMING_WEIGHT,
+) -> dict[str, float]:
+    """Return logit lifts for K and BB from catcher framing effects.
+
+    Parameters
+    ----------
+    catcher_id : int
+        Catcher MLB ID.
+    season : int
+        Season to look up (uses most recent available if exact season
+        is missing).
+    framing_data : pd.DataFrame
+        Output of ``get_catcher_framing_effects()``.  Must contain
+        columns: catcher_id, season, logit_lift.
+    weight : float
+        Scaling factor applied to the raw framing logit lift.
+        Default 0.3 reflects that called strikes are only a fraction
+        of the pathways to K or BB outcomes.
+
+    Returns
+    -------
+    dict[str, float]
+        Keys: ``k_logit_lift`` (positive = more Ks),
+        ``bb_logit_lift`` (negative = fewer BBs when framing is good).
+        Both are 0.0 if catcher not found.
+    """
+    if framing_data is None or framing_data.empty:
+        return {"k_logit_lift": 0.0, "bb_logit_lift": 0.0}
+
+    # Look up exact season first, then fall back to most recent prior season
+    mask = framing_data["catcher_id"] == catcher_id
+    catcher_rows = framing_data.loc[mask]
+
+    if catcher_rows.empty:
+        return {"k_logit_lift": 0.0, "bb_logit_lift": 0.0}
+
+    exact = catcher_rows.loc[catcher_rows["season"] == season]
+    if not exact.empty:
+        raw_lift = float(exact.iloc[0]["logit_lift"])
+    else:
+        # Use most recent season <= requested season
+        prior = catcher_rows.loc[catcher_rows["season"] <= season]
+        if prior.empty:
+            return {"k_logit_lift": 0.0, "bb_logit_lift": 0.0}
+        raw_lift = float(prior.sort_values("season").iloc[-1]["logit_lift"])
+
+    weighted_lift = raw_lift * weight
+
+    # Good framing (positive lift) -> more called strikes -> more K, fewer BB
+    return {
+        "k_logit_lift": weighted_lift,
+        "bb_logit_lift": -weighted_lift,
+    }
+
+
+def build_catcher_framing_lookup(
+    train_seasons: list[int],
+    test_season: int,
+) -> dict[str, dict[tuple[int, int], float]]:
+    """Build (game_pk, pitcher_id) -> catcher framing logit lifts.
+
+    Computes framing effects from training seasons, identifies the starting
+    catcher for each starting pitcher's game in the test season, and returns
+    per-(game_pk, pitcher_id) logit lifts for K and BB.
+
+    For each game the starting pitcher's team is identified via
+    fact_player_game_mlb, and the starting catcher on that same team
+    (from fact_lineup) provides the framing effect.
+
+    Parameters
+    ----------
+    train_seasons : list[int]
+        Seasons to compute framing effects from.
+    test_season : int
+        Season whose games to map.
+
+    Returns
+    -------
+    dict[str, dict[tuple[int, int], float]]
+        ``{"k": {(game_pk, pitcher_id): lift}, "bb": {(game_pk, pitcher_id): lift}}``.
+        Each lift is the weighted logit-scale adjustment.
+    """
+    from src.data.db import read_sql
+    from src.data.queries import get_catcher_framing_effects
+
+    # Compute framing effects from training data
+    framing_data = get_catcher_framing_effects(seasons=train_seasons)
+    if framing_data.empty:
+        logger.warning("No catcher framing data for seasons %s", train_seasons)
+        return {"k": {}, "bb": {}}
+
+    # Get starting catchers per game in the test season with team info
+    catcher_assignments = read_sql(f"""
+        SELECT fl.game_pk, fl.player_id AS catcher_id,
+               fl.team_id
+        FROM production.fact_lineup fl
+        JOIN production.dim_game dg ON fl.game_pk = dg.game_pk
+        WHERE fl.position = 'C'
+          AND fl.is_starter = true
+          AND dg.season = {int(test_season)}
+          AND dg.game_type = 'R'
+    """, {})
+
+    if catcher_assignments.empty:
+        logger.warning("No catcher lineup data for season %d", test_season)
+        return {"k": {}, "bb": {}}
+
+    # Get starting pitcher -> team mapping for test season
+    pitcher_teams = read_sql(f"""
+        SELECT fpg.game_pk, fpg.player_id AS pitcher_id, fpg.team_id
+        FROM production.fact_player_game_mlb fpg
+        JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+        WHERE fpg.pit_is_starter = true
+          AND dg.season = {int(test_season)}
+          AND dg.game_type = 'R'
+    """, {})
+
+    if pitcher_teams.empty:
+        logger.warning("No starter data for season %d", test_season)
+        return {"k": {}, "bb": {}}
+
+    # Build (game_pk, team_id) -> catcher framing lift
+    catcher_lift_by_team: dict[tuple[int, int], dict[str, float]] = {}
+    last_train = max(train_seasons)
+    for _, row in catcher_assignments.iterrows():
+        gpk = int(row["game_pk"])
+        catcher_id = int(row["catcher_id"])
+        team_id = int(row["team_id"])
+
+        lifts = get_catcher_framing_lift(
+            catcher_id=catcher_id,
+            season=last_train,
+            framing_data=framing_data,
+        )
+        catcher_lift_by_team[(gpk, team_id)] = lifts
+
+    # Map each starter game to the catcher on the SAME team
+    k_lifts: dict[tuple[int, int], float] = {}
+    bb_lifts: dict[tuple[int, int], float] = {}
+
+    for _, row in pitcher_teams.iterrows():
+        gpk = int(row["game_pk"])
+        pid = int(row["pitcher_id"])
+        team_id = int(row["team_id"])
+        team_key = (gpk, team_id)
+
+        if team_key in catcher_lift_by_team:
+            lifts = catcher_lift_by_team[team_key]
+            k_lifts[(gpk, pid)] = lifts["k_logit_lift"]
+            bb_lifts[(gpk, pid)] = lifts["bb_logit_lift"]
+
+    n_entries = len(k_lifts)
+    non_zero_k = sum(1 for v in k_lifts.values() if abs(v) > 0.001)
+    logger.info(
+        "Catcher framing lookup: %d pitcher-games, %d non-zero K lifts",
+        n_entries, non_zero_k,
+    )
+    return {"k": k_lifts, "bb": bb_lifts}

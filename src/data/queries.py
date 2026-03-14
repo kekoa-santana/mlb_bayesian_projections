@@ -2920,3 +2920,124 @@ def get_rest_bucket_stats(seasons: list[int] | None = None) -> pd.DataFrame:
     """
     logger.info("Fetching rest bucket stats for seasons %s", seasons)
     return read_sql(query)
+
+
+# ---------------------------------------------------------------------------
+# Catcher framing effects
+# ---------------------------------------------------------------------------
+def get_catcher_framing_effects(
+    seasons: list[int] | None = None,
+    shrinkage_k: int = 500,
+) -> pd.DataFrame:
+    """Compute per-catcher called-strike-rate lift on taken pitches.
+
+    For each catcher-season, computes the called-strike rate on non-swing
+    pitches, applies empirical Bayes shrinkage, and returns a logit-scale
+    lift relative to the season league average.
+
+    Join path: fact_lineup (position='C', starter) -> fact_player_game_mlb
+    (pitcher team_id) -> fact_pitch (is_swing=false).
+
+    Parameters
+    ----------
+    seasons : list[int], optional
+        Seasons to include. Defaults to 2018-2025.
+    shrinkage_k : int
+        Shrinkage constant in taken-pitch units.  ``shrunk_rate =
+        (n * observed + k * league_avg) / (n + k)``.  Default 500
+        provides heavy shrinkage for low-sample catchers.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: catcher_id, season, pitches_received, called_strikes,
+        called_strike_rate_raw, league_cs_rate, called_strike_rate_shrunk,
+        logit_lift.
+    """
+    if seasons is None:
+        seasons = list(range(2018, 2026))
+
+    season_list = ",".join(str(int(s)) for s in seasons)
+    query = f"""
+    WITH catcher_game AS (
+        SELECT fl.game_pk, fl.player_id AS catcher_id,
+               fl.team_id, fl.season
+        FROM production.fact_lineup fl
+        WHERE fl.position = 'C'
+          AND fl.is_starter = true
+          AND fl.season IN ({season_list})
+    ),
+    catcher_pitch AS (
+        SELECT
+            cg.catcher_id,
+            cg.season,
+            COUNT(*)                       AS pitches_received,
+            SUM(fp.is_called_strike::int)  AS called_strikes
+        FROM catcher_game cg
+        JOIN production.fact_player_game_mlb pg
+            ON pg.game_pk = cg.game_pk
+           AND pg.team_id = cg.team_id
+        JOIN production.fact_pitch fp
+            ON fp.game_pk = cg.game_pk
+           AND fp.pitcher_id = pg.player_id
+        JOIN production.dim_game dg
+            ON fp.game_pk = dg.game_pk
+        WHERE fp.is_swing = false
+          AND dg.game_type = 'R'
+          AND pg.player_role = 'pitcher'
+        GROUP BY cg.catcher_id, cg.season
+    )
+    SELECT
+        catcher_id,
+        season,
+        pitches_received,
+        called_strikes,
+        ROUND(called_strikes::numeric
+              / NULLIF(pitches_received, 0), 5) AS called_strike_rate_raw
+    FROM catcher_pitch
+    ORDER BY season, pitches_received DESC
+    """
+    logger.info(
+        "Fetching catcher framing effects for seasons %s (shrinkage_k=%d)",
+        seasons, shrinkage_k,
+    )
+    df = read_sql(query, {})
+
+    if df.empty:
+        return df
+
+    import numpy as _np
+    from scipy.special import logit as _logit
+
+    _clip = lambda x: _np.clip(x, 1e-6, 1 - 1e-6)  # noqa: E731
+
+    # League-average called-strike rate per season (weighted by pitches)
+    season_league = (
+        df.groupby("season")
+        .apply(
+            lambda g: g["called_strikes"].sum() / g["pitches_received"].sum(),
+            include_groups=False,
+        )
+        .rename("league_cs_rate")
+    )
+    df = df.merge(season_league, on="season", how="left")
+
+    # Shrinkage toward season league average
+    n = df["pitches_received"].values.astype(float)
+    obs = df["called_strike_rate_raw"].values.astype(float)
+    lg = df["league_cs_rate"].values.astype(float)
+    df["called_strike_rate_shrunk"] = (
+        (n * obs + shrinkage_k * lg) / (n + shrinkage_k)
+    ).round(5)
+
+    # Logit lift relative to league average
+    df["logit_lift"] = (
+        _logit(_clip(df["called_strike_rate_shrunk"].values))
+        - _logit(_clip(lg))
+    ).round(5)
+
+    logger.info(
+        "Catcher framing: %d catcher-seasons, lift range=[%.4f, %.4f]",
+        len(df), df["logit_lift"].min(), df["logit_lift"].max(),
+    )
+    return df

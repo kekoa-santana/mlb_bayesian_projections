@@ -1094,6 +1094,13 @@ def _build_pitcher_prop_predictions(
                 sn_key, len(lineup_proneness_lifts),
             )
 
+    # 7b. Catcher framing lifts (K and BB only, keyed by (game_pk, pitcher_id))
+    from src.models.game_k_model import build_catcher_framing_lookup
+    catcher_framing_lifts: dict[tuple[int, int], float] | None = None
+    if sn_key in ("k", "bb"):
+        framing_lookup = build_catcher_framing_lookup(train_seasons, test_season)
+        catcher_framing_lifts = framing_lookup.get(sn_key, {}) or None
+
     # 8. Batch predict
     predictions = predict_game_batch_stat(
         stat_name=config.stat_name,
@@ -1108,6 +1115,7 @@ def _build_pitcher_prop_predictions(
         context_lifts=context_lifts,
         lineup_proneness_lifts=lineup_proneness_lifts,
         park_factors=park_factors,
+        catcher_framing_lifts=catcher_framing_lifts,
         model_type=config.model_type,
         default_lines=config.default_lines if config.default_lines else None,
         actual_col=config.actual_col,
@@ -1349,6 +1357,14 @@ def _build_batter_prop_predictions(
     if config.park_adjusted:
         park_factors = _build_park_factor_lookup(train_seasons, test_season)
 
+    # Catcher framing lifts for batter K/BB props
+    # Keyed by (game_pk, pitcher_id) since different sides have different catchers
+    from src.models.game_k_model import build_catcher_framing_lookup
+    catcher_framing: dict[tuple[int, int], float] = {}
+    if sn in ("k", "bb"):
+        framing_lookup = build_catcher_framing_lookup(train_seasons, test_season)
+        catcher_framing = framing_lookup.get(sn, {})
+
     # 7. Opposing pitcher lifts (Phase 1J)
     opp_pitcher_lift_lookup: dict[tuple[int, int], float] = {}
     if config.opposing_pitcher_weight > 0.0:
@@ -1441,9 +1457,12 @@ def _build_batter_prop_predictions(
         pa_mu = pa_info["mu_pa"]
         pa_sigma = pa_info["sigma_pa"]
 
-        # Context (stat-specific umpire + weather lifts)
+        # Context (stat-specific umpire + weather + catcher framing lifts)
+        framing_lift = catcher_framing.get((game_pk, pitcher_id), 0.0)
         context_lift = (
-            umpire_stat_lifts.get(game_pk, 0.0) + weather_stat_lifts.get(game_pk, 0.0)
+            umpire_stat_lifts.get(game_pk, 0.0)
+            + weather_stat_lifts.get(game_pk, 0.0)
+            + framing_lift
         )
         pf = 1.0
         if park_factors is not None:
