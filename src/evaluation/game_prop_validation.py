@@ -53,6 +53,10 @@ from src.models.hitter_model import (
     fit_hitter_model,
     prepare_hitter_data,
 )
+from src.models.derived_stats import (
+    derive_batter_rates_batch,
+    derive_pitcher_rates_batch,
+)
 from src.models.matchup import score_matchup_for_stat
 from src.models.pitcher_model import (
     PITCHER_STAT_CONFIGS,
@@ -81,6 +85,11 @@ class GamePropConfig:
     matchup_metric: str | None  # "whiff_rate", "chase_rate", "barrel_rate", None
     park_adjusted: bool      # apply park factor?
     default_lines: list[float] = field(default_factory=list)
+    derived: bool = False    # derive from Bayesian K%/BB%/HR% posteriors
+    # Phase 1G: lineup proneness weight for pitcher props (0.0 = off)
+    lineup_proneness_weight: float = 0.0
+    # Phase 1J: opposing pitcher quality weight for batter props (0.0 = off)
+    opposing_pitcher_weight: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -102,11 +111,11 @@ PITCHER_PROP_CONFIGS: dict[str, GamePropConfig] = {
     ),
     "h": GamePropConfig(
         "h", "pitcher", "h_per_bf", "hits", False, "binomial",
-        None, False, [3.5, 4.5, 5.5, 6.5, 7.5],
+        None, False, [3.5, 4.5, 5.5, 6.5, 7.5], derived=True,
     ),
     "outs": GamePropConfig(
         "outs", "pitcher", "outs_per_bf", "outs", False, "binomial",
-        None, False, [14.5, 15.5, 16.5, 17.5, 18.5],
+        None, False, [14.5, 15.5, 16.5, 17.5, 18.5], derived=True,
     ),
 }
 
@@ -125,7 +134,7 @@ BATTER_PROP_CONFIGS: dict[str, GamePropConfig] = {
     ),
     "h": GamePropConfig(
         "h", "batter", "h_rate", "hits", False, "binomial",
-        None, False, [0.5, 1.5, 2.5],
+        None, False, [0.5, 1.5, 2.5], derived=True,
     ),
 }
 
@@ -582,6 +591,239 @@ def _load_batter_season_totals(seasons: list[int]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# 4b. BABIP data loaders for derived stats
+# ---------------------------------------------------------------------------
+
+def _load_pitcher_babip_data(
+    seasons: list[int],
+) -> dict[int, tuple[float | None, float]]:
+    """Load pitcher BABIP and BIP counts from the last training season.
+
+    Parameters
+    ----------
+    seasons : list[int]
+        Training seasons.
+
+    Returns
+    -------
+    dict[int, tuple[float | None, float]]
+        {pitcher_id: (observed_babip, bip_count)}.
+    """
+    last_season = max(seasons)
+    try:
+        from src.data.db import read_sql
+
+        df = read_sql("""
+            SELECT
+                pb.pitcher_id,
+                SUM(pb.hits - pb.home_runs)::float AS hits_on_bip,
+                SUM(pb.batters_faced - pb.strike_outs - pb.walks
+                    - pb.hit_by_pitch - pb.home_runs)::float AS bip
+            FROM staging.pitching_boxscores pb
+            JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+            WHERE dg.season = :season
+              AND dg.game_type = 'R'
+            GROUP BY pb.pitcher_id
+            HAVING SUM(pb.batters_faced - pb.strike_outs - pb.walks
+                       - pb.hit_by_pitch - pb.home_runs) > 0
+        """, {"season": last_season})
+
+        result: dict[int, tuple[float | None, float]] = {}
+        for _, row in df.iterrows():
+            pid = int(row["pitcher_id"])
+            bip = float(row["bip"])
+            babip = float(row["hits_on_bip"]) / bip if bip > 0 else None
+            result[pid] = (babip, bip)
+        logger.info(
+            "Loaded BABIP data for %d pitchers from season %d",
+            len(result), last_season,
+        )
+        return result
+    except Exception as e:
+        logger.warning("Failed to load pitcher BABIP data: %s", e)
+        return {}
+
+
+def _load_batter_babip_data(
+    seasons: list[int],
+) -> dict[int, tuple[float | None, float]]:
+    """Load batter BABIP and BIP counts from the last training season.
+
+    Parameters
+    ----------
+    seasons : list[int]
+        Training seasons.
+
+    Returns
+    -------
+    dict[int, tuple[float | None, float]]
+        {batter_id: (observed_babip, bip_count)}.
+    """
+    last_season = max(seasons)
+    try:
+        from src.data.db import read_sql
+
+        df = read_sql("""
+            SELECT
+                bb.batter_id,
+                SUM(bb.hits - bb.home_runs)::float AS hits_on_bip,
+                SUM(bb.at_bats - bb.strikeouts - bb.home_runs)::float AS bip
+            FROM staging.batting_boxscores bb
+            JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+            WHERE dg.season = :season
+              AND dg.game_type = 'R'
+            GROUP BY bb.batter_id
+            HAVING SUM(bb.at_bats - bb.strikeouts - bb.home_runs) > 0
+        """, {"season": last_season})
+
+        result: dict[int, tuple[float | None, float]] = {}
+        for _, row in df.iterrows():
+            bid = int(row["batter_id"])
+            bip = float(row["bip"])
+            babip = float(row["hits_on_bip"]) / bip if bip > 0 else None
+            result[bid] = (babip, bip)
+        logger.info(
+            "Loaded BABIP data for %d batters from season %d",
+            len(result), last_season,
+        )
+        return result
+    except Exception as e:
+        logger.warning("Failed to load batter BABIP data: %s", e)
+        return {}
+
+
+def _extract_all_bayesian_pitcher_posteriors(
+    train_seasons: list[int],
+    draws: int,
+    tune: int,
+    chains: int,
+    random_seed: int,
+) -> dict[str, dict[int, np.ndarray]]:
+    """Train K%, BB%, HR/BF models and extract posteriors for all pitchers.
+
+    Used by the derived stats path which needs all three Bayesian posteriors
+    to compute H/BF and Outs/BF.
+
+    Parameters
+    ----------
+    train_seasons : list[int]
+        Training seasons.
+    draws, tune, chains, random_seed : int
+        MCMC parameters.
+
+    Returns
+    -------
+    dict[str, dict[int, np.ndarray]]
+        {stat_key: {pitcher_id: samples}}.
+    """
+    last_train = max(train_seasons)
+    df_model = build_multi_season_pitcher_data(train_seasons, min_bf=10)
+
+    all_posteriors: dict[str, dict[int, np.ndarray]] = {}
+
+    for stat_key in ("k_rate", "bb_rate", "hr_per_bf"):
+        if stat_key not in PITCHER_STAT_CONFIGS:
+            logger.error("No pitcher stat config for %s", stat_key)
+            continue
+
+        data = prepare_pitcher_data(df_model, stat=stat_key)
+        _, trace = fit_pitcher_model(
+            data, draws=draws, tune=tune, chains=chains,
+            random_seed=random_seed,
+        )
+
+        df = data["df"]
+        pitcher_ids = df[df["season"] == last_train]["pitcher_id"].unique()
+
+        posteriors: dict[int, np.ndarray] = {}
+        for pid in pitcher_ids:
+            try:
+                samples = extract_pitcher_rate_samples(
+                    trace, data, pid, last_train,
+                    project_forward=True, random_seed=random_seed,
+                )
+                posteriors[pid] = samples
+            except (ValueError, KeyError):
+                continue
+
+        all_posteriors[stat_key] = posteriors
+        logger.info(
+            "Extracted pitcher %s posteriors for %d pitchers",
+            stat_key, len(posteriors),
+        )
+
+    return all_posteriors
+
+
+def _extract_all_bayesian_batter_posteriors(
+    train_seasons: list[int],
+    draws: int,
+    tune: int,
+    chains: int,
+    random_seed: int,
+) -> dict[str, dict[int, np.ndarray]]:
+    """Train K%, BB%, HR% batter models and extract posteriors.
+
+    Parameters
+    ----------
+    train_seasons : list[int]
+        Training seasons.
+    draws, tune, chains, random_seed : int
+        MCMC parameters.
+
+    Returns
+    -------
+    dict[str, dict[int, np.ndarray]]
+        {stat_key: {batter_id: samples}}.
+    """
+    last_train = max(train_seasons)
+    df_model = build_multi_season_hitter_data(train_seasons, min_pa=10)
+
+    all_posteriors: dict[str, dict[int, np.ndarray]] = {}
+
+    # Batter stats may use "hr_rate" instead of "hr_per_bf"
+    stat_keys = ["k_rate", "bb_rate"]
+    # Check which HR key exists in hitter configs
+    for hr_key in ("hr_rate", "hr_per_pa"):
+        if hr_key in HITTER_STAT_CONFIGS:
+            stat_keys.append(hr_key)
+            break
+
+    for stat_key in stat_keys:
+        if stat_key not in HITTER_STAT_CONFIGS:
+            logger.warning("No hitter stat config for %s, skipping", stat_key)
+            continue
+
+        data = prepare_hitter_data(df_model, stat=stat_key)
+        _, trace = fit_hitter_model(
+            data, draws=draws, tune=tune, chains=chains,
+            random_seed=random_seed,
+        )
+
+        df = data["df"]
+        batter_ids = df[df["season"] == last_train]["batter_id"].unique()
+
+        posteriors: dict[int, np.ndarray] = {}
+        for bid in batter_ids:
+            try:
+                samples = extract_hitter_rate_samples(
+                    trace, data, bid, last_train,
+                    project_forward=True, random_seed=random_seed,
+                )
+                posteriors[bid] = samples
+            except (ValueError, KeyError):
+                continue
+
+        all_posteriors[stat_key] = posteriors
+        logger.info(
+            "Extracted batter %s posteriors for %d batters",
+            stat_key, len(posteriors),
+        )
+
+    return all_posteriors
+
+
+# ---------------------------------------------------------------------------
 # 5. build_game_prop_predictions — generic prediction builder
 # ---------------------------------------------------------------------------
 
@@ -671,7 +913,41 @@ def _build_pitcher_prop_predictions(
     posteriors: dict[str, dict[int, np.ndarray]] | None = None
     season_totals: pd.DataFrame | None = None
 
-    if config.bayesian:
+    if config.derived:
+        # Derived path: train K%, BB%, HR/BF Bayesian models, then derive
+        # H/BF or Outs/BF from their posteriors + shrunk BABIP.
+        all_posteriors = _extract_all_bayesian_pitcher_posteriors(
+            train_seasons, draws, tune, chains, random_seed,
+        )
+        babip_data = _load_pitcher_babip_data(train_seasons)
+        derived = derive_pitcher_rates_batch(
+            pitcher_posteriors=all_posteriors,
+            pitcher_babip_data=babip_data,
+            stat=config.rate_col,
+            rng=rng,
+        )
+        if derived:
+            pitcher_posteriors = derived
+        else:
+            # Fallback to shrinkage if derived path fails
+            logger.warning(
+                "Derived path returned no results for %s, "
+                "falling back to shrinkage",
+                config.rate_col,
+            )
+            season_totals = _load_pitcher_season_totals(train_seasons)
+            last_season_totals = season_totals[
+                season_totals["season"] == last_train
+            ].copy()
+            pitcher_posteriors = {}
+            for pid in last_season_totals["pitcher_id"].unique():
+                samples = _get_pitcher_rate_samples(
+                    config, pid, last_season_totals,
+                    n_samples=n_mc_draws, rng=rng,
+                )
+                if samples is not None:
+                    pitcher_posteriors[pid] = samples
+    elif config.bayesian:
         posteriors = _extract_all_pitcher_posteriors(
             config, train_seasons, draws, tune, chains, random_seed,
         )
@@ -698,8 +974,9 @@ def _build_pitcher_prop_predictions(
                 pitcher_posteriors[pid] = samples
 
     logger.info(
-        "Rate samples for %d pitchers (%s, bayesian=%s)",
+        "Rate samples for %d pitchers (%s, bayesian=%s, derived=%s)",
         len(pitcher_posteriors), config.rate_col, config.bayesian,
+        config.derived,
     )
 
     # 2. Build BF priors from training seasons
@@ -733,26 +1010,91 @@ def _build_pitcher_prop_predictions(
     game_lineups = get_cached_game_lineups(test_season)
     game_batter_stats = get_cached_game_batter_stats(test_season)
 
-    # 5. Context lifts (umpire + weather, from game_k_validation helpers)
+    # 5. Context lifts (umpire + weather, stat-specific)
     from src.evaluation.game_k_validation import (
-        _build_umpire_lift_lookup,
-        _build_weather_lift_lookup,
+        _build_umpire_lift_lookup_multi,
+        _build_weather_lift_lookup_multi,
     )
-    umpire_lifts = _build_umpire_lift_lookup(train_seasons, test_season)
-    weather_lifts = _build_weather_lift_lookup(train_seasons, test_season)
+    umpire_lifts_multi = _build_umpire_lift_lookup_multi(train_seasons, test_season)
+    weather_lifts_multi = _build_weather_lift_lookup_multi(train_seasons, test_season)
 
-    # Combine context lifts
+    # Combine stat-specific context lifts for the current prop
+    sn_key = config.stat_name.lower()
+    umpire_stat_lifts = umpire_lifts_multi.get(sn_key, {})
+    weather_stat_lifts = weather_lifts_multi.get(sn_key, {})
     context_lifts: dict[int, float] = {}
-    all_gpks = set(umpire_lifts.keys()) | set(weather_lifts.keys())
+    all_gpks = set(umpire_stat_lifts.keys()) | set(weather_stat_lifts.keys())
     for gpk in all_gpks:
-        context_lifts[gpk] = umpire_lifts.get(gpk, 0.0) + weather_lifts.get(gpk, 0.0)
+        context_lifts[gpk] = umpire_stat_lifts.get(gpk, 0.0) + weather_stat_lifts.get(gpk, 0.0)
 
     # 6. Park factors (for HR)
     park_factors: dict[int, float] | None = None
     if config.park_adjusted:
         park_factors = _build_park_factor_lookup(train_seasons, test_season)
 
-    # 7. Batch predict
+    # 7. Lineup proneness lifts (Phase 1G)
+    lineup_proneness_lifts: dict[int, float] | None = None
+    if config.lineup_proneness_weight > 0.0:
+        from src.models.lineup_adjustments import (
+            build_game_lineup_map,
+            compute_lineup_proneness_batch,
+        )
+
+        # Get batter posteriors for the same stat
+        batter_posteriors_for_stat: dict[int, np.ndarray] = {}
+        try:
+            all_batter_posteriors = _extract_all_bayesian_batter_posteriors(
+                train_seasons, draws, tune, chains, random_seed,
+            )
+            # Map pitcher stat to batter stat key
+            batter_stat_key_map = {
+                "k_rate": "k_rate",
+                "bb_rate": "bb_rate",
+                "hr_per_bf": "hr_rate",
+                "h_per_bf": "h_rate",
+                "outs_per_bf": "k_rate",  # fallback
+            }
+            batter_key = batter_stat_key_map.get(config.rate_col, config.rate_col)
+            if batter_key in all_batter_posteriors:
+                batter_posteriors_for_stat = all_batter_posteriors[batter_key]
+            else:
+                logger.info(
+                    "No batter posteriors for %s, skipping lineup proneness",
+                    batter_key,
+                )
+        except Exception as e:
+            logger.warning("Could not extract batter posteriors: %s", e)
+
+        if batter_posteriors_for_stat:
+            # League average batter rate for this stat
+            league_avg_map = {
+                "k_rate": 0.222, "bb_rate": 0.085, "hr_rate": 0.033,
+                "h_rate": 0.250, "hr_per_bf": 0.033,
+            }
+            league_avg = league_avg_map.get(
+                batter_stat_key_map.get(config.rate_col, config.rate_col),
+                0.20,
+            )
+
+            # Build opposing lineup map per game
+            game_lineup_map = build_game_lineup_map(
+                game_records=test_game_logs,
+                game_lineups_df=game_lineups,
+            )
+
+            lineup_proneness_lifts = compute_lineup_proneness_batch(
+                game_lineups=game_lineup_map,
+                batter_posteriors=batter_posteriors_for_stat,
+                league_avg_rate=league_avg,
+                stat_name=sn_key,
+                weight=config.lineup_proneness_weight,
+            )
+            logger.info(
+                "Lineup proneness (%s): %d games with lifts",
+                sn_key, len(lineup_proneness_lifts),
+            )
+
+    # 8. Batch predict
     predictions = predict_game_batch_stat(
         stat_name=config.stat_name,
         game_records=test_game_logs,
@@ -764,6 +1106,7 @@ def _build_pitcher_prop_predictions(
         game_batter_ks=game_batter_stats,
         game_lineups=game_lineups,
         context_lifts=context_lifts,
+        lineup_proneness_lifts=lineup_proneness_lifts,
         park_factors=park_factors,
         model_type=config.model_type,
         default_lines=config.default_lines if config.default_lines else None,
@@ -887,7 +1230,40 @@ def _build_batter_prop_predictions(
     posteriors: dict[str, dict[int, np.ndarray]] | None = None
     season_totals: pd.DataFrame | None = None
 
-    if config.bayesian:
+    if config.derived:
+        # Derived path: train K%, BB%, HR% Bayesian models, then derive
+        # H/PA from their posteriors + shrunk BABIP.
+        all_posteriors = _extract_all_bayesian_batter_posteriors(
+            train_seasons, draws, tune, chains, random_seed,
+        )
+        babip_data = _load_batter_babip_data(train_seasons)
+        derived = derive_batter_rates_batch(
+            batter_posteriors=all_posteriors,
+            batter_babip_data=babip_data,
+            rng=rng,
+        )
+        if derived:
+            batter_posteriors = derived
+        else:
+            # Fallback to shrinkage if derived path fails
+            logger.warning(
+                "Derived path returned no results for batter %s, "
+                "falling back to shrinkage",
+                config.rate_col,
+            )
+            season_totals = _load_batter_season_totals(train_seasons)
+            last_season_totals = season_totals[
+                season_totals["season"] == last_train
+            ].copy()
+            batter_posteriors = {}
+            for bid in last_season_totals["batter_id"].unique():
+                samples = _get_batter_rate_samples(
+                    config, bid, last_season_totals,
+                    n_samples=n_mc_draws, rng=rng,
+                )
+                if samples is not None:
+                    batter_posteriors[bid] = samples
+    elif config.bayesian:
         posteriors = _extract_all_batter_posteriors(
             config, train_seasons, draws, tune, chains, random_seed,
         )
@@ -911,8 +1287,9 @@ def _build_batter_prop_predictions(
                 batter_posteriors[bid] = samples
 
     logger.info(
-        "Rate samples for %d batters (%s, bayesian=%s)",
+        "Rate samples for %d batters (%s, bayesian=%s, derived=%s)",
         len(batter_posteriors), config.rate_col, config.bayesian,
+        config.derived,
     )
 
     # 2. Build PA priors from training batter game logs
@@ -954,21 +1331,85 @@ def _build_batter_prop_predictions(
             if key not in batter_pitcher_lookup:
                 batter_pitcher_lookup[key] = int(row["pitcher_id"])
 
-    # 6. Context lifts
+    # 6. Context lifts (stat-specific)
     from src.evaluation.game_k_validation import (
-        _build_umpire_lift_lookup,
-        _build_weather_lift_lookup,
+        _build_umpire_lift_lookup_multi,
+        _build_weather_lift_lookup_multi,
     )
-    umpire_lifts = _build_umpire_lift_lookup(train_seasons, test_season)
-    weather_lifts = _build_weather_lift_lookup(train_seasons, test_season)
+    umpire_lifts_multi = _build_umpire_lift_lookup_multi(train_seasons, test_season)
+    weather_lifts_multi = _build_weather_lift_lookup_multi(train_seasons, test_season)
+
+    # Stat-specific umpire + weather lifts for this prop
+    sn = config.stat_name.lower()
+    umpire_stat_lifts = umpire_lifts_multi.get(sn, {})
+    weather_stat_lifts = weather_lifts_multi.get(sn, {})
 
     # Park factors
     park_factors: dict[int, float] | None = None
     if config.park_adjusted:
         park_factors = _build_park_factor_lookup(train_seasons, test_season)
 
-    # 7. Predict per batter-game
-    sn = config.stat_name.lower()
+    # 7. Opposing pitcher lifts (Phase 1J)
+    opp_pitcher_lift_lookup: dict[tuple[int, int], float] = {}
+    if config.opposing_pitcher_weight > 0.0:
+        from src.models.lineup_adjustments import compute_opposing_pitcher_lift
+
+        # Get pitcher posteriors for the corresponding pitcher stat
+        pitcher_posteriors_for_stat: dict[int, np.ndarray] = {}
+        try:
+            all_pitcher_posteriors = _extract_all_bayesian_pitcher_posteriors(
+                train_seasons, draws, tune, chains, random_seed,
+            )
+            # Map batter stat to pitcher stat key
+            pitcher_stat_key_map = {
+                "k_rate": "k_rate",
+                "bb_rate": "bb_rate",
+                "hr_rate": "hr_per_bf",
+                "h_rate": "h_per_bf",
+            }
+            pitcher_key = pitcher_stat_key_map.get(
+                config.rate_col, config.rate_col
+            )
+            if pitcher_key in all_pitcher_posteriors:
+                pitcher_posteriors_for_stat = all_pitcher_posteriors[pitcher_key]
+            else:
+                logger.info(
+                    "No pitcher posteriors for %s, skipping opposing pitcher lift",
+                    pitcher_key,
+                )
+        except Exception as e:
+            logger.warning("Could not extract pitcher posteriors: %s", e)
+
+        if pitcher_posteriors_for_stat:
+            # League average pitcher rate for this stat
+            league_avg_pitcher_map = {
+                "k_rate": 0.222, "bb_rate": 0.085, "hr_per_bf": 0.033,
+                "h_per_bf": 0.230, "outs_per_bf": 0.640,
+            }
+            league_avg_pitcher = league_avg_pitcher_map.get(pitcher_key, 0.20)
+
+            n_opp_lifts = 0
+            for (gpk, bid), pid in batter_pitcher_lookup.items():
+                if pid in pitcher_posteriors_for_stat:
+                    pitcher_mean = float(
+                        np.mean(pitcher_posteriors_for_stat[pid])
+                    )
+                    lift = compute_opposing_pitcher_lift(
+                        pitcher_rate_posterior_mean=pitcher_mean,
+                        league_avg_pitcher_rate=league_avg_pitcher,
+                        stat_name=sn,
+                        weight=config.opposing_pitcher_weight,
+                    )
+                    if lift != 0.0:
+                        opp_pitcher_lift_lookup[(gpk, bid)] = lift
+                        n_opp_lifts += 1
+
+            logger.info(
+                "Opposing pitcher %s lifts: %d batter-games with lifts",
+                sn, n_opp_lifts,
+            )
+
+    # 8. Predict per batter-game
     records: list[dict[str, Any]] = []
     n_total = len(test_batter_gl)
     n_predicted = 0
@@ -1000,13 +1441,16 @@ def _build_batter_prop_predictions(
         pa_mu = pa_info["mu_pa"]
         pa_sigma = pa_info["sigma_pa"]
 
-        # Context
+        # Context (stat-specific umpire + weather lifts)
         context_lift = (
-            umpire_lifts.get(game_pk, 0.0) + weather_lifts.get(game_pk, 0.0)
+            umpire_stat_lifts.get(game_pk, 0.0) + weather_stat_lifts.get(game_pk, 0.0)
         )
         pf = 1.0
         if park_factors is not None:
             pf = park_factors.get(game_pk, 1.0)
+
+        # Opposing pitcher lift (Phase 1J)
+        opp_lift = opp_pitcher_lift_lookup.get((game_pk, batter_id), 0.0)
 
         # Predict
         pred = predict_batter_game(
@@ -1020,6 +1464,7 @@ def _build_batter_prop_predictions(
             hitter_vuln=hitter_vuln,
             baselines_pt=baselines_pt,
             context_logit_lift=context_lift,
+            opposing_pitcher_lift=opp_lift,
             park_factor=pf,
             model_type=config.model_type,
             default_lines=config.default_lines if config.default_lines else None,
@@ -1045,6 +1490,7 @@ def _build_batter_prop_predictions(
             "pa_mu": pred["pa_mu"],
             "pa_sigma": pred["pa_sigma"],
             "matchup_logit_lift": pred["matchup_logit_lift"],
+            "opposing_pitcher_lift": pred.get("opposing_pitcher_lift", 0.0),
             f"batter_{config.rate_col}_mean": float(np.mean(rate_samples)),
         }
 

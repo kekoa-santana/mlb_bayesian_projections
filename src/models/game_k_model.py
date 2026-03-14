@@ -19,6 +19,11 @@ from scipy.special import expit, logit
 
 from src.models.bf_model import draw_bf_samples, get_bf_distribution
 from src.models.matchup import score_matchup, score_matchup_for_stat
+from src.models.rest_adjustment import (
+    apply_rest_to_bf,
+    compute_rest_for_game,
+    get_rest_adjustment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +31,127 @@ logger = logging.getLogger(__name__)
 _CLIP_LO = 1e-6
 _CLIP_HI = 1 - 1e-6
 
+# ---------------------------------------------------------------------------
+# League-average TTO logit lifts (relative to overall rate).
+# Computed from 2018-2025 fact_pa:
+#   TTO1 K=.2378  BB=.0848  HR=.0298   overall K=.2256  BB=.0812  HR=.0316
+#   TTO2 K=.2095  BB=.0748  HR=.0339
+#   TTO3 K=.1942  BB=.0747  HR=.0366
+# Lift = logit(tto_rate) - logit(overall_rate)
+# ---------------------------------------------------------------------------
+_LEAGUE_TTO_LOGIT_LIFTS: dict[str, np.ndarray] = {
+    "k": np.array([
+        logit(0.23782) - logit(0.22557),   # TTO1: +0.066
+        logit(0.20952) - logit(0.22557),   # TTO2: -0.085
+        logit(0.19421) - logit(0.22557),   # TTO3: -0.171
+    ]),
+    "bb": np.array([
+        logit(0.08483) - logit(0.08115),   # TTO1: +0.047
+        logit(0.07479) - logit(0.08115),   # TTO2: -0.082
+        logit(0.07470) - logit(0.08115),   # TTO3: -0.083
+    ]),
+    "hr": np.array([
+        logit(0.02979) - logit(0.03162),   # TTO1: -0.062
+        logit(0.03385) - logit(0.03162),   # TTO2: +0.072
+        logit(0.03658) - logit(0.03162),   # TTO3: +0.160
+    ]),
+}
+
+# Number of BF in each TTO block (9 batters per time through)
+_BF_PER_TTO = 9
+
 
 def _safe_logit(p: np.ndarray) -> np.ndarray:
     """Logit with clipping."""
     return logit(np.clip(p, _CLIP_LO, _CLIP_HI))
+
+
+def build_tto_logit_lifts(
+    tto_profiles: pd.DataFrame | None,
+    pitcher_id: int,
+    season: int,
+    stat_name: str = "k",
+) -> np.ndarray:
+    """Get TTO logit lifts for a pitcher, falling back to league average.
+
+    Parameters
+    ----------
+    tto_profiles : pd.DataFrame or None
+        Output of ``get_tto_adjustment_profiles()``.  Must contain columns:
+        pitcher_id, season, tto, {stat}_rate, overall_{stat}_rate.
+        If None, returns league-average lifts.
+    pitcher_id : int
+        Pitcher MLB ID.
+    season : int
+        Season to look up.
+    stat_name : str
+        One of 'k', 'bb', 'hr'.
+
+    Returns
+    -------
+    np.ndarray
+        Shape (3,) logit lifts for TTO 1, 2, 3.
+    """
+    sn = stat_name.lower()
+    league_lifts = _LEAGUE_TTO_LOGIT_LIFTS.get(sn)
+    if league_lifts is None:
+        return np.zeros(3)
+
+    if tto_profiles is None or tto_profiles.empty:
+        return league_lifts.copy()
+
+    mask = (
+        (tto_profiles["pitcher_id"] == pitcher_id)
+        & (tto_profiles["season"] == season)
+    )
+    pitcher_data = tto_profiles[mask]
+
+    if len(pitcher_data) < 3:
+        return league_lifts.copy()
+
+    rate_col = f"{sn}_rate"
+    overall_col = f"overall_{sn}_rate"
+
+    if rate_col not in pitcher_data.columns or overall_col not in pitcher_data.columns:
+        return league_lifts.copy()
+
+    pitcher_data = pitcher_data.sort_values("tto")
+    tto_rates = pitcher_data[rate_col].values.astype(float)
+    overall_rate = pitcher_data[overall_col].values[0].astype(float)
+
+    # Avoid degenerate rates
+    if overall_rate < _CLIP_LO or overall_rate > _CLIP_HI:
+        return league_lifts.copy()
+
+    overall_logit = logit(np.clip(overall_rate, _CLIP_LO, _CLIP_HI))
+    tto_logits = logit(np.clip(tto_rates, _CLIP_LO, _CLIP_HI))
+    pitcher_lifts = tto_logits - overall_logit
+
+    # Reliability-weight toward league average based on PA
+    pa_counts = pitcher_data["pa_count"].values.astype(float)
+    reliability = np.clip(pa_counts / 100.0, 0.0, 1.0)  # full weight at 100 PA
+    blended = reliability * pitcher_lifts + (1.0 - reliability) * league_lifts
+
+    return blended
+
+
+def _assign_bf_to_tto(bf: int) -> np.ndarray:
+    """Assign each BF to a TTO block (0-indexed: 0=TTO1, 1=TTO2, 2=TTO3).
+
+    Parameters
+    ----------
+    bf : int
+        Total batters faced in the game.
+
+    Returns
+    -------
+    np.ndarray
+        Shape (bf,) with values 0, 1, or 2 indicating TTO block.
+    """
+    tto_assignments = np.zeros(bf, dtype=int)
+    for i in range(bf):
+        tto_assignments[i] = min(i // _BF_PER_TTO, 2)
+    return tto_assignments
 
 
 def simulate_game_ks(
@@ -39,6 +161,8 @@ def simulate_game_ks(
     lineup_matchup_lifts: np.ndarray | None = None,
     umpire_k_logit_lift: float = 0.0,
     weather_k_logit_lift: float = 0.0,
+    tto_logit_lifts: np.ndarray | None = None,
+    rest_k_logit_lift: float = 0.0,
     n_draws: int = 4000,
     bf_min: int = 3,
     bf_max: int = 35,
@@ -51,9 +175,9 @@ def simulate_game_ks(
     pitcher_k_rate_samples : np.ndarray
         K% posterior samples from Layer 1 (values in [0, 1]).
     bf_mu : float
-        Mean batters faced for this pitcher.
+        Mean batters faced for this pitcher (rest-adjusted if applicable).
     bf_sigma : float
-        Std of batters faced.
+        Std of batters faced (rest-adjusted if applicable).
     lineup_matchup_lifts : np.ndarray or None
         Shape (9,) logit-scale lifts per batting order slot.
         Positive = batter more vulnerable → more Ks.
@@ -64,6 +188,13 @@ def simulate_game_ks(
     weather_k_logit_lift : float
         Logit-scale shift for weather effect on K-rate.
         Positive = weather conditions increase Ks (e.g. cold).
+    tto_logit_lifts : np.ndarray or None
+        Shape (3,) logit-scale lifts for TTO 1, 2, 3+.
+        Applied per-BF based on times-through-order block.
+        None = no TTO adjustment (flat rate, backward compatible).
+    rest_k_logit_lift : float
+        Logit-scale shift for days-rest effect on K-rate.
+        From ``rest_adjustment.get_rest_adjustment()``.
     n_draws : int
         Number of Monte Carlo draws.
     bf_min : int
@@ -97,8 +228,13 @@ def simulate_game_ks(
     if lineup_matchup_lifts is None:
         lineup_matchup_lifts = np.zeros(9)
 
-    # Convert pitcher K% to logit scale and apply umpire + weather adjustments
-    k_logit = _safe_logit(k_rate_draws) + umpire_k_logit_lift + weather_k_logit_lift
+    # Convert pitcher K% to logit scale and apply context adjustments
+    k_logit = (
+        _safe_logit(k_rate_draws)
+        + umpire_k_logit_lift
+        + weather_k_logit_lift
+        + rest_k_logit_lift
+    )
 
     # Vectorize by grouping draws with same BF value
     k_totals = np.zeros(n_draws, dtype=int)
@@ -109,25 +245,46 @@ def simulate_game_ks(
         n_bf_draws = mask.sum()
         bf_int = int(bf_val)
 
-        # Allocate PA across 9 batting order slots
-        base_pa = bf_int // 9
-        extra = bf_int % 9
-        pa_per_slot = np.full(9, base_pa, dtype=int)
-        pa_per_slot[:extra] += 1
-
-        # For each slot with PA > 0, simulate Ks
         game_ks = np.zeros(n_bf_draws, dtype=int)
         k_logit_subset = k_logit[mask]
 
-        for slot in range(9):
-            if pa_per_slot[slot] == 0:
-                continue
-            # Adjust K rate by matchup lift for this slot
-            adjusted_logit = k_logit_subset + lineup_matchup_lifts[slot]
-            adjusted_p = expit(adjusted_logit)
-            # Binomial draw: K per slot
-            slot_ks = rng.binomial(n=pa_per_slot[slot], p=adjusted_p)
-            game_ks += slot_ks
+        if tto_logit_lifts is not None:
+            # TTO-aware: iterate over each BF position, applying the
+            # correct TTO lift and matchup lift per batter faced.
+            # BF 0-8 → TTO1, 9-17 → TTO2, 18+ → TTO3.
+            # Group consecutive BF positions by (tto, slot) to batch
+            # Bernoulli draws into Binomial where possible.
+            #
+            # Build a (tto_block, slot) → count mapping for this bf_int.
+            tto_slot_counts: dict[tuple[int, int], int] = {}
+            for bf_idx in range(bf_int):
+                tto_block = min(bf_idx // _BF_PER_TTO, 2)
+                slot = bf_idx % 9
+                key = (tto_block, slot)
+                tto_slot_counts[key] = tto_slot_counts.get(key, 0) + 1
+
+            for (tto_block, slot), count in tto_slot_counts.items():
+                adjusted_logit = (
+                    k_logit_subset
+                    + lineup_matchup_lifts[slot]
+                    + tto_logit_lifts[tto_block]
+                )
+                adjusted_p = expit(adjusted_logit)
+                game_ks += rng.binomial(n=count, p=adjusted_p)
+        else:
+            # Original flat-rate path (no TTO adjustment)
+            base_pa = bf_int // 9
+            extra = bf_int % 9
+            pa_per_slot = np.full(9, base_pa, dtype=int)
+            pa_per_slot[:extra] += 1
+
+            for slot in range(9):
+                if pa_per_slot[slot] == 0:
+                    continue
+                adjusted_logit = k_logit_subset + lineup_matchup_lifts[slot]
+                adjusted_p = expit(adjusted_logit)
+                slot_ks = rng.binomial(n=pa_per_slot[slot], p=adjusted_p)
+                game_ks += slot_ks
 
         k_totals[mask] = game_ks
 
@@ -324,6 +481,7 @@ def predict_game(
     baselines_pt: dict[str, dict[str, float]] | None = None,
     umpire_k_logit_lift: float = 0.0,
     weather_k_logit_lift: float = 0.0,
+    days_rest: int | None = None,
     n_draws: int = 4000,
     random_seed: int = 42,
     bf_min: int = 3,
@@ -353,6 +511,8 @@ def predict_game(
         Logit-scale shift for HP umpire K-rate tendency (0.0 = neutral).
     weather_k_logit_lift : float
         Logit-scale shift for weather effect on K-rate (0.0 = neutral).
+    days_rest : int or None
+        Days since pitcher's previous start.  None = no rest adjustment.
     n_draws : int
         Monte Carlo draws.
     random_seed : int
@@ -365,12 +525,18 @@ def predict_game(
     dict
         Keys: k_samples, k_over_probs, expected_k, std_k,
         bf_mu, bf_sigma, lineup_matchup_lifts, per_batter_details,
-        umpire_k_logit_lift, weather_k_logit_lift.
+        umpire_k_logit_lift, weather_k_logit_lift, rest_k_logit_lift,
+        days_rest, rest_bucket.
     """
     # BF distribution
     bf_info = get_bf_distribution(pitcher_id, season, bf_priors)
     bf_mu = bf_info["mu_bf"]
     bf_sigma = bf_info["sigma_bf"]
+
+    # Rest adjustments (pre-computed before MC loop)
+    rest_adj = get_rest_adjustment(days_rest)
+    rest_k_lift = rest_adj["k_lift"]
+    bf_mu, bf_sigma = apply_rest_to_bf(bf_mu, bf_sigma, days_rest)
 
     # Matchup lifts
     lineup_lifts = None
@@ -390,6 +556,7 @@ def predict_game(
         lineup_matchup_lifts=lineup_lifts,
         umpire_k_logit_lift=umpire_k_logit_lift,
         weather_k_logit_lift=weather_k_logit_lift,
+        rest_k_logit_lift=rest_k_lift,
         n_draws=n_draws,
         bf_min=bf_min,
         bf_max=bf_max,
@@ -409,6 +576,9 @@ def predict_game(
         "per_batter_details": per_batter_details,
         "umpire_k_logit_lift": umpire_k_logit_lift,
         "weather_k_logit_lift": weather_k_logit_lift,
+        "rest_k_logit_lift": rest_k_lift,
+        "days_rest": days_rest,
+        "rest_bucket": rest_adj["rest_bucket"],
     }
 
 
@@ -423,6 +593,7 @@ def predict_game_batch(
     game_lineups: pd.DataFrame | None = None,
     umpire_lifts: dict[int, float] | None = None,
     weather_lifts: dict[int, float] | None = None,
+    rest_df: pd.DataFrame | None = None,
     n_draws: int = 4000,
     bf_min: int = 3,
     bf_max: int = 35,
@@ -454,6 +625,9 @@ def predict_game_batch(
         Mapping of game_pk → umpire K logit lift.
     weather_lifts : dict[int, float] or None
         Mapping of game_pk → weather K logit lift.
+    rest_df : pd.DataFrame or None
+        Pre-computed days-rest data from ``queries.get_days_rest()``.
+        If provided, applies rest-based BF and K-rate adjustments.
     n_draws : int
         Monte Carlo draws per game.
     bf_min, bf_max : int
@@ -465,7 +639,8 @@ def predict_game_batch(
         One row per game with: game_pk, pitcher_id, season, actual_k,
         actual_bf, expected_k, std_k, p_over_X_5 columns,
         pitcher_k_rate_mean, bf_mu, n_matched_batters,
-        umpire_k_logit_lift, weather_k_logit_lift.
+        umpire_k_logit_lift, weather_k_logit_lift, days_rest,
+        rest_bucket.
     """
     records = []
     n_games = len(game_records)
@@ -475,6 +650,14 @@ def predict_game_batch(
     if game_lineups is not None and not game_lineups.empty:
         for gpk, grp in game_lineups.groupby("game_pk"):
             _lineup_index[int(gpk)] = grp
+
+    # Pre-index rest data for fast lookup: (pitcher_id, game_pk) -> days_rest
+    _rest_index: dict[tuple[int, int], int] = {}
+    if rest_df is not None and not rest_df.empty:
+        for _, rrow in rest_df.iterrows():
+            _rest_index[(int(rrow["pitcher_id"]), int(rrow["game_pk"]))] = int(
+                rrow["days_rest"]
+            )
 
     for i, (_, game) in enumerate(game_records.iterrows()):
         pitcher_id = int(game["pitcher_id"])
@@ -534,6 +717,9 @@ def predict_game_batch(
         if weather_lifts is not None:
             wx_lift = weather_lifts.get(game_pk, 0.0)
 
+        # --- Days rest ---
+        dr = _rest_index.get((pitcher_id, game_pk))
+
         result = predict_game(
             pitcher_id=pitcher_id,
             season=season,
@@ -545,6 +731,7 @@ def predict_game_batch(
             baselines_pt=baselines_pt,
             umpire_k_logit_lift=ump_lift,
             weather_k_logit_lift=wx_lift,
+            days_rest=dr,
             n_draws=n_draws,
             random_seed=42 + i,
             bf_min=bf_min,
@@ -564,6 +751,8 @@ def predict_game_batch(
             "n_matched_batters": n_matched,
             "umpire_k_logit_lift": ump_lift,
             "weather_k_logit_lift": wx_lift,
+            "days_rest": dr,
+            "rest_bucket": result["rest_bucket"],
         }
 
         # Add P(over) columns
@@ -599,6 +788,7 @@ def simulate_game_stat(
     opp_sigma: float,
     lineup_matchup_lifts: np.ndarray | None = None,
     context_logit_lift: float = 0.0,
+    tto_logit_lifts: np.ndarray | None = None,
     n_draws: int = 4000,
     opp_min: int = 3,
     opp_max: int = 35,
@@ -624,6 +814,11 @@ def simulate_game_stat(
         For batters, shape (1,) with the single matchup lift.
     context_logit_lift : float
         Additional logit-scale context shift (umpire, weather, park).
+    tto_logit_lifts : np.ndarray or None
+        Shape (3,) logit-scale lifts for TTO 1, 2, 3+.
+        Applied per-BF based on times-through-order block.
+        Only used in pitcher mode (n_slots == 9).
+        None = no TTO adjustment (backward compatible).
     n_draws : int
         Number of Monte Carlo draws.
     opp_min, opp_max : int
@@ -663,7 +858,7 @@ def simulate_game_stat(
     stat_totals = np.zeros(n_draws, dtype=int)
 
     if n_slots == 1:
-        # Batter mode: single Binomial draw per MC iteration
+        # Batter mode: single Binomial draw per MC iteration (no TTO)
         adjusted_logit = rate_logit + lineup_matchup_lifts[0]
         adjusted_p = expit(adjusted_logit)
         stat_totals = rng.binomial(n=opp_draws.astype(int), p=adjusted_p)
@@ -675,22 +870,40 @@ def simulate_game_stat(
             n_opp_draws = mask.sum()
             opp_int = int(opp_val)
 
-            # Allocate PA across slots
-            base_pa = opp_int // n_slots
-            extra = opp_int % n_slots
-            pa_per_slot = np.full(n_slots, base_pa, dtype=int)
-            pa_per_slot[:extra] += 1
-
             game_stats = np.zeros(n_opp_draws, dtype=int)
             rate_logit_subset = rate_logit[mask]
 
-            for slot in range(n_slots):
-                if pa_per_slot[slot] == 0:
-                    continue
-                adjusted_logit = rate_logit_subset + lineup_matchup_lifts[slot]
-                adjusted_p = expit(adjusted_logit)
-                slot_stats = rng.binomial(n=pa_per_slot[slot], p=adjusted_p)
-                game_stats += slot_stats
+            if tto_logit_lifts is not None:
+                # TTO-aware: group BF by (tto_block, slot) for precise lifts
+                tto_slot_counts: dict[tuple[int, int], int] = {}
+                for bf_idx in range(opp_int):
+                    tto_block = min(bf_idx // _BF_PER_TTO, 2)
+                    slot = bf_idx % n_slots
+                    key = (tto_block, slot)
+                    tto_slot_counts[key] = tto_slot_counts.get(key, 0) + 1
+
+                for (tto_block, slot), count in tto_slot_counts.items():
+                    adjusted_logit = (
+                        rate_logit_subset
+                        + lineup_matchup_lifts[slot]
+                        + tto_logit_lifts[tto_block]
+                    )
+                    adjusted_p = expit(adjusted_logit)
+                    game_stats += rng.binomial(n=count, p=adjusted_p)
+            else:
+                # Original flat-rate path
+                base_pa = opp_int // n_slots
+                extra = opp_int % n_slots
+                pa_per_slot = np.full(n_slots, base_pa, dtype=int)
+                pa_per_slot[:extra] += 1
+
+                for slot in range(n_slots):
+                    if pa_per_slot[slot] == 0:
+                        continue
+                    adjusted_logit = rate_logit_subset + lineup_matchup_lifts[slot]
+                    adjusted_p = expit(adjusted_logit)
+                    slot_stats = rng.binomial(n=pa_per_slot[slot], p=adjusted_p)
+                    game_stats += slot_stats
 
             stat_totals[mask] = game_stats
 
@@ -704,6 +917,7 @@ def simulate_game_stat_poisson(
     lineup_matchup_lifts: np.ndarray | None = None,
     context_logit_lift: float = 0.0,
     park_factor: float = 1.0,
+    tto_logit_lifts: np.ndarray | None = None,
     n_draws: int = 4000,
     opp_min: int = 3,
     opp_max: int = 35,
@@ -732,6 +946,10 @@ def simulate_game_stat_poisson(
         Additional logit-scale context shift.
     park_factor : float
         Multiplicative park factor for the stat (e.g., HR park factor).
+    tto_logit_lifts : np.ndarray or None
+        Shape (3,) logit-scale lifts for TTO 1, 2, 3+.
+        Only used in pitcher mode (n_slots > 1).
+        None = no TTO adjustment (backward compatible).
     n_draws : int
         Number of Monte Carlo draws.
     opp_min, opp_max : int
@@ -770,7 +988,7 @@ def simulate_game_stat_poisson(
     stat_totals = np.zeros(n_draws, dtype=int)
 
     if n_slots == 1:
-        # Batter mode: single Poisson draw per MC iteration
+        # Batter mode: single Poisson draw per MC iteration (no TTO)
         adjusted_logit = rate_logit + lineup_matchup_lifts[0]
         adjusted_rate = expit(adjusted_logit)
         lam = adjusted_rate * opp_draws * park_factor
@@ -783,23 +1001,42 @@ def simulate_game_stat_poisson(
             n_opp_draws = mask.sum()
             opp_int = int(opp_val)
 
-            # Allocate PA across slots
-            base_pa = opp_int // n_slots
-            extra = opp_int % n_slots
-            pa_per_slot = np.full(n_slots, base_pa, dtype=int)
-            pa_per_slot[:extra] += 1
-
             game_stats = np.zeros(n_opp_draws, dtype=int)
             rate_logit_subset = rate_logit[mask]
 
-            for slot in range(n_slots):
-                if pa_per_slot[slot] == 0:
-                    continue
-                adjusted_logit = rate_logit_subset + lineup_matchup_lifts[slot]
-                adjusted_rate = expit(adjusted_logit)
-                lam = adjusted_rate * pa_per_slot[slot] * park_factor
-                slot_stats = rng.poisson(lam=lam)
-                game_stats += slot_stats
+            if tto_logit_lifts is not None:
+                # TTO-aware: group BF by (tto_block, slot)
+                tto_slot_counts: dict[tuple[int, int], int] = {}
+                for bf_idx in range(opp_int):
+                    tto_block = min(bf_idx // _BF_PER_TTO, 2)
+                    slot = bf_idx % n_slots
+                    key = (tto_block, slot)
+                    tto_slot_counts[key] = tto_slot_counts.get(key, 0) + 1
+
+                for (tto_block, slot), count in tto_slot_counts.items():
+                    adjusted_logit = (
+                        rate_logit_subset
+                        + lineup_matchup_lifts[slot]
+                        + tto_logit_lifts[tto_block]
+                    )
+                    adjusted_rate = expit(adjusted_logit)
+                    lam = adjusted_rate * count * park_factor
+                    game_stats += rng.poisson(lam=lam)
+            else:
+                # Original flat-rate path
+                base_pa = opp_int // n_slots
+                extra = opp_int % n_slots
+                pa_per_slot = np.full(n_slots, base_pa, dtype=int)
+                pa_per_slot[:extra] += 1
+
+                for slot in range(n_slots):
+                    if pa_per_slot[slot] == 0:
+                        continue
+                    adjusted_logit = rate_logit_subset + lineup_matchup_lifts[slot]
+                    adjusted_rate = expit(adjusted_logit)
+                    lam = adjusted_rate * pa_per_slot[slot] * park_factor
+                    slot_stats = rng.poisson(lam=lam)
+                    game_stats += slot_stats
 
             stat_totals[mask] = game_stats
 
@@ -914,6 +1151,7 @@ def predict_game_stat(
     hitter_vuln: pd.DataFrame | None = None,
     baselines_pt: dict[str, dict[str, float]] | None = None,
     context_logit_lift: float = 0.0,
+    lineup_proneness_lift: float = 0.0,
     park_factor: float = 1.0,
     model_type: str = "binomial",
     n_draws: int = 4000,
@@ -945,6 +1183,9 @@ def predict_game_stat(
         League baselines per pitch type. Required if lineup given.
     context_logit_lift : float
         Logit-scale context shift (umpire + weather + park combined).
+    lineup_proneness_lift : float
+        Logit-scale lift from aggregate lineup K/BB/HR-proneness (Phase 1G).
+        Positive = lineup more prone to this outcome. Default 0.0 (off).
     park_factor : float
         Multiplicative park factor. Used only for Poisson model (HR).
     model_type : str
@@ -961,7 +1202,8 @@ def predict_game_stat(
     dict
         Keys: stat_samples, over_probs, expected_{stat_name},
         std_{stat_name}, bf_mu, bf_sigma, lineup_matchup_lifts,
-        per_batter_details, context_logit_lift, park_factor.
+        per_batter_details, context_logit_lift, lineup_proneness_lift,
+        park_factor.
     """
     # BF distribution
     bf_info = get_bf_distribution(pitcher_id, season, bf_priors)
@@ -978,6 +1220,9 @@ def predict_game_stat(
                 pitcher_arsenal, hitter_vuln, baselines_pt,
             )
 
+    # Combine context + lineup proneness into total context lift
+    total_context = context_logit_lift + lineup_proneness_lift
+
     # Monte Carlo simulation
     if model_type == "poisson":
         stat_samples = simulate_game_stat_poisson(
@@ -985,7 +1230,7 @@ def predict_game_stat(
             opp_mu=bf_mu,
             opp_sigma=bf_sigma,
             lineup_matchup_lifts=lineup_lifts,
-            context_logit_lift=context_logit_lift,
+            context_logit_lift=total_context,
             park_factor=park_factor,
             n_draws=n_draws,
             opp_min=bf_min,
@@ -999,7 +1244,7 @@ def predict_game_stat(
             opp_mu=bf_mu,
             opp_sigma=bf_sigma,
             lineup_matchup_lifts=lineup_lifts,
-            context_logit_lift=context_logit_lift,
+            context_logit_lift=total_context,
             n_draws=n_draws,
             opp_min=bf_min,
             opp_max=bf_max,
@@ -1020,6 +1265,7 @@ def predict_game_stat(
         "lineup_matchup_lifts": lineup_lifts,
         "per_batter_details": per_batter_details,
         "context_logit_lift": context_logit_lift,
+        "lineup_proneness_lift": lineup_proneness_lift,
         "park_factor": park_factor,
     }
 
@@ -1111,6 +1357,7 @@ def predict_batter_game(
     hitter_vuln: pd.DataFrame | None = None,
     baselines_pt: dict[str, dict[str, float]] | None = None,
     context_logit_lift: float = 0.0,
+    opposing_pitcher_lift: float = 0.0,
     park_factor: float = 1.0,
     model_type: str = "binomial",
     default_lines: list[float] | None = None,
@@ -1141,6 +1388,10 @@ def predict_batter_game(
         League baselines per pitch type.
     context_logit_lift : float
         Logit-scale context shift (umpire + weather).
+    opposing_pitcher_lift : float
+        Logit-scale lift from opposing pitcher quality (Phase 1J).
+        Positive = opposing pitcher is better than average at generating
+        this outcome. Default 0.0 (off).
     park_factor : float
         Multiplicative park factor. Used only for Poisson model (HR).
     model_type : str
@@ -1156,7 +1407,8 @@ def predict_batter_game(
     -------
     dict
         Keys: stat_samples, over_probs, expected_{stat_name},
-        std_{stat_name}, pa_mu, pa_sigma, matchup_logit_lift.
+        std_{stat_name}, pa_mu, pa_sigma, matchup_logit_lift,
+        opposing_pitcher_lift.
     """
     sn = stat_name.lower()
     lift_key = _STAT_LIFT_KEYS.get(sn, "matchup_logit_lift")
@@ -1177,13 +1429,16 @@ def predict_batter_game(
         if np.isnan(matchup_lift):
             matchup_lift = 0.0
 
+    # Combine context + opposing pitcher lift
+    total_context = context_logit_lift + opposing_pitcher_lift
+
     # Simulate
     stat_samples = simulate_batter_game_stat(
         rate_samples=rate_samples,
         pa_mu=pa_mu,
         pa_sigma=pa_sigma,
         matchup_logit_lift=matchup_lift,
-        context_logit_lift=context_logit_lift,
+        context_logit_lift=total_context,
         park_factor=park_factor,
         model_type=model_type,
         n_draws=n_draws,
@@ -1201,6 +1456,7 @@ def predict_batter_game(
         "pa_sigma": pa_sigma,
         "matchup_logit_lift": matchup_lift,
         "matchup_detail": matchup_detail,
+        "opposing_pitcher_lift": opposing_pitcher_lift,
     }
 
 
@@ -1215,6 +1471,7 @@ def predict_game_batch_stat(
     game_batter_ks: pd.DataFrame | None = None,
     game_lineups: pd.DataFrame | None = None,
     context_lifts: dict[int, float] | None = None,
+    lineup_proneness_lifts: dict[int, float] | None = None,
     park_factors: dict[int, float] | None = None,
     model_type: str = "binomial",
     default_lines: list[float] | None = None,
@@ -1252,6 +1509,9 @@ def predict_game_batch_stat(
         team_id. Preferred over game_batter_ks.
     context_lifts : dict[int, float] or None
         Mapping of game_pk → combined context logit lift.
+    lineup_proneness_lifts : dict[int, float] or None
+        Mapping of game_pk → lineup proneness logit lift (Phase 1G).
+        Pre-computed from aggregate lineup K/BB/HR-proneness.
     park_factors : dict[int, float] or None
         Mapping of game_pk → park factor (multiplicative, Poisson only).
     model_type : str
@@ -1271,7 +1531,8 @@ def predict_game_batch_stat(
         One row per game with: game_pk, pitcher_id, season,
         actual_{stat_name}, actual_bf, expected_{stat_name},
         std_{stat_name}, p_over_X_5 columns, pitcher_rate_mean,
-        bf_mu, n_matched_batters, context_logit_lift, park_factor.
+        bf_mu, n_matched_batters, context_logit_lift,
+        lineup_proneness_lift, park_factor.
     """
     sn = stat_name.lower()
     records: list[dict[str, Any]] = []
@@ -1338,6 +1599,10 @@ def predict_game_batch_stat(
         if park_factors is not None:
             pf = park_factors.get(game_pk, 1.0)
 
+        lp_lift = 0.0
+        if lineup_proneness_lifts is not None:
+            lp_lift = lineup_proneness_lifts.get(game_pk, 0.0)
+
         result = predict_game_stat(
             stat_name=stat_name,
             pitcher_id=pitcher_id,
@@ -1349,6 +1614,7 @@ def predict_game_batch_stat(
             hitter_vuln=hitter_vuln,
             baselines_pt=baselines_pt,
             context_logit_lift=ctx_lift,
+            lineup_proneness_lift=lp_lift,
             park_factor=pf,
             model_type=model_type,
             n_draws=n_draws,
@@ -1369,6 +1635,7 @@ def predict_game_batch_stat(
             "bf_mu": result["bf_mu"],
             "n_matched_batters": n_matched,
             "context_logit_lift": ctx_lift,
+            "lineup_proneness_lift": lp_lift,
             "park_factor": pf,
         }
 

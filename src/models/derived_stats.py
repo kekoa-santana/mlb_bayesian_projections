@@ -1,0 +1,436 @@
+"""
+Derived pitcher/batter rates from Bayesian posteriors.
+
+Instead of using crude Beta-shrinkage priors for H/BF and Outs/BF,
+derive them as residuals from the Bayesian-projected K%, BB%, HR%
+posteriors.  This propagates calibrated uncertainty from the hierarchical
+models into H and Outs predictions.
+
+Identity used
+-------------
+    BIP/BF = 1 - K% - BB% - HR% - HBP%
+    H/BF   = BIP/BF  *  BABIP
+    Outs/BF = K% + BIP/BF * (1 - BABIP)
+
+BABIP is extremely noisy year-to-year (r = 0.105 for qualified pitchers),
+so we shrink each pitcher's observed BABIP heavily toward the league
+average (~0.292) using a Beta conjugate prior.
+"""
+from __future__ import annotations
+
+import logging
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# League-average constants (2018-2025 pooled)
+# ---------------------------------------------------------------------------
+LEAGUE_BABIP: float = 0.292
+LEAGUE_HBP_RATE: float = 0.011
+LEAGUE_H_PER_BF: float = 0.220
+LEAGUE_OUTS_PER_BF: float = 0.703
+
+# Batter-side league averages
+BATTER_LEAGUE_BABIP: float = 0.300  # slightly higher perspective (includes sac bunts etc.)
+BATTER_LEAGUE_HBP_RATE: float = 0.011
+
+
+def _shrink_babip(
+    observed_babip: float | None,
+    bip: float,
+    league_babip: float = LEAGUE_BABIP,
+    effective_n: float = 30.0,
+) -> tuple[float, float]:
+    """Shrink observed BABIP toward league average using Beta conjugate.
+
+    Parameters
+    ----------
+    observed_babip : float or None
+        Pitcher's observed BABIP in the training period.
+        If None, returns league average with prior uncertainty.
+    bip : float
+        Number of balls in play (reliability weight).
+    league_babip : float
+        League-average BABIP to shrink toward.
+    effective_n : float
+        Prior strength (number of pseudo-BIP).  Higher = more shrinkage.
+        Default 30 reflects BABIP's very low YoY correlation (~0.10).
+
+    Returns
+    -------
+    tuple[float, float]
+        (alpha_posterior, beta_posterior) for a Beta distribution.
+    """
+    alpha_prior = league_babip * effective_n
+    beta_prior = (1 - league_babip) * effective_n
+
+    if observed_babip is None or np.isnan(observed_babip) or bip < 1:
+        return alpha_prior, beta_prior
+
+    hits_on_bip = observed_babip * bip
+    outs_on_bip = bip - hits_on_bip
+
+    alpha_post = alpha_prior + hits_on_bip
+    beta_post = beta_prior + outs_on_bip
+
+    return max(alpha_post, 0.1), max(beta_post, 0.1)
+
+
+def derive_pitcher_h_rate(
+    k_rate_posterior: np.ndarray,
+    bb_rate_posterior: np.ndarray,
+    hr_rate_posterior: np.ndarray,
+    observed_babip: float | None = None,
+    bip: float = 0.0,
+    hbp_rate: float = LEAGUE_HBP_RATE,
+    league_babip: float = LEAGUE_BABIP,
+    babip_prior_n: float = 30.0,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Derive pitcher H/BF rate posterior from Bayesian K%, BB%, HR% posteriors.
+
+    The decomposition is:
+        BIP/BF = 1 - K% - BB% - HR% - HBP%
+        H/BF   = BIP/BF * BABIP + HR%
+    (because Hits includes home runs, but BABIP excludes HR from numerator)
+
+    BABIP is drawn from a Beta posterior (heavy shrinkage toward league avg).
+
+    Parameters
+    ----------
+    k_rate_posterior : np.ndarray
+        Posterior samples of pitcher K% (shape: [n_samples]).
+    bb_rate_posterior : np.ndarray
+        Posterior samples of pitcher BB%.
+    hr_rate_posterior : np.ndarray
+        Posterior samples of pitcher HR/BF.
+    observed_babip : float or None
+        Pitcher's observed BABIP.  If None, uses league average.
+    bip : float
+        Number of balls in play in the training data (for BABIP reliability).
+    hbp_rate : float
+        HBP rate (treated as fixed — very stable).
+    league_babip : float
+        League-average BABIP.
+    babip_prior_n : float
+        Effective prior sample size for BABIP shrinkage.
+    rng : np.random.Generator or None
+
+    Returns
+    -------
+    np.ndarray
+        Posterior samples of H/BF rate.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    n_samples = len(k_rate_posterior)
+
+    # BIP rate per BF
+    bip_rate = 1.0 - k_rate_posterior - bb_rate_posterior - hr_rate_posterior - hbp_rate
+    bip_rate = np.clip(bip_rate, 0.0, 1.0)
+
+    # BABIP posterior draws
+    alpha, beta = _shrink_babip(observed_babip, bip, league_babip, babip_prior_n)
+    babip_samples = rng.beta(alpha, beta, size=n_samples)
+
+    # H/BF = hits on BIP + home runs (since "hits" includes HR in baseball)
+    h_rate = bip_rate * babip_samples + hr_rate_posterior
+    return np.clip(h_rate, 0.0, 1.0)
+
+
+def derive_pitcher_outs_rate(
+    k_rate_posterior: np.ndarray,
+    bb_rate_posterior: np.ndarray,
+    hr_rate_posterior: np.ndarray,
+    observed_babip: float | None = None,
+    bip: float = 0.0,
+    hbp_rate: float = LEAGUE_HBP_RATE,
+    league_babip: float = LEAGUE_BABIP,
+    babip_prior_n: float = 30.0,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Derive pitcher Outs/BF rate posterior from Bayesian K%, BB%, HR% posteriors.
+
+    The decomposition is:
+        BIP/BF = 1 - K% - BB% - HR% - HBP%
+        Outs/BF = K% + BIP/BF * (1 - BABIP)
+
+    Parameters
+    ----------
+    k_rate_posterior : np.ndarray
+        Posterior samples of pitcher K% (shape: [n_samples]).
+    bb_rate_posterior : np.ndarray
+        Posterior samples of pitcher BB%.
+    hr_rate_posterior : np.ndarray
+        Posterior samples of pitcher HR/BF.
+    observed_babip : float or None
+        Pitcher's observed BABIP.
+    bip : float
+        Number of balls in play in the training data.
+    hbp_rate : float
+        HBP rate (treated as fixed).
+    league_babip : float
+        League-average BABIP.
+    babip_prior_n : float
+        Effective prior sample size for BABIP shrinkage.
+    rng : np.random.Generator or None
+
+    Returns
+    -------
+    np.ndarray
+        Posterior samples of Outs/BF rate.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    n_samples = len(k_rate_posterior)
+
+    bip_rate = 1.0 - k_rate_posterior - bb_rate_posterior - hr_rate_posterior - hbp_rate
+    bip_rate = np.clip(bip_rate, 0.0, 1.0)
+
+    alpha, beta = _shrink_babip(observed_babip, bip, league_babip, babip_prior_n)
+    babip_samples = rng.beta(alpha, beta, size=n_samples)
+
+    # Outs = strikeouts + outs on BIP
+    outs_rate = k_rate_posterior + bip_rate * (1.0 - babip_samples)
+    return np.clip(outs_rate, 0.0, 1.0)
+
+
+def derive_batter_h_rate(
+    k_rate_posterior: np.ndarray,
+    bb_rate_posterior: np.ndarray,
+    hr_rate_posterior: np.ndarray,
+    observed_babip: float | None = None,
+    bip: float = 0.0,
+    hbp_rate: float = BATTER_LEAGUE_HBP_RATE,
+    league_babip: float = BATTER_LEAGUE_BABIP,
+    babip_prior_n: float = 30.0,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Derive batter H/PA rate posterior from Bayesian K%, BB%, HR% posteriors.
+
+    Same decomposition as the pitcher side but from the batter perspective:
+        BIP/PA = 1 - K% - BB% - HR% - HBP%
+        H/PA   = BIP/PA * BABIP + HR%
+    (because Hits includes home runs, but BABIP excludes HR from numerator)
+
+    Parameters
+    ----------
+    k_rate_posterior : np.ndarray
+        Posterior samples of batter K%.
+    bb_rate_posterior : np.ndarray
+        Posterior samples of batter BB%.
+    hr_rate_posterior : np.ndarray
+        Posterior samples of batter HR/PA.
+    observed_babip : float or None
+        Batter's observed BABIP.
+    bip : float
+        Balls in play for reliability weighting.
+    hbp_rate : float
+        HBP rate.
+    league_babip : float
+        League-average BABIP (batter perspective).
+    babip_prior_n : float
+        Effective prior sample size for BABIP shrinkage.
+    rng : np.random.Generator or None
+
+    Returns
+    -------
+    np.ndarray
+        Posterior samples of H/PA rate.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    n_samples = len(k_rate_posterior)
+
+    bip_rate = 1.0 - k_rate_posterior - bb_rate_posterior - hr_rate_posterior - hbp_rate
+    bip_rate = np.clip(bip_rate, 0.0, 1.0)
+
+    alpha, beta = _shrink_babip(observed_babip, bip, league_babip, babip_prior_n)
+    babip_samples = rng.beta(alpha, beta, size=n_samples)
+
+    # H/PA = hits on BIP + home runs
+    h_rate = bip_rate * babip_samples + hr_rate_posterior
+    return np.clip(h_rate, 0.0, 1.0)
+
+
+def derive_pitcher_rates_batch(
+    pitcher_posteriors: dict[str, dict[int, np.ndarray]],
+    pitcher_babip_data: dict[int, tuple[float | None, float]],
+    stat: str,
+    hbp_rate: float = LEAGUE_HBP_RATE,
+    league_babip: float = LEAGUE_BABIP,
+    babip_prior_n: float = 30.0,
+    rng: np.random.Generator | None = None,
+) -> dict[int, np.ndarray]:
+    """Derive H/BF or Outs/BF posteriors for a batch of pitchers.
+
+    Requires K%, BB%, and HR/BF Bayesian posteriors to be available.
+
+    Parameters
+    ----------
+    pitcher_posteriors : dict
+        {rate_col: {pitcher_id: samples}}.
+        Must contain "k_rate", "bb_rate", "hr_per_bf".
+    pitcher_babip_data : dict
+        {pitcher_id: (observed_babip, bip_count)}.
+    stat : str
+        "h_per_bf" or "outs_per_bf".
+    hbp_rate : float
+        League HBP rate.
+    league_babip : float
+        League BABIP.
+    babip_prior_n : float
+        Prior strength for BABIP shrinkage.
+    rng : np.random.Generator or None
+
+    Returns
+    -------
+    dict[int, np.ndarray]
+        {pitcher_id: rate_samples}.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    k_posteriors = pitcher_posteriors.get("k_rate", {})
+    bb_posteriors = pitcher_posteriors.get("bb_rate", {})
+    hr_posteriors = pitcher_posteriors.get("hr_per_bf", {})
+
+    if not k_posteriors or not bb_posteriors or not hr_posteriors:
+        logger.warning(
+            "Missing Bayesian posteriors for derived %s — need k_rate, "
+            "bb_rate, hr_per_bf. Available: %s",
+            stat, list(pitcher_posteriors.keys()),
+        )
+        return {}
+
+    # Find pitchers with all three posteriors
+    common_ids = (
+        set(k_posteriors.keys())
+        & set(bb_posteriors.keys())
+        & set(hr_posteriors.keys())
+    )
+
+    derive_fn = derive_pitcher_h_rate if stat == "h_per_bf" else derive_pitcher_outs_rate
+    results: dict[int, np.ndarray] = {}
+
+    for pid in common_ids:
+        k_samples = k_posteriors[pid]
+        bb_samples = bb_posteriors[pid]
+        hr_samples = hr_posteriors[pid]
+
+        # Align sample sizes (take minimum)
+        n = min(len(k_samples), len(bb_samples), len(hr_samples))
+        k_samples = k_samples[:n]
+        bb_samples = bb_samples[:n]
+        hr_samples = hr_samples[:n]
+
+        obs_babip, bip_count = pitcher_babip_data.get(pid, (None, 0.0))
+
+        results[pid] = derive_fn(
+            k_rate_posterior=k_samples,
+            bb_rate_posterior=bb_samples,
+            hr_rate_posterior=hr_samples,
+            observed_babip=obs_babip,
+            bip=bip_count,
+            hbp_rate=hbp_rate,
+            league_babip=league_babip,
+            babip_prior_n=babip_prior_n,
+            rng=rng,
+        )
+
+    logger.info(
+        "Derived %s posteriors for %d/%d pitchers (from Bayesian K%%/BB%%/HR%%)",
+        stat, len(results), len(common_ids),
+    )
+    return results
+
+
+def derive_batter_rates_batch(
+    batter_posteriors: dict[str, dict[int, np.ndarray]],
+    batter_babip_data: dict[int, tuple[float | None, float]],
+    hbp_rate: float = BATTER_LEAGUE_HBP_RATE,
+    league_babip: float = BATTER_LEAGUE_BABIP,
+    babip_prior_n: float = 30.0,
+    rng: np.random.Generator | None = None,
+) -> dict[int, np.ndarray]:
+    """Derive H/PA posteriors for a batch of batters.
+
+    Parameters
+    ----------
+    batter_posteriors : dict
+        {rate_col: {batter_id: samples}}.
+        Must contain "k_rate", "bb_rate", and one of "hr_rate"/"hr_per_pa".
+    batter_babip_data : dict
+        {batter_id: (observed_babip, bip_count)}.
+    hbp_rate : float
+        League HBP rate.
+    league_babip : float
+        League BABIP.
+    babip_prior_n : float
+        Prior strength for BABIP shrinkage.
+    rng : np.random.Generator or None
+
+    Returns
+    -------
+    dict[int, np.ndarray]
+        {batter_id: h_rate_samples}.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    k_posteriors = batter_posteriors.get("k_rate", {})
+    bb_posteriors = batter_posteriors.get("bb_rate", {})
+    # Batter HR rate may be keyed as "hr_rate" or "hr_per_pa"
+    hr_posteriors = batter_posteriors.get("hr_rate", {})
+    if not hr_posteriors:
+        hr_posteriors = batter_posteriors.get("hr_per_pa", {})
+
+    if not k_posteriors or not bb_posteriors or not hr_posteriors:
+        logger.warning(
+            "Missing Bayesian posteriors for derived batter H rate — "
+            "need k_rate, bb_rate, hr_rate. Available: %s",
+            list(batter_posteriors.keys()),
+        )
+        return {}
+
+    common_ids = (
+        set(k_posteriors.keys())
+        & set(bb_posteriors.keys())
+        & set(hr_posteriors.keys())
+    )
+
+    results: dict[int, np.ndarray] = {}
+    for bid in common_ids:
+        k_samples = k_posteriors[bid]
+        bb_samples = bb_posteriors[bid]
+        hr_samples = hr_posteriors[bid]
+
+        n = min(len(k_samples), len(bb_samples), len(hr_samples))
+        k_samples = k_samples[:n]
+        bb_samples = bb_samples[:n]
+        hr_samples = hr_samples[:n]
+
+        obs_babip, bip_count = batter_babip_data.get(bid, (None, 0.0))
+
+        results[bid] = derive_batter_h_rate(
+            k_rate_posterior=k_samples,
+            bb_rate_posterior=bb_samples,
+            hr_rate_posterior=hr_samples,
+            observed_babip=obs_babip,
+            bip=bip_count,
+            hbp_rate=hbp_rate,
+            league_babip=league_babip,
+            babip_prior_n=babip_prior_n,
+            rng=rng,
+        )
+
+    logger.info(
+        "Derived batter H/PA posteriors for %d/%d batters",
+        len(results), len(common_ids),
+    )
+    return results
