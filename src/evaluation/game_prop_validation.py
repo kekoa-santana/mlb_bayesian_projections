@@ -1101,6 +1101,16 @@ def _build_pitcher_prop_predictions(
         framing_lookup = build_catcher_framing_lookup(train_seasons, test_season)
         catcher_framing_lifts = framing_lookup.get(sn_key, {}) or None
 
+    # 7c. Days rest data (Phase 1I)
+    from src.data.queries import get_days_rest
+    rest_df = get_days_rest([test_season])
+    logger.info("Rest data: %d starter games with rest info", len(rest_df) if rest_df is not None else 0)
+
+    # 7d. TTO adjustment profiles (Phase 1A)
+    from src.data.queries import get_tto_adjustment_profiles
+    tto_profiles = get_tto_adjustment_profiles(train_seasons)
+    logger.info("TTO profiles: %d rows", len(tto_profiles) if tto_profiles is not None else 0)
+
     # 8. Batch predict
     predictions = predict_game_batch_stat(
         stat_name=config.stat_name,
@@ -1116,6 +1126,8 @@ def _build_pitcher_prop_predictions(
         lineup_proneness_lifts=lineup_proneness_lifts,
         park_factors=park_factors,
         catcher_framing_lifts=catcher_framing_lifts,
+        rest_df=rest_df,
+        tto_profiles=tto_profiles,
         model_type=config.model_type,
         default_lines=config.default_lines if config.default_lines else None,
         actual_col=config.actual_col,

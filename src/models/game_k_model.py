@@ -1154,6 +1154,8 @@ def predict_game_stat(
     lineup_proneness_lift: float = 0.0,
     park_factor: float = 1.0,
     model_type: str = "binomial",
+    days_rest: int | None = None,
+    tto_logit_lifts: np.ndarray | None = None,
     n_draws: int = 4000,
     random_seed: int = 42,
     bf_min: int = 3,
@@ -1190,6 +1192,12 @@ def predict_game_stat(
         Multiplicative park factor. Used only for Poisson model (HR).
     model_type : str
         'binomial' or 'poisson'. Use 'poisson' for rare events (HR).
+    days_rest : int or None
+        Days since pitcher's last start. None = normal rest assumed.
+        Adjusts BF distribution and adds stat-specific rate lift.
+    tto_logit_lifts : np.ndarray or None
+        Shape (3,) logit lifts for TTO 1, 2, 3+. From
+        ``build_tto_logit_lifts()``. None = flat rate (no TTO).
     n_draws : int
         Monte Carlo draws.
     random_seed : int
@@ -1203,12 +1211,22 @@ def predict_game_stat(
         Keys: stat_samples, over_probs, expected_{stat_name},
         std_{stat_name}, bf_mu, bf_sigma, lineup_matchup_lifts,
         per_batter_details, context_logit_lift, lineup_proneness_lift,
-        park_factor.
+        park_factor, days_rest, rest_bucket.
     """
     # BF distribution
     bf_info = get_bf_distribution(pitcher_id, season, bf_priors)
     bf_mu = bf_info["mu_bf"]
     bf_sigma = bf_info["sigma_bf"]
+
+    # Rest adjustments: modify BF distribution + add rate lift
+    # Only apply for stats with empirical rest signal (K, BB, HR).
+    # H and Outs are derived/noisy — rest BF adjustment adds noise there.
+    _REST_STATS = {"k", "bb", "hr"}
+    rest_adj = get_rest_adjustment(days_rest)
+    sn_lower = stat_name.lower()
+    rest_lift = rest_adj.get(f"{sn_lower}_lift", 0.0) if sn_lower in _REST_STATS else 0.0
+    if sn_lower in _REST_STATS:
+        bf_mu, bf_sigma = apply_rest_to_bf(bf_mu, bf_sigma, days_rest)
 
     # Matchup lifts
     lineup_lifts = None
@@ -1220,8 +1238,8 @@ def predict_game_stat(
                 pitcher_arsenal, hitter_vuln, baselines_pt,
             )
 
-    # Combine context + lineup proneness into total context lift
-    total_context = context_logit_lift + lineup_proneness_lift
+    # Combine context + lineup proneness + rest into total context lift
+    total_context = context_logit_lift + lineup_proneness_lift + rest_lift
 
     # Monte Carlo simulation
     if model_type == "poisson":
@@ -1232,6 +1250,7 @@ def predict_game_stat(
             lineup_matchup_lifts=lineup_lifts,
             context_logit_lift=total_context,
             park_factor=park_factor,
+            tto_logit_lifts=tto_logit_lifts,
             n_draws=n_draws,
             opp_min=bf_min,
             opp_max=bf_max,
@@ -1245,6 +1264,7 @@ def predict_game_stat(
             opp_sigma=bf_sigma,
             lineup_matchup_lifts=lineup_lifts,
             context_logit_lift=total_context,
+            tto_logit_lifts=tto_logit_lifts,
             n_draws=n_draws,
             opp_min=bf_min,
             opp_max=bf_max,
@@ -1267,6 +1287,8 @@ def predict_game_stat(
         "context_logit_lift": context_logit_lift,
         "lineup_proneness_lift": lineup_proneness_lift,
         "park_factor": park_factor,
+        "days_rest": days_rest,
+        "rest_bucket": rest_adj["rest_bucket"],
     }
 
 
@@ -1474,6 +1496,8 @@ def predict_game_batch_stat(
     lineup_proneness_lifts: dict[int, float] | None = None,
     park_factors: dict[int, float] | None = None,
     catcher_framing_lifts: dict[tuple[int, int], float] | None = None,
+    rest_df: pd.DataFrame | None = None,
+    tto_profiles: pd.DataFrame | None = None,
     model_type: str = "binomial",
     default_lines: list[float] | None = None,
     actual_col: str = "strike_outs",
@@ -1519,6 +1543,12 @@ def predict_game_batch_stat(
         Mapping of (game_pk, pitcher_id) → catcher framing logit lift.
         This is separate from context_lifts because two pitchers in the
         same game have different catchers. Only used for K and BB stats.
+    rest_df : pd.DataFrame or None
+        Days-rest data from ``get_days_rest()``. Columns: pitcher_id,
+        game_pk, days_rest. Adjusts BF distribution and rate lifts.
+    tto_profiles : pd.DataFrame or None
+        TTO adjustment profiles from ``get_tto_adjustment_profiles()``.
+        Used to build per-pitcher TTO logit lifts for the simulation.
     model_type : str
         'binomial' or 'poisson'.
     default_lines : list[float] or None
@@ -1548,6 +1578,14 @@ def predict_game_batch_stat(
     if game_lineups is not None and not game_lineups.empty:
         for gpk, grp in game_lineups.groupby("game_pk"):
             _lineup_index[int(gpk)] = grp
+
+    # Pre-index rest data: (pitcher_id, game_pk) → days_rest
+    _rest_index: dict[tuple[int, int], int] = {}
+    if rest_df is not None and not rest_df.empty:
+        for _, rrow in rest_df.iterrows():
+            _rest_index[(int(rrow["pitcher_id"]), int(rrow["game_pk"]))] = int(
+                rrow["days_rest"]
+            )
 
     for i, (_, game) in enumerate(game_records.iterrows()):
         pitcher_id = int(game["pitcher_id"])
@@ -1616,6 +1654,19 @@ def predict_game_batch_stat(
         # Add framing lift to context (it's logit-additive like umpire/weather)
         total_ctx = ctx_lift + framing_lift
 
+        # Days rest lookup
+        dr = _rest_index.get((pitcher_id, game_pk))
+
+        # TTO logit lifts (pitcher-specific, stat-specific)
+        tto_lifts = None
+        if tto_profiles is not None and sn in ("k", "bb", "hr"):
+            tto_lifts = build_tto_logit_lifts(
+                tto_profiles=tto_profiles,
+                pitcher_id=pitcher_id,
+                season=season,
+                stat_name=sn,
+            )
+
         result = predict_game_stat(
             stat_name=stat_name,
             pitcher_id=pitcher_id,
@@ -1630,6 +1681,8 @@ def predict_game_batch_stat(
             lineup_proneness_lift=lp_lift,
             park_factor=pf,
             model_type=model_type,
+            days_rest=dr,
+            tto_logit_lifts=tto_lifts,
             n_draws=n_draws,
             random_seed=42 + i,
             bf_min=bf_min,
@@ -1651,6 +1704,8 @@ def predict_game_batch_stat(
             "lineup_proneness_lift": lp_lift,
             "catcher_framing_lift": framing_lift,
             "park_factor": pf,
+            "days_rest": dr,
+            "rest_bucket": result.get("rest_bucket", "normal"),
         }
 
         # Add P(over) columns
