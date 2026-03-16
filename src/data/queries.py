@@ -1446,17 +1446,17 @@ def get_hitter_team_venue(season: int) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 20. Umpire K-rate tendencies (derived from pitch/PA data)
+# 20. Umpire tendencies (K, BB, HR rate — derived from pitch/PA data)
 # ---------------------------------------------------------------------------
-def get_umpire_k_tendencies(
+def get_umpire_tendencies(
     seasons: list[int] | None = None,
     min_games: int = 30,
 ) -> pd.DataFrame:
-    """Compute per-umpire K-rate tendencies with shrinkage toward league mean.
+    """Compute per-umpire K, BB, and HR rate tendencies with shrinkage.
 
     Uses multi-season PA-level data joined to dim_umpire to compute each
-    HP umpire's K-rate, then shrinks toward the league mean based on games
-    umpired (more games = more trust in the observed rate).
+    HP umpire's K-rate, BB-rate, and HR-rate, then shrinks toward the
+    league mean based on games umpired (more games = more trust).
 
     Parameters
     ----------
@@ -1468,8 +1468,10 @@ def get_umpire_k_tendencies(
     Returns
     -------
     pd.DataFrame
-        Columns: hp_umpire_name, games, total_pa, k_rate, league_k_rate,
-        k_rate_shrunk, k_logit_lift.
+        Columns: hp_umpire_name, games, total_pa, k_rate, bb_rate, hr_rate,
+        league_k_rate, league_bb_rate, league_hr_rate,
+        k_rate_shrunk, bb_rate_shrunk, hr_rate_shrunk,
+        k_logit_lift, bb_logit_lift, hr_logit_lift.
     """
     if seasons is None:
         seasons = list(range(2021, 2026))
@@ -1482,7 +1484,11 @@ def get_umpire_k_tendencies(
             COUNT(DISTINCT du.game_pk) AS games,
             COUNT(fpa.pa_id) AS total_pa,
             SUM(CASE WHEN fpa.events IN ('strikeout','strikeout_double_play')
-                     THEN 1 ELSE 0 END) AS total_k
+                     THEN 1 ELSE 0 END) AS total_k,
+            SUM(CASE WHEN fpa.events = 'walk'
+                     THEN 1 ELSE 0 END) AS total_bb,
+            SUM(CASE WHEN fpa.events = 'home_run'
+                     THEN 1 ELSE 0 END) AS total_hr
         FROM production.dim_umpire du
         JOIN production.dim_game dg ON du.game_pk = dg.game_pk
         JOIN production.fact_pa fpa ON du.game_pk = fpa.game_pk
@@ -1497,44 +1503,88 @@ def get_umpire_k_tendencies(
         games,
         total_pa,
         total_k,
-        ROUND((total_k::numeric / NULLIF(total_pa, 0)), 5) AS k_rate
+        total_bb,
+        total_hr,
+        ROUND((total_k::numeric / NULLIF(total_pa, 0)), 5) AS k_rate,
+        ROUND((total_bb::numeric / NULLIF(total_pa, 0)), 5) AS bb_rate,
+        ROUND((total_hr::numeric / NULLIF(total_pa, 0)), 5) AS hr_rate
     FROM ump_stats
     ORDER BY games DESC
     """
-    logger.info("Fetching umpire K tendencies for seasons %s (min_games=%d)",
+    logger.info("Fetching umpire tendencies for seasons %s (min_games=%d)",
                 seasons, min_games)
     df = read_sql(query, {})
 
     if df.empty:
         return df
 
-    # League average K-rate across all umpires (weighted by PA)
-    league_k_rate = float(df["total_k"].sum() / df["total_pa"].sum())
-    df["league_k_rate"] = league_k_rate
+    import numpy as _np
+    from scipy.special import logit as _logit
+    _clip = lambda x: _np.clip(x, 1e-6, 1 - 1e-6)
 
     # Shrinkage: trust umpires with more games
     # k = 80 games (~1 full season) as the shrinkage constant
     shrinkage_k = 80.0
     df["reliability"] = df["games"] / (df["games"] + shrinkage_k)
+
+    # --- K-rate ---
+    league_k_rate = float(df["total_k"].sum() / df["total_pa"].sum())
+    df["league_k_rate"] = league_k_rate
     df["k_rate_shrunk"] = (
         df["reliability"] * df["k_rate"]
         + (1 - df["reliability"]) * league_k_rate
     )
-
-    # Convert to logit-scale lift relative to league average
-    import numpy as _np
-    from scipy.special import logit as _logit
-    _clip = lambda x: _np.clip(x, 1e-6, 1 - 1e-6)
     df["k_logit_lift"] = (
         _logit(_clip(df["k_rate_shrunk"].values))
         - _logit(_clip(league_k_rate))
     ).round(4)
 
+    # --- BB-rate ---
+    league_bb_rate = float(df["total_bb"].sum() / df["total_pa"].sum())
+    df["league_bb_rate"] = league_bb_rate
+    df["bb_rate_shrunk"] = (
+        df["reliability"] * df["bb_rate"]
+        + (1 - df["reliability"]) * league_bb_rate
+    )
+    df["bb_logit_lift"] = (
+        _logit(_clip(df["bb_rate_shrunk"].values))
+        - _logit(_clip(league_bb_rate))
+    ).round(4)
+
+    # --- HR-rate ---
+    league_hr_rate = float(df["total_hr"].sum() / df["total_pa"].sum())
+    df["league_hr_rate"] = league_hr_rate
+    df["hr_rate_shrunk"] = (
+        df["reliability"] * df["hr_rate"]
+        + (1 - df["reliability"]) * league_hr_rate
+    )
+    df["hr_logit_lift"] = (
+        _logit(_clip(df["hr_rate_shrunk"].values))
+        - _logit(_clip(league_hr_rate))
+    ).round(4)
+
     df = df.drop(columns=["reliability"])
-    logger.info("Umpire tendencies: %d umpires, league K%%=%.4f, lift range=[%.4f, %.4f]",
-                len(df), league_k_rate,
-                df["k_logit_lift"].min(), df["k_logit_lift"].max())
+    logger.info(
+        "Umpire tendencies: %d umpires, league K%%=%.4f BB%%=%.4f HR%%=%.5f, "
+        "K lift range=[%.4f, %.4f], BB lift range=[%.4f, %.4f], "
+        "HR lift range=[%.4f, %.4f]",
+        len(df), league_k_rate, league_bb_rate, league_hr_rate,
+        df["k_logit_lift"].min(), df["k_logit_lift"].max(),
+        df["bb_logit_lift"].min(), df["bb_logit_lift"].max(),
+        df["hr_logit_lift"].min(), df["hr_logit_lift"].max(),
+    )
     return df
+
+
+def get_umpire_k_tendencies(
+    seasons: list[int] | None = None,
+    min_games: int = 30,
+) -> pd.DataFrame:
+    """Backward-compatible alias for ``get_umpire_tendencies()``.
+
+    Returns the same DataFrame (which now includes bb/hr columns too).
+    """
+    return get_umpire_tendencies(seasons=seasons, min_games=min_games)
 
 
 # ---------------------------------------------------------------------------
@@ -1716,6 +1766,116 @@ def get_game_lineups(season: int) -> pd.DataFrame:
     ORDER BY fl.game_pk, fl.batting_order
     """
     logger.info("Fetching game lineups for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# 23b. Lineup for a single game
+# ---------------------------------------------------------------------------
+def get_lineup_for_game(game_pk: int) -> pd.DataFrame:
+    """Fetch the starting batting lineup for a single game.
+
+    Parameters
+    ----------
+    game_pk : int
+        MLB game identifier.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: game_pk, player_id, batting_order, team_id, batter_name,
+        home_away.  Up to 18 rows (9 per team).
+    """
+    query = """
+    SELECT
+        fl.game_pk,
+        fl.player_id,
+        fl.batting_order,
+        fl.team_id,
+        fl.home_away,
+        COALESCE(dp.player_name, 'Unknown') AS batter_name
+    FROM production.fact_lineup fl
+    LEFT JOIN production.dim_player dp ON fl.player_id = dp.player_id
+    WHERE fl.game_pk = :game_pk
+      AND fl.batting_order BETWEEN 1 AND 9
+      AND fl.is_starter = true
+    ORDER BY fl.team_id, fl.batting_order
+    """
+    logger.info("Fetching lineup for game_pk=%d", game_pk)
+    return read_sql(query, {"game_pk": game_pk})
+
+
+# ---------------------------------------------------------------------------
+# 23c. Opposing starting pitcher for a game
+# ---------------------------------------------------------------------------
+def get_opposing_pitcher_for_game(
+    game_pk: int, team_id: int
+) -> pd.DataFrame:
+    """Fetch the opposing starting pitcher for a given team in a game.
+
+    Parameters
+    ----------
+    game_pk : int
+        MLB game identifier.
+    team_id : int
+        Team ID for which we want the *opponent's* starter.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: game_pk, pitcher_id, pitcher_name, team_id.
+        One row (the opposing starter), or empty if not found.
+    """
+    query = """
+    SELECT
+        pb.game_pk,
+        pb.pitcher_id,
+        COALESCE(dp.player_name, 'Unknown') AS pitcher_name,
+        pb.team_id
+    FROM staging.pitching_boxscores pb
+    LEFT JOIN production.dim_player dp ON pb.pitcher_id = dp.player_id
+    WHERE pb.game_pk = :game_pk
+      AND pb.is_starter = true
+      AND pb.team_id != :team_id
+    LIMIT 1
+    """
+    logger.info(
+        "Fetching opposing pitcher for game_pk=%d, team_id=%d",
+        game_pk, team_id,
+    )
+    return read_sql(query, {"game_pk": game_pk, "team_id": team_id})
+
+
+# ---------------------------------------------------------------------------
+# 23d. Starting pitchers for a full season (batch)
+# ---------------------------------------------------------------------------
+def get_game_starting_pitchers(season: int) -> pd.DataFrame:
+    """Fetch starting pitchers for all regular-season games in a season.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: game_pk, pitcher_id, team_id.
+        Two rows per game (home and away starters).
+    """
+    query = """
+    SELECT
+        pb.game_pk,
+        pb.pitcher_id,
+        pb.team_id
+    FROM staging.pitching_boxscores pb
+    JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+    WHERE dg.season = :season
+      AND dg.game_type = 'R'
+      AND pb.is_starter = true
+    ORDER BY pb.game_pk, pb.team_id
+    """
+    logger.info("Fetching starting pitchers for %d", season)
     return read_sql(query, {"season": season})
 
 
@@ -2494,6 +2654,98 @@ def get_milb_pitcher_season_totals(season: int) -> pd.DataFrame:
     return read_sql(query, {"season": season})
 
 
+def get_tto_adjustment_profiles(
+    seasons: list[int],
+    min_pa_per_tto: int = 30,
+) -> pd.DataFrame:
+    """Per-pitcher TTO (times-through-order) adjustment factors.
+
+    For each pitcher-season with sufficient PA in each TTO bucket (1st, 2nd,
+    3rd+), compute the logit-scale lift relative to their own overall K/BB/HR
+    rate.  The result is used inside the MC game simulator to apply different
+    rates for each TTO block.
+
+    Parameters
+    ----------
+    seasons : list[int]
+        Seasons to include (e.g. [2018, 2019, ..., 2025]).
+    min_pa_per_tto : int
+        Minimum PA in *each* TTO bucket for a pitcher-season to be included.
+        Default 30 ensures reasonable reliability.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, season, tto (1/2/3),
+        k_rate, bb_rate, hr_rate, overall_k_rate, overall_bb_rate,
+        overall_hr_rate, pa_count.
+        One row per (pitcher_id, season, tto).
+    """
+    season_list = ", ".join(str(s) for s in seasons)
+    query = f"""
+    WITH pitcher_tto AS (
+        SELECT
+            fp.pitcher_id,
+            dg.season,
+            LEAST(fp.times_through_order, 3) AS tto,
+            COUNT(*)                           AS pa_count,
+            AVG(CASE WHEN fp.events = 'strikeout' THEN 1.0 ELSE 0.0 END) AS k_rate,
+            AVG(CASE WHEN fp.events = 'walk'      THEN 1.0 ELSE 0.0 END) AS bb_rate,
+            AVG(CASE WHEN fp.events = 'home_run'  THEN 1.0 ELSE 0.0 END) AS hr_rate
+        FROM production.fact_pa fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.game_type = 'R'
+          AND dg.season IN ({season_list})
+          AND fp.events IS NOT NULL
+        GROUP BY fp.pitcher_id, dg.season, LEAST(fp.times_through_order, 3)
+    ),
+    pitcher_overall AS (
+        SELECT
+            fp.pitcher_id,
+            dg.season,
+            AVG(CASE WHEN fp.events = 'strikeout' THEN 1.0 ELSE 0.0 END) AS overall_k_rate,
+            AVG(CASE WHEN fp.events = 'walk'      THEN 1.0 ELSE 0.0 END) AS overall_bb_rate,
+            AVG(CASE WHEN fp.events = 'home_run'  THEN 1.0 ELSE 0.0 END) AS overall_hr_rate
+        FROM production.fact_pa fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.game_type = 'R'
+          AND dg.season IN ({season_list})
+          AND fp.events IS NOT NULL
+        GROUP BY fp.pitcher_id, dg.season
+    ),
+    qualified AS (
+        -- Only keep pitcher-seasons where all 3 TTO buckets meet min PA
+        SELECT pitcher_id, season
+        FROM pitcher_tto
+        GROUP BY pitcher_id, season
+        HAVING COUNT(DISTINCT tto) = 3
+           AND MIN(pa_count) >= {min_pa_per_tto}
+    )
+    SELECT
+        pt.pitcher_id,
+        pt.season,
+        pt.tto,
+        pt.k_rate,
+        pt.bb_rate,
+        pt.hr_rate,
+        po.overall_k_rate,
+        po.overall_bb_rate,
+        po.overall_hr_rate,
+        pt.pa_count
+    FROM pitcher_tto pt
+    JOIN pitcher_overall po
+      ON pt.pitcher_id = po.pitcher_id AND pt.season = po.season
+    JOIN qualified q
+      ON pt.pitcher_id = q.pitcher_id AND pt.season = q.season
+    ORDER BY pt.pitcher_id, pt.season, pt.tto
+    """
+    logger.info(
+        "Fetching TTO adjustment profiles for seasons %s (min_pa=%d)",
+        seasons, min_pa_per_tto,
+    )
+    return read_sql(query)
+
+
 def get_prospect_info() -> pd.DataFrame:
     """Fetch enriched prospect metadata from dim_prospects.
 
@@ -2523,3 +2775,269 @@ def get_prospect_info() -> pd.DataFrame:
     """
     logger.info("Fetching prospect info from dim_prospects")
     return read_sql(query)
+
+
+# ---------------------------------------------------------------------------
+# 30. Days rest for starting pitchers
+# ---------------------------------------------------------------------------
+def get_days_rest(seasons: list[int] | None = None) -> pd.DataFrame:
+    """Compute days since previous start for each pitcher start.
+
+    Uses ``fact_player_game_mlb`` with ``pit_is_starter = true`` and
+    ``pit_bf >= 9`` to filter out openers / bullpen games.
+
+    Parameters
+    ----------
+    seasons : list[int], optional
+        Seasons to include.  Defaults to 2018-2025.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, game_pk, game_date, season, days_rest,
+        rest_bucket, pit_k, pit_bb, pit_bf, pit_ip.
+        ``rest_bucket`` is one of ``'short'``, ``'normal'``, ``'extended'``.
+    """
+    if seasons is None:
+        seasons = list(range(2018, 2026))
+
+    season_list = ",".join(str(int(s)) for s in seasons)
+    query = f"""
+    WITH starter_games AS (
+        SELECT
+            fpg.player_id  AS pitcher_id,
+            fpg.game_pk,
+            fpg.game_date,
+            fpg.season,
+            fpg.pit_k,
+            fpg.pit_bb,
+            fpg.pit_bf,
+            fpg.pit_ip,
+            LAG(fpg.game_date) OVER (
+                PARTITION BY fpg.player_id ORDER BY fpg.game_date
+            ) AS prev_start_date
+        FROM production.fact_player_game_mlb fpg
+        JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+        WHERE fpg.pit_is_starter = true
+          AND fpg.pit_bf >= 9
+          AND fpg.pit_ip > 0
+          AND dg.game_type = 'R'
+          AND dg.season IN ({season_list})
+    )
+    SELECT
+        pitcher_id,
+        game_pk,
+        game_date,
+        season,
+        (game_date - prev_start_date) AS days_rest,
+        CASE
+            WHEN (game_date - prev_start_date) <= 4 THEN 'short'
+            WHEN (game_date - prev_start_date) = 5  THEN 'normal'
+            ELSE 'extended'
+        END AS rest_bucket,
+        pit_k,
+        pit_bb,
+        pit_bf,
+        pit_ip
+    FROM starter_games
+    WHERE prev_start_date IS NOT NULL
+      AND (game_date - prev_start_date) BETWEEN 3 AND 14
+    ORDER BY pitcher_id, game_date
+    """
+    logger.info("Fetching days rest for seasons %s", seasons)
+    return read_sql(query)
+
+
+def get_rest_bucket_stats(seasons: list[int] | None = None) -> pd.DataFrame:
+    """League-average K%, BB%, and BF by rest bucket.
+
+    Empirical baseline for computing rest-based adjustments.
+
+    Parameters
+    ----------
+    seasons : list[int], optional
+        Seasons to include.  Defaults to 2018-2025.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: rest_bucket, n_starts, avg_k_rate, avg_bb_rate,
+        avg_bf, std_bf, avg_ip.
+    """
+    if seasons is None:
+        seasons = list(range(2018, 2026))
+
+    season_list = ",".join(str(int(s)) for s in seasons)
+    query = f"""
+    WITH starter_games AS (
+        SELECT
+            fpg.player_id  AS pitcher_id,
+            fpg.game_pk,
+            fpg.game_date,
+            fpg.season,
+            fpg.pit_k,
+            fpg.pit_bb,
+            fpg.pit_bf,
+            fpg.pit_ip,
+            LAG(fpg.game_date) OVER (
+                PARTITION BY fpg.player_id ORDER BY fpg.game_date
+            ) AS prev_start_date
+        FROM production.fact_player_game_mlb fpg
+        JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+        WHERE fpg.pit_is_starter = true
+          AND fpg.pit_bf >= 9
+          AND fpg.pit_ip > 0
+          AND dg.game_type = 'R'
+          AND dg.season IN ({season_list})
+    ),
+    with_rest AS (
+        SELECT *,
+            (game_date - prev_start_date) AS days_rest
+        FROM starter_games
+        WHERE prev_start_date IS NOT NULL
+    ),
+    bucketed AS (
+        SELECT *,
+            CASE
+                WHEN days_rest <= 4 THEN 'short'
+                WHEN days_rest = 5  THEN 'normal'
+                ELSE 'extended'
+            END AS rest_bucket
+        FROM with_rest
+        WHERE days_rest BETWEEN 3 AND 14
+    )
+    SELECT
+        rest_bucket,
+        COUNT(*)                                              AS n_starts,
+        ROUND(AVG(pit_k::numeric / NULLIF(pit_bf, 0)), 4)    AS avg_k_rate,
+        ROUND(AVG(pit_bb::numeric / NULLIF(pit_bf, 0)), 4)   AS avg_bb_rate,
+        ROUND(AVG(pit_bf::numeric), 2)                        AS avg_bf,
+        ROUND(STDDEV(pit_bf::numeric), 2)                     AS std_bf,
+        ROUND(AVG(pit_ip::numeric), 2)                        AS avg_ip
+    FROM bucketed
+    GROUP BY rest_bucket
+    ORDER BY rest_bucket
+    """
+    logger.info("Fetching rest bucket stats for seasons %s", seasons)
+    return read_sql(query)
+
+
+# ---------------------------------------------------------------------------
+# Catcher framing effects
+# ---------------------------------------------------------------------------
+def get_catcher_framing_effects(
+    seasons: list[int] | None = None,
+    shrinkage_k: int = 500,
+) -> pd.DataFrame:
+    """Compute per-catcher called-strike-rate lift on taken pitches.
+
+    For each catcher-season, computes the called-strike rate on non-swing
+    pitches, applies empirical Bayes shrinkage, and returns a logit-scale
+    lift relative to the season league average.
+
+    Join path: fact_lineup (position='C', starter) -> fact_player_game_mlb
+    (pitcher team_id) -> fact_pitch (is_swing=false).
+
+    Parameters
+    ----------
+    seasons : list[int], optional
+        Seasons to include. Defaults to 2018-2025.
+    shrinkage_k : int
+        Shrinkage constant in taken-pitch units.  ``shrunk_rate =
+        (n * observed + k * league_avg) / (n + k)``.  Default 500
+        provides heavy shrinkage for low-sample catchers.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: catcher_id, season, pitches_received, called_strikes,
+        called_strike_rate_raw, league_cs_rate, called_strike_rate_shrunk,
+        logit_lift.
+    """
+    if seasons is None:
+        seasons = list(range(2018, 2026))
+
+    season_list = ",".join(str(int(s)) for s in seasons)
+    query = f"""
+    WITH catcher_game AS (
+        SELECT fl.game_pk, fl.player_id AS catcher_id,
+               fl.team_id, fl.season
+        FROM production.fact_lineup fl
+        WHERE fl.position = 'C'
+          AND fl.is_starter = true
+          AND fl.season IN ({season_list})
+    ),
+    catcher_pitch AS (
+        SELECT
+            cg.catcher_id,
+            cg.season,
+            COUNT(*)                       AS pitches_received,
+            SUM(fp.is_called_strike::int)  AS called_strikes
+        FROM catcher_game cg
+        JOIN production.fact_player_game_mlb pg
+            ON pg.game_pk = cg.game_pk
+           AND pg.team_id = cg.team_id
+        JOIN production.fact_pitch fp
+            ON fp.game_pk = cg.game_pk
+           AND fp.pitcher_id = pg.player_id
+        JOIN production.dim_game dg
+            ON fp.game_pk = dg.game_pk
+        WHERE fp.is_swing = false
+          AND dg.game_type = 'R'
+          AND pg.player_role = 'pitcher'
+        GROUP BY cg.catcher_id, cg.season
+    )
+    SELECT
+        catcher_id,
+        season,
+        pitches_received,
+        called_strikes,
+        ROUND(called_strikes::numeric
+              / NULLIF(pitches_received, 0), 5) AS called_strike_rate_raw
+    FROM catcher_pitch
+    ORDER BY season, pitches_received DESC
+    """
+    logger.info(
+        "Fetching catcher framing effects for seasons %s (shrinkage_k=%d)",
+        seasons, shrinkage_k,
+    )
+    df = read_sql(query, {})
+
+    if df.empty:
+        return df
+
+    import numpy as _np
+    from scipy.special import logit as _logit
+
+    _clip = lambda x: _np.clip(x, 1e-6, 1 - 1e-6)  # noqa: E731
+
+    # League-average called-strike rate per season (weighted by pitches)
+    season_league = (
+        df.groupby("season")
+        .apply(
+            lambda g: g["called_strikes"].sum() / g["pitches_received"].sum(),
+            include_groups=False,
+        )
+        .rename("league_cs_rate")
+    )
+    df = df.merge(season_league, on="season", how="left")
+
+    # Shrinkage toward season league average
+    n = df["pitches_received"].values.astype(float)
+    obs = df["called_strike_rate_raw"].values.astype(float)
+    lg = df["league_cs_rate"].values.astype(float)
+    df["called_strike_rate_shrunk"] = (
+        (n * obs + shrinkage_k * lg) / (n + shrinkage_k)
+    ).round(5)
+
+    # Logit lift relative to league average
+    df["logit_lift"] = (
+        _logit(_clip(df["called_strike_rate_shrunk"].values))
+        - _logit(_clip(lg))
+    ).round(5)
+
+    logger.info(
+        "Catcher framing: %d catcher-seasons, lift range=[%.4f, %.4f]",
+        len(df), df["logit_lift"].min(), df["logit_lift"].max(),
+    )
+    return df
