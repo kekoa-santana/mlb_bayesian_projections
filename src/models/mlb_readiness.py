@@ -5,15 +5,19 @@ Uses translated MiLB stats (K%, BB%, ISO), age-relative-to-level,
 career progression, and defensive position to estimate the likelihood
 a prospect reaches and sustains MLB playing time (200+ PA season).
 
+Also incorporates organizational depth (players ahead at same position
+in the org pipeline) from ``fact_prospect_snapshot`` and
+``fact_prospect_transition`` tables.
+
 Trained on 2018-2021 MiLB prospects, validated on 2022-2023 debutants.
-Test AUC: 0.958, 5-fold CV AUC: 0.966.
+Test AUC: 0.961, 5-fold CV AUC: 0.973.
 
 Calibration (test set):
-    P < 5%:    0.3% actually stuck (long shots)
-    P 5-10%:   7.6% (fringe)
-    P 10-20%: 20.3% (solid prospects)
-    P 20-40%: 39.3% (strong prospects)
-    P 40%+:   76.1% (near locks)
+    P < 5%:    0.4% actually stuck (long shots)
+    P 5-10%:   9.0% (fringe)
+    P 10-20%: 28.8% (solid prospects)
+    P 20-40%: 32.7% (strong prospects)
+    P 40%+:   84.7% (near locks)
 """
 from __future__ import annotations
 
@@ -46,12 +50,71 @@ _POS_GROUP_MAP = {
 # One-hot columns (drop_first=True, reference=C)
 _POS_DUMMY_COLS = ["pos_CI", "pos_MI", "pos_OF", "pos_Unknown"]
 
-_ALL_FEATURES = _STAT_FEATURES + _POS_DUMMY_COLS
+# Organizational depth features
+_DEPTH_FEATURES = ["n_above", "total_at_pos_in_org"]
+
+_ALL_FEATURES = _STAT_FEATURES + _POS_DUMMY_COLS + _DEPTH_FEATURES
 
 _LEVEL_MAP = {"A": 1, "A+": 2, "AA": 3, "AAA": 4}
 
 # PA scaling by level (same as augmentation)
 _LEVEL_PA_SCALE = {"AAA": 0.80, "AA": 0.55, "A+": 0.40, "A": 0.30}
+
+
+def _load_org_depth() -> pd.DataFrame:
+    """Load or build organizational depth data from prospect snapshots.
+
+    Returns per-player latest-season depth metrics: how many prospects
+    at the same position group are at the same or higher level in their org.
+    """
+    cache_path = CACHE_DIR / "prospect_org_depth.parquet"
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
+
+    logger.info("Building org depth from fact_prospect_snapshot (first run)")
+    from src.data.db import read_sql
+
+    snap = read_sql("""
+        SELECT player_id, season, primary_position, level,
+               parent_org_id, parent_org_name
+        FROM production.fact_prospect_snapshot
+        WHERE primary_position NOT IN ('P', 'PH', 'PR')
+    """, {})
+
+    pos_gmap = {
+        "C": "C", "SS": "MI", "2B": "MI", "3B": "CI", "1B": "CI",
+        "CF": "OF", "LF": "OF", "RF": "OF", "DH": "DH",
+    }
+    lvl_num = {"ROK": 0, "A": 1, "A+": 2, "AA": 3, "AAA": 4, "MLB": 5}
+    snap["pos_group"] = snap["primary_position"].map(pos_gmap).fillna("Other")
+    snap["level_num"] = snap["level"].map(lvl_num).fillna(-1)
+
+    records = []
+    for (org, season, pos), grp in snap.groupby(
+        ["parent_org_id", "season", "pos_group"]
+    ):
+        for _, row in grp.iterrows():
+            ahead = grp[
+                (grp["level_num"] >= row["level_num"])
+                & (grp["player_id"] != row["player_id"])
+            ]
+            blockers = grp[
+                (grp["level_num"] > row["level_num"])
+                & (grp["player_id"] != row["player_id"])
+            ]
+            records.append({
+                "player_id": int(row["player_id"]),
+                "season": int(season),
+                "parent_org_name": row["parent_org_name"],
+                "n_same_or_above": len(ahead),
+                "n_above": len(blockers),
+                "total_at_pos_in_org": len(grp),
+            })
+
+    depth_df = pd.DataFrame(records)
+    depth_df.to_parquet(cache_path, index=False)
+    logger.info("Cached org depth: %d rows", len(depth_df))
+    return depth_df
 
 
 def _build_prospect_features(
@@ -154,6 +217,23 @@ def _build_prospect_features(
     for col in _POS_DUMMY_COLS:
         pos_name = col.replace("pos_", "")
         df[col] = (df["pos_group"] == pos_name).astype(int)
+
+    # Organizational depth features
+    depth_df = _load_org_depth()
+    if not depth_df.empty:
+        # Use most recent depth snapshot per player
+        depth_latest = (
+            depth_df.sort_values("season", ascending=False)
+            .drop_duplicates("player_id", keep="first")
+        )
+        df = df.merge(
+            depth_latest[["player_id", "n_above", "total_at_pos_in_org"]],
+            on="player_id",
+            how="left",
+        )
+    else:
+        df["n_above"] = np.nan
+        df["total_at_pos_in_org"] = np.nan
 
     return df
 
