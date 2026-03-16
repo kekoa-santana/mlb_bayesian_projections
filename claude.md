@@ -290,7 +290,7 @@ Every model must be evaluated with:
 27. [x] Minor league translation system
 
 ### Phase 8: Model Enhancement — IN PROGRESS
-28. [ ] AR(1) process replacement for random walk
+28. [x] AR(1) process replacement for random walk (rho ~ Beta(8,2) in hitter_model, pitcher_model, pitcher_k_rate_model)
 29. [ ] wOBA projection (replacing xwOBA)
 30. [ ] Enhanced season evolution modeling
 

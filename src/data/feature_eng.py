@@ -975,6 +975,293 @@ def build_multi_season_pitcher_data(
 
 
 # ---------------------------------------------------------------------------
+# MiLB rookie augmentation — synthetic prior rows
+# ---------------------------------------------------------------------------
+
+# Effective PA/BF scaling by level — converts MiLB PA into "MLB-equivalent
+# prior strength".  AAA translates most reliably so gets ~80% credit;
+# A-ball is noisier, ~30%.
+_MILB_LEVEL_PA_SCALE: dict[str, float] = {
+    "AAA": 0.80,
+    "AA": 0.55,
+    "A+": 0.40,
+    "A": 0.30,
+}
+
+# Level priority for picking best MiLB row per player (higher = prefer)
+_LEVEL_PRIORITY: dict[str, int] = {"AAA": 4, "AA": 3, "A+": 2, "A": 1}
+
+
+def _pick_best_milb_row(player_df: pd.DataFrame) -> pd.Series:
+    """Pick the most informative MiLB row for a player.
+
+    Prefers the most recent season, then the highest level within
+    that season for maximum translation reliability.
+    """
+    latest_season = player_df["season"].max()
+    latest = player_df[player_df["season"] == latest_season].copy()
+    latest["_level_pri"] = latest["level"].map(_LEVEL_PRIORITY).fillna(0)
+    return latest.sort_values("_level_pri", ascending=False).iloc[0]
+
+
+def augment_hitters_with_milb_priors(
+    mlb_df: pd.DataFrame,
+    milb_df: pd.DataFrame | None = None,
+    projection_season: int = 2026,
+    min_confidence: float = 0.40,
+    min_pa: int = 50,
+    max_age: int = 28,
+) -> pd.DataFrame:
+    """Add MiLB rookies as synthetic training rows for Bayesian projection.
+
+    For each MiLB player NOT in the MLB training data, creates a synthetic
+    season row using translated rates and scaled PA.  The hierarchical model
+    naturally gives these players wider posteriors due to fewer trials.
+
+    Parameters
+    ----------
+    mlb_df : pd.DataFrame
+        Output of ``build_multi_season_hitter_data()``.
+    milb_df : pd.DataFrame or None
+        Translated MiLB batter data (from ``build_milb_translated_data``).
+        If None, loads from cache.
+    projection_season : int
+        Target season for projections (used to compute prospect age).
+    min_confidence : float
+        Minimum ``translation_confidence`` to include a prospect.
+    min_pa : int
+        Minimum MiLB PA to include a prospect.
+    max_age : int
+        Maximum age at MiLB level. Filters out journeyman minor leaguers.
+
+    Returns
+    -------
+    pd.DataFrame
+        MLB data + synthetic rookie rows, with ``_from_milb`` flag.
+    """
+    if milb_df is None:
+        try:
+            milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_batters.parquet")
+        except FileNotFoundError:
+            logger.warning("No MiLB translated batters cache found, skipping augmentation")
+            mlb_df["_from_milb"] = False
+            return mlb_df
+
+    mlb_ids = set(mlb_df["batter_id"].unique())
+
+    # Only consider recent MiLB seasons (last 2 years before projection)
+    recent_cutoff = projection_season - 2
+    candidates = milb_df[
+        (~milb_df["player_id"].isin(mlb_ids))
+        & (milb_df["translation_confidence"] >= min_confidence)
+        & (milb_df["pa"] >= min_pa)
+        & (milb_df["season"] >= recent_cutoff)
+        & (milb_df["age_at_level"] <= max_age)
+    ].copy()
+
+    if candidates.empty:
+        logger.info("No MiLB rookies meet augmentation criteria")
+        mlb_df["_from_milb"] = False
+        return mlb_df
+
+    # Pick best row per player
+    rows: list[dict] = []
+    for pid, grp in candidates.groupby("player_id"):
+        best = _pick_best_milb_row(grp)
+
+        # Compute projected age in target season
+        years_ahead = projection_season - int(best["season"])
+        age_proj = float(best["age_at_level"]) + years_ahead
+        age_bucket = 0 if age_proj <= 25 else (1 if age_proj <= 30 else 2)
+
+        # Scale PA by level reliability — fewer effective trials for lower levels
+        level_scale = _MILB_LEVEL_PA_SCALE.get(best["level"], 0.25)
+        effective_pa = max(int(best["pa"] * level_scale), 10)
+
+        # Back-solve counts from translated rates
+        k_rate = float(best["translated_k_pct"])
+        bb_rate = float(best["translated_bb_pct"])
+        k_count = int(round(k_rate * effective_pa))
+        bb_count = int(round(bb_rate * effective_pa))
+
+        row = {
+            "batter_id": int(pid),
+            "batter_name": best.get("player_name", ""),
+            "batter_stand": None,
+            "season": projection_season - 1,  # As if they played last season
+            "birth_date": None,
+            "age": int(round(age_proj - 1)),  # Age in that "season"
+            "age_bucket": age_bucket,
+            "pa": effective_pa,
+            "k": k_count,
+            "bb": bb_count,
+            "ibb": 0,
+            "hbp": 0,
+            "sf": 0,
+            "hits": 0,
+            "hr": 0,
+            "xwoba_avg": np.nan,
+            "barrel_pct": np.nan,
+            "hard_hit_pct": np.nan,
+            "bip": 0,
+            "gb": 0,
+            "fb": 0,
+            "bip_with_la": 0,
+            "hr_fb": np.nan,
+            "k_rate": k_rate,
+            "bb_rate": bb_rate,
+            "hr_rate": np.nan,
+            "gb_rate": np.nan,
+            "fb_rate": np.nan,
+            "hr_per_fb": np.nan,
+            "woba": np.nan,
+            # Statcast covariates — NaN → skill_tier defaults to 1 (average)
+            "whiff_rate": np.nan,
+            "chase_rate": np.nan,
+            "z_contact_pct": np.nan,
+            "fb_pct": np.nan,
+            "skill_tier": 1,  # Default to average (no Statcast for MiLB)
+            "_from_milb": True,
+            "_milb_level": best["level"],
+            "_milb_confidence": float(best["translation_confidence"]),
+        }
+        rows.append(row)
+
+    rookie_df = pd.DataFrame(rows)
+    mlb_df = mlb_df.copy()
+    mlb_df["_from_milb"] = False
+
+    combined = pd.concat([mlb_df, rookie_df], ignore_index=True)
+    logger.info(
+        "Augmented with %d MiLB hitter rookies (min_conf=%.2f, min_pa=%d)",
+        len(rookie_df), min_confidence, min_pa,
+    )
+    return combined
+
+
+def augment_pitchers_with_milb_priors(
+    mlb_df: pd.DataFrame,
+    milb_df: pd.DataFrame | None = None,
+    projection_season: int = 2026,
+    min_confidence: float = 0.40,
+    min_bf: int = 50,
+    max_age: int = 28,
+) -> pd.DataFrame:
+    """Add MiLB rookie pitchers as synthetic training rows.
+
+    Same approach as ``augment_hitters_with_milb_priors`` but for pitchers.
+
+    Parameters
+    ----------
+    mlb_df : pd.DataFrame
+        Output of ``build_multi_season_pitcher_data()``.
+    milb_df : pd.DataFrame or None
+        Translated MiLB pitcher data. If None, loads from cache.
+    projection_season : int
+        Target projection season.
+    min_confidence : float
+        Minimum ``translation_confidence``.
+    min_bf : int
+        Minimum MiLB BF.
+    max_age : int
+        Maximum age at MiLB level. Filters out journeyman minor leaguers.
+
+    Returns
+    -------
+    pd.DataFrame
+        MLB data + synthetic rookie rows, with ``_from_milb`` flag.
+    """
+    if milb_df is None:
+        try:
+            milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_pitchers.parquet")
+        except FileNotFoundError:
+            logger.warning("No MiLB translated pitchers cache found, skipping augmentation")
+            mlb_df["_from_milb"] = False
+            return mlb_df
+
+    mlb_ids = set(mlb_df["pitcher_id"].unique())
+
+    # Only consider recent MiLB seasons (last 2 years before projection)
+    recent_cutoff = projection_season - 2
+    candidates = milb_df[
+        (~milb_df["player_id"].isin(mlb_ids))
+        & (milb_df["translation_confidence"] >= min_confidence)
+        & (milb_df["bf"] >= min_bf)
+        & (milb_df["season"] >= recent_cutoff)
+        & (milb_df["age_at_level"] <= max_age)
+    ].copy()
+
+    if candidates.empty:
+        logger.info("No MiLB rookie pitchers meet augmentation criteria")
+        mlb_df["_from_milb"] = False
+        return mlb_df
+
+    rows: list[dict] = []
+    for pid, grp in candidates.groupby("player_id"):
+        best = _pick_best_milb_row(grp)
+
+        years_ahead = projection_season - int(best["season"])
+        age_proj = float(best["age_at_level"]) + years_ahead
+        age_bucket = 0 if age_proj <= 25 else (1 if age_proj <= 30 else 2)
+
+        level_scale = _MILB_LEVEL_PA_SCALE.get(best["level"], 0.25)
+        effective_bf = max(int(best["bf"] * level_scale), 10)
+
+        k_rate = float(best["translated_k_pct"])
+        bb_rate = float(best["translated_bb_pct"])
+        hr_per_bf = float(best["translated_hr_bf"]) if pd.notna(best.get("translated_hr_bf")) else 0.03
+        k_count = int(round(k_rate * effective_bf))
+        bb_count = int(round(bb_rate * effective_bf))
+        hr_count = int(round(hr_per_bf * effective_bf))
+
+        # Estimate IP from BF (~2.8 BF per IP for starters)
+        est_ip = effective_bf / 2.8
+
+        row = {
+            "pitcher_id": int(pid),
+            "pitcher_name": best.get("player_name", ""),
+            "pitch_hand": None,
+            "season": projection_season - 1,
+            "birth_date": None,
+            "age": int(round(age_proj - 1)),
+            "age_bucket": age_bucket,
+            "games": 1,
+            "ip": est_ip,
+            "k": k_count,
+            "bb": bb_count,
+            "hr": hr_count,
+            "batters_faced": effective_bf,
+            "k_rate": k_rate,
+            "bb_rate": bb_rate,
+            "hr_per_bf": hr_per_bf,
+            "hr_per_9": hr_per_bf * 9 * 2.8,
+            "is_starter": 1,  # Assume starter for prospects
+            # Statcast — NaN → skill_tier defaults to 1
+            "whiff_rate": np.nan,
+            "barrel_rate_against": np.nan,
+            "zone_pct": np.nan,
+            "gb_pct": np.nan,
+            "avg_velo": np.nan,
+            "skill_tier": 1,  # Default to average (no Statcast for MiLB)
+            "_from_milb": True,
+            "_milb_level": best["level"],
+            "_milb_confidence": float(best["translation_confidence"]),
+        }
+        rows.append(row)
+
+    rookie_df = pd.DataFrame(rows)
+    mlb_df = mlb_df.copy()
+    mlb_df["_from_milb"] = False
+
+    combined = pd.concat([mlb_df, rookie_df], ignore_index=True)
+    logger.info(
+        "Augmented with %d MiLB pitcher rookies (min_conf=%.2f, min_bf=%d)",
+        len(rookie_df), min_confidence, min_bf,
+    )
+    return combined
+
+
+# ---------------------------------------------------------------------------
 # Hitter observed profile (cached)
 # ---------------------------------------------------------------------------
 def get_cached_hitter_observed_profile(
