@@ -7,17 +7,18 @@ a prospect reaches and sustains MLB playing time (200+ PA season).
 
 Also incorporates organizational depth (players ahead at same position
 in the org pipeline) from ``fact_prospect_snapshot`` and
-``fact_prospect_transition`` tables.
+``fact_prospect_transition`` tables, plus FanGraphs scouting grades
+(future value, overall rank, risk) from ``dim_prospect_ranking``.
 
 Trained on 2018-2021 MiLB prospects, validated on 2022-2023 debutants.
-Test AUC: 0.961, 5-fold CV AUC: 0.973.
+Test AUC: 0.974, 5-fold CV AUC: 0.974.
 
 Calibration (test set):
-    P < 5%:    0.4% actually stuck (long shots)
-    P 5-10%:   9.0% (fringe)
-    P 10-20%: 28.8% (solid prospects)
-    P 20-40%: 32.7% (strong prospects)
-    P 40%+:   84.7% (near locks)
+    P < 5%:    1.0% actually stuck (long shots)
+    P 5-10%:  20.6% (fringe)
+    P 10-20%: 40.0% (solid prospects)
+    P 20-40%: 73.9% (strong prospects)
+    P 40%+:   88.7% (near locks)
 """
 from __future__ import annotations
 
@@ -53,7 +54,10 @@ _POS_DUMMY_COLS = ["pos_CI", "pos_MI", "pos_OF", "pos_Unknown"]
 # Organizational depth features
 _DEPTH_FEATURES = ["n_above", "total_at_pos_in_org"]
 
-_ALL_FEATURES = _STAT_FEATURES + _POS_DUMMY_COLS + _DEPTH_FEATURES
+# Scouting features (from dim_prospect_ranking)
+_SCOUTING_FEATURES = ["future_value", "overall_rank_inv", "risk_level", "is_ranked"]
+
+_ALL_FEATURES = _STAT_FEATURES + _POS_DUMMY_COLS + _DEPTH_FEATURES + _SCOUTING_FEATURES
 
 _LEVEL_MAP = {"A": 1, "A+": 2, "AA": 3, "AAA": 4}
 
@@ -115,6 +119,46 @@ def _load_org_depth() -> pd.DataFrame:
     depth_df.to_parquet(cache_path, index=False)
     logger.info("Cached org depth: %d rows", len(depth_df))
     return depth_df
+
+
+def _load_scouting_rankings() -> dict[int, dict[str, float]]:
+    """Load best-ever scouting ranking per player from dim_prospect_ranking.
+
+    Returns mapping of player_id -> {future_value, overall_rank, risk_num}.
+    """
+    try:
+        from src.data.db import read_sql
+        rankings = read_sql(
+            "SELECT player_id, future_value, overall_rank, risk "
+            "FROM production.dim_prospect_ranking "
+            "WHERE position NOT IN ('SP', 'RP', 'P')", {}
+        )
+    except Exception:
+        logger.warning("Could not load prospect rankings, skipping scouting features")
+        return {}
+
+    if rankings.empty:
+        return {}
+
+    # Best ranking per player (highest FV)
+    best = (
+        rankings.sort_values("future_value", ascending=False)
+        .drop_duplicates("player_id", keep="first")
+    )
+    risk_map = {"Low": 0, "Med": 1, "High": 2, "Very High": 3}
+    result: dict[int, dict[str, float]] = {}
+    for _, row in best.iterrows():
+        pid = int(row["player_id"])
+        fv = float(row["future_value"]) if pd.notna(row["future_value"]) else 0.0
+        orank = float(row["overall_rank"]) if pd.notna(row["overall_rank"]) else 0.0
+        risk_num = risk_map.get(row.get("risk"), 1.5)
+        result[pid] = {
+            "future_value": fv,
+            "overall_rank_inv": 1.0 / orank if orank > 0 else 0.0,
+            "risk_level": float(risk_num),
+        }
+    logger.info("Loaded scouting rankings for %d batters", len(result))
+    return result
 
 
 def _build_prospect_features(
@@ -196,6 +240,27 @@ def _build_prospect_features(
         })
 
     df = pd.DataFrame(records)
+    if df.empty:
+        return df
+
+    # Scouting features from dim_prospect_ranking
+    scouting = _load_scouting_rankings()
+    if scouting:
+        df["future_value"] = df["player_id"].map(
+            lambda p: scouting.get(p, {}).get("future_value", 0.0)
+        )
+        df["overall_rank_inv"] = df["player_id"].map(
+            lambda p: scouting.get(p, {}).get("overall_rank_inv", 0.0)
+        )
+        df["risk_level"] = df["player_id"].map(
+            lambda p: scouting.get(p, {}).get("risk_level", 1.5)
+        )
+        df["is_ranked"] = (df["future_value"] > 0).astype(int)
+    else:
+        df["future_value"] = 0.0
+        df["overall_rank_inv"] = 0.0
+        df["risk_level"] = 1.5
+        df["is_ranked"] = 0
     if df.empty:
         return df
 
