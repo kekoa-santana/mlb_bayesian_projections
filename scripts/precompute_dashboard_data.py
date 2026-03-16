@@ -834,6 +834,75 @@ def main() -> None:
             logger.warning("Missing %s — run build_milb_translations.py first", fname)
 
     # =================================================================
+    # 6e. Prospect readiness scores + FanGraphs rankings
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Building prospect readiness scores...")
+
+    try:
+        from src.models.mlb_readiness import train_readiness_model, score_prospects
+        from src.data.db import read_sql
+
+        target_season = FROM_SEASON + 1  # e.g. 2026
+
+        # Train model and score prospects
+        bundle = train_readiness_model()
+        prospects = score_prospects(projection_season=target_season)
+        logger.info(
+            "Readiness model: AUC=%.3f, scored %d prospects",
+            bundle["train_auc"], len(prospects),
+        )
+
+        # Load FanGraphs rankings for the target season
+        rankings = read_sql(
+            "SELECT player_id, player_name, org, position, overall_rank, "
+            "org_rank, future_value, risk, eta, source "
+            "FROM production.dim_prospect_ranking "
+            f"WHERE season = {target_season}",
+            {},
+        )
+        if not rankings.empty:
+            # Prefer fg_report, deduplicate
+            rankings = rankings.sort_values(
+                "source", ascending=True  # fg_report before fg_updated
+            ).drop_duplicates("player_id", keep="first")
+            logger.info("FanGraphs rankings: %d prospects for %d", len(rankings), target_season)
+        else:
+            logger.warning("No FanGraphs rankings for season %d", target_season)
+
+        # Merge readiness scores with rankings
+        if not prospects.empty:
+            # Select readiness columns
+            readiness_cols = [
+                "player_id", "name", "pos_group", "primary_position",
+                "max_level", "max_level_num", "readiness_score", "readiness_tier",
+                "wtd_k_pct", "wtd_bb_pct", "wtd_iso", "k_bb_diff", "sb_rate",
+                "youngest_age_rel", "min_age", "career_milb_pa",
+                "n_above", "total_at_pos_in_org",
+                "future_value", "is_ranked",
+            ]
+            available_cols = [c for c in readiness_cols if c in prospects.columns]
+            prospect_out = prospects[available_cols].copy()
+
+            # Merge FG rankings for extra columns (org, org_rank, risk, eta)
+            if not rankings.empty:
+                fg_cols = ["player_id", "org", "overall_rank", "org_rank", "risk", "eta"]
+                fg_available = [c for c in fg_cols if c in rankings.columns]
+                prospect_out = prospect_out.merge(
+                    rankings[fg_available], on="player_id", how="left",
+                )
+
+            prospect_out.to_parquet(
+                DASHBOARD_DIR / "prospect_readiness.parquet", index=False,
+            )
+            logger.info("Saved prospect_readiness.parquet: %d rows", len(prospect_out))
+        else:
+            logger.warning("No prospect readiness scores generated")
+
+    except Exception:
+        logger.exception("Failed to build prospect readiness scores")
+
+    # =================================================================
     # 7. Save preseason snapshot (frozen projections for end-of-season comparison)
     # =================================================================
     logger.info("=" * 60)
