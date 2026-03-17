@@ -879,7 +879,6 @@ def main() -> None:
                 "wtd_k_pct", "wtd_bb_pct", "wtd_iso", "k_bb_diff", "sb_rate",
                 "youngest_age_rel", "min_age", "career_milb_pa",
                 "n_above", "total_at_pos_in_org",
-                "future_value", "is_ranked",
             ]
             available_cols = [c for c in readiness_cols if c in prospects.columns]
             prospect_out = prospects[available_cols].copy()
@@ -901,6 +900,50 @@ def main() -> None:
 
     except Exception:
         logger.exception("Failed to build prospect readiness scores")
+
+    # =================================================================
+    # 6f. TDD Prospect Rankings (composite score)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Building TDD prospect rankings...")
+
+    try:
+        from src.models.prospect_ranking import rank_prospects
+
+        prospect_rankings = rank_prospects(projection_season=FROM_SEASON + 1)
+        if not prospect_rankings.empty:
+            prospect_rankings.to_parquet(
+                DASHBOARD_DIR / "prospect_rankings.parquet", index=False,
+            )
+            logger.info(
+                "Saved prospect_rankings.parquet: %d rows", len(prospect_rankings),
+            )
+        else:
+            logger.warning("No prospect rankings generated")
+
+    except Exception:
+        logger.exception("Failed to build prospect rankings")
+
+    # =================================================================
+    # 6g. MLB Positional Rankings (2026 value)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Building MLB positional rankings...")
+
+    try:
+        from src.models.player_rankings import rank_all
+
+        rankings = rank_all(
+            season=FROM_SEASON, projection_season=FROM_SEASON + 1,
+        )
+        for key, rdf in rankings.items():
+            if not rdf.empty:
+                fname = f"{key}_rankings.parquet"
+                rdf.to_parquet(DASHBOARD_DIR / fname, index=False)
+                logger.info("Saved %s: %d rows", fname, len(rdf))
+
+    except Exception:
+        logger.exception("Failed to build MLB positional rankings")
 
     # =================================================================
     # 7. Save preseason snapshot (frozen projections for end-of-season comparison)
