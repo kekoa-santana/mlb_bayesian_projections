@@ -254,17 +254,23 @@ def _build_hitter_playing_time_score() -> pd.DataFrame:
     counting = pd.read_parquet(DASHBOARD_DIR / "hitter_counting.parquet")
     pa_pctl = _pctl(counting["projected_pa_mean"])
 
-    # Blend with health score if available
-    health_path = DASHBOARD_DIR / "health_scores.parquet"
-    if health_path.exists():
-        health_df = pd.read_parquet(health_path)
-        counting = counting.merge(
-            health_df[["player_id", "health_score", "health_label"]].rename(
-                columns={"player_id": "batter_id"}
-            ),
-            on="batter_id",
-            how="left",
-        )
+    # Health scores: prefer columns already on counting parquet,
+    # fall back to standalone health_scores.parquet
+    has_health = "health_score" in counting.columns and counting["health_score"].notna().any()
+    if not has_health:
+        health_path = DASHBOARD_DIR / "health_scores.parquet"
+        if health_path.exists():
+            health_df = pd.read_parquet(health_path)
+            counting = counting.merge(
+                health_df[["player_id", "health_score", "health_label"]].rename(
+                    columns={"player_id": "batter_id"}
+                ),
+                on="batter_id",
+                how="left",
+            )
+            has_health = True
+
+    if has_health:
         counting["health_score"] = counting["health_score"].fillna(0.85)
         counting["health_label"] = counting["health_label"].fillna("Unknown")
         health_pctl = _pctl(counting["health_score"])
@@ -420,16 +426,18 @@ def rank_hitters(
         + 0.50 * base.loc[is_catcher, "framing_score"]
     )
 
-    # For DH: zero out fielding, redistribute to offense
+    # For DH: only half the fielding weight redirects to offense.
+    # The other half is lost — a positional penalty reflecting zero
+    # defensive value. DH max = 0.90 vs 1.00 for position players.
     is_dh = base["position"] == "DH"
-    dh_offense_wt = _HITTER_WEIGHTS["offense"] + _HITTER_WEIGHTS["fielding"]
+    dh_offense_wt = _HITTER_WEIGHTS["offense"] + _HITTER_WEIGHTS["fielding"] / 2
     base["tdd_value_score"] = (
         _HITTER_WEIGHTS["offense"] * base["offense_score"]
         + _HITTER_WEIGHTS["fielding"] * base["fielding_combined"]
         + _HITTER_WEIGHTS["playing_time"] * base["pt_score"]
         + _HITTER_WEIGHTS["trajectory"] * base["trajectory_score"]
     )
-    # Recalc for DH (no fielding)
+    # Recalc for DH (half fielding weight lost as positional penalty)
     base.loc[is_dh, "tdd_value_score"] = (
         dh_offense_wt * base.loc[is_dh, "offense_score"]
         + _HITTER_WEIGHTS["playing_time"] * base.loc[is_dh, "pt_score"]
@@ -653,17 +661,23 @@ def _build_pitcher_workload_score() -> pd.DataFrame:
     counting = pd.read_parquet(DASHBOARD_DIR / "pitcher_counting.parquet")
     bf_pctl = _pctl(counting["projected_bf_mean"])
 
-    # Blend with health score if available
-    health_path = DASHBOARD_DIR / "health_scores.parquet"
-    if health_path.exists():
-        health_df = pd.read_parquet(health_path)
-        counting = counting.merge(
-            health_df[["player_id", "health_score", "health_label"]].rename(
-                columns={"player_id": "pitcher_id"}
-            ),
-            on="pitcher_id",
-            how="left",
-        )
+    # Health scores: prefer columns already on counting parquet,
+    # fall back to standalone health_scores.parquet
+    has_health = "health_score" in counting.columns and counting["health_score"].notna().any()
+    if not has_health:
+        health_path = DASHBOARD_DIR / "health_scores.parquet"
+        if health_path.exists():
+            health_df = pd.read_parquet(health_path)
+            counting = counting.merge(
+                health_df[["player_id", "health_score", "health_label"]].rename(
+                    columns={"player_id": "pitcher_id"}
+                ),
+                on="pitcher_id",
+                how="left",
+            )
+            has_health = True
+
+    if has_health:
         counting["health_score"] = counting["health_score"].fillna(0.85)
         counting["health_label"] = counting["health_label"].fillna("Unknown")
         health_pctl = _pctl(counting["health_score"])
