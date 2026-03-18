@@ -883,7 +883,7 @@ def main() -> None:
     logger.info("Building TDD prospect rankings...")
 
     try:
-        from src.models.prospect_ranking import rank_prospects
+        from src.models.prospect_ranking import rank_prospects, rank_pitching_prospects
 
         prospect_rankings = rank_prospects(projection_season=FROM_SEASON + 1)
         if not prospect_rankings.empty:
@@ -894,7 +894,21 @@ def main() -> None:
                 "Saved prospect_rankings.parquet: %d rows", len(prospect_rankings),
             )
         else:
-            logger.warning("No prospect rankings generated")
+            logger.warning("No batting prospect rankings generated")
+
+        pitching_prospect_rankings = rank_pitching_prospects(
+            projection_season=FROM_SEASON + 1,
+        )
+        if not pitching_prospect_rankings.empty:
+            pitching_prospect_rankings.to_parquet(
+                DASHBOARD_DIR / "pitching_prospect_rankings.parquet", index=False,
+            )
+            logger.info(
+                "Saved pitching_prospect_rankings.parquet: %d rows",
+                len(pitching_prospect_rankings),
+            )
+        else:
+            logger.warning("No pitching prospect rankings generated")
 
     except Exception:
         logger.exception("Failed to build prospect rankings")
