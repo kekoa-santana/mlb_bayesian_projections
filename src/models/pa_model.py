@@ -42,6 +42,7 @@ def compute_hitter_pa_priors(
     min_pa: int = 100,
     pop_games: dict | None = None,
     pop_pa_rate: dict | None = None,
+    health_scores: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Compute shrinkage-estimated PA priors per hitter.
 
@@ -61,6 +62,11 @@ def compute_hitter_pa_priors(
         Override population game priors by age bucket.
     pop_pa_rate : dict, optional
         Override population PA/game rate.
+    health_scores : pd.DataFrame, optional
+        Output of health_score.compute_health_scores.
+        Must have: player_id, health_score, health_label.
+        When provided, replaces blunt age penalties with data-driven
+        health adjustments. Falls back to age penalties when None.
 
     Returns
     -------
@@ -68,7 +74,7 @@ def compute_hitter_pa_priors(
         One row per batter with columns: batter_id, batter_name,
         projected_games, sigma_games, projected_pa_per_game, sigma_pa_rate,
         projected_pa, age, age_bucket, reliability_games, reliability_pa_rate,
-        n_seasons.
+        n_seasons, health_score, health_label.
     """
     if pop_games is None:
         pop_games = POP_GAMES_BY_AGE
@@ -158,18 +164,35 @@ def compute_hitter_pa_priors(
         mu_pa_rate = rel_pa * weighted_pa_rate + (1 - rel_pa) * pop_pa_rate["mu"]
         sigma_pa_rate = rel_pa * 0.2 + (1 - rel_pa) * pop_pa_rate["sigma"]
 
-        # Age regression: slight decline in games for veterans
-        if age >= 35:
-            mu_g *= 0.90
-        elif age >= 33:
-            mu_g *= 0.95
+        # Health/durability adjustment (replaces blunt age penalties)
+        h_score = None
+        h_label = ""
+        if health_scores is not None and not health_scores.empty:
+            h_row = health_scores[health_scores["player_id"] == bid]
+            if not h_row.empty:
+                h_score = float(h_row.iloc[0]["health_score"])
+                h_label = str(h_row.iloc[0]["health_label"])
+
+        if h_score is not None:
+            # Data-driven: games_mult 0.75x (worst) to 1.02x (best)
+            games_mult = 0.75 + 0.27 * h_score
+            # Wider intervals for injury-prone: 1.50x (worst) to 0.85x (best)
+            sigma_mult = 1.50 - 0.65 * h_score
+            mu_g *= games_mult
+            sigma_g *= sigma_mult
+        else:
+            # Fallback: blunt age penalties (backward compat)
+            if age >= 35:
+                mu_g *= 0.90
+            elif age >= 33:
+                mu_g *= 0.95
 
         # Cap at 162 games
         mu_g = min(mu_g, 162)
 
         projected_pa = int(mu_g * mu_pa_rate)
 
-        results.append({
+        row_dict = {
             "batter_id": bid,
             "batter_name": player_latest.get("batter_name", ""),
             "projected_games": round(mu_g, 1),
@@ -182,7 +205,11 @@ def compute_hitter_pa_priors(
             "reliability_games": round(rel_g, 3),
             "reliability_pa_rate": round(rel_pa, 3),
             "n_seasons": n_seasons,
-        })
+        }
+        if h_score is not None:
+            row_dict["health_score"] = round(h_score, 4)
+            row_dict["health_label"] = h_label
+        results.append(row_dict)
 
     result_df = pd.DataFrame(results)
     logger.info(

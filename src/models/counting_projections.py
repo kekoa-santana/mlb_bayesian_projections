@@ -219,6 +219,10 @@ def project_hitter_counting(
                 n_draws, rng=rng,
             )
             games_samples = pa_samples / max(pr["projected_pa_per_game"], 3.0)
+            # Carry health columns from PA priors
+            if "health_score" in pa_priors.columns:
+                row["health_score"] = pr.get("health_score", None)
+                row["health_label"] = pr.get("health_label", "")
 
         row["projected_pa_mean"] = float(np.mean(pa_samples))
         row["projected_games_mean"] = float(np.mean(games_samples))
@@ -323,6 +327,7 @@ def project_pitcher_counting(
     n_draws: int = 4000,
     min_bf: int = 200,
     random_seed: int = 42,
+    health_scores: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Project counting stats for all pitchers.
 
@@ -339,6 +344,9 @@ def project_pitcher_counting(
     min_bf : int
         Minimum BF in from_season to include.
     random_seed : int
+    health_scores : pd.DataFrame, optional
+        Output of health_score.compute_health_scores.
+        When provided, adjusts projected games and sigma by health.
 
     Returns
     -------
@@ -407,6 +415,19 @@ def project_pitcher_counting(
         else:
             proj_games = pop_games
 
+        # Health/durability adjustment
+        h_score = None
+        h_label = ""
+        if health_scores is not None and not health_scores.empty:
+            h_row = health_scores[health_scores["player_id"] == pid]
+            if not h_row.empty:
+                h_score = float(h_row.iloc[0]["health_score"])
+                h_label = str(h_row.iloc[0]["health_label"])
+                games_mult = 0.75 + 0.27 * h_score
+                sigma_mult = 1.50 - 0.65 * h_score
+                proj_games *= games_mult
+                pop_games_sd *= sigma_mult
+
         # BF/game projection
         if len(player_hist) > 0:
             bf_per_game = (player_hist["batters_faced"] / player_hist["games"].replace(0, np.nan)).mean()
@@ -427,6 +448,10 @@ def project_pitcher_counting(
         # Total BF
         bf_samples = np.round(games_samples * bf_game_samples).astype(int)
         bf_samples = np.clip(bf_samples, 10, 900)
+
+        if h_score is not None:
+            row["health_score"] = round(h_score, 4)
+            row["health_label"] = h_label
 
         row["projected_bf_mean"] = float(np.mean(bf_samples))
         row["projected_games_mean"] = float(np.mean(games_samples))

@@ -153,7 +153,7 @@ def _build_hitter_offense_score(
     """
     # Merge projection + observed on batter_id
     merged = proj[["batter_id", "projected_k_rate", "projected_bb_rate",
-                    "projected_hr_rate", "composite_score"]].merge(
+                    "projected_hr_per_fb", "composite_score"]].merge(
         observed[["batter_id", "pa", "k_pct", "bb_pct", "woba", "wrc_plus",
                    "barrel_pct", "hard_hit_pct", "xwoba"]],
         on="batter_id", how="inner",
@@ -165,7 +165,7 @@ def _build_hitter_offense_score(
     # --- Projected component (Bayesian rates) ---
     proj_k_score = _inv_pctl(merged["projected_k_rate"])
     proj_bb_score = _pctl(merged["projected_bb_rate"])
-    proj_hr_score = _pctl(merged["projected_hr_rate"])
+    proj_hr_score = _pctl(merged["projected_hr_per_fb"])
     projected = 0.35 * proj_k_score + 0.30 * proj_bb_score + 0.35 * proj_hr_score
 
     # --- Observed component (Statcast + traditional) ---
@@ -241,22 +241,59 @@ def _build_catcher_framing_score(season: int = 2025) -> pd.DataFrame:
 
 
 def _build_hitter_playing_time_score() -> pd.DataFrame:
-    """Score projected playing time from counting projections.
+    """Score projected playing time from counting projections + health.
+
+    Blends 70% projected PA percentile with 30% health score percentile
+    when health scores are available.
 
     Returns
     -------
     pd.DataFrame
-        Columns: batter_id, pt_score.
+        Columns: batter_id, pt_score, health_score, health_label.
     """
     counting = pd.read_parquet(DASHBOARD_DIR / "hitter_counting.parquet")
-    counting["pt_score"] = _pctl(counting["projected_pa_mean"])
-    return counting[["batter_id", "pt_score"]]
+    pa_pctl = _pctl(counting["projected_pa_mean"])
+
+    # Blend with health score if available
+    health_path = DASHBOARD_DIR / "health_scores.parquet"
+    if health_path.exists():
+        health_df = pd.read_parquet(health_path)
+        counting = counting.merge(
+            health_df[["player_id", "health_score", "health_label"]].rename(
+                columns={"player_id": "batter_id"}
+            ),
+            on="batter_id",
+            how="left",
+        )
+        counting["health_score"] = counting["health_score"].fillna(0.85)
+        counting["health_label"] = counting["health_label"].fillna("Unknown")
+        health_pctl = _pctl(counting["health_score"])
+        counting["pt_score"] = 0.70 * pa_pctl + 0.30 * health_pctl
+    else:
+        counting["pt_score"] = pa_pctl
+        counting["health_score"] = np.nan
+        counting["health_label"] = ""
+
+    cols = ["batter_id", "pt_score", "health_score", "health_label"]
+    return counting[[c for c in cols if c in counting.columns]]
 
 
 def _build_hitter_trajectory_score() -> pd.DataFrame:
-    """Score age-based trajectory from projections.
+    """Score trajectory using posterior certainty and projected quality.
 
-    Younger players with positive delta (projected > observed) score higher.
+    Rewards players whose Bayesian posteriors are tight (proven track
+    record) and whose projected rates are strong. Age still matters
+    but is secondary — a 33-year-old with 8 years of elite data should
+    score well, not get destroyed by age alone.
+
+    Components
+    ----------
+    - **Projection certainty** (50%): tighter posterior SD = more proven.
+      Directly leverages what the Bayesian model already knows about
+      year-over-year consistency.
+    - **Age upside** (20%): younger players get a modest bump.
+    - **Projected rate quality** (30%): how good are the projected rates
+      themselves (low K%, high BB%).
 
     Returns
     -------
@@ -265,15 +302,25 @@ def _build_hitter_trajectory_score() -> pd.DataFrame:
     """
     proj = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet")
 
-    # delta_k_rate < 0 means projected K% is lower (improving)
-    # delta_bb_rate > 0 means projected BB% is higher (improving)
-    k_improving = _inv_pctl(proj["delta_k_rate"].fillna(0))
-    bb_improving = _pctl(proj["delta_bb_rate"].fillna(0))
+    # Posterior certainty: tighter SD = more proven/consistent
+    # Average across K% and BB% SDs, then invert (lower SD = higher score)
+    k_certainty = _inv_pctl(proj["projected_k_rate_sd"].fillna(proj["projected_k_rate_sd"].median()))
+    bb_certainty = _inv_pctl(proj["projected_bb_rate_sd"].fillna(proj["projected_bb_rate_sd"].median()))
+    certainty_score = 0.50 * k_certainty + 0.50 * bb_certainty
 
-    # Age factor: younger = more upside
+    # Projected rate quality: how good are the projected rates?
+    proj_k_quality = _inv_pctl(proj["projected_k_rate"])
+    proj_bb_quality = _pctl(proj["projected_bb_rate"])
+    rate_quality = 0.50 * proj_k_quality + 0.50 * proj_bb_quality
+
+    # Age upside: younger = more room to grow (but modest weight)
     age_score = _inv_pctl(proj["age"].fillna(30))
 
-    proj["trajectory_score"] = 0.30 * k_improving + 0.30 * bb_improving + 0.40 * age_score
+    proj["trajectory_score"] = (
+        0.50 * certainty_score
+        + 0.30 * rate_quality
+        + 0.20 * age_score
+    )
     return proj[["batter_id", "trajectory_score"]]
 
 
@@ -324,7 +371,7 @@ def rank_hitters(
 
     # Start from projections as base (has batter_id, name, age, etc.)
     base = proj[["batter_id", "batter_name", "age", "batter_stand",
-                 "projected_k_rate", "projected_bb_rate", "projected_hr_rate",
+                 "projected_k_rate", "projected_bb_rate", "projected_hr_per_fb",
                  "projected_k_rate_sd", "projected_bb_rate_sd",
                  "composite_score"]].copy()
 
@@ -360,6 +407,9 @@ def rank_hitters(
     base["offense_score"] = base["offense_score"].fillna(0.50)
     base["pt_score"] = base["pt_score"].fillna(0.50)
     base["trajectory_score"] = base["trajectory_score"].fillna(0.50)
+    if "health_score" not in base.columns:
+        base["health_score"] = np.nan
+        base["health_label"] = ""
 
     # --- Composite score ---
     # For catchers: blend framing into fielding component
@@ -386,6 +436,81 @@ def rank_hitters(
         + _HITTER_WEIGHTS["trajectory"] * base.loc[is_dh, "trajectory_score"]
     )
 
+    # --- Two-way player bonus ---
+    # Players who also pitch (e.g. Ohtani) get credit for pitching value.
+    # Check both Bayesian pitcher projections and raw pitching stats,
+    # since a two-way player may not appear in projections (e.g. missed
+    # a full season pitching due to injury).
+    base["two_way_bonus"] = 0.0
+    base["is_two_way"] = False
+    try:
+        from src.data.db import read_sql as _read_sql
+
+        pitcher_proj = pd.read_parquet(DASHBOARD_DIR / "pitcher_projections.parquet")
+
+        # Also check raw pitching advanced stats for recent seasons
+        recent_pitching = _read_sql(f"""
+            SELECT pitcher_id, k_pct, bb_pct, swstr_pct, batters_faced
+            FROM production.fact_pitching_advanced
+            WHERE season >= {season - 2} AND batters_faced >= 100
+        """, {})
+        # Aggregate across recent seasons (PA-weighted)
+        if not recent_pitching.empty:
+            rp_agg = (
+                recent_pitching.groupby("pitcher_id")
+                .apply(
+                    lambda g: pd.Series({
+                        "k_pct": np.average(g["k_pct"], weights=g["batters_faced"]),
+                        "bb_pct": np.average(g["bb_pct"], weights=g["batters_faced"]),
+                        "total_bf": g["batters_faced"].sum(),
+                    }),
+                    include_groups=False,
+                )
+                .reset_index()
+            )
+        else:
+            rp_agg = pd.DataFrame(columns=["pitcher_id", "k_pct", "bb_pct", "total_bf"])
+
+        # Find two-way players: hitters who appear in pitcher data
+        hitter_ids = set(base["batter_id"])
+        proj_pitcher_ids = set(pitcher_proj["pitcher_id"]) & hitter_ids
+        raw_pitcher_ids = set(rp_agg["pitcher_id"]) & hitter_ids
+        two_way_ids = proj_pitcher_ids | raw_pitcher_ids
+
+        if two_way_ids:
+            # Use projections if available, raw stats as fallback
+            for pid in two_way_ids:
+                if pid in proj_pitcher_ids:
+                    pp = pitcher_proj[pitcher_proj["pitcher_id"] == pid].iloc[0]
+                    k_val = pp["projected_k_rate"]
+                    bb_val = pp["projected_bb_rate"]
+                    ref_k = pitcher_proj["projected_k_rate"]
+                    ref_bb = pitcher_proj["projected_bb_rate"]
+                else:
+                    pp_raw = rp_agg[rp_agg["pitcher_id"] == pid].iloc[0]
+                    k_val = pp_raw["k_pct"]
+                    bb_val = pp_raw["bb_pct"]
+                    ref_k = rp_agg["k_pct"]
+                    ref_bb = rp_agg["bb_pct"]
+
+                k_pctl = (ref_k < k_val).mean()
+                bb_pctl = (ref_bb > bb_val).mean()
+                pitcher_value = 0.60 * k_pctl + 0.40 * bb_pctl
+                # Scale bonus: elite pitcher value (0.8+) adds up to ~0.15
+                bonus = pitcher_value * 0.18
+                mask = base["batter_id"] == pid
+                base.loc[mask, "two_way_bonus"] = bonus
+                base.loc[mask, "is_two_way"] = True
+                pname = base.loc[mask, "batter_name"].iloc[0]
+                logger.info(
+                    "Two-way bonus: %s — pitcher value=%.3f, bonus=+%.3f",
+                    pname, pitcher_value, bonus,
+                )
+    except Exception:
+        logger.exception("Could not compute two-way player bonus")
+
+    base["tdd_value_score"] = base["tdd_value_score"] + base["two_way_bonus"]
+
     # --- Rank within each position ---
     base = base.sort_values("tdd_value_score", ascending=False)
     base["pos_rank"] = base.groupby("position").cumcount() + 1
@@ -396,16 +521,18 @@ def rank_hitters(
     # Select output columns
     output_cols = [
         "pos_rank", "overall_rank", "batter_id", "batter_name", "position",
-        "age", "batter_stand",
+        "age", "batter_stand", "is_two_way",
         # Composite
         "tdd_value_score",
         # Sub-scores
         "offense_score", "fielding_combined", "framing_score",
-        "pt_score", "trajectory_score",
+        "pt_score", "trajectory_score", "two_way_bonus",
+        # Health
+        "health_score", "health_label",
         # Observed
         "pa", "woba", "wrc_plus", "xwoba", "barrel_pct", "hard_hit_pct",
         # Projected
-        "projected_k_rate", "projected_bb_rate", "projected_hr_rate",
+        "projected_k_rate", "projected_bb_rate", "projected_hr_per_fb",
         "projected_k_rate_sd", "projected_bb_rate_sd",
     ]
     available = [c for c in output_cols if c in base.columns]
@@ -513,21 +640,49 @@ def _build_pitcher_command_score(
 
 
 def _build_pitcher_workload_score() -> pd.DataFrame:
-    """Score projected workload from counting projections.
+    """Score projected workload from counting projections + health.
+
+    Blends 70% projected BF percentile with 30% health score percentile
+    when health scores are available.
 
     Returns
     -------
     pd.DataFrame
-        Columns: pitcher_id, workload_score.
+        Columns: pitcher_id, workload_score, health_score, health_label.
     """
     counting = pd.read_parquet(DASHBOARD_DIR / "pitcher_counting.parquet")
-    # Use projected BF (batters faced) as workload proxy
-    counting["workload_score"] = _pctl(counting["projected_bf_mean"])
-    return counting[["pitcher_id", "workload_score"]]
+    bf_pctl = _pctl(counting["projected_bf_mean"])
+
+    # Blend with health score if available
+    health_path = DASHBOARD_DIR / "health_scores.parquet"
+    if health_path.exists():
+        health_df = pd.read_parquet(health_path)
+        counting = counting.merge(
+            health_df[["player_id", "health_score", "health_label"]].rename(
+                columns={"player_id": "pitcher_id"}
+            ),
+            on="pitcher_id",
+            how="left",
+        )
+        counting["health_score"] = counting["health_score"].fillna(0.85)
+        counting["health_label"] = counting["health_label"].fillna("Unknown")
+        health_pctl = _pctl(counting["health_score"])
+        counting["workload_score"] = 0.70 * bf_pctl + 0.30 * health_pctl
+    else:
+        counting["workload_score"] = bf_pctl
+        counting["health_score"] = np.nan
+        counting["health_label"] = ""
+
+    cols = ["pitcher_id", "workload_score", "health_score", "health_label"]
+    return counting[[c for c in cols if c in counting.columns]]
 
 
 def _build_pitcher_trajectory_score() -> pd.DataFrame:
-    """Score trajectory from projection deltas and age.
+    """Score trajectory using posterior certainty and projected quality.
+
+    Same philosophy as hitter trajectory: reward proven track records
+    (tight posteriors) and strong projected rates, with a modest
+    age upside factor.
 
     Returns
     -------
@@ -536,13 +691,24 @@ def _build_pitcher_trajectory_score() -> pd.DataFrame:
     """
     proj = pd.read_parquet(DASHBOARD_DIR / "pitcher_projections.parquet")
 
-    # delta_k_rate > 0 means projected K% higher than observed (improving)
-    k_improving = _pctl(proj["delta_k_rate"].fillna(0))
-    # delta_bb_rate < 0 means projected BB% lower than observed (improving)
-    bb_improving = _inv_pctl(proj["delta_bb_rate"].fillna(0))
-    age_score = _inv_pctl(proj["age"].fillna(30))
+    # Posterior certainty: tighter SD = more proven
+    k_certainty = _inv_pctl(proj["projected_k_rate_sd"].fillna(proj["projected_k_rate_sd"].median()))
+    bb_certainty = _inv_pctl(proj["projected_bb_rate_sd"].fillna(proj["projected_bb_rate_sd"].median()))
+    certainty_score = 0.50 * k_certainty + 0.50 * bb_certainty
 
-    proj["trajectory_score"] = 0.30 * k_improving + 0.30 * bb_improving + 0.40 * age_score
+    # Projected rate quality
+    proj_k_quality = _pctl(proj["projected_k_rate"])  # higher K% = better for pitchers
+    proj_bb_quality = _inv_pctl(proj["projected_bb_rate"])  # lower BB% = better
+    rate_quality = 0.60 * proj_k_quality + 0.40 * proj_bb_quality
+
+    # Age upside
+    age_score = _inv_pctl(proj["age"].fillna(28))
+
+    proj["trajectory_score"] = (
+        0.50 * certainty_score
+        + 0.30 * rate_quality
+        + 0.20 * age_score
+    )
     return proj[["pitcher_id", "trajectory_score"]]
 
 
@@ -620,6 +786,9 @@ def rank_pitchers(
     # Fill missing with neutral
     for col in ["stuff_score", "command_score", "workload_score", "trajectory_score"]:
         base[col] = base[col].fillna(0.50)
+    if "health_score" not in base.columns:
+        base["health_score"] = np.nan
+        base["health_label"] = ""
 
     # --- Composite ---
     base["tdd_value_score"] = (
@@ -644,6 +813,8 @@ def rank_pitchers(
         "tdd_value_score",
         # Sub-scores
         "stuff_score", "command_score", "workload_score", "trajectory_score",
+        # Health
+        "health_score", "health_label",
         # Observed
         "batters_faced", "k_pct", "bb_pct", "swstr_pct", "csw_pct",
         "xwoba_against", "woba_against",

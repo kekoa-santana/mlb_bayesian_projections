@@ -53,6 +53,7 @@ from src.data.queries import (
     get_weather_effects,
 )
 from src.models.bf_model import compute_pitcher_bf_priors
+from src.models.health_score import compute_health_scores
 from src.models.counting_projections import (
     project_hitter_counting,
     project_pitcher_counting,
@@ -206,10 +207,17 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("Computing counting stat projections...")
 
+    # Health/durability scores (replaces blunt age penalties)
+    logger.info("Computing health/durability scores...")
+    health_df = compute_health_scores(FROM_SEASON)
+    health_df.to_parquet(DASHBOARD_DIR / "health_scores.parquet", index=False)
+    logger.info("Saved health scores: %d players", len(health_df))
+
     # Hitter counting stats (with park factor adjustment for HR)
     hitter_ext = build_multi_season_hitter_extended(SEASONS, min_pa=1)
     pa_priors = compute_hitter_pa_priors(
         hitter_ext, from_season=FROM_SEASON, min_pa=100,
+        health_scores=health_df,
     )
 
     # Load park factors for HR adjustment
@@ -243,41 +251,8 @@ def main() -> None:
         n_draws=4000,
         min_bf=200,
         random_seed=42,
+        health_scores=health_df,
     )
-
-    # ── Injury adjustment: scale counting stats by games-available fraction ──
-    inj_path = DASHBOARD_DIR / "preseason_injuries.parquet"
-    if inj_path.exists():
-        inj_df = pd.read_parquet(inj_path)
-        inj_df = inj_df[inj_df["player_id"].notna() & (inj_df["est_missed_games"] > 0)]
-        inj_frac = dict(zip(
-            inj_df["player_id"].astype(int),
-            ((162 - inj_df["est_missed_games"].clip(upper=162)) / 162).values,
-        ))
-        logger.info("Applying injury adjustments to %d players", len(inj_frac))
-
-        # Columns to scale (all counting distribution columns)
-        hitter_scale_cols = [
-            c for c in hitter_counting.columns
-            if c.startswith("total_") or c in ("projected_pa_mean", "projected_games_mean")
-        ]
-        for pid, frac in inj_frac.items():
-            mask = hitter_counting["batter_id"] == pid
-            if mask.any():
-                hitter_counting.loc[mask, hitter_scale_cols] *= frac
-                logger.info("  Hitter %d: %.0f%% season", pid, frac * 100)
-
-        pitcher_scale_cols = [
-            c for c in pitcher_counting.columns
-            if c.startswith("total_") or c in ("projected_bf_mean", "projected_games_mean")
-        ]
-        for pid, frac in inj_frac.items():
-            mask = pitcher_counting["pitcher_id"] == pid
-            if mask.any():
-                pitcher_counting.loc[mask, pitcher_scale_cols] *= frac
-                logger.info("  Pitcher %d: %.0f%% season", pid, frac * 100)
-    else:
-        logger.info("No preseason injuries file found — skipping injury adjustments")
 
     hitter_counting.to_parquet(DASHBOARD_DIR / "hitter_counting.parquet", index=False)
     logger.info("Saved hitter counting projections: %d players", len(hitter_counting))
