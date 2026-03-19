@@ -1111,6 +1111,31 @@ def main() -> None:
         logger.exception("Failed to compute hitter breakout archetypes")
 
     # =================================================================
+    # 6j. Pitcher breakout archetypes
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Scoring pitcher breakout archetypes...")
+
+    try:
+        from src.models.pitcher_breakout_model import score_pitcher_breakout_candidates
+
+        p_breakouts = score_pitcher_breakout_candidates(season=FROM_SEASON, min_bf=200)
+        if not p_breakouts.empty:
+            p_breakouts.to_parquet(
+                DASHBOARD_DIR / "pitcher_breakout_candidates.parquet",
+                index=False,
+            )
+            logger.info(
+                "Saved pitcher_breakout_candidates.parquet: %d rows",
+                len(p_breakouts),
+            )
+        else:
+            logger.warning("No pitcher breakout candidates generated")
+
+    except Exception:
+        logger.exception("Failed to compute pitcher breakout archetypes")
+
+    # =================================================================
     # 7. Save preseason snapshot (frozen projections for end-of-season comparison)
     # =================================================================
     logger.info("=" * 60)

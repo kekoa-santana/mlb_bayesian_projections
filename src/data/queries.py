@@ -1139,6 +1139,48 @@ def get_batted_ball_spray(season: int) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# 14c. Pitcher fly-ball / HR data (for xFIP computation)
+# ---------------------------------------------------------------------------
+def get_pitcher_fly_ball_data(season: int) -> pd.DataFrame:
+    """Per-pitcher fly ball counts and HR/FB rate.
+
+    Uses batted-ball data to count fly balls (launch_angle > 25) and
+    home runs.  Required for xFIP derivation.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, total_bip, fly_balls, home_runs, hr_per_fb.
+    """
+    query = """
+    SELECT
+        fp.pitcher_id,
+        COUNT(*)                                                    AS total_bip,
+        SUM(CASE WHEN sbb.launch_angle > 25 THEN 1 ELSE 0 END)    AS fly_balls,
+        SUM(CASE WHEN sbb.is_homerun THEN 1 ELSE 0 END)            AS home_runs,
+        SUM(CASE WHEN sbb.is_homerun THEN 1 ELSE 0 END)::float
+            / NULLIF(SUM(CASE WHEN sbb.launch_angle > 25
+                         THEN 1 ELSE 0 END), 0)                    AS hr_per_fb
+    FROM production.fact_pitch fp
+    JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+    JOIN production.sat_batted_balls sbb ON fp.pitch_id = sbb.pitch_id
+    WHERE dg.season = :season
+      AND dg.game_type = 'R'
+      AND fp.is_bip = true
+      AND sbb.launch_angle IS NOT NULL
+    GROUP BY fp.pitcher_id
+    HAVING COUNT(*) >= 50
+    """
+    logger.info("Fetching pitcher fly ball data for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
 # 15. Sprint speed
 # ---------------------------------------------------------------------------
 def get_sprint_speed(season: int) -> pd.DataFrame:

@@ -658,21 +658,21 @@ def rank_hitters(
     base = base.merge(playing_time, on="batter_id", how="left")
     base = base.merge(trajectory, on="batter_id", how="left")
 
-    # Breakout archetype data
+    # Breakout archetype data (GMM-derived)
     breakout_path = DASHBOARD_DIR / "hitter_breakout_candidates.parquet"
     if breakout_path.exists():
         breakout_df = pd.read_parquet(breakout_path)
         breakout_cols = [
             "batter_id", "breakout_type", "breakout_score",
-            "breakout_tier", "breakout_hole",
-            "hitter_fit", "all_around_fit",
+            "breakout_tier", "breakout_hole", "gmm_fit",
+            "prob_power_surge", "prob_diamond_in_the_rough",
         ]
         available_bc = [c for c in breakout_cols if c in breakout_df.columns]
         base = base.merge(breakout_df[available_bc], on="batter_id", how="left")
     else:
         for col in ["breakout_type", "breakout_tier", "breakout_hole"]:
             base[col] = ""
-        for col in ["breakout_score", "hitter_fit", "all_around_fit"]:
+        for col in ["breakout_score", "gmm_fit"]:
             base[col] = np.nan
 
     # Fill missing with neutral
@@ -848,9 +848,10 @@ def rank_hitters(
         # Projected
         "projected_k_rate", "projected_bb_rate", "projected_hr_per_fb",
         "projected_k_rate_sd", "projected_bb_rate_sd",
-        # Breakout archetype
+        # Breakout archetype (GMM-derived)
         "breakout_type", "breakout_score", "breakout_tier",
-        "breakout_hole", "hitter_fit", "all_around_fit",
+        "breakout_hole", "gmm_fit",
+        "prob_power_surge", "prob_diamond_in_the_rough",
     ]
     available = [c for c in output_cols if c in base.columns]
     result = base[available].sort_values(["position", "pos_rank"])
@@ -1279,6 +1280,23 @@ def rank_pitchers(
     base = base.merge(durability, on="pitcher_id", how="left")
     base = base.merge(trajectory, on="pitcher_id", how="left")
 
+    # Pitcher breakout archetype data (GMM-derived)
+    p_breakout_path = DASHBOARD_DIR / "pitcher_breakout_candidates.parquet"
+    if p_breakout_path.exists():
+        p_bo = pd.read_parquet(p_breakout_path)
+        p_bo_cols = [
+            "pitcher_id", "breakout_type", "breakout_score",
+            "breakout_tier", "breakout_hole", "gmm_fit",
+            "prob_stuff_dominant", "prob_command_leap", "prob_era_correction",
+        ]
+        available_pbc = [c for c in p_bo_cols if c in p_bo.columns]
+        base = base.merge(p_bo[available_pbc], on="pitcher_id", how="left")
+    else:
+        for col in ["breakout_type", "breakout_tier", "breakout_hole"]:
+            base[col] = ""
+        for col in ["breakout_score", "gmm_fit"]:
+            base[col] = np.nan
+
     # Fill missing with neutral
     for col in ["stuff_score", "command_score", "workload_score", "trajectory_score"]:
         base[col] = base[col].fillna(0.50)
@@ -1287,6 +1305,13 @@ def rank_pitchers(
     if "health_score" not in base.columns:
         base["health_score"] = np.nan
         base["health_label"] = ""
+
+    # Blend pitcher breakout potential into trajectory (same pattern as hitters)
+    base["breakout_score"] = base["breakout_score"].fillna(0.0)
+    p_breakout_pctl = _pctl(base["breakout_score"].clip(lower=0))
+    base["trajectory_score"] = (
+        0.65 * base["trajectory_score"] + 0.35 * p_breakout_pctl
+    )
 
     # Blend innings durability into SP workload (30% durability, 70% base workload)
     is_sp = base["role"] == "SP"
@@ -1352,6 +1377,10 @@ def rank_pitchers(
         "projected_era", "projected_era_sd",
         "projected_era_2_5", "projected_era_97_5",
         "projected_fip", "projected_fip_sd",
+        # Breakout archetype (GMM-derived)
+        "breakout_type", "breakout_score", "breakout_tier",
+        "breakout_hole", "gmm_fit",
+        "prob_stuff_dominant", "prob_command_leap", "prob_era_correction",
     ]
     available = [c for c in output_cols if c in base.columns]
     result = base[available].sort_values(["role", "role_rank"])
