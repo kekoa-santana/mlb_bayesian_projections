@@ -73,6 +73,18 @@ def load_preseason_k_samples() -> dict[str, np.ndarray]:
     return {k: data[k] for k in data.files}
 
 
+def load_preseason_rate_samples(stat_name: str) -> dict[str, np.ndarray]:
+    """Load frozen preseason BB% or HR/BF samples."""
+    npz_name = f"pitcher_{stat_name}_samples"
+    path = SNAPSHOT_DIR / f"{npz_name}_preseason.npz"
+    if not path.exists():
+        path = DASHBOARD_DIR / f"{npz_name}.npz"
+    if not path.exists():
+        return {}
+    data = np.load(path)
+    return {k: data[k] for k in data.files}
+
+
 def get_observed_hitter_totals() -> pd.DataFrame:
     """Query 2026 hitter season totals from the database."""
     from src.data.db import read_sql
@@ -102,6 +114,7 @@ def get_observed_pitcher_totals() -> pd.DataFrame:
             SUM(pb.batters_faced) AS batters_faced,
             SUM(pb.strike_outs) AS strike_outs,
             SUM(pb.walks) AS walks,
+            SUM(pb.home_runs) AS hr,
             COUNT(*) AS games_pitched,
             SUM(CASE WHEN pb.is_starter THEN 1 ELSE 0 END) AS games_started
         FROM staging.pitching_boxscores pb
@@ -181,6 +194,39 @@ def update_k_samples_step() -> dict[str, np.ndarray]:
         min_bf=10, n_samples=8000,
     )
     logger.info("Updated K%% samples: %d pitchers", len(updated))
+    return updated
+
+
+def update_rate_samples_step(
+    stat_name: str,
+    trials_col: str,
+    successes_col: str,
+    league_avg: float,
+) -> dict[str, np.ndarray]:
+    """Conjugate-update BB% or HR/BF samples (same Beta-Binomial logic as K)."""
+    from src.models.in_season_updater import update_pitcher_k_samples
+
+    preseason = load_preseason_rate_samples(stat_name)
+    if not preseason:
+        logger.warning("No preseason %s samples — skipping", stat_name)
+        return {}
+
+    p_obs = get_observed_pitcher_totals()
+    if p_obs.empty:
+        logger.info("No 2026 pitcher data — using preseason %s samples", stat_name)
+        return preseason
+
+    # Remap columns to match update_pitcher_k_samples expectations
+    obs_remapped = p_obs.rename(columns={
+        trials_col: "batters_faced",
+        successes_col: "strike_outs",
+    })
+
+    updated = update_pitcher_k_samples(
+        preseason, obs_remapped,
+        min_bf=10, n_samples=8000,
+    )
+    logger.info("Updated %s samples: %d pitchers", stat_name, len(updated))
     return updated
 
 
@@ -357,6 +403,24 @@ def main() -> None:
         )
         logger.info("Saved updated K%% samples for %d pitchers", len(k_samples))
 
+    # Step 2b: Update BB% and HR/BF samples
+    logger.info("Step 2b: Updating pitcher BB%% and HR/BF samples...")
+    bb_samples = update_rate_samples_step(
+        "bb", trials_col="batters_faced", successes_col="walks",
+        league_avg=0.08,
+    )
+    if bb_samples:
+        np.savez_compressed(DASHBOARD_DIR / "pitcher_bb_samples.npz", **bb_samples)
+        logger.info("Saved updated BB%% samples for %d pitchers", len(bb_samples))
+
+    hr_samples = update_rate_samples_step(
+        "hr", trials_col="batters_faced", successes_col="hr",
+        league_avg=0.03,
+    )
+    if hr_samples:
+        np.savez_compressed(DASHBOARD_DIR / "pitcher_hr_samples.npz", **hr_samples)
+        logger.info("Saved updated HR/BF samples for %d pitchers", len(hr_samples))
+
     # Step 3: Update team assignments
     logger.info("Step 3: Updating team assignments...")
     try:
@@ -402,6 +466,8 @@ def main() -> None:
         "hitters_updated": len(h_updated) if not h_updated.empty else 0,
         "pitchers_updated": len(p_updated) if not p_updated.empty else 0,
         "k_samples_count": len(k_samples),
+        "bb_samples_count": len(bb_samples),
+        "hr_samples_count": len(hr_samples),
     }
     meta_path = DASHBOARD_DIR / "update_metadata.json"
     with open(meta_path, "w") as f:

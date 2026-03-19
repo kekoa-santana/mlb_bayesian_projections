@@ -59,6 +59,7 @@ from src.models.counting_projections import (
     project_pitcher_counting,
 )
 from src.models.game_k_model import extract_pitcher_k_rate_samples
+from src.models.pitcher_model import extract_rate_samples
 from src.models.hitter_projections import (
     fit_all_models as fit_hitter_models,
     project_forward as project_hitter_forward,
@@ -339,6 +340,39 @@ def main() -> None:
         **k_samples_dict,
     )
     logger.info("Saved preseason K%% samples snapshot")
+
+    # =================================================================
+    # 3b. BB% and HR/BF posterior samples (from composite model)
+    # =================================================================
+    for stat_name, npz_name in [("bb_rate", "pitcher_bb_samples"), ("hr_per_bf", "pitcher_hr_samples")]:
+        if stat_name not in pitcher_results:
+            logger.warning("No %s model in pitcher_results — skipping %s samples", stat_name, stat_name)
+            continue
+        stat_data = pitcher_results[stat_name]["data"]
+        stat_trace = pitcher_results[stat_name]["trace"]
+        stat_df = stat_data["df"]
+        stat_active = stat_df[
+            (stat_df["season"] == FROM_SEASON) & (stat_df["batters_faced"] >= 50)
+        ]["pitcher_id"].unique()
+
+        samples_dict: dict[str, np.ndarray] = {}
+        for pid in stat_active:
+            try:
+                samples = extract_rate_samples(
+                    stat_trace, stat_data,
+                    pitcher_id=int(pid),
+                    season=FROM_SEASON,
+                    project_forward=True,
+                )
+                samples_dict[str(int(pid))] = samples
+            except ValueError:
+                continue
+
+        np.savez_compressed(DASHBOARD_DIR / f"{npz_name}.npz", **samples_dict)
+        logger.info("Saved %s posterior samples for %d pitchers", stat_name, len(samples_dict))
+
+        np.savez_compressed(snapshot_dir / f"{npz_name}_preseason.npz", **samples_dict)
+        logger.info("Saved preseason %s samples snapshot", stat_name)
 
     # =================================================================
     # 4. BF priors
@@ -982,6 +1016,25 @@ def main() -> None:
 
     except Exception:
         logger.exception("Failed to build prospect rankings")
+
+    # =================================================================
+    # 6f-ii. Prospect-to-MLB player comps
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Building prospect-to-MLB player comps...")
+
+    try:
+        from src.models.prospect_comps import find_all_comps
+
+        comps = find_all_comps(projection_season=FROM_SEASON + 1)
+        for key, cdf in comps.items():
+            if not cdf.empty:
+                fname = f"prospect_comps_{key}.parquet"
+                cdf.to_parquet(DASHBOARD_DIR / fname, index=False)
+                logger.info("Saved %s: %d rows", fname, len(cdf))
+
+    except Exception:
+        logger.exception("Failed to build prospect comps")
 
     # =================================================================
     # 6g. MLB Positional Rankings (2026 value)
