@@ -1086,6 +1086,31 @@ def main() -> None:
         logger.exception("Failed to build position eligibility")
 
     # =================================================================
+    # 6i. Hitter breakout archetypes
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Scoring hitter breakout archetypes...")
+
+    try:
+        from src.models.breakout_model import score_breakout_candidates
+
+        breakouts = score_breakout_candidates(season=FROM_SEASON, min_pa=200)
+        if not breakouts.empty:
+            breakouts.to_parquet(
+                DASHBOARD_DIR / "hitter_breakout_candidates.parquet",
+                index=False,
+            )
+            logger.info(
+                "Saved hitter_breakout_candidates.parquet: %d rows",
+                len(breakouts),
+            )
+        else:
+            logger.warning("No breakout candidates generated")
+
+    except Exception:
+        logger.exception("Failed to compute hitter breakout archetypes")
+
+    # =================================================================
     # 7. Save preseason snapshot (frozen projections for end-of-season comparison)
     # =================================================================
     logger.info("=" * 60)

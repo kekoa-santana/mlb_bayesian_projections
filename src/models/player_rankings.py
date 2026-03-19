@@ -658,6 +658,23 @@ def rank_hitters(
     base = base.merge(playing_time, on="batter_id", how="left")
     base = base.merge(trajectory, on="batter_id", how="left")
 
+    # Breakout archetype data
+    breakout_path = DASHBOARD_DIR / "hitter_breakout_candidates.parquet"
+    if breakout_path.exists():
+        breakout_df = pd.read_parquet(breakout_path)
+        breakout_cols = [
+            "batter_id", "breakout_type", "breakout_score",
+            "breakout_tier", "breakout_hole",
+            "hitter_fit", "all_around_fit",
+        ]
+        available_bc = [c for c in breakout_cols if c in breakout_df.columns]
+        base = base.merge(breakout_df[available_bc], on="batter_id", how="left")
+    else:
+        for col in ["breakout_type", "breakout_tier", "breakout_hole"]:
+            base[col] = ""
+        for col in ["breakout_score", "hitter_fit", "all_around_fit"]:
+            base[col] = np.nan
+
     # Fill missing with neutral
     base["fielding_score"] = base["fielding_score"].fillna(0.50)
     base["framing_score"] = base["framing_score"].fillna(0.50)
@@ -679,6 +696,19 @@ def rank_hitters(
     base["offense_score"] = (base["offense_score"] * platoon_modifier).clip(0, 1)
     base["pt_score"] = base["pt_score"].fillna(0.50)
     base["trajectory_score"] = base["trajectory_score"].fillna(0.50)
+
+    # Blend breakout potential into trajectory.
+    # Breakout model's room_to_grow is the strongest predictive signal
+    # (r=0.24 vs wOBA improvement, validated 2.5x lift on 3 folds).
+    # Trajectory already captures certainty + age + trends; breakout adds
+    # archetype fit × skills-production gap.  35% blend avoids double-counting
+    # age/trend while adding genuine new signal.
+    base["breakout_score"] = base["breakout_score"].fillna(0.0)
+    breakout_pctl = _pctl(base["breakout_score"].clip(lower=0))
+    base["trajectory_score"] = (
+        0.65 * base["trajectory_score"] + 0.35 * breakout_pctl
+    )
+
     if "health_score" not in base.columns:
         base["health_score"] = np.nan
         base["health_label"] = ""
@@ -818,6 +848,9 @@ def rank_hitters(
         # Projected
         "projected_k_rate", "projected_bb_rate", "projected_hr_per_fb",
         "projected_k_rate_sd", "projected_bb_rate_sd",
+        # Breakout archetype
+        "breakout_type", "breakout_score", "breakout_tier",
+        "breakout_hole", "hitter_fit", "all_around_fit",
     ]
     available = [c for c in output_cols if c in base.columns]
     result = base[available].sort_values(["position", "pos_rank"])

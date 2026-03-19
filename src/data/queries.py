@@ -1097,6 +1097,48 @@ def get_hitter_observed_profile(season: int) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# 14b. Batted-ball spray distribution
+# ---------------------------------------------------------------------------
+def get_batted_ball_spray(season: int) -> pd.DataFrame:
+    """Per-batter batted ball spray distribution (pull / middle / oppo).
+
+    Uses pre-computed ``spray_bucket`` from ``sat_batted_balls``, which is
+    already relative to batter handedness ('pull' = pulled side for that hitter).
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, bip, pull_pct, middle_pct, oppo_pct.
+    """
+    query = """
+    SELECT
+        fpa.batter_id,
+        COUNT(*)                                                    AS bip,
+        SUM(CASE WHEN sbb.spray_bucket = 'pull' THEN 1 ELSE 0 END)::float
+            / NULLIF(COUNT(*), 0)                                   AS pull_pct,
+        SUM(CASE WHEN sbb.spray_bucket = 'middle' THEN 1 ELSE 0 END)::float
+            / NULLIF(COUNT(*), 0)                                   AS middle_pct,
+        SUM(CASE WHEN sbb.spray_bucket = 'oppo' THEN 1 ELSE 0 END)::float
+            / NULLIF(COUNT(*), 0)                                   AS oppo_pct
+    FROM production.sat_batted_balls sbb
+    JOIN production.fact_pa fpa ON sbb.pa_id = fpa.pa_id
+    JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
+    WHERE dg.season = :season
+      AND dg.game_type = 'R'
+      AND sbb.spray_bucket IS NOT NULL
+    GROUP BY fpa.batter_id
+    HAVING COUNT(*) >= 50
+    """
+    logger.info("Fetching batted ball spray distribution for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
 # 15. Sprint speed
 # ---------------------------------------------------------------------------
 def get_sprint_speed(season: int) -> pd.DataFrame:
