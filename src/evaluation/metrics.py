@@ -217,6 +217,80 @@ def compute_temperature(
     return float(result.x)
 
 
+def calibrate_posterior_samples(
+    samples: np.ndarray,
+    calibration_t: float,
+) -> np.ndarray:
+    """Scale posterior sample spread by calibration_t on logit scale.
+
+    Preserves the posterior mean while adjusting the spread of the
+    distribution.  Used to correct systematic over- or under-confidence
+    identified in walk-forward backtesting.
+
+    Parameters
+    ----------
+    samples : np.ndarray
+        Posterior samples on rate scale [0, 1].
+    calibration_t : float
+        Scale factor for posterior spread.
+        T < 1.0 narrows intervals (posterior was too wide / over-coverage).
+        T > 1.0 widens intervals (posterior was too narrow / under-coverage).
+        T = 1.0 no change.
+
+    Returns
+    -------
+    np.ndarray
+        Calibrated posterior samples.
+    """
+    if abs(calibration_t - 1.0) < 1e-6 or len(samples) < 2:
+        return samples
+
+    eps = np.clip(samples, 1e-6, 1 - 1e-6)
+    logit_s = logit(eps)
+    mu = np.mean(logit_s)
+    logit_scaled = mu + (logit_s - mu) * calibration_t
+    return expit(logit_scaled)
+
+
+def compute_posterior_calibration_t(
+    coverage_80: float,
+    target_80: float = 0.80,
+) -> float:
+    """Derive calibration T from observed 80% CI coverage.
+
+    If the 80% credible interval has empirical coverage > target (too wide),
+    T < 1.0 will narrow the intervals.  If coverage < target (too narrow),
+    T > 1.0 will widen them.
+
+    Uses the analytical z-ratio for approximate-Normal posteriors:
+        T = z(target_coverage) / z(actual_coverage)
+
+    Parameters
+    ----------
+    coverage_80 : float
+        Observed empirical coverage of the 80% CI (e.g., 0.88).
+    target_80 : float
+        Target coverage (default 0.80).
+
+    Returns
+    -------
+    float
+        Calibration T value.
+    """
+    from scipy.stats import norm
+
+    if coverage_80 <= 0.01 or coverage_80 >= 0.99:
+        return 1.0
+
+    z_target = norm.ppf(0.5 + target_80 / 2)  # 1.282 for 80%
+    z_actual = norm.ppf(0.5 + coverage_80 / 2)
+
+    if z_actual <= 0.01:
+        return 1.0
+
+    return float(z_target / z_actual)
+
+
 def compute_ppc_pvalues(
     trace_ppc: np.ndarray,
     observed: np.ndarray,

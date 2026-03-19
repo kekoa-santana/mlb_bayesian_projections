@@ -138,6 +138,38 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         sigma_season_mu=0.35,
         sigma_season_floor=0.28,
     ),
+    "woba": StatConfig(
+        name="woba",
+        count_col="woba",           # value column for normal likelihood
+        trials_col="pa",            # PA weight (for career averages)
+        rate_col="woba",
+        likelihood="normal",
+        league_avg=LEAGUE_AVG_OVERALL["woba"],  # 0.315
+        covariates=[
+            ("hard_hit_pct", 0.0, 0.2, "hard_hit% → wOBA"),
+            ("barrel_pct", 0.0, 0.2, "barrel% → wOBA"),
+        ],
+        # empirical natural-scale yr-to-yr SD ≈ 0.028
+        sigma_season_mu=0.025,
+        sigma_season_floor=0.020,
+        sigma_player_prior=0.5,
+        sigma_obs_prior=0.04,       # population SD ≈ 0.038
+    ),
+    "chase_rate": StatConfig(
+        name="chase_rate",
+        count_col="chase_swings",
+        trials_col="out_of_zone_pitches",
+        rate_col="chase_rate",
+        likelihood="binomial",
+        league_avg=LEAGUE_AVG_OVERALL["chase_rate"],  # 0.30
+        # No covariates — chase_rate is self-predictive (r=0.84 YoY);
+        # same rationale as GB% (r=0.73): hierarchical + AR(1) handles it.
+        # Adding bb_rate would be circular (bb_rate uses chase_rate as covariate).
+        covariates=[],
+        # empirical logit-scale yr-to-yr SD ≈ 0.15
+        sigma_season_mu=0.13,
+        sigma_season_floor=0.10,
+    ),
 }
 
 

@@ -434,3 +434,269 @@ def derive_batter_rates_batch(
         len(results), len(common_ids),
     )
     return results
+
+
+# ---------------------------------------------------------------------------
+# ERA/FIP derivation constants (2018-2025 pooled)
+# ---------------------------------------------------------------------------
+LEAGUE_ERA: float = 4.17
+LEAGUE_FIP_CONSTANT: float = 3.20
+LEAGUE_GB_PCT: float = 0.446
+ERA_FIP_GAP_EFFECTIVE_N: float = 15.0
+GB_ERA_COEFFICIENT: float = -0.035  # per 1pp GB% above league
+
+
+def derive_pitcher_fip(
+    k_rate_posterior: np.ndarray,
+    bb_rate_posterior: np.ndarray,
+    hr_rate_posterior: np.ndarray,
+    outs_rate_posterior: np.ndarray,
+    hbp_rate: float = LEAGUE_HBP_RATE,
+    fip_constant: float = LEAGUE_FIP_CONSTANT,
+) -> np.ndarray:
+    """Derive FIP posterior from Bayesian rate posteriors.
+
+    FIP = (13*HR/BF + 3*(BB/BF + HBP/BF) - 2*K/BF) / (IP/BF) + cFIP
+
+    where IP/BF = Outs/BF / 3.
+
+    Parameters
+    ----------
+    k_rate_posterior : np.ndarray
+        Posterior samples of K%.
+    bb_rate_posterior : np.ndarray
+        Posterior samples of BB%.
+    hr_rate_posterior : np.ndarray
+        Posterior samples of HR/BF.
+    outs_rate_posterior : np.ndarray
+        Posterior samples of Outs/BF.
+    hbp_rate : float
+        HBP rate (fixed — very stable).
+    fip_constant : float
+        League FIP constant.
+
+    Returns
+    -------
+    np.ndarray
+        Posterior samples of FIP.
+    """
+    ip_per_bf = outs_rate_posterior / 3.0
+    ip_per_bf = np.clip(ip_per_bf, 0.01, None)
+
+    numerator = (
+        13.0 * hr_rate_posterior
+        + 3.0 * (bb_rate_posterior + hbp_rate)
+        - 2.0 * k_rate_posterior
+    )
+    fip = numerator / ip_per_bf + fip_constant
+
+    return np.clip(fip, 0.0, 15.0)
+
+
+def _shrink_era_fip_gap(
+    observed_gap: float | None,
+    ip: float,
+    gb_pct: float | None,
+    league_gb: float = LEAGUE_GB_PCT,
+    xgb_prior_mean: float | None = None,
+) -> tuple[float, float]:
+    """Conjugate Normal shrinkage of ERA-FIP gap toward informed prior.
+
+    ERA-FIP gap has YoY r~0.15, warranting heavy shrinkage.  The prior
+    mean comes from either an XGBoost model (if available) or a simple
+    GB%-linear formula (high GB% → negative gap).
+
+    Parameters
+    ----------
+    observed_gap : float or None
+        Pitcher's observed ERA minus FIP.
+    ip : float
+        Innings pitched (reliability weight).
+    gb_pct : float or None
+        Pitcher's ground ball percentage (fraction, e.g. 0.50).
+    league_gb : float
+        League average GB%.
+    xgb_prior_mean : float or None
+        XGBoost-predicted ERA-FIP gap prior.  When provided, overrides
+        the simple GB%-linear formula.
+
+    Returns
+    -------
+    tuple[float, float]
+        (gap_mean, gap_sd) for the shrunken ERA-FIP gap.
+    """
+    # Prior mean: XGBoost prediction > GB%-linear fallback
+    if xgb_prior_mean is not None and not np.isnan(xgb_prior_mean):
+        prior_mean = xgb_prior_mean
+    elif gb_pct is not None and not np.isnan(gb_pct):
+        pp_above = (gb_pct - league_gb) * 100.0
+        prior_mean = GB_ERA_COEFFICIENT * pp_above
+    else:
+        prior_mean = 0.0
+
+    prior_sd = 0.50  # population SD of ERA-FIP gap
+
+    if observed_gap is None or np.isnan(observed_gap) or ip < 10:
+        return prior_mean, prior_sd
+
+    # Conjugate Normal: prior weight = ERA_FIP_GAP_EFFECTIVE_N (IP units),
+    # observation weight = ip.
+    total = ERA_FIP_GAP_EFFECTIVE_N + ip
+    gap_mean = (
+        ERA_FIP_GAP_EFFECTIVE_N * prior_mean + ip * observed_gap
+    ) / total
+    gap_sd = prior_sd / np.sqrt(1.0 + ip / ERA_FIP_GAP_EFFECTIVE_N)
+
+    return gap_mean, gap_sd
+
+
+def derive_pitcher_era(
+    fip_posterior: np.ndarray,
+    observed_era_fip_gap: float | None,
+    ip: float,
+    gb_pct: float | None,
+    rng: np.random.Generator | None = None,
+    xgb_gap_prior: float | None = None,
+) -> np.ndarray:
+    """Derive ERA posterior by adding shrunken ERA-FIP gap to FIP posterior.
+
+    ERA = FIP + shrunken(observed_ERA - observed_FIP)
+
+    Parameters
+    ----------
+    fip_posterior : np.ndarray
+        Posterior samples of FIP.
+    observed_era_fip_gap : float or None
+        Pitcher's observed ERA minus FIP.
+    ip : float
+        Innings pitched (for gap shrinkage reliability).
+    gb_pct : float or None
+        Pitcher's ground ball percentage.
+    rng : np.random.Generator or None
+    xgb_gap_prior : float or None
+        XGBoost-predicted ERA-FIP gap prior.  Overrides GB%-linear formula.
+
+    Returns
+    -------
+    np.ndarray
+        Posterior samples of ERA.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    gap_mean, gap_sd = _shrink_era_fip_gap(
+        observed_era_fip_gap, ip, gb_pct,
+        xgb_prior_mean=xgb_gap_prior,
+    )
+
+    n_samples = len(fip_posterior)
+    gap_samples = rng.normal(gap_mean, max(gap_sd, 0.01), size=n_samples)
+
+    era = fip_posterior + gap_samples
+    return np.clip(era, 0.0, 15.0)
+
+
+def derive_pitcher_fip_batch(
+    pitcher_posteriors: dict[str, dict[int, np.ndarray]],
+    pitcher_babip_data: dict[int, tuple[float | None, float]],
+    hbp_rate: float = LEAGUE_HBP_RATE,
+    fip_constant: float = LEAGUE_FIP_CONSTANT,
+    league_babip: float = LEAGUE_BABIP,
+    babip_prior_n: float = 30.0,
+    rng: np.random.Generator | None = None,
+) -> dict[int, np.ndarray]:
+    """Derive FIP posteriors for a batch of pitchers.
+
+    Internally derives Outs/BF posteriors from K/BB/HR posteriors
+    (using league BABIP), then computes FIP from all four rate posteriors.
+
+    Parameters
+    ----------
+    pitcher_posteriors : dict
+        {rate_col: {pitcher_id: samples}}.
+        Must contain "k_rate", "bb_rate", "hr_per_bf".
+    pitcher_babip_data : dict
+        {pitcher_id: (observed_babip, bip_count)}.
+    hbp_rate : float
+        League HBP rate.
+    fip_constant : float
+        League FIP constant.
+    league_babip : float
+        League BABIP.
+    babip_prior_n : float
+        Prior strength for BABIP shrinkage.
+    rng : np.random.Generator or None
+
+    Returns
+    -------
+    dict[int, np.ndarray]
+        {pitcher_id: fip_samples}.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    # Derive outs_per_bf posteriors
+    outs_posteriors = derive_pitcher_rates_batch(
+        pitcher_posteriors, pitcher_babip_data, "outs_per_bf",
+        hbp_rate=hbp_rate, league_babip=league_babip,
+        babip_prior_n=babip_prior_n, rng=rng,
+    )
+
+    k_posteriors = pitcher_posteriors.get("k_rate", {})
+    bb_posteriors = pitcher_posteriors.get("bb_rate", {})
+    hr_posteriors = pitcher_posteriors.get("hr_per_bf", {})
+
+    common_ids = (
+        set(k_posteriors.keys())
+        & set(bb_posteriors.keys())
+        & set(hr_posteriors.keys())
+        & set(outs_posteriors.keys())
+    )
+
+    results: dict[int, np.ndarray] = {}
+    for pid in common_ids:
+        k_s = k_posteriors[pid]
+        bb_s = bb_posteriors[pid]
+        hr_s = hr_posteriors[pid]
+        outs_s = outs_posteriors[pid]
+
+        n = min(len(k_s), len(bb_s), len(hr_s), len(outs_s))
+        results[pid] = derive_pitcher_fip(
+            k_s[:n], bb_s[:n], hr_s[:n], outs_s[:n],
+            hbp_rate=hbp_rate, fip_constant=fip_constant,
+        )
+
+    logger.info("Derived FIP posteriors for %d pitchers", len(results))
+    return results
+
+
+def derive_pitcher_era_batch(
+    fip_posteriors: dict[int, np.ndarray],
+    pitcher_era_fip_data: dict[int, tuple[float | None, float, float | None]],
+    rng: np.random.Generator | None = None,
+) -> dict[int, np.ndarray]:
+    """Derive ERA posteriors for a batch of pitchers.
+
+    Parameters
+    ----------
+    fip_posteriors : dict
+        {pitcher_id: fip_samples} from ``derive_pitcher_fip_batch``.
+    pitcher_era_fip_data : dict
+        {pitcher_id: (observed_era_fip_gap, ip, gb_pct)}.
+    rng : np.random.Generator or None
+
+    Returns
+    -------
+    dict[int, np.ndarray]
+        {pitcher_id: era_samples}.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    results: dict[int, np.ndarray] = {}
+    for pid, fip_post in fip_posteriors.items():
+        gap, ip, gb_pct = pitcher_era_fip_data.get(pid, (None, 0.0, None))
+        results[pid] = derive_pitcher_era(fip_post, gap, ip, gb_pct, rng=rng)
+
+    logger.info("Derived ERA posteriors for %d pitchers", len(results))
+    return results

@@ -153,6 +153,85 @@ def _assign_hitter_positions(season: int = 2025, min_starts: int = 20) -> pd.Dat
     return assigned
 
 
+def get_hitter_position_eligibility(
+    season: int = 2025, min_starts: int = 10,
+) -> pd.DataFrame:
+    """Return all positions each hitter is eligible for.
+
+    A player qualifies at a position with ``min_starts`` or more starts
+    there in the given season.  Falls back to ``dim_player`` primary
+    position for players with no lineup data.
+
+    Parameters
+    ----------
+    season : int
+        Season to pull lineup starts from.
+    min_starts : int
+        Minimum starts at a position to be eligible.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: player_id, position, starts, pct, is_primary.
+    """
+    from src.data.db import read_sql
+
+    # All position starts per player
+    starts = read_sql(f"""
+        SELECT player_id, position, count(*) as starts
+        FROM production.fact_lineup
+        WHERE season = {season} AND is_starter = true
+              AND position NOT IN ('P', 'PR', 'PH')
+        GROUP BY player_id, position
+        HAVING count(*) >= {min_starts}
+    """, {})
+
+    if starts.empty:
+        # Fallback only
+        fallback = read_sql("""
+            SELECT player_id, primary_position as position
+            FROM production.dim_player
+            WHERE primary_position NOT IN ('P', 'TWP')
+              AND active = true
+        """, {})
+        fallback["starts"] = 0
+        fallback["pct"] = 1.0
+        fallback["is_primary"] = True
+        return fallback
+
+    # Compute percentage of each player's total starts
+    totals = starts.groupby("player_id")["starts"].transform("sum")
+    starts["pct"] = starts["starts"] / totals
+
+    # Mark primary (most starts)
+    starts["is_primary"] = (
+        starts["starts"]
+        == starts.groupby("player_id")["starts"].transform("max")
+    )
+
+    # Add fallback for players not in lineup data
+    fallback = read_sql("""
+        SELECT player_id, primary_position as position
+        FROM production.dim_player
+        WHERE primary_position NOT IN ('P', 'TWP')
+          AND active = true
+    """, {})
+    missing = fallback[~fallback["player_id"].isin(starts["player_id"])]
+    if not missing.empty:
+        missing = missing.copy()
+        missing["starts"] = 0
+        missing["pct"] = 1.0
+        missing["is_primary"] = True
+        starts = pd.concat(
+            [starts, missing[["player_id", "position", "starts", "pct", "is_primary"]]],
+            ignore_index=True,
+        )
+
+    return starts.sort_values(
+        ["player_id", "starts"], ascending=[True, False],
+    ).reset_index(drop=True)
+
+
 def _assign_pitcher_roles() -> pd.DataFrame:
     """Assign SP/RP role from pitcher projections.
 
@@ -425,21 +504,24 @@ def _build_hitter_playing_time_score() -> pd.DataFrame:
 
 
 def _build_hitter_trajectory_score() -> pd.DataFrame:
-    """Score trajectory using posterior certainty and projected quality.
+    """Score trajectory using posterior certainty, age, and proven status.
 
-    Rewards players whose Bayesian posteriors are tight (proven track
-    record) and whose projected rates are strong. Age still matters
-    but is secondary — a 33-year-old with 8 years of elite data should
-    score well, not get destroyed by age alone.
+    Designed so that elite proven players (like a 33-year-old with 8
+    years of elite data) score at least neutral on trajectory.  Uses
+    coefficient of variation (SD/mean) instead of raw SD for certainty,
+    so high-K% hitters aren't mechanically penalized by wider rate-scale
+    SDs.  Does NOT include rate quality — that's offense_score's job.
 
     Components
     ----------
-    - **Projection certainty** (50%): tighter posterior SD = more proven.
-      Directly leverages what the Bayesian model already knows about
-      year-over-year consistency.
-    - **Age upside** (20%): younger players get a modest bump.
-    - **Projected rate quality** (30%): how good are the projected rates
-      themselves (low K%, high BB%).
+    - **Projection certainty** (55%): lower CV = more proven.  Uses
+      SD/mean on rate scale, which normalizes for the logit-scale
+      stretching that makes high-K% hitters look artificially uncertain.
+    - **Age factor** (25%): younger players get upside credit.  Decline
+      penalty starts at 33 (not 31) and is softer — proven veterans
+      shouldn't be destroyed for being in their early 30s.
+    - **Season trend** (20%): if the Bayesian projection improves on the
+      prior season's observed rate, that's a positive signal.
 
     Returns
     -------
@@ -448,30 +530,35 @@ def _build_hitter_trajectory_score() -> pd.DataFrame:
     """
     proj = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet")
 
-    # Posterior certainty: tighter SD = more proven/consistent
-    # Average across K% and BB% SDs, then invert (lower SD = higher score)
-    k_certainty = _inv_pctl(proj["projected_k_rate_sd"].fillna(proj["projected_k_rate_sd"].median()))
-    bb_certainty = _inv_pctl(proj["projected_bb_rate_sd"].fillna(proj["projected_bb_rate_sd"].median()))
+    # Posterior certainty via coefficient of variation (SD / mean)
+    # CV normalizes for rate-dependent SD scaling — a 26% K hitter with
+    # 3.6pp SD has CV=0.14, comparable to a 15% K hitter with 2.1pp SD
+    k_mean = proj["projected_k_rate"].clip(0.01)
+    bb_mean = proj["projected_bb_rate"].clip(0.01)
+    k_cv = proj["projected_k_rate_sd"].fillna(k_mean.median() * 0.15) / k_mean
+    bb_cv = proj["projected_bb_rate_sd"].fillna(bb_mean.median() * 0.15) / bb_mean
+    k_certainty = _inv_pctl(k_cv)
+    bb_certainty = _inv_pctl(bb_cv)
     certainty_score = 0.50 * k_certainty + 0.50 * bb_certainty
 
-    # Projected rate quality: how good are the projected rates?
-    proj_k_quality = _inv_pctl(proj["projected_k_rate"])
-    proj_bb_quality = _pctl(proj["projected_bb_rate"])
-    rate_quality = 0.50 * proj_k_quality + 0.50 * proj_bb_quality
-
-    # Age factor: combines upside (younger = better) with decline risk
-    # Under 28: pure upside. 28-31: neutral. 32+: escalating decline penalty.
+    # Age factor: softer than before — decline starts at 33, not 31
     age = proj["age"].fillna(30)
     age_upside = _inv_pctl(age)
-
-    # Decline risk: 0 until 31, then escalates. 32→0.1, 34→0.3, 36→0.5, 38→0.7
-    decline_penalty = ((age - 31).clip(lower=0) / 10.0).clip(0, 0.7)
+    decline_penalty = ((age - 33).clip(lower=0) / 12.0).clip(0, 0.5)
     age_factor = (age_upside - decline_penalty).clip(0, 1)
 
+    # Season trend: did projected rate improve on observed?
+    # Uses K% delta (negative = improving) and BB% delta (positive = improving)
+    delta_k = proj.get("delta_k_rate", pd.Series(0.0, index=proj.index))
+    delta_bb = proj.get("delta_bb_rate", pd.Series(0.0, index=proj.index))
+    k_trend = _inv_pctl(delta_k.fillna(0))   # lower delta = better (K% dropping)
+    bb_trend = _pctl(delta_bb.fillna(0))      # higher delta = better (BB% rising)
+    trend_score = 0.50 * k_trend + 0.50 * bb_trend
+
     proj["trajectory_score"] = (
-        0.45 * certainty_score
-        + 0.30 * rate_quality
+        0.55 * certainty_score
         + 0.25 * age_factor
+        + 0.20 * trend_score
     )
     return proj[["batter_id", "trajectory_score"]]
 
@@ -514,6 +601,10 @@ def rank_hitters(
     # Position assignments
     positions = _assign_hitter_positions(season=season)
 
+    # Load aggressiveness data for discipline modifier
+    from src.data.queries import get_hitter_aggressiveness
+    aggressiveness = get_hitter_aggressiveness(season)
+
     # Build sub-scores
     offense = _build_hitter_offense_score(proj, observed)
     baserunning = _build_hitter_baserunning_score()
@@ -535,6 +626,13 @@ def rank_hitters(
                    "xba", "xslg", "barrel_pct", "hard_hit_pct"]],
         on="batter_id", how="inner",
     )
+
+    # Merge aggressiveness data for discipline modifier and display
+    if not aggressiveness.empty:
+        base = base.merge(
+            aggressiveness[["batter_id", "chase_rate", "two_strike_whiff_rate"]],
+            on="batter_id", how="left",
+        )
 
     # Merge position
     base = base.merge(
@@ -566,6 +664,14 @@ def rank_hitters(
     base["offense_score"] = base["offense_score"].fillna(0.50)
     base["baserunning_score"] = base["baserunning_score"].fillna(0.50)
     base["platoon_score"] = base["platoon_score"].fillna(0.50)
+
+    # Discipline modifier: low chase + low 2-strike whiff = more valuable
+    if "chase_rate" in base.columns:
+        chase_pctl = _inv_pctl(base["chase_rate"].fillna(base["chase_rate"].median()))
+        whiff_2s_pctl = _inv_pctl(base["two_strike_whiff_rate"].fillna(base["two_strike_whiff_rate"].median()))
+        discipline_score = 0.60 * chase_pctl + 0.40 * whiff_2s_pctl
+        discipline_modifier = 0.95 + 0.10 * discipline_score  # scales ±5%
+        base["offense_score"] = (base["offense_score"] * discipline_modifier).clip(0, 1)
 
     # Apply platoon modifier to offense: balanced hitters get a small boost,
     # extreme-split hitters get penalized. Scales offense by ±5%.
@@ -708,6 +814,7 @@ def rank_hitters(
         # Observed
         "pa", "woba", "wrc_plus", "xwoba", "xba", "xslg",
         "barrel_pct", "hard_hit_pct",
+        "chase_rate", "two_strike_whiff_rate",
         # Projected
         "projected_k_rate", "projected_bb_rate", "projected_hr_per_fb",
         "projected_k_rate_sd", "projected_bb_rate_sd",
@@ -735,6 +842,7 @@ def rank_hitters(
 def _build_pitcher_stuff_score(
     proj: pd.DataFrame,
     observed: pd.DataFrame,
+    run_values: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Blend projected and observed stuff/quality metrics.
 
@@ -744,6 +852,8 @@ def _build_pitcher_stuff_score(
         Pitcher projections.
     observed : pd.DataFrame
         Observed pitching advanced stats.
+    run_values : pd.DataFrame, optional
+        Pitcher run values from ``get_pitcher_run_values``.
 
     Returns
     -------
@@ -760,6 +870,11 @@ def _build_pitcher_stuff_score(
     if merged.empty:
         return pd.DataFrame(columns=["pitcher_id", "stuff_score"])
 
+    # Merge run values if available
+    if run_values is not None and not run_values.empty:
+        rv_dedup = run_values[["pitcher_id", "weighted_rv_per_100"]].drop_duplicates()
+        merged = merged.merge(rv_dedup, on="pitcher_id", how="left")
+
     # Projected: K rate (higher = better), HR/BF (lower = better),
     # GB% (higher = better — values groundball pitchers)
     proj_k = _pctl(merged["projected_k_rate"])
@@ -767,13 +882,21 @@ def _build_pitcher_stuff_score(
     proj_gb = _pctl(merged["gb_pct"].fillna(merged["gb_pct"].median()))
     projected = 0.55 * proj_k + 0.25 * proj_hr + 0.20 * proj_gb
 
-    # Observed: SwStr%, CSW%, xwOBA-against (lower = better),
-    # barrel%-against (lower = better)
+    # Observed: SwStr%, CSW%, run value (lower = better stuff),
+    # xwOBA-against (lower = better), barrel%-against (lower = better)
     obs_swstr = _pctl(merged["swstr_pct"].fillna(0))
     obs_csw = _pctl(merged["csw_pct"].fillna(0))
     obs_xwoba = _inv_pctl(merged["xwoba_against"].fillna(merged["xwoba_against"].median()))
     obs_barrel = _inv_pctl(merged["barrel_pct_against"].fillna(0))
-    observed_score = 0.30 * obs_swstr + 0.30 * obs_csw + 0.25 * obs_xwoba + 0.15 * obs_barrel
+
+    if "weighted_rv_per_100" in merged.columns:
+        obs_run_value = _inv_pctl(merged["weighted_rv_per_100"].fillna(merged["weighted_rv_per_100"].median()))
+        observed_score = (
+            0.25 * obs_swstr + 0.25 * obs_csw + 0.20 * obs_run_value
+            + 0.20 * obs_xwoba + 0.10 * obs_barrel
+        )
+    else:
+        observed_score = 0.30 * obs_swstr + 0.30 * obs_csw + 0.25 * obs_xwoba + 0.15 * obs_barrel
 
     merged["stuff_score"] = _PROJ_WEIGHT_BASE * projected + _OBS_WEIGHT_BASE * observed_score
     return merged[["pitcher_id", "stuff_score"]]
@@ -782,6 +905,7 @@ def _build_pitcher_stuff_score(
 def _build_pitcher_command_score(
     proj: pd.DataFrame,
     observed: pd.DataFrame,
+    efficiency: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Score command/control from projected BB% and observed metrics.
 
@@ -791,6 +915,8 @@ def _build_pitcher_command_score(
         Pitcher projections.
     observed : pd.DataFrame
         Observed pitching advanced stats.
+    efficiency : pd.DataFrame, optional
+        Pitcher efficiency data from ``get_pitcher_efficiency``.
 
     Returns
     -------
@@ -805,6 +931,12 @@ def _build_pitcher_command_score(
     if merged.empty:
         return pd.DataFrame(columns=["pitcher_id", "command_score"])
 
+    # Merge efficiency data if available
+    if efficiency is not None and not efficiency.empty:
+        eff_cols = ["pitcher_id", "first_strike_pct", "putaway_rate"]
+        eff_subset = efficiency[[c for c in eff_cols if c in efficiency.columns]].copy()
+        merged = merged.merge(eff_subset, on="pitcher_id", how="left")
+
     # Lower BB% = better command
     proj_bb = _inv_pctl(merged["projected_bb_rate"])
     obs_bb = _inv_pctl(merged["bb_pct"].fillna(merged["bb_pct"].median()))
@@ -812,7 +944,16 @@ def _build_pitcher_command_score(
     obs_chase = _pctl(merged["chase_pct"].fillna(0))
 
     projected_cmd = proj_bb
-    observed_cmd = 0.40 * obs_bb + 0.30 * obs_zone + 0.30 * obs_chase
+
+    if "first_strike_pct" in merged.columns and "putaway_rate" in merged.columns:
+        obs_first_strike = _pctl(merged["first_strike_pct"].fillna(merged["first_strike_pct"].median()))
+        obs_putaway = _pctl(merged["putaway_rate"].fillna(merged["putaway_rate"].median()))
+        observed_cmd = (
+            0.30 * obs_bb + 0.20 * obs_zone + 0.20 * obs_chase
+            + 0.15 * obs_first_strike + 0.15 * obs_putaway
+        )
+    else:
+        observed_cmd = 0.40 * obs_bb + 0.30 * obs_zone + 0.30 * obs_chase
 
     merged["command_score"] = _PROJ_WEIGHT_BASE * projected_cmd + _OBS_WEIGHT_BASE * observed_cmd
     return merged[["pitcher_id", "command_score"]]
@@ -978,20 +1119,19 @@ def _build_pitcher_trajectory_score(season: int = 2025) -> pd.DataFrame:
     """
     proj = pd.read_parquet(DASHBOARD_DIR / "pitcher_projections.parquet")
 
-    # Posterior certainty: tighter SD = more proven
-    k_certainty = _inv_pctl(proj["projected_k_rate_sd"].fillna(proj["projected_k_rate_sd"].median()))
-    bb_certainty = _inv_pctl(proj["projected_bb_rate_sd"].fillna(proj["projected_bb_rate_sd"].median()))
+    # Posterior certainty via CV (SD/mean) — same fix as hitters
+    k_mean = proj["projected_k_rate"].clip(0.01)
+    bb_mean = proj["projected_bb_rate"].clip(0.01)
+    k_cv = proj["projected_k_rate_sd"].fillna(k_mean.median() * 0.15) / k_mean
+    bb_cv = proj["projected_bb_rate_sd"].fillna(bb_mean.median() * 0.15) / bb_mean
+    k_certainty = _inv_pctl(k_cv)
+    bb_certainty = _inv_pctl(bb_cv)
     certainty_score = 0.50 * k_certainty + 0.50 * bb_certainty
 
-    # Projected rate quality
-    proj_k_quality = _pctl(proj["projected_k_rate"])  # higher K% = better for pitchers
-    proj_bb_quality = _inv_pctl(proj["projected_bb_rate"])  # lower BB% = better
-    rate_quality = 0.60 * proj_k_quality + 0.40 * proj_bb_quality
-
-    # Age factor with decline risk (same logic as hitters)
+    # Age factor — softer decline, starts at 33
     age = proj["age"].fillna(28)
     age_upside = _inv_pctl(age)
-    decline_penalty = ((age - 31).clip(lower=0) / 10.0).clip(0, 0.7)
+    decline_penalty = ((age - 33).clip(lower=0) / 12.0).clip(0, 0.5)
     age_factor = (age_upside - decline_penalty).clip(0, 1)
 
     # Velocity trend
@@ -1003,8 +1143,7 @@ def _build_pitcher_trajectory_score(season: int = 2025) -> pd.DataFrame:
     velo_score = ((proj["velo_delta"] + 2.0) / 4.0).clip(0, 1)
 
     proj["trajectory_score"] = (
-        0.35 * certainty_score
-        + 0.25 * rate_quality
+        0.40 * certainty_score
         + 0.20 * age_factor
         + 0.20 * velo_score
     )
@@ -1050,18 +1189,29 @@ def rank_pitchers(
     # Role assignment
     roles = _assign_pitcher_roles()
 
+    # Load run values and efficiency for enhanced scoring
+    from src.data.queries import get_pitcher_run_values, get_pitcher_efficiency
+    run_values = get_pitcher_run_values(season)
+    efficiency = get_pitcher_efficiency(season)
+
     # Build sub-scores
-    stuff = _build_pitcher_stuff_score(proj, observed)
-    command = _build_pitcher_command_score(proj, observed)
+    stuff = _build_pitcher_stuff_score(proj, observed, run_values=run_values)
+    command = _build_pitcher_command_score(proj, observed, efficiency=efficiency)
     workload = _build_pitcher_workload_score()
     durability = _build_pitcher_innings_durability()
     trajectory = _build_pitcher_trajectory_score(season=season)
 
-    # Base from projections
-    base = proj[["pitcher_id", "pitcher_name", "age", "pitch_hand",
+    # Base from projections (include ERA/FIP if available)
+    base_cols = ["pitcher_id", "pitcher_name", "age", "pitch_hand",
                  "is_starter", "projected_k_rate", "projected_bb_rate",
                  "projected_hr_per_bf", "projected_k_rate_sd",
-                 "projected_bb_rate_sd", "composite_score"]].copy()
+                 "projected_bb_rate_sd", "composite_score",
+                 "projected_era", "projected_era_sd",
+                 "projected_era_2_5", "projected_era_97_5",
+                 "projected_fip", "projected_fip_sd",
+                 "observed_era", "observed_fip"]
+    base_cols = [c for c in base_cols if c in proj.columns]
+    base = proj[base_cols].copy()
 
     # Merge observed for display
     base = base.merge(
@@ -1069,6 +1219,18 @@ def rank_pitchers(
                    "swstr_pct", "csw_pct", "xwoba_against", "woba_against"]],
         on="pitcher_id", how="inner",
     )
+
+    # Merge run values for display
+    if not run_values.empty:
+        rv_display = run_values[["pitcher_id", "weighted_rv_per_100"]].drop_duplicates()
+        base = base.merge(rv_display, on="pitcher_id", how="left")
+
+    # Merge efficiency for display
+    if not efficiency.empty:
+        base = base.merge(
+            efficiency[["pitcher_id", "first_strike_pct", "putaway_rate"]],
+            on="pitcher_id", how="left",
+        )
 
     # Merge role
     base = base.merge(roles, on="pitcher_id", how="left")
@@ -1149,9 +1311,14 @@ def rank_pitchers(
         # Observed
         "batters_faced", "k_pct", "bb_pct", "swstr_pct", "csw_pct",
         "xwoba_against", "woba_against",
+        "weighted_rv_per_100", "first_strike_pct", "putaway_rate",
+        "observed_era", "observed_fip",
         # Projected
         "projected_k_rate", "projected_bb_rate", "projected_hr_per_bf",
         "projected_k_rate_sd", "projected_bb_rate_sd",
+        "projected_era", "projected_era_sd",
+        "projected_era_2_5", "projected_era_97_5",
+        "projected_fip", "projected_fip_sd",
     ]
     available = [c for c in output_cols if c in base.columns]
     result = base[available].sort_values(["role", "role_rank"])

@@ -116,11 +116,14 @@ def _compute_batter_rate_quality(df: pd.DataFrame) -> pd.Series:
     # Speed tool: SB rate (higher = faster, more baserunning value)
     sb_pctl = _percentile_rank(df["sb_rate"].fillna(0))
 
-    # Weight: K% (contact), BB% (discipline), ISO (power),
+    # HR power tool
+    hr_pctl = _percentile_rank(df["wtd_hr_pa"].fillna(0))
+
+    # Weight: K% (contact), BB% (discipline), ISO (power), HR/PA (power),
     # K-BB spread (hit tool), SB rate (speed)
     return (
-        0.25 * k_pctl + 0.20 * bb_pctl + 0.20 * iso_pctl
-        + 0.20 * kbb_pctl + 0.15 * sb_pctl
+        0.22 * k_pctl + 0.18 * bb_pctl + 0.15 * iso_pctl
+        + 0.10 * hr_pctl + 0.20 * kbb_pctl + 0.15 * sb_pctl
     )
 
 
@@ -218,6 +221,56 @@ def _compute_trajectory(
             stat_score = 0.5
 
         scores[pid] = 0.50 * promo_score + 0.50 * stat_score
+
+    return scores
+
+
+def _compute_transition_velocity(
+    prospect_ids: set[int],
+) -> dict[int, float]:
+    """Score promotion velocity from fact_prospect_transition.
+
+    Faster promotions (fewer days between levels) = better score.
+    Demotions apply a mild penalty.
+
+    Returns
+    -------
+    dict[int, float]
+        Player ID -> velocity score (0-1).
+    """
+    try:
+        from src.data.queries import get_prospect_transitions
+        transitions = get_prospect_transitions(list(prospect_ids))
+    except Exception:
+        return {}
+
+    if transitions.empty:
+        return {}
+
+    scores: dict[int, float] = {}
+
+    for pid, grp in transitions.groupby("player_id"):
+        promos = grp[grp["transition_type"] == "promotion"].sort_values("event_date")
+        demos = grp[grp["transition_type"] == "demotion"]
+
+        if promos.empty:
+            scores[pid] = 0.3  # no promotions = low velocity
+            continue
+
+        # Average days between promotions
+        if len(promos) >= 2:
+            promo_dates = pd.to_datetime(promos["event_date"])
+            avg_days = promo_dates.diff().dropna().dt.days.mean()
+            # Normalize: 180 days between promos = 1.0, 720+ days = 0.0
+            speed_score = float(np.clip(1.0 - (avg_days - 180) / 540, 0, 1))
+        else:
+            speed_score = 0.5
+
+        # Demotion penalty: mild — single demotion is fine, multiple is concerning
+        n_demos = len(demos)
+        demo_penalty = min(n_demos * 0.10, 0.30)  # cap at 0.30
+
+        scores[pid] = float(np.clip(speed_score - demo_penalty, 0, 1))
 
     return scores
 
@@ -469,9 +522,17 @@ def _build_pitcher_prospect_features(
         if total_bf < min_bf:
             continue
 
-        wtd_k = (grp["translated_k_pct"] * grp["bf"]).sum() / total_bf
-        wtd_bb = (grp["translated_bb_pct"] * grp["bf"]).sum() / total_bf
-        wtd_hr = (grp["translated_hr_bf"] * grp["bf"]).sum() / total_bf
+        conf = grp["translation_confidence"].fillna(0.5) if "translation_confidence" in grp.columns else pd.Series(0.5, index=grp.index)
+        conf_bf = conf * grp["bf"]
+        conf_bf_sum = conf_bf.sum()
+        if conf_bf_sum > 0:
+            wtd_k = (grp["translated_k_pct"] * conf_bf).sum() / conf_bf_sum
+            wtd_bb = (grp["translated_bb_pct"] * conf_bf).sum() / conf_bf_sum
+            wtd_hr = (grp["translated_hr_bf"] * conf_bf).sum() / conf_bf_sum
+        else:
+            wtd_k = (grp["translated_k_pct"] * grp["bf"]).sum() / total_bf
+            wtd_bb = (grp["translated_bb_pct"] * grp["bf"]).sum() / total_bf
+            wtd_hr = (grp["translated_hr_bf"] * grp["bf"]).sum() / total_bf
 
         # Determine SP vs RP from games_started ratio
         total_games = grp["games"].sum()
@@ -603,9 +664,16 @@ def rank_prospects(
     resilience = df["player_id"].map(resilience_scores).fillna(0.5)
     availability = df["player_id"].map(availability_scores).fillna(0.5)
 
-    # Blend: 50% base trajectory, 25% promotion resilience, 25% availability
-    df["comp_trajectory"] = (
-        0.50 * base_traj + 0.25 * resilience + 0.25 * availability
+    # Transition velocity from fact_prospect_transition
+    transition_scores = _compute_transition_velocity(prospect_ids)
+    transition_vel = df["player_id"].map(transition_scores).fillna(0.5)
+
+    # Blend: transition velocity available -> use it; otherwise fall back to prior blend
+    has_transition = df["player_id"].map(lambda x: x in transition_scores)
+    df["comp_trajectory"] = np.where(
+        has_transition,
+        0.35 * base_traj + 0.25 * transition_vel + 0.20 * resilience + 0.20 * availability,
+        0.50 * base_traj + 0.25 * resilience + 0.25 * availability,
     )
     df["promotion_resilience"] = resilience
     df["availability_score"] = availability
@@ -660,7 +728,7 @@ def rank_prospects(
         "comp_readiness", "comp_rate_quality", "comp_age",
         "comp_trajectory", "comp_positional",
         # Translated stats
-        "wtd_k_pct", "wtd_bb_pct", "wtd_iso", "k_bb_diff", "sb_rate",
+        "wtd_k_pct", "wtd_bb_pct", "wtd_iso", "wtd_hr_pa", "k_bb_diff", "sb_rate",
         "career_milb_pa", "youngest_age_rel",
         # Sub-trajectory components
         "promotion_resilience", "availability_score",
@@ -741,9 +809,20 @@ def rank_pitching_prospects(
     logger.info("Building pitcher prospect rankings for %d prospects", len(df))
 
     # -------------------------------------------------------------------
-    # Component 1: Readiness (heuristic for pitchers)
+    # Component 1: Readiness (ML model with heuristic fallback)
     # -------------------------------------------------------------------
-    df["comp_readiness"] = _compute_pitcher_readiness_heuristic(df)
+    # Try ML model first, fall back to heuristic
+    try:
+        from src.models.mlb_readiness import train_pitcher_readiness_model
+        pitcher_model = train_pitcher_readiness_model(milb_df=milb_recent)
+        _pitcher_features = pitcher_model["features"]
+        X = df[_pitcher_features].fillna(0).values
+        X_s = pitcher_model["scaler"].transform(X)
+        df["comp_readiness"] = pitcher_model["model"].predict_proba(X_s)[:, 1]
+        logger.info("Pitcher readiness: using ML model (AUC=%.3f)", pitcher_model["train_auc"])
+    except Exception as e:
+        logger.warning("Pitcher readiness ML failed (%s), using heuristic", e)
+        df["comp_readiness"] = _compute_pitcher_readiness_heuristic(df)
     df["readiness_score"] = df["comp_readiness"]
     df["readiness_tier"] = pd.cut(
         df["readiness_score"],
@@ -766,7 +845,18 @@ def rank_pitching_prospects(
     # -------------------------------------------------------------------
     prospect_ids = set(df["player_id"].unique())
     traj_scores = _compute_pitcher_trajectory(milb_recent, prospect_ids)
-    df["comp_trajectory"] = df["player_id"].map(traj_scores).fillna(0.5)
+    base_traj = df["player_id"].map(traj_scores).fillna(0.5)
+
+    # Transition velocity
+    transition_scores = _compute_transition_velocity(prospect_ids)
+    transition_vel = df["player_id"].map(transition_scores).fillna(0.5)
+
+    has_transition = df["player_id"].map(lambda x: x in transition_scores)
+    df["comp_trajectory"] = np.where(
+        has_transition,
+        0.50 * base_traj + 0.50 * transition_vel,
+        base_traj,
+    )
 
     # -------------------------------------------------------------------
     # Component 5: Positional scarcity (SP > RP)

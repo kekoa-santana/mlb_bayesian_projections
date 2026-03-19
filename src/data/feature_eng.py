@@ -723,16 +723,19 @@ def build_multi_season_hitter_data(
             df = df[df["pa"] >= min_pa]
 
         # Merge approach metrics (whiff_rate, chase_rate, z_contact_pct, fb_pct)
+        # and chase raw counts (chase_swings, out_of_zone_pitches) for Bayesian chase_rate model
         try:
             obs = get_cached_hitter_observed_profile(s)
             merge_cols = ["batter_id"]
-            for col in ["whiff_rate", "chase_rate", "z_contact_pct", "fb_pct"]:
+            for col in ["whiff_rate", "chase_rate", "z_contact_pct", "fb_pct",
+                         "chase_swings", "out_of_zone_pitches"]:
                 if col in obs.columns:
                     merge_cols.append(col)
             df = df.merge(obs[merge_cols], on="batter_id", how="left")
         except Exception:
             logger.warning("No hitter observed profile for %d, skipping merge", s)
-            for col in ["whiff_rate", "chase_rate", "z_contact_pct", "fb_pct"]:
+            for col in ["whiff_rate", "chase_rate", "z_contact_pct", "fb_pct",
+                         "chase_swings", "out_of_zone_pitches"]:
                 if col not in df.columns:
                     df[col] = np.nan
 
@@ -1118,6 +1121,8 @@ def augment_hitters_with_milb_priors(
             # Statcast covariates — NaN → skill_tier defaults to 1 (average)
             "whiff_rate": np.nan,
             "chase_rate": np.nan,
+            "chase_swings": 0,
+            "out_of_zone_pitches": 0,
             "z_contact_pct": np.nan,
             "fb_pct": np.nan,
             "skill_tier": 1,  # Default to average (no Statcast for MiLB)
@@ -1305,6 +1310,63 @@ def get_cached_pitcher_observed_profile(
         "pitcher_observed_profile", season,
         get_pitcher_observed_profile, force_rebuild,
     )
+
+
+# ---------------------------------------------------------------------------
+# Pitcher ERA-FIP gap data (for ERA derivation)
+# ---------------------------------------------------------------------------
+def get_pitcher_era_fip_data(
+    season: int,
+) -> dict[int, tuple[float | None, float, float | None, float | None, float | None]]:
+    """Get ERA-FIP gap data for each pitcher in a season.
+
+    Merges traditional stats (ERA, FIP, IP) with observed profile (GB%)
+    to produce the inputs needed for ERA derivation.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    dict[int, tuple]
+        {pitcher_id: (era_fip_gap, ip, gb_pct, observed_era, observed_fip)}.
+        era_fip_gap is None if either ERA or FIP is missing/NaN.
+    """
+    from src.data.queries import get_pitcher_traditional_stats
+
+    trad = get_pitcher_traditional_stats(season)
+
+    try:
+        obs = get_cached_pitcher_observed_profile(season)
+        if "gb_pct" in obs.columns:
+            trad = trad.merge(
+                obs[["pitcher_id", "gb_pct"]], on="pitcher_id", how="left",
+            )
+        else:
+            trad["gb_pct"] = np.nan
+    except Exception:
+        logger.warning("Could not load pitcher observed profile for GB%% (season %d)", season)
+        trad["gb_pct"] = np.nan
+
+    result: dict[int, tuple] = {}
+    for _, row in trad.iterrows():
+        pid = int(row["pitcher_id"])
+        era = float(row["era"]) if pd.notna(row.get("era")) else None
+        fip = float(row["fip"]) if pd.notna(row.get("fip")) else None
+        ip = float(row.get("ip", 0))
+        gb = float(row["gb_pct"]) if pd.notna(row.get("gb_pct")) else None
+
+        if era is not None and fip is not None:
+            gap = era - fip
+        else:
+            gap = None
+
+        result[pid] = (gap, ip, gb, era, fip)
+
+    logger.info("ERA-FIP data for %d pitchers (season %d)", len(result), season)
+    return result
 
 
 # ---------------------------------------------------------------------------

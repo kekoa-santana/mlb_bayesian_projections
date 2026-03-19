@@ -268,18 +268,19 @@ def _build_hitter_feature_matrix(seasons: list[int]) -> pd.DataFrame:
         except Exception:
             logger.warning("No hitter observed profile for %d", season)
 
-        # Merge sprint speed
-        try:
-            sprint = get_cached_sprint_speed(season)
-            season_df = season_df.merge(
-                sprint[["player_id", "sprint_speed"]].rename(
-                    columns={"player_id": "batter_id"}
-                ),
-                on="batter_id",
-                how="left",
-            )
-        except Exception:
-            logger.warning("No sprint speed for %d", season)
+        # Merge sprint speed (skip if already present from extended data)
+        if "sprint_speed" not in season_df.columns:
+            try:
+                sprint = get_cached_sprint_speed(season)
+                season_df = season_df.merge(
+                    sprint[["player_id", "sprint_speed"]].rename(
+                        columns={"player_id": "batter_id"}
+                    ),
+                    on="batter_id",
+                    how="left",
+                )
+            except Exception:
+                logger.warning("No sprint speed for %d", season)
 
         all_frames.append(season_df)
 

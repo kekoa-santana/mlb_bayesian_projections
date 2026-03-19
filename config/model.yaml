@@ -36,3 +36,28 @@ game_k:
   pop_within_pitcher_std: 3.4
   min_bf_for_evaluation: 15
   k_lines: [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5]
+
+clustering:
+  hitter_k: 6
+  pitcher_k: 6
+  archetype_matchup_min_pa: 100
+  archetype_matchup_seasons: [2020, 2021, 2022, 2023, 2024, 2025]
+
+# Posterior calibration T per stat.
+# T < 1.0 narrows CIs (if backtests show over-coverage at 80% level).
+# T > 1.0 widens CIs (if backtests show under-coverage).
+# T = 1.0 disables calibration (default).
+# Run walk-forward backtests to compute optimal T per stat.
+calibration:
+  hitter:
+    k_rate: 1.0
+    bb_rate: 1.0
+    gb_rate: 1.0
+    fb_rate: 1.0
+    hr_per_fb: 1.0
+    woba: 1.0
+    chase_rate: 1.0
+  pitcher:
+    k_rate: 1.0
+    bb_rate: 1.0
+    hr_per_bf: 1.0

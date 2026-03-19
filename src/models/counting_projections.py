@@ -42,9 +42,10 @@ HITTER_COUNTING_STATS = {
 }
 
 PITCHER_COUNTING_STATS = {
-    "total_k":    CountingStat("total_k",    "Strikeouts", "k_rate",     "bf", True),
-    "total_bb":   CountingStat("total_bb",   "Walks",      "bb_rate",    "bf", True),
-    "total_outs": CountingStat("total_outs", "Outs",       "outs_per_bf", "bf", False),
+    "total_k":    CountingStat("total_k",    "Strikeouts",  "k_rate",      "bf", True),
+    "total_bb":   CountingStat("total_bb",   "Walks",       "bb_rate",     "bf", True),
+    "total_outs": CountingStat("total_outs", "Outs",        "outs_per_bf", "bf", False),
+    "total_er":   CountingStat("total_er",   "Earned Runs", "er_per_bf",   "bf", False),
 }
 
 
@@ -358,6 +359,14 @@ def project_pitcher_counting(
 
     rng = np.random.default_rng(random_seed)
 
+    # Ensure er_per_bf exists (needed for total_er stat)
+    if "earned_runs" in pitcher_extended.columns and "er_per_bf" not in pitcher_extended.columns:
+        pitcher_extended = pitcher_extended.copy()
+        pitcher_extended["er_per_bf"] = (
+            pitcher_extended["earned_runs"]
+            / pitcher_extended["batters_faced"].replace(0, float("nan"))
+        ).round(4)
+
     season_df = pitcher_extended[
         (pitcher_extended["season"] == from_season)
         & (pitcher_extended["batters_faced"] >= min_bf)
@@ -368,6 +377,7 @@ def project_pitcher_counting(
         return pd.DataFrame()
 
     pop_outs_per_bf = float(season_df["outs_per_bf"].mean()) if "outs_per_bf" in season_df.columns else 0.70
+    pop_er_per_bf = float(season_df["er_per_bf"].mean()) if "er_per_bf" in season_df.columns else 0.11
 
     results = []
     for _, player in season_df.iterrows():
@@ -457,6 +467,7 @@ def project_pitcher_counting(
         row["projected_games_mean"] = float(np.mean(games_samples))
 
         # For each counting stat
+        _saved_counts: dict[str, np.ndarray] = {}
         for stat_name, cfg in PITCHER_COUNTING_STATS.items():
             if cfg.bayesian and cfg.rate_col in rate_model_results:
                 res = rate_model_results[cfg.rate_col]
@@ -472,17 +483,22 @@ def project_pitcher_counting(
                 except (ValueError, KeyError):
                     rate_samples = np.full(n_draws, float(player.get(cfg.rate_col, 0)))
             else:
-                # Shrinkage for outs_per_bf
-                mean_r, std_r = _shrinkage_rate(
-                    player_hist, cfg.rate_col, "batters_faced",
-                    pop_outs_per_bf, shrinkage_k=3.0
-                )
+                # Shrinkage for outs_per_bf / er_per_bf
+                pop_mean = pop_outs_per_bf if cfg.name == "total_outs" else pop_er_per_bf
+                if cfg.rate_col in player_hist.columns:
+                    mean_r, std_r = _shrinkage_rate(
+                        player_hist, cfg.rate_col, "batters_faced",
+                        pop_mean, shrinkage_k=3.0
+                    )
+                else:
+                    mean_r, std_r = pop_mean, pop_mean * 0.30
                 rate_samples = rng.normal(mean_r, std_r, size=n_draws)
                 rate_samples = np.clip(rate_samples, 0, 1)
 
             # Multiply rate x BF
             count_samples = np.round(rate_samples * bf_samples).astype(int)
             count_samples = np.clip(count_samples, 0, 999)
+            _saved_counts[stat_name] = count_samples
 
             summary = _compute_stat_summary(count_samples)
             for k, v in summary.items():
@@ -495,6 +511,27 @@ def project_pitcher_counting(
                 row["actual_bb"] = int(player.get("bb", 0))
             elif cfg.name == "total_outs":
                 row["actual_outs"] = int(player.get("outs", 0))
+            elif cfg.name == "total_er":
+                row["actual_er"] = int(player.get("earned_runs", 0))
+
+        # Derive IP and ERA from outs and ER projections
+        if "total_outs" in _saved_counts and "total_er" in _saved_counts:
+            ip_samples = _saved_counts["total_outs"].astype(float) / 3.0
+            er_samples = _saved_counts["total_er"].astype(float)
+
+            ip_summary = _compute_stat_summary(ip_samples)
+            for k, v in ip_summary.items():
+                row[f"projected_ip_{k}"] = v
+
+            safe_ip = np.where(ip_samples > 0, ip_samples, np.nan)
+            era_samples = er_samples / safe_ip * 9.0
+            era_valid = era_samples[~np.isnan(era_samples)]
+            if len(era_valid) > 0:
+                era_summary = _compute_stat_summary(np.clip(era_valid, 0, 15))
+                for k, v in era_summary.items():
+                    row[f"projected_era_{k}"] = v
+
+        row["actual_ip"] = float(player.get("ip", 0))
 
         results.append(row)
 
@@ -613,8 +650,16 @@ def marcel_counting_pitcher(
     -------
     pd.DataFrame
         Marcel projections: pitcher_id, marcel_k, marcel_bb,
-        marcel_outs, marcel_bf.
+        marcel_outs, marcel_bf, marcel_earned_runs.
     """
+    # Ensure er_per_bf exists
+    if "earned_runs" in pitcher_extended.columns and "er_per_bf" not in pitcher_extended.columns:
+        pitcher_extended = pitcher_extended.copy()
+        pitcher_extended["er_per_bf"] = (
+            pitcher_extended["earned_runs"]
+            / pitcher_extended["batters_faced"].replace(0, float("nan"))
+        ).round(4)
+
     season_df = pitcher_extended[
         (pitcher_extended["season"] == from_season)
         & (pitcher_extended["batters_faced"] >= min_bf)
@@ -659,12 +704,22 @@ def marcel_counting_pitcher(
         m_bb_rate = _marcel_rate(player_hist, "bb_rate", league_bb)
         m_outs_rate = _marcel_rate(player_hist, "outs_per_bf", league_outs)
 
-        results.append({
+        result_row = {
             "pitcher_id": pid,
             "marcel_bf": int(marcel_bf),
             "marcel_k": int(m_k_rate * marcel_bf),
             "marcel_bb": int(m_bb_rate * marcel_bf),
             "marcel_outs": int(m_outs_rate * marcel_bf),
-        })
+        }
+
+        # Marcel ER
+        if "er_per_bf" in player_hist.columns:
+            league_er = float(
+                pitcher_extended[pitcher_extended["season"] == from_season]["er_per_bf"].mean()
+            ) if "er_per_bf" in pitcher_extended.columns else 0.11
+            m_er_rate = _marcel_rate(player_hist, "er_per_bf", league_er)
+            result_row["marcel_earned_runs"] = int(m_er_rate * marcel_bf)
+
+        results.append(result_row)
 
     return pd.DataFrame(results)

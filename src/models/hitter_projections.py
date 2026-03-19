@@ -38,8 +38,8 @@ from src.models.hitter_model import (
 
 logger = logging.getLogger(__name__)
 
-# Only project stable stats with the Bayesian model
-ALL_STATS = ["k_rate", "bb_rate", "gb_rate", "fb_rate", "hr_per_fb"]
+# Bayesian-projected stats (hierarchical + AR(1))
+ALL_STATS = ["k_rate", "bb_rate", "gb_rate", "fb_rate", "hr_per_fb", "woba", "chase_rate"]
 
 # --------------------------------------------------------------------------
 # Composite dimension weights and components
@@ -225,6 +225,7 @@ def project_forward(
     from_season: int,
     min_pa: int = 200,
     random_seed: int = 42,
+    calibration_t: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """Forward-project K%/BB% and build 6-dimension composite.
 
@@ -238,6 +239,10 @@ def project_forward(
         Minimum PA in from_season to include in projections.
     random_seed : int
         For reproducibility.
+    calibration_t : dict, optional
+        Per-stat calibration factors {stat_name: T}.
+        T < 1.0 narrows intervals, T > 1.0 widens.
+        From ``config/model.yaml`` calibration section.
 
     Returns
     -------
@@ -302,12 +307,17 @@ def project_forward(
         proj_lo = {}
         proj_hi = {}
 
+        _cal_t = (calibration_t or {}).get(stat, 1.0)
+
         for batter_id in base["batter_id"]:
             try:
                 samples = extract_rate_samples(
                     trace, data, batter_id, from_season,
                     project_forward=True, random_seed=random_seed,
                 )
+                if _cal_t != 1.0:
+                    from src.evaluation.metrics import calibrate_posterior_samples
+                    samples = calibrate_posterior_samples(samples, _cal_t)
                 proj_means[batter_id] = float(np.mean(samples))
                 proj_sds[batter_id] = float(np.std(samples))
                 proj_lo[batter_id] = float(np.percentile(samples, 2.5))

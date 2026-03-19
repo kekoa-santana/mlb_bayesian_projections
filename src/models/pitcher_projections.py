@@ -190,11 +190,114 @@ def _compute_composite(base: pd.DataFrame) -> pd.DataFrame:
     return base
 
 
+def _derive_fip_era(
+    base: pd.DataFrame,
+    pitcher_rate_samples: dict[str, dict[int, np.ndarray]],
+    era_fip_data: dict | None,
+    rng: np.random.Generator,
+    xgb_gap_priors: dict[int, float] | None = None,
+    xgb_babip_priors: dict[int, float] | None = None,
+) -> None:
+    """Add projected FIP/ERA columns to base DataFrame in-place."""
+    from src.models.derived_stats import (
+        derive_pitcher_fip,
+        derive_pitcher_outs_rate,
+        derive_pitcher_era,
+    )
+
+    needed = ["k_rate", "bb_rate", "hr_per_bf"]
+    if not all(s in pitcher_rate_samples for s in needed):
+        return
+
+    fip_means: dict[int, float] = {}
+    fip_sds: dict[int, float] = {}
+    fip_lo: dict[int, float] = {}
+    fip_hi: dict[int, float] = {}
+    era_means: dict[int, float] = {}
+    era_sds: dict[int, float] = {}
+    era_lo: dict[int, float] = {}
+    era_hi: dict[int, float] = {}
+
+    for pid in base["pitcher_id"]:
+        if not all(
+            pid in pitcher_rate_samples.get(s, {}) for s in needed
+        ):
+            continue
+
+        k_s = pitcher_rate_samples["k_rate"][pid]
+        bb_s = pitcher_rate_samples["bb_rate"][pid]
+        hr_s = pitcher_rate_samples["hr_per_bf"][pid]
+        n = min(len(k_s), len(bb_s), len(hr_s))
+        k_s, bb_s, hr_s = k_s[:n], bb_s[:n], hr_s[:n]
+
+        # Derive outs — use XGBoost BABIP prior if available, else league avg
+        babip_prior = (xgb_babip_priors or {}).get(pid)
+        outs_s = derive_pitcher_outs_rate(
+            k_s, bb_s, hr_s,
+            observed_babip=None, bip=0,
+            league_babip=babip_prior if babip_prior is not None else 0.292,
+            rng=rng,
+        )
+
+        fip_s = derive_pitcher_fip(k_s, bb_s, hr_s, outs_s)
+        fip_means[pid] = float(np.mean(fip_s))
+        fip_sds[pid] = float(np.std(fip_s))
+        fip_lo[pid] = float(np.percentile(fip_s, 2.5))
+        fip_hi[pid] = float(np.percentile(fip_s, 97.5))
+
+        # ERA = FIP + shrunken gap (with XGBoost prior if available)
+        gap_prior = (xgb_gap_priors or {}).get(pid)
+        if era_fip_data and pid in era_fip_data:
+            gap, ip, gb = era_fip_data[pid][:3]
+            era_s = derive_pitcher_era(
+                fip_s, gap, ip, gb, rng=rng, xgb_gap_prior=gap_prior,
+            )
+        else:
+            era_s = fip_s.copy()
+
+        era_means[pid] = float(np.mean(era_s))
+        era_sds[pid] = float(np.std(era_s))
+        era_lo[pid] = float(np.percentile(era_s, 2.5))
+        era_hi[pid] = float(np.percentile(era_s, 97.5))
+
+    base["projected_fip"] = base["pitcher_id"].map(fip_means)
+    base["projected_fip_sd"] = base["pitcher_id"].map(fip_sds)
+    base["projected_fip_2_5"] = base["pitcher_id"].map(fip_lo)
+    base["projected_fip_97_5"] = base["pitcher_id"].map(fip_hi)
+
+    base["projected_era"] = base["pitcher_id"].map(era_means)
+    base["projected_era_sd"] = base["pitcher_id"].map(era_sds)
+    base["projected_era_2_5"] = base["pitcher_id"].map(era_lo)
+    base["projected_era_97_5"] = base["pitcher_id"].map(era_hi)
+
+    # Observed ERA and FIP from era_fip_data
+    if era_fip_data:
+        obs_era = {
+            pid: vals[3]
+            for pid, vals in era_fip_data.items()
+            if len(vals) > 3 and vals[3] is not None
+        }
+        obs_fip = {
+            pid: vals[4]
+            for pid, vals in era_fip_data.items()
+            if len(vals) > 4 and vals[4] is not None
+        }
+        base["observed_era"] = base["pitcher_id"].map(obs_era)
+        base["observed_fip"] = base["pitcher_id"].map(obs_fip)
+
+    logger.info(
+        "Derived FIP/ERA projections for %d pitchers", len(fip_means),
+    )
+
+
 def project_forward(
     model_results: dict[str, dict[str, Any]],
     from_season: int,
     min_bf: int = 200,
     random_seed: int = 42,
+    era_fip_data: dict[int, tuple] | None = None,
+    calibration_t: dict[str, float] | None = None,
+    xgb_priors: dict[str, dict[int, float]] | None = None,
 ) -> pd.DataFrame:
     """Forward-project K%/BB% and build 4-dimension composite.
 
@@ -207,6 +310,15 @@ def project_forward(
     min_bf : int
         Minimum BF in from_season to include in projections.
     random_seed : int
+    era_fip_data : dict, optional
+        {pitcher_id: (era_fip_gap, ip, gb_pct, observed_era, observed_fip)}.
+        Output of ``feature_eng.get_pitcher_era_fip_data()``.
+    calibration_t : dict, optional
+        Per-stat calibration factors {stat_name: T}.
+        T < 1.0 narrows intervals, T > 1.0 widens.
+    xgb_priors : dict, optional
+        {"era_fip_gap": {pid: value}, "babip": {pid: value}}.
+        XGBoost-predicted priors from ``xgb_priors.predict_pitcher_priors``.
 
     Returns
     -------
@@ -231,7 +343,10 @@ def project_forward(
                         from_season, min_bf)
         return pd.DataFrame()
 
-    # For each Bayesian stat (K%, BB%), extract observed + projected
+    rng = np.random.default_rng(random_seed)
+    pitcher_rate_samples: dict[str, dict[int, np.ndarray]] = {}
+
+    # For each Bayesian stat (K%, BB%, HR/BF), extract observed + projected
     for stat, res in model_results.items():
         cfg = PITCHER_STAT_CONFIGS[stat]
         data = res["data"]
@@ -267,6 +382,8 @@ def project_forward(
         proj_sds = {}
         proj_lo = {}
         proj_hi = {}
+        pitcher_rate_samples[stat] = {}
+        _cal_t = (calibration_t or {}).get(stat, 1.0)
 
         for pitcher_id in base["pitcher_id"]:
             try:
@@ -274,10 +391,14 @@ def project_forward(
                     trace, data, pitcher_id, from_season,
                     project_forward=True, random_seed=random_seed,
                 )
+                if _cal_t != 1.0:
+                    from src.evaluation.metrics import calibrate_posterior_samples
+                    samples = calibrate_posterior_samples(samples, _cal_t)
                 proj_means[pitcher_id] = float(np.mean(samples))
                 proj_sds[pitcher_id] = float(np.std(samples))
                 proj_lo[pitcher_id] = float(np.percentile(samples, 2.5))
                 proj_hi[pitcher_id] = float(np.percentile(samples, 97.5))
+                pitcher_rate_samples[stat][pitcher_id] = samples
             except ValueError:
                 continue
 
@@ -286,6 +407,14 @@ def project_forward(
         base[ci_lo_col] = base["pitcher_id"].map(proj_lo)
         base[ci_hi_col] = base["pitcher_id"].map(proj_hi)
         base[delta_col] = base[proj_col] - base[obs_col]
+
+    # Derive FIP/ERA from rate posteriors
+    _xgb = xgb_priors or {}
+    _derive_fip_era(
+        base, pitcher_rate_samples, era_fip_data, rng,
+        xgb_gap_priors=_xgb.get("era_fip_gap"),
+        xgb_babip_priors=_xgb.get("babip"),
+    )
 
     # Enrich with observed stats (whiff, velo, extension, zone%, GB%)
     base = _enrich_with_observed(base, from_season)

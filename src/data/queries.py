@@ -1084,7 +1084,9 @@ def get_hitter_observed_profile(season: int) -> pd.DataFrame:
         ROUND(ba.avg_exit_velo::numeric, 1)                         AS avg_exit_velo,
         ROUND(ba.fb_pct::numeric, 4)                                AS fb_pct,
         ROUND(ba.hard_hit_pct::numeric, 4)                          AS hard_hit_pct,
-        ba.bip
+        ba.bip,
+        pa.chase_swings,
+        pa.ooz_pitches                                              AS out_of_zone_pitches
     FROM pitch_agg pa
     LEFT JOIN batted_agg ba ON pa.batter_id = ba.batter_id
     WHERE pa.swings >= 50
@@ -3041,3 +3043,97 @@ def get_catcher_framing_effects(
         len(df), df["logit_lift"].min(), df["logit_lift"].max(),
     )
     return df
+
+
+# ---------------------------------------------------------------------------
+# Pitcher pitch-type run values
+# ---------------------------------------------------------------------------
+def get_pitcher_run_values(season: int) -> pd.DataFrame:
+    """Per-pitcher pitch-type run values with a weighted composite.
+
+    Returns individual pitch-type rows plus a per-pitcher
+    ``weighted_rv_per_100`` column (usage-weighted run value per 100
+    pitches across all pitch types).
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, pitch_type, run_value_per_100, usage_pct,
+        weighted_rv_per_100.
+    """
+    query = """
+    WITH raw AS (
+        SELECT
+            pitcher_id,
+            pitch_type,
+            run_value_per_100,
+            usage_pct
+        FROM production.fact_pitch_type_run_value
+        WHERE season = :season
+    ),
+    weighted AS (
+        SELECT
+            pitcher_id,
+            SUM(run_value_per_100 * usage_pct) AS weighted_rv_per_100
+        FROM raw
+        GROUP BY pitcher_id
+    )
+    SELECT
+        r.pitcher_id,
+        r.pitch_type,
+        r.run_value_per_100,
+        r.usage_pct,
+        w.weighted_rv_per_100
+    FROM raw r
+    JOIN weighted w ON r.pitcher_id = w.pitcher_id
+    ORDER BY r.pitcher_id, r.usage_pct DESC
+    """
+    logger.info("Fetching pitcher run values for %d", season)
+    return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# Prospect transitions
+# ---------------------------------------------------------------------------
+def get_prospect_transitions(player_ids: list[int]) -> pd.DataFrame:
+    """Fetch prospect transition records (promotions, demotions, etc.).
+
+    Parameters
+    ----------
+    player_ids : list[int]
+        Player IDs to retrieve transitions for.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: player_id, event_date, from_level, to_level,
+        from_sport_id, to_sport_id, from_team_name, to_team_name,
+        transition_type, season.
+    """
+    if not player_ids:
+        return pd.DataFrame()
+
+    placeholders = ", ".join(str(int(pid)) for pid in player_ids)
+    query = f"""
+    SELECT
+        player_id,
+        event_date,
+        from_level,
+        to_level,
+        from_sport_id,
+        to_sport_id,
+        from_team_name,
+        to_team_name,
+        transition_type,
+        season
+    FROM production.fact_prospect_transition
+    WHERE player_id IN ({placeholders})
+    ORDER BY player_id, event_date
+    """
+    logger.info("Fetching prospect transitions for %d players", len(player_ids))
+    return read_sql(query, {})

@@ -45,6 +45,7 @@ PITCHER_ACTUAL_MAP = {
     "total_k": "k",
     "total_bb": "bb",
     "total_outs": "outs",
+    "total_er": "earned_runs",
 }
 
 

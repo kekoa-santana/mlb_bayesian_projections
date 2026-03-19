@@ -176,12 +176,26 @@ def main() -> None:
     # =================================================================
     logger.info("=" * 60)
     logger.info("Fitting hitter composite models (K%%, BB%%)...")
+
+    # Load posterior calibration T from config
+    import yaml
+    with open(PROJECT_ROOT / "config" / "model.yaml") as f:
+        _cfg = yaml.safe_load(f)
+    _cal = _cfg.get("calibration", {})
+    hitter_cal_t = _cal.get("hitter", {})
+    pitcher_cal_t = _cal.get("pitcher", {})
+    if any(v != 1.0 for v in hitter_cal_t.values()):
+        logger.info("Hitter calibration T: %s", hitter_cal_t)
+    if any(v != 1.0 for v in pitcher_cal_t.values()):
+        logger.info("Pitcher calibration T: %s", pitcher_cal_t)
+
     hitter_results = fit_hitter_models(
         seasons=SEASONS, min_pa=100,
         draws=draws, tune=tune, chains=chains, random_seed=42,
     )
     hitter_proj = project_hitter_forward(
         hitter_results, from_season=FROM_SEASON, min_pa=200,
+        calibration_t=hitter_cal_t,
     )
     hitter_proj.to_parquet(DASHBOARD_DIR / "hitter_projections.parquet", index=False)
     logger.info("Saved hitter projections: %d players", len(hitter_proj))
@@ -195,8 +209,28 @@ def main() -> None:
         seasons=SEASONS, min_bf=100,
         draws=draws, tune=tune, chains=chains, random_seed=42,
     )
+    # Get ERA-FIP gap data for ERA derivation
+    from src.data.feature_eng import get_pitcher_era_fip_data
+    era_fip_data = get_pitcher_era_fip_data(FROM_SEASON)
+    logger.info("Loaded ERA-FIP data for %d pitchers", len(era_fip_data))
+
+    # Train XGBoost priors for ERA-FIP gap and BABIP
+    from src.models.xgb_priors import train_all_pitcher_priors, predict_pitcher_priors
+    xgb_models = train_all_pitcher_priors(seasons=SEASONS, min_ip=40.0)
+    xgb_preds: dict[str, dict[int, float]] = {}
+    for target, bundle in xgb_models.items():
+        if bundle.get("model") is not None:
+            xgb_preds[target] = predict_pitcher_priors(bundle, FROM_SEASON)
+            logger.info(
+                "XGBoost %s: %d predictions (train RMSE=%.4f)",
+                target, len(xgb_preds[target]), bundle["train_rmse"],
+            )
+
     pitcher_proj = project_pitcher_forward(
         pitcher_results, from_season=FROM_SEASON, min_bf=200,
+        era_fip_data=era_fip_data,
+        calibration_t=pitcher_cal_t,
+        xgb_priors=xgb_preds,
     )
     pitcher_proj.to_parquet(DASHBOARD_DIR / "pitcher_projections.parquet", index=False)
     logger.info("Saved pitcher projections: %d players", len(pitcher_proj))
@@ -655,6 +689,42 @@ def main() -> None:
         logger.warning("Archetype hitter data failed: %s", e)
 
     # =================================================================
+    # 5d. Player-level archetype clustering (hitter + pitcher archetypes)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Exporting player archetype assignments...")
+    try:
+        from src.data.player_clustering import export_for_dashboard as export_archetypes
+
+        arch_paths = export_archetypes(
+            export_season=FROM_SEASON,
+            output_dir=DASHBOARD_DIR,
+            force_rebuild=True,
+        )
+        logger.info("Exported player archetypes: %s", list(arch_paths.keys()))
+    except Exception as e:
+        logger.warning("Player archetype export failed: %s", e)
+
+    # =================================================================
+    # 5e. Archetype matchup matrix (pitcher type vs hitter type outcomes)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Building archetype matchup matrix...")
+    try:
+        from src.data.archetype_matchups import (
+            build_archetype_matchup_matrix,
+            export_archetype_matchups_for_dashboard,
+        )
+
+        arch_matrix = build_archetype_matchup_matrix(force_rebuild=True)
+        logger.info("Built archetype matchup matrix: %d pairs", len(arch_matrix))
+
+        arch_path = export_archetype_matchups_for_dashboard(output_dir=DASHBOARD_DIR)
+        logger.info("Exported archetype matchup matrix to %s", arch_path)
+    except Exception as e:
+        logger.warning("Archetype matchup matrix failed: %s", e)
+
+    # =================================================================
     # 6. Traditional / actual stats (2025 season from boxscores + Statcast)
     # =================================================================
     logger.info("=" * 60)
@@ -933,6 +1003,34 @@ def main() -> None:
 
     except Exception:
         logger.exception("Failed to build MLB positional rankings")
+
+    # =================================================================
+    # 6h. Hitter position eligibility (multi-position depth chart)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Building hitter position eligibility...")
+
+    try:
+        from src.models.player_rankings import get_hitter_position_eligibility
+
+        elig = get_hitter_position_eligibility(season=FROM_SEASON, min_starts=10)
+        if not elig.empty:
+            elig.to_parquet(
+                DASHBOARD_DIR / "hitter_position_eligibility.parquet",
+                index=False,
+            )
+            n_players = elig["player_id"].nunique()
+            n_rows = len(elig)
+            logger.info(
+                "Saved hitter_position_eligibility.parquet: "
+                "%d rows (%d unique players)",
+                n_rows, n_players,
+            )
+        else:
+            logger.warning("No position eligibility data generated")
+
+    except Exception:
+        logger.exception("Failed to build position eligibility")
 
     # =================================================================
     # 7. Save preseason snapshot (frozen projections for end-of-season comparison)

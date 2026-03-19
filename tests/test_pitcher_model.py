@@ -105,7 +105,8 @@ class TestBuildModel:
         assert "sigma_season" in model.named_vars
         assert "rate" in model.named_vars
         assert "beta_starter" in model.named_vars
-        assert model.named_vars["mu_pop"].eval().shape == (3,)
+        # mu_pop has shape (N_AGE_BUCKETS, N_SKILL_TIERS) = (3, 4)
+        assert model.named_vars["mu_pop"].eval().shape == (3, 4)
 
 
 class TestFitAndExtract:
@@ -169,6 +170,8 @@ class TestFitAndExtract:
         assert "min_ess_bulk" in result
 
     def test_age_bucket_mu_pop(self, fitted_k_rate):
+        """mu_pop should have shape (N_AGE_BUCKETS, N_SKILL_TIERS) = (3, 4)."""
         _, trace = fitted_k_rate
         mu_pop = trace.posterior["mu_pop"].values
-        assert mu_pop.shape[-1] == 3
+        # shape: (chains, draws, 3, 4)
+        assert mu_pop.shape[-2:] == (3, 4)

@@ -77,7 +77,7 @@ class TestCountingStatConfig:
         assert set(HITTER_COUNTING_STATS.keys()) == {"total_k", "total_bb", "total_hr", "total_sb"}
 
     def test_pitcher_stats_keys(self) -> None:
-        assert set(PITCHER_COUNTING_STATS.keys()) == {"total_k", "total_bb", "total_outs"}
+        assert set(PITCHER_COUNTING_STATS.keys()) == {"total_k", "total_bb", "total_outs", "total_er"}
 
     def test_bayesian_flags(self) -> None:
         """K and BB should use Bayesian posteriors; HR, SB, outs should not."""

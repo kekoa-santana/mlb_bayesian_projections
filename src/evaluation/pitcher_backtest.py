@@ -227,6 +227,21 @@ def walk_forward_pitcher_stat_backtest(
     ci_hi = comp["ci_95_hi"].values
     coverage_95 = float(np.mean((actual >= ci_lo) & (actual <= ci_hi)))
 
+    # 80% CI coverage (approximate from mean ± 1.282 * SD)
+    from scipy.stats import norm as _norm
+    z80 = _norm.ppf(0.90)
+    bayes_sd = comp[f"bayes_{stat}_sd"].values if f"bayes_{stat}_sd" in comp.columns else None
+    if bayes_sd is not None:
+        ci80_lo = bayes - z80 * bayes_sd
+        ci80_hi = bayes + z80 * bayes_sd
+        coverage_80 = float(np.mean((actual >= ci80_lo) & (actual <= ci80_hi)))
+    else:
+        coverage_80 = float("nan")
+
+    # Compute optimal calibration T from 80% coverage
+    from src.evaluation.metrics import compute_posterior_calibration_t
+    optimal_cal_t = compute_posterior_calibration_t(coverage_80)
+
     mae_imp = (marcel_mae - bayes_mae) / marcel_mae * 100 if marcel_mae > 0 else 0
     rmse_imp = (marcel_rmse - bayes_rmse) / marcel_rmse * 100 if marcel_rmse > 0 else 0
 
@@ -291,7 +306,10 @@ def walk_forward_pitcher_stat_backtest(
         "pitcher %s: Bayes MAE=%.4f, Marcel MAE=%.4f (%.1f%%)",
         stat, bayes_mae, marcel_mae, mae_imp,
     )
-    logger.info("pitcher %s: 95%% CI coverage: %.1f%%", stat, coverage_95 * 100)
+    logger.info(
+        "pitcher %s: 80%% CI coverage: %.1f%%, 95%% CI coverage: %.1f%% (optimal T=%.3f)",
+        stat, coverage_80 * 100, coverage_95 * 100, optimal_cal_t,
+    )
     logger.info(
         "pitcher %s: CRPS Bayes=%.4f, Marcel=%.4f", stat, bayes_crps, marcel_crps,
     )
@@ -306,7 +324,9 @@ def walk_forward_pitcher_stat_backtest(
         "bayes_rmse": bayes_rmse,
         "marcel_rmse": marcel_rmse,
         "rmse_improvement_pct": rmse_imp,
+        "coverage_80": coverage_80,
         "coverage_95": coverage_95,
+        "calibration_t": optimal_cal_t,
         "bayes_brier": bayes_brier,
         "marcel_brier": marcel_brier,
         "bayes_crps": bayes_crps,
@@ -416,7 +436,9 @@ def run_pitcher_backtest(
                 "bayes_rmse": metrics["bayes_rmse"],
                 "marcel_rmse": metrics["marcel_rmse"],
                 "rmse_improvement_pct": metrics["rmse_improvement_pct"],
+                "coverage_80": metrics["coverage_80"],
                 "coverage_95": metrics["coverage_95"],
+                "calibration_t": metrics["calibration_t"],
                 "bayes_brier": metrics["bayes_brier"],
                 "marcel_brier": metrics["marcel_brier"],
                 "bayes_crps": metrics["bayes_crps"],

@@ -69,11 +69,10 @@ class TestCompositeDimensions:
         assert abs(total - 1.0) < 1e-9
 
     def test_all_projected_stats_have_models(self):
-        """ALL_STATS should only contain stable, projectable stats."""
+        """ALL_STATS should contain all Bayesian-projected pitcher stats."""
         assert "k_rate" in ALL_STATS
         assert "bb_rate" in ALL_STATS
-        # HR/BF removed — not stable enough for Bayesian projection
-        assert "hr_per_bf" not in ALL_STATS
+        assert "hr_per_bf" in ALL_STATS
 
     def test_four_dimensions(self):
         expected = {"stuff", "command", "ground_ball", "trajectory"}

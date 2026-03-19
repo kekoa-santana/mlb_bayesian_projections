@@ -164,9 +164,20 @@ def _build_prospect_features(
         if total_pa < min_pa:
             continue
 
-        wtd_k = (grp["translated_k_pct"] * grp["pa"]).sum() / total_pa
-        wtd_bb = (grp["translated_bb_pct"] * grp["pa"]).sum() / total_pa
-        wtd_iso = (grp["translated_iso"] * grp["pa"]).sum() / total_pa
+        # Weight by translation confidence * PA (AAA data counts more than A-ball)
+        conf = grp["translation_confidence"].fillna(0.5) if "translation_confidence" in grp.columns else pd.Series(0.5, index=grp.index)
+        conf_pa = conf * grp["pa"]
+        conf_pa_sum = conf_pa.sum()
+        if conf_pa_sum > 0:
+            wtd_k = (grp["translated_k_pct"] * conf_pa).sum() / conf_pa_sum
+            wtd_bb = (grp["translated_bb_pct"] * conf_pa).sum() / conf_pa_sum
+            wtd_iso = (grp["translated_iso"] * conf_pa).sum() / conf_pa_sum
+            wtd_hr_pa = (grp["translated_hr_pa"] * conf_pa).sum() / conf_pa_sum if "translated_hr_pa" in grp.columns else 0
+        else:
+            wtd_k = (grp["translated_k_pct"] * grp["pa"]).sum() / total_pa
+            wtd_bb = (grp["translated_bb_pct"] * grp["pa"]).sum() / total_pa
+            wtd_iso = (grp["translated_iso"] * grp["pa"]).sum() / total_pa
+            wtd_hr_pa = (grp["translated_hr_pa"] * grp["pa"]).sum() / total_pa if "translated_hr_pa" in grp.columns else 0
         total_sb = grp["sb"].sum() if "sb" in grp.columns else 0
 
         records.append({
@@ -181,6 +192,7 @@ def _build_prospect_features(
             "wtd_k_pct": wtd_k,
             "wtd_bb_pct": wtd_bb,
             "wtd_iso": wtd_iso,
+            "wtd_hr_pa": wtd_hr_pa,
             "k_bb_diff": wtd_k - wtd_bb,
             "youngest_age_rel": grp["age_relative_to_level_avg"].min(),
             "avg_age_rel": grp["age_relative_to_level_avg"].mean(),
@@ -399,6 +411,228 @@ def score_prospects(
     result = features_df.sort_values("readiness_score", ascending=False)
     logger.info(
         "Scored %d prospects: %d Elite, %d Strong, %d Developing",
+        len(result),
+        (result["readiness_tier"] == "Elite").sum(),
+        (result["readiness_tier"] == "Strong").sum(),
+        (result["readiness_tier"] == "Developing").sum(),
+    )
+    return result
+
+
+# ===================================================================
+# Pitcher readiness model
+# ===================================================================
+
+# Feature list for pitcher readiness (must match training order)
+_PITCHER_STAT_FEATURES = [
+    "wtd_k_pct", "wtd_bb_pct", "wtd_hr_bf", "k_bb_diff",
+    "youngest_age_rel", "avg_age_rel", "min_age",
+    "max_level_num", "levels_played", "career_milb_bf", "career_seasons",
+    "sp_pct",
+]
+
+
+def _get_mlb_pitcher_stuck_ids(
+    seasons: list[int] | None = None,
+    min_bf: int = 100,
+) -> set[int]:
+    """Get pitcher IDs who had at least one season with min_bf batters faced."""
+    if seasons is None:
+        seasons = list(range(2018, 2026))
+    stuck: set[int] = set()
+    try:
+        from src.data.db import read_sql
+        df = read_sql(
+            "SELECT DISTINCT pitcher_id FROM production.fact_pitching_advanced "
+            "WHERE batters_faced >= :min_bf",
+            {"min_bf": min_bf},
+        )
+        stuck.update(df["pitcher_id"].astype(int).unique())
+    except Exception:
+        logger.warning("Could not load MLB pitcher IDs from fact_pitching_advanced")
+    return stuck
+
+
+def _get_mlb_pitcher_first_seasons(
+    seasons: list[int] | None = None,
+) -> dict[int, int]:
+    """Load first MLB season per pitcher from cached pitcher season totals."""
+    if seasons is None:
+        seasons = list(range(2018, 2026))
+    first: dict[int, int] = {}
+    for yr in seasons:
+        try:
+            df = pd.read_parquet(CACHE_DIR / f"pitcher_season_totals_age_{yr}.parquet")
+            for pid in df["pitcher_id"].unique():
+                if pid not in first:
+                    first[int(pid)] = yr
+        except FileNotFoundError:
+            continue
+    return first
+
+
+def train_pitcher_readiness_model(
+    milb_df: pd.DataFrame | None = None,
+    max_train_season: int = 2022,
+    min_debut_window: int = 2,
+) -> dict[str, Any]:
+    """Train the MLB readiness model for pitching prospects.
+
+    Follows the same pattern as ``train_readiness_model()`` but uses
+    pitcher-specific features and labels (100+ BF in an MLB season).
+
+    Parameters
+    ----------
+    milb_df : pd.DataFrame or None
+        Translated MiLB pitcher data. If None, loads from cache.
+    max_train_season : int
+        Latest MiLB season to include in training data.
+    min_debut_window : int
+        Years after MiLB to allow for MLB debut before labeling.
+
+    Returns
+    -------
+    dict
+        Keys: model (LogisticRegression), scaler (StandardScaler),
+        features (list[str]), train_auc (float), n_train (int),
+        n_positive (int).
+    """
+    if milb_df is None:
+        milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_pitchers.parquet")
+
+    mlb_first = _get_mlb_pitcher_first_seasons()
+    stuck_ids = _get_mlb_pitcher_stuck_ids()
+
+    from src.models.prospect_ranking import _build_pitcher_prospect_features
+    features_df = _build_pitcher_prospect_features(milb_df)
+
+    if features_df.empty:
+        logger.warning("No pitcher prospect features built for training")
+        return {
+            "model": None, "scaler": None, "features": _PITCHER_STAT_FEATURES,
+            "train_auc": 0.0, "n_train": 0, "n_positive": 0,
+        }
+
+    # Exclude veterans doing MiLB rehab
+    for pid, first_yr in mlb_first.items():
+        mask = features_df["player_id"] == pid
+        if mask.any():
+            milb_first_yr = features_df.loc[mask, "latest_season"].min()
+            if first_yr < milb_first_yr:
+                features_df = features_df[~mask]
+
+    features_df["stuck_mlb"] = features_df["player_id"].isin(stuck_ids)
+
+    # Train on prospects with enough time to debut
+    train = features_df[features_df["latest_season"] <= max_train_season].copy()
+
+    if train.empty or train["stuck_mlb"].sum() == 0:
+        logger.warning("Insufficient pitcher training data")
+        return {
+            "model": None, "scaler": None, "features": _PITCHER_STAT_FEATURES,
+            "train_auc": 0.0, "n_train": 0, "n_positive": 0,
+        }
+
+    X = train[_PITCHER_STAT_FEATURES].fillna(0).values
+    y = train["stuck_mlb"].astype(int).values
+
+    scaler = StandardScaler()
+    X_s = scaler.fit_transform(X)
+
+    model = LogisticRegression(random_state=42, max_iter=2000, C=0.3)
+    model.fit(X_s, y)
+
+    probs = model.predict_proba(X_s)[:, 1]
+    from sklearn.metrics import roc_auc_score
+    auc = roc_auc_score(y, probs)
+
+    logger.info(
+        "Pitcher readiness model trained: %d prospects, %d positive, AUC=%.3f",
+        len(train), y.sum(), auc,
+    )
+
+    return {
+        "model": model,
+        "scaler": scaler,
+        "features": _PITCHER_STAT_FEATURES,
+        "train_auc": auc,
+        "n_train": len(train),
+        "n_positive": int(y.sum()),
+    }
+
+
+def score_pitcher_prospects(
+    milb_df: pd.DataFrame | None = None,
+    model_bundle: dict[str, Any] | None = None,
+    seasons: list[int] | None = None,
+    projection_season: int = 2026,
+) -> pd.DataFrame:
+    """Score current MiLB pitching prospects with MLB readiness probability.
+
+    Parameters
+    ----------
+    milb_df : pd.DataFrame or None
+        Translated MiLB pitcher data. If None, loads from cache.
+    model_bundle : dict or None
+        Output of ``train_pitcher_readiness_model()``. If None, trains fresh.
+    seasons : list[int] or None
+        Only include prospects with MiLB data in these seasons.
+        Default: [projection_season - 2, projection_season - 1].
+    projection_season : int
+        Target projection year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Prospect features + ``readiness_score`` column (0-1 probability),
+        sorted by score descending.
+    """
+    if milb_df is None:
+        milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_pitchers.parquet")
+
+    if model_bundle is None:
+        model_bundle = train_pitcher_readiness_model(milb_df)
+
+    if model_bundle["model"] is None:
+        logger.warning("No pitcher readiness model available")
+        return pd.DataFrame()
+
+    if seasons is None:
+        seasons = [projection_season - 2, projection_season - 1]
+
+    mlb_first = _get_mlb_pitcher_first_seasons()
+
+    # Build features for current prospects
+    recent_milb = milb_df[milb_df["season"].isin(seasons)].copy()
+    from src.models.prospect_ranking import _build_pitcher_prospect_features
+    features_df = _build_pitcher_prospect_features(recent_milb)
+
+    if features_df.empty:
+        logger.warning("No pitcher prospects found for seasons %s", seasons)
+        return pd.DataFrame()
+
+    # Exclude players already in MLB
+    mlb_ids = set(mlb_first.keys())
+    features_df = features_df[~features_df["player_id"].isin(mlb_ids)].copy()
+
+    if features_df.empty:
+        return pd.DataFrame()
+
+    # Score
+    X = features_df[model_bundle["features"]].fillna(0).values
+    X_s = model_bundle["scaler"].transform(X)
+    features_df["readiness_score"] = model_bundle["model"].predict_proba(X_s)[:, 1]
+
+    # Add tier labels
+    features_df["readiness_tier"] = pd.cut(
+        features_df["readiness_score"],
+        bins=[0, 0.05, 0.10, 0.20, 0.40, 1.0],
+        labels=["Long Shot", "Fringe", "Developing", "Strong", "Elite"],
+    )
+
+    result = features_df.sort_values("readiness_score", ascending=False)
+    logger.info(
+        "Scored %d pitcher prospects: %d Elite, %d Strong, %d Developing",
         len(result),
         (result["readiness_tier"] == "Elite").sum(),
         (result["readiness_tier"] == "Strong").sum(),

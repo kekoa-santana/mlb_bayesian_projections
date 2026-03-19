@@ -43,6 +43,17 @@ def _make_synthetic_data(
                 age_bucket = 1
             else:
                 age_bucket = 2
+            # Batted ball decomposition columns
+            bip_with_la = int(pa * 0.65) + rng.integers(-10, 10)
+            bip_with_la = max(bip_with_la, 1)
+            gb = rng.binomial(bip_with_la, 0.43)
+            fb = rng.binomial(bip_with_la, 0.35)
+            fb = max(fb, 1)
+            hr_fb = min(hr, fb)  # HR on fly balls, capped at total fb
+            # Chase / approach columns
+            out_of_zone_pitches = int(pa * 1.5) + rng.integers(-20, 20)
+            out_of_zone_pitches = max(out_of_zone_pitches, 10)
+            chase_swings = rng.binomial(out_of_zone_pitches, 0.29)
             records.append({
                 "batter_id": 100000 + p,
                 "batter_name": f"Player, Test{p}",
@@ -55,12 +66,25 @@ def _make_synthetic_data(
                 "bb": bb,
                 "hits": int(pa * 0.25),
                 "hr": hr,
-                "xwoba_avg": float(np.clip(true_xwoba + rng.normal(0, 0.02), 0.1, 0.5)),
                 "barrel_pct": float(rng.beta(2, 30)),
                 "hard_hit_pct": float(rng.beta(8, 16)),
                 "k_rate": round(k / pa, 4),
                 "bb_rate": round(bb / pa, 4),
                 "hr_rate": round(hr / pa, 4),
+                # Batted ball decomposition
+                "bip_with_la": bip_with_la,
+                "gb": gb,
+                "fb": fb,
+                "hr_fb": hr_fb,
+                "gb_rate": round(gb / bip_with_la, 4),
+                "fb_rate": round(fb / bip_with_la, 4),
+                "hr_per_fb": round(hr_fb / fb, 4),
+                # wOBA (normal likelihood)
+                "woba": round(float(rng.normal(0.315, 0.035)), 3),
+                # Chase rate (binomial)
+                "out_of_zone_pitches": out_of_zone_pitches,
+                "chase_swings": chase_swings,
+                "chase_rate": round(chase_swings / out_of_zone_pitches, 4),
             })
     return pd.DataFrame(records)
 
@@ -78,12 +102,11 @@ class TestPrepareData:
         assert len(data["player_age_bucket"]) == 10
         assert all(b in (0, 1, 2) for b in data["player_age_bucket"])
 
-    def test_prepare_normal_stat(self):
+    def test_prepare_gb_rate(self):
         df = _make_synthetic_data(n_players=10, n_seasons=2)
-        data = prepare_hitter_data(df, "xwoba")
-        assert "y_obs" in data
-        assert "pa_weight" in data
-        assert data["stat"] == "xwoba"
+        data = prepare_hitter_data(df, "gb_rate")
+        assert data["stat"] == "gb_rate"
+        assert data["n_players"] == 10
 
     def test_prepare_all_stats(self):
         df = _make_synthetic_data(n_players=10, n_seasons=2)
@@ -104,14 +127,8 @@ class TestBuildModel:
         assert "sigma_player" in model.named_vars
         assert "sigma_season" in model.named_vars
         assert "rate" in model.named_vars
-        # mu_pop should have shape (3,) for age buckets
-        assert model.named_vars["mu_pop"].eval().shape == (3,)
-
-    def test_build_normal(self):
-        df = _make_synthetic_data(n_players=10, n_seasons=2)
-        data = prepare_hitter_data(df, "xwoba")
-        model = build_hitter_model(data)
-        assert "sigma_obs" in model.named_vars
+        # mu_pop has shape (N_AGE_BUCKETS, N_SKILL_TIERS) = (3, 4)
+        assert model.named_vars["mu_pop"].eval().shape == (3, 4)
 
 
 class TestFitAndExtract:
@@ -136,9 +153,9 @@ class TestFitAndExtract:
         return data, trace
 
     @pytest.fixture(scope="class")
-    def fitted_xwoba(self):
+    def fitted_gb_rate(self):
         df = _make_synthetic_data(n_players=15, n_seasons=2)
-        data = prepare_hitter_data(df, "xwoba")
+        data = prepare_hitter_data(df, "gb_rate")
         model, trace = fit_hitter_model(
             data, draws=200, tune=100, chains=2, random_seed=42,
         )
@@ -159,12 +176,11 @@ class TestFitAndExtract:
         assert "bb_rate_mean" in posteriors.columns
         assert posteriors["bb_rate_mean"].between(0, 1).all()
 
-    def test_xwoba_posteriors(self, fitted_xwoba):
-        data, trace = fitted_xwoba
+    def test_gb_rate_posteriors(self, fitted_gb_rate):
+        data, trace = fitted_gb_rate
         posteriors = extract_posteriors(trace, data)
-        assert "xwoba_mean" in posteriors.columns
-        # xwOBA should be roughly in (0.1, 0.6)
-        assert posteriors["xwoba_mean"].between(0.05, 0.7).all()
+        assert "gb_rate_mean" in posteriors.columns
+        assert posteriors["gb_rate_mean"].between(0, 1).all()
 
     def test_extract_samples(self, fitted_k_rate):
         data, trace = fitted_k_rate
@@ -194,7 +210,8 @@ class TestFitAndExtract:
         assert "min_ess_bulk" in result
 
     def test_age_bucket_mu_pop(self, fitted_k_rate):
-        """mu_pop should have 3 age-bucket values."""
+        """mu_pop should have shape (N_AGE_BUCKETS, N_SKILL_TIERS) = (3, 4)."""
         _, trace = fitted_k_rate
         mu_pop = trace.posterior["mu_pop"].values
-        assert mu_pop.shape[-1] == 3
+        # shape: (chains, draws, 3, 4)
+        assert mu_pop.shape[-2:] == (3, 4)
