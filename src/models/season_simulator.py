@@ -688,3 +688,338 @@ def season_results_to_dataframe(
     df = pd.DataFrame(rows)
     logger.info("Converted %d pitcher season results to DataFrame", len(df))
     return df
+
+
+# ===================================================================
+# Hitter Season Simulation
+# ===================================================================
+
+@dataclass
+class HitterSeasonSimResult:
+    """Results from a hitter season-level simulation.
+
+    All arrays have shape (n_seasons,).
+    """
+
+    batter_id: int
+    k_season: np.ndarray
+    bb_season: np.ndarray
+    h_season: np.ndarray
+    hr_season: np.ndarray
+    single_season: np.ndarray
+    double_season: np.ndarray
+    triple_season: np.ndarray
+    tb_season: np.ndarray
+    r_season: np.ndarray
+    rbi_season: np.ndarray
+    hbp_season: np.ndarray
+    sb_season: np.ndarray
+    pa_season: np.ndarray
+    games_season: np.ndarray
+    dk_season: np.ndarray
+    espn_season: np.ndarray
+    n_seasons: int = 0
+
+    def avg_season(self) -> np.ndarray:
+        """Batting average = H / AB (AB ~ PA - BB - HBP)."""
+        ab = (self.pa_season - self.bb_season - self.hbp_season).clip(1)
+        return self.h_season.astype(float) / ab
+
+    def obp_season(self) -> np.ndarray:
+        """On-base percentage."""
+        return (self.h_season + self.bb_season + self.hbp_season).astype(float) / self.pa_season.clip(1)
+
+    def slg_season(self) -> np.ndarray:
+        """Slugging percentage."""
+        ab = (self.pa_season - self.bb_season - self.hbp_season).clip(1)
+        return self.tb_season.astype(float) / ab
+
+    def summary(self) -> dict[str, dict[str, float]]:
+        """Summary statistics for all stats."""
+        stats = {}
+        for name, arr in [
+            ("k", self.k_season), ("bb", self.bb_season),
+            ("h", self.h_season), ("hr", self.hr_season),
+            ("single", self.single_season), ("double", self.double_season),
+            ("triple", self.triple_season), ("tb", self.tb_season),
+            ("r", self.r_season), ("rbi", self.rbi_season),
+            ("hbp", self.hbp_season), ("sb", self.sb_season),
+            ("pa", self.pa_season), ("games", self.games_season),
+            ("dk", self.dk_season), ("espn", self.espn_season),
+        ]:
+            stats[name] = _stat_summary(arr)
+
+        # Derived rates
+        avg = self.avg_season()
+        stats["avg"] = _stat_summary(np.clip(avg, 0, 1))
+        obp = self.obp_season()
+        stats["obp"] = _stat_summary(np.clip(obp, 0, 1))
+        slg = self.slg_season()
+        stats["slg"] = _stat_summary(np.clip(slg, 0, 4))
+        stats["ops"] = _stat_summary(np.clip(obp + slg, 0, 5))
+
+        return stats
+
+
+def simulate_hitter_season(
+    batter_id: int,
+    k_rate_samples: np.ndarray,
+    bb_rate_samples: np.ndarray,
+    hr_rate_samples: np.ndarray,
+    n_games_mu: float = 145.0,
+    n_games_sigma: float = 26.0,
+    batting_order: int = 5,
+    babip_adj: float = 0.0,
+    sb_rate: float = 0.0,
+    sb_rate_sd: float = 0.0,
+    n_seasons: int = 200,
+    random_seed: int = 42,
+) -> HitterSeasonSimResult:
+    """Simulate full seasons for a hitter using the batter game simulator.
+
+    Batches all games across all seasons into a single
+    ``simulate_batter_game()`` call, then slices back into seasons.
+
+    Parameters
+    ----------
+    batter_id : int
+        Batter MLB ID.
+    k_rate_samples, bb_rate_samples, hr_rate_samples : np.ndarray
+        Layer 1 posterior rate samples.
+    n_games_mu, n_games_sigma : float
+        Projected games (mean, std) from PA model.
+    batting_order : int
+        Typical lineup slot (1-9).
+    babip_adj : float
+        Batter BABIP adjustment.
+    sb_rate, sb_rate_sd : float
+        Stolen bases per game (mean, std).
+    n_seasons : int
+        Number of season simulations.
+    random_seed : int
+
+    Returns
+    -------
+    HitterSeasonSimResult
+    """
+    from src.models.game_sim.batter_simulator import simulate_batter_game
+    from src.models.game_sim.fantasy_scoring import compute_season_batter_fantasy
+
+    rng = np.random.default_rng(random_seed)
+
+    # Draw games per season
+    games_per_season = rng.normal(n_games_mu, n_games_sigma, size=n_seasons)
+    games_per_season = np.clip(np.round(games_per_season), 20, 162).astype(int)
+    total_sims = int(games_per_season.sum())
+
+    # Run all games in one batch (league-average opponent, no matchup lifts)
+    result = simulate_batter_game(
+        batter_k_rate_samples=k_rate_samples,
+        batter_bb_rate_samples=bb_rate_samples,
+        batter_hr_rate_samples=hr_rate_samples,
+        batting_order=batting_order,
+        starter_k_rate=0.226,   # league average
+        starter_bb_rate=0.082,
+        starter_hr_rate=0.031,
+        starter_bf_mu=22.0,
+        starter_bf_sigma=4.5,
+        bullpen_k_rate=0.253,
+        bullpen_bb_rate=0.084,
+        bullpen_hr_rate=0.024,
+        batter_babip_adj=babip_adj,
+        n_sims=total_sims,
+        random_seed=random_seed,
+    )
+
+    # Slice back into seasons and sum
+    k_out = np.zeros(n_seasons, dtype=np.int32)
+    bb_out = np.zeros(n_seasons, dtype=np.int32)
+    h_out = np.zeros(n_seasons, dtype=np.int32)
+    hr_out = np.zeros(n_seasons, dtype=np.int32)
+    single_out = np.zeros(n_seasons, dtype=np.int32)
+    double_out = np.zeros(n_seasons, dtype=np.int32)
+    triple_out = np.zeros(n_seasons, dtype=np.int32)
+    tb_out = np.zeros(n_seasons, dtype=np.int32)
+    r_out = np.zeros(n_seasons, dtype=np.int32)
+    rbi_out = np.zeros(n_seasons, dtype=np.int32)
+    hbp_out = np.zeros(n_seasons, dtype=np.int32)
+    pa_out = np.zeros(n_seasons, dtype=np.int32)
+
+    idx = 0
+    for s in range(n_seasons):
+        n = games_per_season[s]
+        end = idx + n
+        k_out[s] = result.k_samples[idx:end].sum()
+        bb_out[s] = result.bb_samples[idx:end].sum()
+        h_out[s] = result.h_samples[idx:end].sum()
+        hr_out[s] = result.hr_samples[idx:end].sum()
+        single_out[s] = result.single_samples[idx:end].sum()
+        double_out[s] = result.double_samples[idx:end].sum()
+        triple_out[s] = result.triple_samples[idx:end].sum()
+        tb_out[s] = result.tb_samples[idx:end].sum()
+        r_out[s] = result.r_samples[idx:end].sum()
+        rbi_out[s] = result.rbi_samples[idx:end].sum()
+        hbp_out[s] = result.hbp_samples[idx:end].sum()
+        pa_out[s] = result.pa_samples[idx:end].sum()
+        idx = end
+
+    # SB: rate x games (not in game sim)
+    sb_draws = rng.normal(sb_rate, max(sb_rate_sd, sb_rate * 0.15 + 0.01), size=n_seasons)
+    sb_out = np.clip(np.round(sb_draws * games_per_season), 0, 100).astype(np.int32)
+
+    # Fantasy scoring
+    fantasy = compute_season_batter_fantasy(
+        k=k_out, bb=bb_out, single=single_out, double=double_out,
+        triple=triple_out, hr=hr_out, rbi=rbi_out, r=r_out,
+        hbp=hbp_out, sb=sb_out,
+    )
+
+    return HitterSeasonSimResult(
+        batter_id=batter_id,
+        k_season=k_out, bb_season=bb_out,
+        h_season=h_out, hr_season=hr_out,
+        single_season=single_out, double_season=double_out,
+        triple_season=triple_out, tb_season=tb_out,
+        r_season=r_out, rbi_season=rbi_out,
+        hbp_season=hbp_out, sb_season=sb_out,
+        pa_season=pa_out, games_season=games_per_season,
+        dk_season=fantasy.dk_points, espn_season=fantasy.espn_points,
+        n_seasons=n_seasons,
+    )
+
+
+def simulate_all_hitters(
+    posteriors: dict[int, dict[str, np.ndarray]],
+    pa_priors: pd.DataFrame,
+    batting_orders: dict[int, int] | None = None,
+    babip_adjs: dict[int, float] | None = None,
+    sb_rates: dict[int, tuple[float, float]] | None = None,
+    health_scores: pd.DataFrame | None = None,
+    n_seasons: int = 200,
+    random_seed: int = 42,
+) -> dict[int, HitterSeasonSimResult]:
+    """Run season simulations for all hitters.
+
+    Parameters
+    ----------
+    posteriors : dict[int, dict[str, np.ndarray]]
+        Keyed by batter_id. Values have 'k_rate', 'bb_rate', 'hr_rate'.
+    pa_priors : pd.DataFrame
+        From ``pa_model.compute_hitter_pa_priors()``.
+        Columns: batter_id, projected_games, sigma_games.
+    batting_orders : dict[int, int], optional
+        batter_id -> typical lineup slot (1-9).
+    babip_adjs : dict[int, float], optional
+        batter_id -> BABIP adjustment.
+    sb_rates : dict[int, tuple[float, float]], optional
+        batter_id -> (sb_per_game_mean, sb_per_game_sd).
+    health_scores : pd.DataFrame, optional
+        Health scores for games/sigma adjustment.
+    n_seasons : int
+    random_seed : int
+
+    Returns
+    -------
+    dict[int, HitterSeasonSimResult]
+    """
+    rng_base = np.random.default_rng(random_seed)
+
+    # Build PA priors lookup
+    pa_lookup: dict[int, tuple[float, float]] = {}
+    if pa_priors is not None and not pa_priors.empty:
+        for _, row in pa_priors.iterrows():
+            pa_lookup[int(row["batter_id"])] = (
+                float(row.get("projected_games", 145)),
+                float(row.get("sigma_games", 26)),
+            )
+
+    # Health lookup
+    health_lookup: dict[int, float] = {}
+    if health_scores is not None and not health_scores.empty:
+        for _, row in health_scores.iterrows():
+            health_lookup[int(row["player_id"])] = float(row["health_score"])
+
+    results: dict[int, HitterSeasonSimResult] = {}
+
+    for bid, post in posteriors.items():
+        seed = int(rng_base.integers(0, 2**31))
+
+        # Games prior
+        games_mu, games_sigma = pa_lookup.get(bid, (145.0, 26.0))
+
+        # Health adjustment
+        h = health_lookup.get(bid, 0.85)
+        games_mu *= 0.75 + 0.27 * h
+        games_sigma *= 1.50 - 0.65 * h
+
+        # Batting order
+        order = (batting_orders or {}).get(bid, 5)
+
+        # BABIP
+        babip = (babip_adjs or {}).get(bid, 0.0)
+
+        # SB
+        sb_mean, sb_sd = (sb_rates or {}).get(bid, (0.0, 0.0))
+
+        results[bid] = simulate_hitter_season(
+            batter_id=bid,
+            k_rate_samples=post["k_rate"],
+            bb_rate_samples=post["bb_rate"],
+            hr_rate_samples=post["hr_rate"],
+            n_games_mu=games_mu,
+            n_games_sigma=games_sigma,
+            batting_order=order,
+            babip_adj=babip,
+            sb_rate=sb_mean,
+            sb_rate_sd=sb_sd,
+            n_seasons=n_seasons,
+            random_seed=seed,
+        )
+
+    logger.info("Simulated %d hitters x %d seasons", len(results), n_seasons)
+    return results
+
+
+def hitter_season_results_to_dataframe(
+    results: dict[int, HitterSeasonSimResult],
+    batter_names: dict[int, str] | None = None,
+) -> pd.DataFrame:
+    """Convert hitter simulation results to a summary DataFrame."""
+    rows = []
+    for bid, sim in results.items():
+        row: dict[str, Any] = {
+            "batter_id": bid,
+            "batter_name": (batter_names or {}).get(bid, ""),
+            "n_seasons": sim.n_seasons,
+        }
+
+        for stat_name, arr in [
+            ("total_k", sim.k_season), ("total_bb", sim.bb_season),
+            ("total_h", sim.h_season), ("total_hr", sim.hr_season),
+            ("total_1b", sim.single_season), ("total_2b", sim.double_season),
+            ("total_3b", sim.triple_season), ("total_tb", sim.tb_season),
+            ("total_r", sim.r_season), ("total_rbi", sim.rbi_season),
+            ("total_hbp", sim.hbp_season), ("total_sb", sim.sb_season),
+            ("total_pa", sim.pa_season), ("total_games", sim.games_season),
+            ("dk_season", sim.dk_season), ("espn_season", sim.espn_season),
+        ]:
+            summary = _stat_summary(arr)
+            for k, v in summary.items():
+                row[f"{stat_name}_{k}"] = v
+
+        # Derived rate distributions
+        for stat_name, arr in [
+            ("projected_avg", sim.avg_season()),
+            ("projected_obp", sim.obp_season()),
+            ("projected_slg", sim.slg_season()),
+            ("projected_ops", sim.obp_season() + sim.slg_season()),
+        ]:
+            summary = _stat_summary(np.clip(arr, 0, 5))
+            for k, v in summary.items():
+                row[f"{stat_name}_{k}"] = v
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    logger.info("Converted %d hitter season results to DataFrame", len(df))
+    return df

@@ -275,3 +275,61 @@ def compute_season_pitcher_fantasy(
         espn_points=espn,
         n_sims=len(k),
     )
+
+
+def compute_season_batter_fantasy(
+    k: np.ndarray,
+    bb: np.ndarray,
+    single: np.ndarray,
+    double: np.ndarray,
+    triple: np.ndarray,
+    hr: np.ndarray,
+    rbi: np.ndarray,
+    r: np.ndarray,
+    hbp: np.ndarray,
+    sb: np.ndarray,
+) -> FantasyResult:
+    """Compute season-level batter fantasy points from counting stat arrays.
+
+    All arrays shape (n_seasons,).
+
+    Parameters
+    ----------
+    k, bb, single, double, triple, hr, rbi, r, hbp, sb : np.ndarray
+        Season counting stat totals.
+
+    Returns
+    -------
+    FantasyResult
+        Season-level DK and ESPN point distributions.
+    """
+    dk = (
+        DK_BAT_SINGLE * single
+        + DK_BAT_DOUBLE * double
+        + DK_BAT_TRIPLE * triple
+        + DK_BAT_HR * hr
+        + DK_BAT_RBI * rbi
+        + DK_BAT_R * r
+        + DK_BAT_BB * bb
+        + DK_BAT_HBP * hbp
+        + DK_BAT_SB * sb
+    ).astype(float)
+
+    espn = (
+        ESPN_BAT_SINGLE * single
+        + ESPN_BAT_DOUBLE * double
+        + ESPN_BAT_TRIPLE * triple
+        + ESPN_BAT_HR * hr
+        + ESPN_BAT_RBI * rbi
+        + ESPN_BAT_R * r
+        + ESPN_BAT_BB * bb
+        + ESPN_BAT_HBP * hbp
+        + ESPN_BAT_SB * sb
+        + ESPN_BAT_K * k
+    ).astype(float)
+
+    return FantasyResult(
+        dk_points=dk,
+        espn_points=espn,
+        n_sims=len(k),
+    )

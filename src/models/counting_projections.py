@@ -604,6 +604,66 @@ def project_pitcher_counting_sim(
     return df
 
 
+def project_hitter_counting_sim(
+    posteriors: dict[int, dict[str, np.ndarray]],
+    pa_priors: pd.DataFrame,
+    batting_orders: dict[int, int] | None = None,
+    babip_adjs: dict[int, float] | None = None,
+    sb_rates: dict[int, tuple[float, float]] | None = None,
+    health_scores: pd.DataFrame | None = None,
+    batter_names: dict[int, str] | None = None,
+    n_seasons: int = 200,
+    random_seed: int = 42,
+) -> pd.DataFrame:
+    """Sim-based hitter counting stat projections.
+
+    Uses the batter game simulator to produce correlated joint
+    distributions over K, BB, H, HR, 1B, 2B, 3B, TB, R, RBI, SB
+    plus DK/ESPN fantasy scoring.
+
+    Parameters
+    ----------
+    posteriors : dict[int, dict[str, np.ndarray]]
+        Keyed by batter_id. Values have 'k_rate', 'bb_rate', 'hr_rate'.
+    pa_priors : pd.DataFrame
+        From ``pa_model.compute_hitter_pa_priors()``.
+    batting_orders : dict[int, int], optional
+        batter_id -> typical lineup slot (1-9).
+    babip_adjs : dict[int, float], optional
+    sb_rates : dict[int, tuple[float, float]], optional
+        batter_id -> (sb_per_game_mean, sb_per_game_sd).
+    health_scores : pd.DataFrame, optional
+    batter_names : dict[int, str], optional
+    n_seasons : int
+    random_seed : int
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per hitter with counting stat summaries, hit breakdown,
+        R, RBI, SB, AVG, OBP, SLG, OPS, DK, ESPN.
+    """
+    from src.models.season_simulator import (
+        simulate_all_hitters,
+        hitter_season_results_to_dataframe,
+    )
+
+    results = simulate_all_hitters(
+        posteriors=posteriors,
+        pa_priors=pa_priors,
+        batting_orders=batting_orders,
+        babip_adjs=babip_adjs,
+        sb_rates=sb_rates,
+        health_scores=health_scores,
+        n_seasons=n_seasons,
+        random_seed=random_seed,
+    )
+
+    df = hitter_season_results_to_dataframe(results, batter_names=batter_names)
+    logger.info("Sim-based hitter projections: %d hitters", len(df))
+    return df
+
+
 def marcel_counting_hitter(
     hitter_extended: pd.DataFrame,
     from_season: int,
