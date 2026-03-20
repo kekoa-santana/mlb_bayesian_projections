@@ -39,6 +39,8 @@ from src.data.feature_eng import (
     get_pitcher_arsenal,
 )
 from src.data.queries import (
+    get_batter_pitch_count_features,
+    get_exit_model_training_data,
     get_game_batter_ks,
     get_game_lineups,
     get_hitter_aggressiveness,
@@ -46,9 +48,13 @@ from src.data.queries import (
     get_park_factors,
     get_hitter_team_venue,
     get_pitcher_efficiency,
+    get_pitcher_exit_tendencies,
     get_pitcher_game_logs,
+    get_pitcher_pitch_count_features,
     get_pitcher_traditional_stats,
     get_player_teams,
+    get_team_bullpen_rates,
+    get_tto_adjustment_profiles,
     get_umpire_k_tendencies,
     get_weather_effects,
 )
@@ -59,6 +65,8 @@ from src.models.counting_projections import (
     project_pitcher_counting,
 )
 from src.models.game_k_model import extract_pitcher_k_rate_samples
+from src.models.game_sim.exit_model import ExitModel
+from src.models.hitter_model import extract_rate_samples as extract_hitter_rate_samples
 from src.models.pitcher_model import extract_rate_samples
 from src.models.hitter_projections import (
     fit_all_models as fit_hitter_models,
@@ -1168,6 +1176,120 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("Processing backtest summaries...")
     precompute_backtest_summaries()
+
+    # =================================================================
+    # 9. Game Simulator Data (Layer 3 v2)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Generating game simulator data...")
+
+    # 9a. Hitter K% and BB% posterior samples
+    for stat_name, npz_name in [("k_rate", "hitter_k_samples"), ("bb_rate", "hitter_bb_samples")]:
+        if stat_name not in hitter_results:
+            logger.warning("No %s model in hitter_results — skipping %s", stat_name, npz_name)
+            continue
+        stat_data = hitter_results[stat_name]["data"]
+        stat_trace = hitter_results[stat_name]["trace"]
+        stat_df = stat_data["df"]
+        stat_active = stat_df[
+            (stat_df["season"] == FROM_SEASON) & (stat_df["pa"] >= 50)
+        ]["batter_id"].unique()
+
+        h_samples_dict: dict[str, np.ndarray] = {}
+        for bid in stat_active:
+            try:
+                samples = extract_hitter_rate_samples(
+                    stat_trace, stat_data,
+                    batter_id=int(bid),
+                    season=FROM_SEASON,
+                    project_forward=True,
+                )
+                h_samples_dict[str(int(bid))] = samples
+            except ValueError:
+                continue
+
+        np.savez_compressed(DASHBOARD_DIR / f"{npz_name}.npz", **h_samples_dict)
+        logger.info("Saved hitter %s posterior samples for %d batters", stat_name, len(h_samples_dict))
+
+        np.savez_compressed(snapshot_dir / f"{npz_name}_preseason.npz", **h_samples_dict)
+        logger.info("Saved preseason hitter %s samples snapshot", stat_name)
+
+    # 9b. Hitter HR synthetic Beta samples (no Bayesian model — use Beta posterior)
+    logger.info("Generating synthetic hitter HR samples...")
+    hr_season = hitter_ext[hitter_ext["season"] == FROM_SEASON].copy()
+    hr_samples_dict: dict[str, np.ndarray] = {}
+    rng_hr = np.random.default_rng(42)
+    for _, row in hr_season.iterrows():
+        bid = int(row["batter_id"])
+        pa = int(row.get("pa", row.get("plate_appearances", 0)))
+        hr = int(row.get("hr", row.get("home_runs", 0)))
+        if pa < 50:
+            continue
+        # Beta(hr + 1, pa - hr + 1) posterior
+        hr_rate_samples = rng_hr.beta(hr + 1, pa - hr + 1, size=10_000)
+        hr_samples_dict[str(bid)] = hr_rate_samples.astype(np.float32)
+    np.savez_compressed(DASHBOARD_DIR / "hitter_hr_samples.npz", **hr_samples_dict)
+    logger.info("Saved hitter HR Beta posterior samples for %d batters", len(hr_samples_dict))
+
+    # 9c. Train + save exit model
+    logger.info("Training pitcher exit model...")
+    try:
+        exit_training = get_exit_model_training_data(SEASONS)
+        exit_tendencies = get_pitcher_exit_tendencies(SEASONS)
+        exit_model = ExitModel()
+        exit_metrics = exit_model.train(exit_training, exit_tendencies)
+        logger.info(
+            "Exit model: AUC=%.4f, n=%d",
+            exit_metrics["auc"], exit_metrics["n_samples"],
+        )
+        exit_model.save(DASHBOARD_DIR / "exit_model.pkl")
+        exit_tendencies.to_parquet(
+            DASHBOARD_DIR / "pitcher_exit_tendencies.parquet", index=False,
+        )
+        logger.info("Saved exit model + tendencies")
+    except Exception:
+        logger.exception("Failed to train exit model")
+
+    # 9d. Pitch count features
+    logger.info("Computing pitch count features...")
+    try:
+        pitcher_pc = get_pitcher_pitch_count_features(SEASONS)
+        pitcher_pc.to_parquet(
+            DASHBOARD_DIR / "pitcher_pitch_count_features.parquet", index=False,
+        )
+        logger.info("Saved pitcher pitch count features: %d rows", len(pitcher_pc))
+
+        batter_pc = get_batter_pitch_count_features(SEASONS)
+        batter_pc.to_parquet(
+            DASHBOARD_DIR / "batter_pitch_count_features.parquet", index=False,
+        )
+        logger.info("Saved batter pitch count features: %d rows", len(batter_pc))
+    except Exception:
+        logger.exception("Failed to compute pitch count features")
+
+    # 9e. TTO profiles
+    logger.info("Computing TTO adjustment profiles...")
+    try:
+        tto_profiles = get_tto_adjustment_profiles(SEASONS)
+        tto_profiles.to_parquet(
+            DASHBOARD_DIR / "tto_profiles.parquet", index=False,
+        )
+        logger.info("Saved TTO profiles: %d rows", len(tto_profiles))
+    except Exception:
+        logger.exception("Failed to compute TTO profiles")
+
+    # 9f. Team bullpen rates
+    logger.info("Computing team bullpen rates...")
+    try:
+        bullpen_rates = get_team_bullpen_rates(SEASONS)
+        bullpen_rates.to_parquet(
+            DASHBOARD_DIR / "team_bullpen_rates.parquet", index=False,
+        )
+        logger.info("Saved team bullpen rates: %d rows", len(bullpen_rates))
+    except Exception:
+        logger.exception("Failed to compute team bullpen rates")
+
+    logger.info("Game simulator data complete.")
 
     # =================================================================
     # Summary
