@@ -994,21 +994,38 @@ def _build_pitcher_command_score(
 
 
 def _build_pitcher_workload_score() -> pd.DataFrame:
-    """Score projected workload from counting projections + health.
+    """Score projected workload from sim-based counting projections + health.
 
-    Blends 70% projected BF percentile with 30% health score percentile
-    when health scores are available.
+    Prefers ``pitcher_counting_sim.parquet`` (sim-based IP/games) over
+    the old ``pitcher_counting.parquet`` (rate x BF). Falls back to old
+    file if sim parquet doesn't exist.
 
     Returns
     -------
     pd.DataFrame
-        Columns: pitcher_id, workload_score, health_score, health_label.
+        Columns: pitcher_id, workload_score, health_score, health_label,
+        plus sim projection columns for display.
     """
-    counting = pd.read_parquet(DASHBOARD_DIR / "pitcher_counting.parquet")
-    bf_pctl = _pctl(counting["projected_bf_mean"])
+    # Prefer sim-based projections (IP, games, ERA, fantasy)
+    sim_path = DASHBOARD_DIR / "pitcher_counting_sim.parquet"
+    old_path = DASHBOARD_DIR / "pitcher_counting.parquet"
 
-    # Health scores: prefer columns already on counting parquet,
-    # fall back to standalone health_scores.parquet
+    if sim_path.exists():
+        counting = pd.read_parquet(sim_path)
+        # Sim has projected_ip_mean and total_games_mean
+        ip_pctl = _pctl(counting["projected_ip_mean"].fillna(0))
+        games_pctl = _pctl(counting["total_games_mean"].fillna(0))
+        base_workload = 0.60 * ip_pctl + 0.40 * games_pctl
+        logger.info("Workload score from sim parquet: %d pitchers", len(counting))
+    elif old_path.exists():
+        counting = pd.read_parquet(old_path)
+        base_workload = _pctl(counting["projected_bf_mean"])
+        logger.info("Workload score from old counting parquet (sim not found)")
+    else:
+        logger.warning("No counting parquet found for workload score")
+        return pd.DataFrame(columns=["pitcher_id", "workload_score"])
+
+    # Health scores
     has_health = "health_score" in counting.columns and counting["health_score"].notna().any()
     if not has_health:
         health_path = DASHBOARD_DIR / "health_scores.parquet"
@@ -1027,9 +1044,9 @@ def _build_pitcher_workload_score() -> pd.DataFrame:
         counting["health_score"] = counting["health_score"].fillna(0.85)
         counting["health_label"] = counting["health_label"].fillna("Unknown")
         health_pctl = _pctl(counting["health_score"])
-        counting["workload_score"] = 0.70 * bf_pctl + 0.30 * health_pctl
+        counting["workload_score"] = 0.70 * base_workload + 0.30 * health_pctl
     else:
-        counting["workload_score"] = bf_pctl
+        counting["workload_score"] = base_workload
         counting["health_score"] = np.nan
         counting["health_label"] = ""
 
@@ -1220,8 +1237,28 @@ def rank_pitchers(
         WHERE season = {season} AND batters_faced >= {min_bf}
     """, {})
 
-    # Role assignment
-    roles = _assign_pitcher_roles()
+    # Role assignment — prefer sim-derived CL/SU/MR roles, fall back to SP/RP
+    roles_path = DASHBOARD_DIR / "pitcher_roles.parquet"
+    if roles_path.exists():
+        rp_roles = pd.read_parquet(roles_path)
+        # Map CL/SU/MR -> RP for composite weights, keep detail for display
+        roles = rp_roles[["pitcher_id", "role"]].copy()
+        roles["role_detail"] = roles["role"]
+        roles["role"] = roles["role"].map(
+            {"CL": "RP", "SU": "RP", "MR": "RP"}
+        ).fillna(roles["role"])
+        # Add SP pitchers not in reliever roles
+        sp_roles = _assign_pitcher_roles()
+        sp_only = sp_roles[
+            (sp_roles["role"] == "SP")
+            & (~sp_roles["pitcher_id"].isin(roles["pitcher_id"]))
+        ].copy()
+        sp_only["role_detail"] = "SP"
+        roles = pd.concat([roles, sp_only], ignore_index=True)
+        logger.info("Roles from sim: %s", roles["role_detail"].value_counts().to_dict())
+    else:
+        roles = _assign_pitcher_roles()
+        roles["role_detail"] = roles["role"]
 
     # Load run values and efficiency for enhanced scoring
     from src.data.queries import get_pitcher_run_values, get_pitcher_efficiency
@@ -1272,6 +1309,21 @@ def rank_pitchers(
     base.loc[missing_role, "role"] = np.where(
         base.loc[missing_role, "is_starter"] == 1, "SP", "RP"
     )
+    if "role_detail" not in base.columns:
+        base["role_detail"] = base["role"]
+    base["role_detail"] = base["role_detail"].fillna(base["role"])
+
+    # Merge sim-based counting projections for display
+    sim_path = DASHBOARD_DIR / "pitcher_counting_sim.parquet"
+    if sim_path.exists():
+        sim_df = pd.read_parquet(sim_path)
+        sim_cols = ["pitcher_id", "total_k_mean", "total_bb_mean", "total_sv_mean",
+                     "total_hld_mean", "projected_ip_mean", "projected_era_mean",
+                     "projected_fip_era_mean", "projected_whip_mean",
+                     "dk_season_mean", "espn_season_mean", "total_games_mean"]
+        sim_cols = [c for c in sim_cols if c in sim_df.columns]
+        base = base.merge(sim_df[sim_cols], on="pitcher_id", how="left")
+        logger.info("Merged sim projections for %d pitchers", base["total_k_mean"].notna().sum())
 
     # Merge sub-scores
     base = base.merge(stuff, on="pitcher_id", how="left")
@@ -1358,7 +1410,7 @@ def rank_pitchers(
     # Select output
     output_cols = [
         "role_rank", "overall_rank", "pitcher_id", "pitcher_name", "role",
-        "age", "pitch_hand",
+        "role_detail", "age", "pitch_hand",
         # Composite
         "tdd_value_score",
         # Sub-scores
@@ -1381,6 +1433,11 @@ def rank_pitchers(
         "breakout_type", "breakout_score", "breakout_tier",
         "breakout_hole", "gmm_fit",
         "prob_stuff_dominant", "prob_command_leap", "prob_era_correction",
+        # Sim-based season projections
+        "total_k_mean", "total_bb_mean", "total_sv_mean", "total_hld_mean",
+        "projected_ip_mean", "projected_era_mean", "projected_fip_era_mean",
+        "projected_whip_mean", "dk_season_mean", "espn_season_mean",
+        "total_games_mean",
     ]
     available = [c for c in output_cols if c in base.columns]
     result = base[available].sort_values(["role", "role_rank"])
