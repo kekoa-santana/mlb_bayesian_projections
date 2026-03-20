@@ -52,6 +52,7 @@ from src.data.queries import (
     get_pitcher_game_logs,
     get_pitcher_pitch_count_features,
     get_pitcher_traditional_stats,
+    get_lineup_priors,
     get_player_teams,
     get_team_bullpen_rates,
     get_tto_adjustment_profiles,
@@ -63,6 +64,7 @@ from src.models.health_score import compute_health_scores
 from src.models.counting_projections import (
     project_hitter_counting,
     project_pitcher_counting,
+    project_pitcher_counting_sim,
 )
 from src.models.game_k_model import extract_pitcher_k_rate_samples
 from src.models.game_sim.exit_model import ExitModel
@@ -301,6 +303,203 @@ def main() -> None:
     logger.info("Saved hitter counting projections: %d players", len(hitter_counting))
     pitcher_counting.to_parquet(DASHBOARD_DIR / "pitcher_counting.parquet", index=False)
     logger.info("Saved pitcher counting projections: %d players", len(pitcher_counting))
+
+    # =================================================================
+    # 2c. Sim-based pitcher counting stats + reliever roles & rankings
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Running sim-based pitcher season projections...")
+
+    try:
+        from src.models.reliever_roles import classify_reliever_roles
+        from src.models.reliever_rankings import rank_relievers
+
+        # 2c-i. Classify reliever roles
+        logger.info("Classifying reliever roles...")
+        reliever_roles = classify_reliever_roles(
+            seasons=list(range(max(2020, SEASONS[0]), SEASONS[-1] + 1)),
+            current_season=FROM_SEASON,
+            min_games=10,
+        )
+        reliever_roles.to_parquet(DASHBOARD_DIR / "pitcher_roles.parquet", index=False)
+        logger.info("Saved reliever roles: %d relievers", len(reliever_roles))
+
+        # 2c-ii. Build posteriors dict from existing rate samples
+        # (reuses pitcher_results from Section 2, which has k_rate/bb_rate traces)
+        logger.info("Building posterior rate samples for season sim...")
+        pitcher_posteriors: dict[int, dict[str, np.ndarray]] = {}
+
+        # Get active pitchers from the projection season
+        active_pitchers = pitcher_ext[
+            (pitcher_ext["season"] == FROM_SEASON)
+            & (pitcher_ext["batters_faced"] >= 50)
+        ][["pitcher_id", "pitcher_name", "batters_faced", "is_starter"]].drop_duplicates("pitcher_id")
+
+        pitcher_name_lookup = dict(
+            zip(active_pitchers["pitcher_id"], active_pitchers["pitcher_name"])
+        )
+
+        rng_post = np.random.default_rng(42)
+        for _, prow in active_pitchers.iterrows():
+            pid = int(prow["pitcher_id"])
+            rates: dict[str, np.ndarray] = {}
+
+            # K rate from composite pitcher model
+            if "k_rate" in pitcher_results:
+                try:
+                    rates["k_rate"] = extract_rate_samples(
+                        pitcher_results["k_rate"]["trace"],
+                        pitcher_results["k_rate"]["data"],
+                        pitcher_id=pid, season=FROM_SEASON,
+                        project_forward=True,
+                    )
+                except (ValueError, KeyError):
+                    rates["k_rate"] = rng_post.beta(5, 20, size=8000)
+            else:
+                rates["k_rate"] = rng_post.beta(5, 20, size=8000)
+
+            # BB rate
+            if "bb_rate" in pitcher_results:
+                try:
+                    rates["bb_rate"] = extract_rate_samples(
+                        pitcher_results["bb_rate"]["trace"],
+                        pitcher_results["bb_rate"]["data"],
+                        pitcher_id=pid, season=FROM_SEASON,
+                        project_forward=True,
+                    )
+                except (ValueError, KeyError):
+                    rates["bb_rate"] = rng_post.beta(3, 30, size=8000)
+            else:
+                rates["bb_rate"] = rng_post.beta(3, 30, size=8000)
+
+            # HR rate — synthetic Beta if no Bayesian model
+            if "hr_per_bf" in pitcher_results:
+                try:
+                    rates["hr_rate"] = extract_rate_samples(
+                        pitcher_results["hr_per_bf"]["trace"],
+                        pitcher_results["hr_per_bf"]["data"],
+                        pitcher_id=pid, season=FROM_SEASON,
+                        project_forward=True,
+                    )
+                except (ValueError, KeyError):
+                    rates["hr_rate"] = rng_post.beta(2, 60, size=8000)
+            else:
+                # Synthetic Beta from observed HR/BF
+                bf = int(prow["batters_faced"])
+                hr_obs = pitcher_ext[
+                    (pitcher_ext["pitcher_id"] == pid)
+                    & (pitcher_ext["season"] == FROM_SEASON)
+                ]["hr"].values
+                hr_count = int(hr_obs[0]) if len(hr_obs) > 0 else int(bf * 0.03)
+                rates["hr_rate"] = rng_post.beta(
+                    hr_count + 1, bf - hr_count + 1, size=8000,
+                ).astype(np.float32)
+
+            pitcher_posteriors[pid] = rates
+
+        logger.info("Built posteriors for %d pitchers", len(pitcher_posteriors))
+
+        # 2c-iii. Build starter-specific priors (n_starts, avg_pitches)
+        logger.info("Building starter-specific priors...")
+        starter_ids = set(
+            active_pitchers[active_pitchers["is_starter"] == 1]["pitcher_id"]
+        )
+        starter_prior_rows = []
+        for _, prow in active_pitchers.iterrows():
+            pid = int(prow["pitcher_id"])
+            if pid not in starter_ids:
+                continue
+
+            player_hist = pitcher_ext[
+                (pitcher_ext["pitcher_id"] == pid)
+                & (pitcher_ext["season"] <= FROM_SEASON)
+                & (pitcher_ext["is_starter"] == 1)
+            ].sort_values("season", ascending=False).head(3)
+
+            if player_hist.empty:
+                starter_prior_rows.append({
+                    "pitcher_id": pid,
+                    "n_starts_mu": 30.0,
+                    "n_starts_sigma": 6.0,
+                    "avg_pitches": 88.0,
+                })
+                continue
+
+            # Weighted starts (5/4/3)
+            weights = [5, 4, 3][:len(player_hist)]
+            adj_games = player_hist["games"].values.copy().astype(float)
+            for i, s in enumerate(player_hist["season"].values):
+                if s == 2020:
+                    adj_games[i] = min(adj_games[i] * (162 / 60), 36)
+            wtd_starts = sum(g * w for g, w in zip(adj_games, weights)) / sum(weights)
+            # Regress toward pop mean
+            n = len(player_hist)
+            rel = n / (n + 1.5)
+            mu = rel * wtd_starts + (1 - rel) * 30.0
+
+            # Sigma from variation (floor at 3)
+            if len(adj_games) >= 2:
+                sigma = max(float(np.std(adj_games, ddof=1)), 3.0)
+            else:
+                sigma = 6.0
+
+            starter_prior_rows.append({
+                "pitcher_id": pid,
+                "n_starts_mu": mu,
+                "n_starts_sigma": sigma,
+                "avg_pitches": 88.0,
+            })
+
+        starter_priors_df = pd.DataFrame(starter_prior_rows) if starter_prior_rows else None
+
+        # 2c-iv. Train exit model (or reuse if already trained in section 9c)
+        logger.info("Training exit model for season sim...")
+        sim_exit_model = ExitModel()
+        try:
+            exit_training_data = get_exit_model_training_data(SEASONS)
+            exit_tend = get_pitcher_exit_tendencies(SEASONS)
+            sim_exit_model.train(exit_training_data, exit_tend)
+            logger.info("Exit model trained for season sim")
+        except Exception as e:
+            logger.warning("Exit model training failed, using fallback: %s", e)
+
+        # 2c-v. Run sim-based projections
+        import time
+        t0 = time.time()
+
+        pitcher_counting_sim = project_pitcher_counting_sim(
+            posteriors=pitcher_posteriors,
+            roles=reliever_roles,
+            exit_model=sim_exit_model,
+            starter_priors=starter_priors_df,
+            health_scores=health_df,
+            pitcher_names=pitcher_name_lookup,
+            n_seasons=200,
+            random_seed=42,
+        )
+        elapsed = time.time() - t0
+        pitcher_counting_sim.to_parquet(
+            DASHBOARD_DIR / "pitcher_counting_sim.parquet", index=False,
+        )
+        logger.info(
+            "Saved sim-based pitcher projections: %d pitchers in %.1fs",
+            len(pitcher_counting_sim), elapsed,
+        )
+
+        # 2c-vi. Reliever rankings
+        logger.info("Building reliever rankings...")
+        rp_rankings = rank_relievers(
+            sim_df=pitcher_counting_sim,
+            roles_df=reliever_roles,
+            season=FROM_SEASON,
+        )
+        rp_rankings.to_parquet(
+            DASHBOARD_DIR / "reliever_rankings.parquet", index=False,
+        )
+        logger.info("Saved reliever rankings: %d relievers", len(rp_rankings))
+
+    except Exception:
+        logger.exception("Failed to run sim-based pitcher projections")
 
     # =================================================================
     # 3. Pitcher K% model (for posterior samples → Game K sim)
@@ -1290,6 +1489,109 @@ def main() -> None:
         logger.exception("Failed to compute team bullpen rates")
 
     logger.info("Game simulator data complete.")
+
+    # =================================================================
+    # 8. Probable starters (greedy position assignment from lineup priors)
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Computing probable starters...")
+    try:
+        from src.data.db import read_sql as _read_sql
+
+        # Get lineup priors (position + batting order history for all players)
+        lineup_priors = get_lineup_priors(FROM_SEASON)
+
+        # Get current active roster with team info
+        roster = _read_sql("""
+            SELECT dr.player_id, dp.player_name, dr.org_id,
+                   dr.primary_position, dr.is_starter,
+                   dt.abbreviation AS team_abbr
+            FROM production.dim_roster dr
+            JOIN production.dim_player dp ON dr.player_id = dp.player_id
+            JOIN production.dim_team dt ON dr.org_id = dt.team_id
+            WHERE dr.level = 'MLB'
+              AND dr.roster_status IN ('active', 'nri')
+              AND dr.primary_position NOT IN ('SP', 'RP', 'P')
+        """)
+
+        POSITIONS = ["C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"]
+
+        all_starters = []
+        for team_abbr, team_roster in roster.groupby("team_abbr"):
+            team_pids = set(team_roster["player_id"])
+
+            # Get this team's players' lineup priors (from ANY team in 2025)
+            team_priors = lineup_priors[
+                lineup_priors["player_id"].isin(team_pids)
+            ].copy()
+
+            assigned = set()
+            team_starters = []
+
+            # Greedy: for each position, pick the available player with the
+            # most starts there
+            for pos in POSITIONS:
+                pos_candidates = team_priors[
+                    (team_priors["position"] == pos)
+                    & (~team_priors["player_id"].isin(assigned))
+                ].sort_values("starts", ascending=False)
+
+                if not pos_candidates.empty:
+                    best = pos_candidates.iloc[0]
+                    pid = int(best["player_id"])
+                    assigned.add(pid)
+                    prow = team_roster[team_roster["player_id"] == pid].iloc[0]
+                    team_starters.append({
+                        "team_abbr": team_abbr,
+                        "position": pos,
+                        "player_id": pid,
+                        "player_name": prow["player_name"],
+                        "batting_order": int(best["batting_order_mode"]),
+                        "starts_at_position": int(best["starts"]),
+                        "pct_at_position": float(best["pct"]),
+                    })
+                else:
+                    # Fallback: use dim_roster primary_position
+                    fallback = team_roster[
+                        (team_roster["primary_position"] == pos)
+                        & (~team_roster["player_id"].isin(assigned))
+                    ]
+                    if not fallback.empty:
+                        fb = fallback.iloc[0]
+                        pid = int(fb["player_id"])
+                        assigned.add(pid)
+                        team_starters.append({
+                            "team_abbr": team_abbr,
+                            "position": pos,
+                            "player_id": pid,
+                            "player_name": fb["player_name"],
+                            "batting_order": 5,  # default middle-order
+                            "starts_at_position": 0,
+                            "pct_at_position": 0.0,
+                        })
+
+            all_starters.extend(team_starters)
+
+        probable_df = pd.DataFrame(all_starters)
+        if not probable_df.empty:
+            probable_df.to_parquet(
+                DASHBOARD_DIR / "probable_starters.parquet", index=False,
+            )
+            logger.info(
+                "Saved probable starters: %d players across %d teams",
+                len(probable_df), probable_df["team_abbr"].nunique(),
+            )
+        else:
+            logger.warning("No probable starters computed")
+
+        # Also save the full lineup priors for reference
+        if not lineup_priors.empty:
+            lineup_priors.to_parquet(
+                DASHBOARD_DIR / "lineup_priors.parquet", index=False,
+            )
+            logger.info("Saved lineup priors: %d rows", len(lineup_priors))
+    except Exception:
+        logger.exception("Failed to compute probable starters")
 
     # =================================================================
     # Summary

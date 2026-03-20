@@ -51,6 +51,16 @@ class BIPOutcomeModel:
             [self.base_probs[k] for k in self._outcome_names]
         )
 
+    def get_league_probs(self) -> np.ndarray:
+        """Get league-average BIP outcome probabilities.
+
+        Returns
+        -------
+        np.ndarray
+            Shape (4,) probabilities for [out, single, double, triple].
+        """
+        return self._base_prob_array.copy()
+
     def compute_pitcher_babip_adj(
         self,
         pitcher_babip: float,

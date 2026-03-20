@@ -48,6 +48,16 @@ clustering:
 # T > 1.0 widens CIs (if backtests show under-coverage).
 # T = 1.0 disables calibration (default).
 # Run walk-forward backtests to compute optimal T per stat.
+season_sim:
+  n_seasons: 200
+  starter_n_starts_pop: 30
+  starter_n_starts_sd: 6
+  reliever_min_games: 10
+  cl_sv_threshold: 24
+  su_hld_threshold: 24
+  unearned_run_fraction: 0.08
+  random_seed: 42
+
 calibration:
   hitter:
     k_rate: 1.0

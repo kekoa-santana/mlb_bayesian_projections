@@ -540,6 +540,70 @@ def project_pitcher_counting(
     return result_df
 
 
+def project_pitcher_counting_sim(
+    posteriors: dict[int, dict[str, np.ndarray]],
+    roles: pd.DataFrame,
+    exit_model: "Any",
+    starter_priors: pd.DataFrame | None = None,
+    health_scores: pd.DataFrame | None = None,
+    babip_adjs: dict[int, float] | None = None,
+    pitcher_names: dict[int, str] | None = None,
+    n_seasons: int = 200,
+    random_seed: int = 42,
+) -> pd.DataFrame:
+    """Sim-based pitcher counting stat projections.
+
+    Uses the PA-by-PA game simulator for starters and lightweight
+    vectorized resolution for relievers. Produces correlated joint
+    distributions over all counting stats + fantasy scoring.
+
+    Parameters
+    ----------
+    posteriors : dict[int, dict[str, np.ndarray]]
+        Keyed by pitcher_id. Values have 'k_rate', 'bb_rate', 'hr_rate'.
+    roles : pd.DataFrame
+        Reliever role classification (pitcher_id, role).
+    exit_model
+        Trained ExitModel.
+    starter_priors : pd.DataFrame, optional
+        Columns: pitcher_id, n_starts_mu, n_starts_sigma, avg_pitches.
+    health_scores : pd.DataFrame, optional
+        Health scores for games/sigma adjustment.
+    babip_adjs : dict[int, float], optional
+        Pitcher-specific BABIP adjustments (shrinkage-regressed).
+    pitcher_names : dict[int, str], optional
+        pitcher_id -> name mapping.
+    n_seasons : int
+        Monte Carlo seasons per pitcher.
+    random_seed : int
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per pitcher with counting stat summaries, plus
+        H, pitches, SV, HLD, ERA, WHIP, FIP-ERA, DK, ESPN columns.
+    """
+    from src.models.season_simulator import (
+        simulate_all_pitchers,
+        season_results_to_dataframe,
+    )
+
+    results = simulate_all_pitchers(
+        posteriors=posteriors,
+        roles=roles,
+        exit_model=exit_model,
+        starter_priors=starter_priors,
+        health_scores=health_scores,
+        babip_adjs=babip_adjs,
+        n_seasons=n_seasons,
+        random_seed=random_seed,
+    )
+
+    df = season_results_to_dataframe(results, pitcher_names=pitcher_names)
+    logger.info("Sim-based pitcher projections: %d pitchers", len(df))
+    return df
+
+
 def marcel_counting_hitter(
     hitter_extended: pd.DataFrame,
     from_season: int,

@@ -27,7 +27,8 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-DASHBOARD_DIR = PROJECT_ROOT / "data" / "dashboard"
+DASHBOARD_REPO = Path(r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard")
+DASHBOARD_DIR = DASHBOARD_REPO / "data" / "dashboard"
 SNAPSHOT_DIR = DASHBOARD_DIR / "snapshots"
 
 logging.basicConfig(

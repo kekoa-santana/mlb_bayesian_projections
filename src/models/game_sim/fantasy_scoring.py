@@ -211,3 +211,67 @@ def compute_pitcher_fantasy(
         espn_points=espn,
         n_sims=result.n_sims,
     )
+
+
+# -----------------------------------------------------------------------
+# Season-level scoring (ESPN saves/blown saves from DB: +2 SV, -2 BS)
+# -----------------------------------------------------------------------
+ESPN_PIT_SV = 2.0    # verified from fantasy.espn_pitcher_game_scores
+ESPN_PIT_BS = -2.0   # verified from fantasy.espn_pitcher_game_scores
+
+
+def compute_season_pitcher_fantasy(
+    k: np.ndarray,
+    bb: np.ndarray,
+    h: np.ndarray,
+    hr: np.ndarray,
+    hbp: np.ndarray,
+    outs: np.ndarray,
+    runs: np.ndarray,
+    sv: np.ndarray,
+    hld: np.ndarray,
+) -> FantasyResult:
+    """Compute season-level fantasy points from counting stat arrays.
+
+    All arrays shape (n_seasons,). DK has no save scoring (confirmed from
+    DB schema — dk_pitcher_game_scores has no SV column). ESPN adds save
+    and blown save points.
+
+    Parameters
+    ----------
+    k, bb, h, hr, hbp, outs, runs, sv, hld : np.ndarray
+        Season counting stat totals.
+
+    Returns
+    -------
+    FantasyResult
+        Season-level DK and ESPN point distributions.
+    """
+    ip = outs.astype(float) / 3.0
+    er = runs.astype(float) * 0.92  # league-average earned run fraction
+
+    # DK: no save scoring — closer DK value comes from stuff
+    dk = (
+        DK_PIT_IP * ip * 3.0  # 0.75 per out = 2.25 per IP, scored per out
+        + DK_PIT_K * k
+        + DK_PIT_ER * er
+        + DK_PIT_H * h
+        + DK_PIT_BB * bb
+        + DK_PIT_HBP * hbp
+    ).astype(float)
+
+    # ESPN: includes save points
+    espn = (
+        ESPN_PIT_IP * ip
+        + ESPN_PIT_K * k
+        + ESPN_PIT_ER * er
+        + ESPN_PIT_H * h
+        + ESPN_PIT_BB * bb
+        + ESPN_PIT_SV * sv
+    ).astype(float)
+
+    return FantasyResult(
+        dk_points=dk,
+        espn_points=espn,
+        n_sims=len(k),
+    )

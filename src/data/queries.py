@@ -1809,7 +1809,9 @@ def get_player_teams(season: int) -> pd.DataFrame:
     )
     SELECT pt.player_id,
            COALESCE(dt.abbreviation, '') AS team_abbr,
-           COALESCE(dt.team_name, '') AS team_name
+           COALESCE(dt.team_name, '') AS team_name,
+           COALESCE(dt.league, '') AS league,
+           COALESCE(dt.division, '') AS division
     FROM primary_team pt
     LEFT JOIN production.dim_team dt ON pt.team_id = dt.team_id
     WHERE pt.rn = 1
@@ -3692,6 +3694,59 @@ def get_team_bullpen_rates(seasons: list[int]) -> pd.DataFrame:
     return read_sql(query)
 
 
+def get_reliever_role_history(
+    seasons: list[int],
+    min_games: int = 10,
+) -> pd.DataFrame:
+    """Per-reliever-season aggregates for role classification.
+
+    Aggregates saves, holds, blown saves, BF, K, BB, HR, HBP, H, runs,
+    outs, pitches from ``fact_player_game_mlb`` for non-starters.
+
+    Parameters
+    ----------
+    seasons : list[int]
+        Seasons to include.
+    min_games : int
+        Minimum relief appearances per season to include.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, season, games, saves, holds, blown_saves,
+        bf, k, bb, hr, h, runs, outs, pitches, k_rate, bb_rate.
+    """
+    season_list = ", ".join(str(s) for s in seasons)
+    query = f"""
+    SELECT
+        player_id AS pitcher_id,
+        season,
+        COUNT(*)                     AS games,
+        SUM(pit_sv)                  AS saves,
+        SUM(pit_hld)                 AS holds,
+        SUM(pit_bs)                  AS blown_saves,
+        SUM(pit_bf)                  AS bf,
+        SUM(pit_k)                   AS k,
+        SUM(pit_bb)                  AS bb,
+        SUM(pit_hr)                  AS hr,
+        SUM(pit_h)                   AS h,
+        SUM(pit_r)                   AS runs,
+        ROUND(SUM(pit_ip) * 3)::int  AS outs,
+        SUM(pit_pitches)             AS pitches,
+        SUM(pit_k)::float / NULLIF(SUM(pit_bf), 0) AS k_rate,
+        SUM(pit_bb)::float / NULLIF(SUM(pit_bf), 0) AS bb_rate
+    FROM production.fact_player_game_mlb
+    WHERE pit_is_starter = FALSE
+      AND pit_bf >= 1
+      AND season IN ({season_list})
+    GROUP BY player_id, season
+    HAVING COUNT(*) >= {min_games}
+    ORDER BY player_id, season
+    """
+    logger.info("Fetching reliever role history for seasons %s (min_games=%d)", seasons, min_games)
+    return read_sql(query)
+
+
 def get_batter_game_actuals(season: int) -> pd.DataFrame:
     """Per-batter game actuals with batting order and opposing starter.
 
@@ -3750,3 +3805,85 @@ def get_batter_game_actuals(season: int) -> pd.DataFrame:
     """
     logger.info("Fetching batter game actuals for %d", season)
     return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# Lineup priors (position + batting order history)
+# ---------------------------------------------------------------------------
+def get_lineup_priors(season: int) -> pd.DataFrame:
+    """Get each player's position and batting order history from fact_lineup.
+
+    Returns one row per player-position with start counts and most common
+    batting order at that position.  Team-agnostic — a player's position
+    history carries over when they change teams.
+
+    Parameters
+    ----------
+    season : int
+        Season to pull lineup data from.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: player_id, position, starts, pct, is_primary,
+        batting_order_mode, bo_games.
+    """
+    query = """
+    WITH pos_starts AS (
+        SELECT
+            fl.player_id,
+            fl.position,
+            COUNT(*) AS starts
+        FROM production.fact_lineup fl
+        JOIN production.dim_game dg ON fl.game_pk = dg.game_pk
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+          AND fl.is_starter = true
+          AND fl.position NOT IN ('P', 'PR', 'PH')
+        GROUP BY fl.player_id, fl.position
+    ),
+    bo_starts AS (
+        SELECT
+            fl.player_id,
+            fl.position,
+            fl.batting_order,
+            COUNT(*) AS bo_games,
+            ROW_NUMBER() OVER (
+                PARTITION BY fl.player_id, fl.position
+                ORDER BY COUNT(*) DESC
+            ) AS rn
+        FROM production.fact_lineup fl
+        JOIN production.dim_game dg ON fl.game_pk = dg.game_pk
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+          AND fl.is_starter = true
+          AND fl.position NOT IN ('P', 'PR', 'PH')
+        GROUP BY fl.player_id, fl.position, fl.batting_order
+    )
+    SELECT
+        ps.player_id,
+        ps.position,
+        ps.starts,
+        bs.batting_order AS batting_order_mode,
+        bs.bo_games
+    FROM pos_starts ps
+    JOIN bo_starts bs
+      ON ps.player_id = bs.player_id
+     AND ps.position = bs.position
+     AND bs.rn = 1
+    ORDER BY ps.player_id, ps.starts DESC
+    """
+    logger.info("Fetching lineup priors for %d", season)
+    df = read_sql(query, {"season": season})
+
+    if df.empty:
+        return df
+
+    # Compute pct and is_primary in Python (same pattern as position eligibility)
+    totals = df.groupby("player_id")["starts"].transform("sum")
+    df["pct"] = df["starts"] / totals
+    idx = df.groupby("player_id")["starts"].idxmax()
+    df["is_primary"] = False
+    df.loc[idx, "is_primary"] = True
+
+    return df
