@@ -88,6 +88,15 @@ class SeasonSimResult:
             - 2.0 * self.k_season.astype(float)
         ) / safe_ip + fip_constant
 
+    def fip_minus_season(self, lg_fip: float = 4.15) -> np.ndarray:
+        """FIP- (FIP minus): pitcher equivalent of wRC+.
+
+        Indexed to 100 = league average. Lower is better.
+        FIP- of 75 means 25% better than average at run prevention.
+        """
+        fip = self.fip_era_season()
+        return fip / lg_fip * 100
+
     def runs_saved_season(self, lg_fip: float = 4.15) -> np.ndarray:
         """FIP-based runs saved above average.
 
@@ -135,6 +144,10 @@ class SeasonSimResult:
         fip_valid = fip_era[~np.isnan(fip_era)]
         if len(fip_valid) > 0:
             stats["fip_era"] = _stat_summary(np.clip(fip_valid, 0, 15))
+        fip_minus = self.fip_minus_season()
+        fm_valid = fip_minus[~np.isnan(fip_minus)]
+        if len(fm_valid) > 0:
+            stats["fip_minus"] = _stat_summary(np.clip(fm_valid, 0, 250))
         rs = self.runs_saved_season()
         rs_valid = rs[~np.isnan(rs)]
         if len(rs_valid) > 0:
@@ -702,6 +715,13 @@ def season_results_to_dataframe(
             fip_summary = _stat_summary(np.clip(fip_valid, 0, 15))
             for k, v in fip_summary.items():
                 row[f"projected_fip_era_{k}"] = v
+
+        fm = sim.fip_minus_season()
+        fm_valid = fm[~np.isnan(fm)]
+        if len(fm_valid) > 0:
+            fm_summary = _stat_summary(np.clip(fm_valid, 0, 250))
+            for k, v in fm_summary.items():
+                row[f"projected_fip_minus_{k}"] = v
 
         rs = sim.runs_saved_season()
         rs_valid = rs[~np.isnan(rs)]
