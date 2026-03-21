@@ -516,10 +516,13 @@ def main() -> None:
         hitter_posteriors: dict[int, dict[str, np.ndarray]] = {}
         hitter_name_lookup: dict[int, str] = {}
 
+        _hitter_cols = ["batter_id", "batter_name", "pa", "hr", "sb", "games",
+                        "h", "k", "bb", "sprint_speed"]
+        _hitter_cols = [c for c in _hitter_cols if c in hitter_ext.columns]
         active_hitters = hitter_ext[
             (hitter_ext["season"] == FROM_SEASON)
             & (hitter_ext["pa"] >= 50)
-        ][["batter_id", "batter_name", "pa", "hr", "sb", "games"]].drop_duplicates("batter_id")
+        ][_hitter_cols].drop_duplicates("batter_id")
 
         hitter_name_lookup = dict(
             zip(active_hitters["batter_id"], active_hitters["batter_name"])
@@ -556,14 +559,83 @@ def main() -> None:
 
         logger.info("Built hitter posteriors for %d batters", len(hitter_posteriors))
 
-        # SB rates from recent history
+        # SB rates: blend observed SB/game with sprint speed signal
+        # Sprint speed (r=0.941 YoY) is more stable than SB rate
         sb_rates: dict[int, tuple[float, float]] = {}
+        # Get sprint speed -> SB/game regression from population
+        pop_sb_rate = active_hitters["sb"].sum() / max(active_hitters["games"].sum(), 1)
         for _, hrow in active_hitters.iterrows():
             bid = int(hrow["batter_id"])
             games = max(int(hrow.get("games", 100)), 1)
             sb = int(hrow.get("sb", 0))
-            sb_per_g = sb / games
-            sb_rates[bid] = (sb_per_g, max(sb_per_g * 0.30, 0.01))
+            observed_rate = sb / games
+
+            # Blend with sprint speed signal if available
+            speed = hrow.get("sprint_speed", None)
+            if speed is not None and not np.isnan(speed) and speed > 0:
+                # Speed-implied SB rate: above-average speed -> more SB
+                # ~27.2 ft/s is league average; each ft/s above adds ~0.04 SB/game
+                speed_implied = max(0, (speed - 27.2) * 0.04 + pop_sb_rate)
+                # Blend 40% speed-implied + 60% observed
+                blended = 0.40 * speed_implied + 0.60 * observed_rate
+            else:
+                blended = observed_rate
+
+            sb_rates[bid] = (blended, max(blended * 0.30, 0.01))
+
+        # Per-player batting order from lineup data
+        logger.info("Loading batting order positions...")
+        try:
+            from src.data.db import read_sql as _rs_bo
+            bo_data = _rs_bo("""
+                SELECT player_id as batter_id,
+                       ROUND(AVG(batting_order))::int as avg_order
+                FROM production.fact_lineup
+                WHERE season = :season AND is_starter = true
+                      AND batting_order BETWEEN 1 AND 9
+                GROUP BY player_id
+                HAVING COUNT(*) >= 20
+            """, {"season": FROM_SEASON})
+            batting_orders = dict(zip(
+                bo_data["batter_id"].astype(int),
+                bo_data["avg_order"].astype(int).clip(1, 9),
+            ))
+            logger.info("Batting orders: %d hitters (mean slot %.1f)",
+                        len(batting_orders), np.mean(list(batting_orders.values())))
+        except Exception as e:
+            logger.warning("Batting order lookup failed: %s", e)
+            batting_orders = None
+
+        # Hitter BABIP adjustments
+        logger.info("Computing hitter BABIP adjustments...")
+        hitter_babip: dict[int, float] = {}
+        try:
+            h_col = "hits_allowed" if "hits_allowed" in hitter_ext.columns else "h"
+            if h_col not in hitter_ext.columns:
+                h_col = None
+            if h_col:
+                recent_h = hitter_ext[
+                    (hitter_ext["season"] >= FROM_SEASON - 2)
+                    & (hitter_ext["season"] <= FROM_SEASON)
+                ].copy()
+                recent_h["bip"] = (recent_h["pa"] - recent_h["k"] - recent_h["hr"] - recent_h["bb"]).clip(1)
+                recent_h["hits_on_bip"] = (recent_h[h_col] - recent_h["hr"]).clip(0)
+                recent_h["babip"] = recent_h["hits_on_bip"] / recent_h["bip"]
+                recent_h["weight"] = np.where(recent_h["season"] == FROM_SEASON, 3.0, 1.0)
+
+                h_agg = recent_h.groupby("batter_id").apply(
+                    lambda g: pd.Series({{
+                        "wtd_babip": np.average(g["babip"], weights=g["weight"] * g["bip"]),
+                        "total_bip": g["bip"].sum(),
+                    }}), include_groups=False,
+                ).reset_index()
+                h_agg["reliability"] = (h_agg["total_bip"] / 500).clip(0, 1)
+                h_agg["babip_adj"] = h_agg["reliability"] * (h_agg["wtd_babip"] - 0.300)
+                hitter_babip = dict(zip(h_agg["batter_id"].astype(int), h_agg["babip_adj"]))
+                logger.info("Hitter BABIP adjustments: %d, mean=%.4f",
+                            len(hitter_babip), np.mean(list(hitter_babip.values())))
+        except Exception as e:
+            logger.warning("Hitter BABIP failed: %s", e)
 
         # Run sim
         import time as _time
@@ -571,6 +643,8 @@ def main() -> None:
         hitter_counting_sim = project_hitter_counting_sim(
             posteriors=hitter_posteriors,
             pa_priors=pa_priors,
+            batting_orders=batting_orders,
+            babip_adjs=hitter_babip if hitter_babip else None,
             sb_rates=sb_rates,
             health_scores=health_df,
             batter_names=hitter_name_lookup,

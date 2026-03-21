@@ -110,10 +110,19 @@ def _print_summary(summary: pd.DataFrame) -> None:
     print()
 
 
+PITCHER_FOLDS = [
+    {"train_seasons": list(range(2018, 2023)), "test_season": 2023},
+    {"train_seasons": list(range(2018, 2024)), "test_season": 2024},
+    {"train_seasons": list(range(2018, 2025)), "test_season": 2025},
+]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Season sim backtest")
     parser.add_argument("--quick", action="store_true",
                         help="Fewer MCMC draws for fast iteration")
+    parser.add_argument("--single-fold", action="store_true",
+                        help="Only run 2024->2025 fold (faster)")
     args = parser.parse_args()
 
     if args.quick:
@@ -126,14 +135,19 @@ def main() -> None:
     out_dir = PROJECT_ROOT / "outputs"
     out_dir.mkdir(exist_ok=True)
 
-    # Single fold: train 2018-2024, test 2025
-    result = walk_forward_season_sim(
-        train_seasons=list(range(2018, 2025)),
-        test_season=2025,
-        **sampling,
-    )
+    folds = PITCHER_FOLDS[-1:] if args.single_fold else PITCHER_FOLDS
 
-    summary = result["summary"]
+    # Pitcher backtests
+    all_pitcher_summaries = []
+    for fold in folds:
+        result = walk_forward_season_sim(
+            train_seasons=fold["train_seasons"],
+            test_season=fold["test_season"],
+            **sampling,
+        )
+        all_pitcher_summaries.append(result["summary"])
+
+    summary = pd.concat(all_pitcher_summaries, ignore_index=True)
     _print_summary(summary)
 
     # Save
@@ -151,13 +165,17 @@ def main() -> None:
     # =================================================================
     logger.info("=" * 60)
     logger.info("Running HITTER sim backtest...")
-    h_result = walk_forward_hitter_sim(
-        train_seasons=list(range(2018, 2025)),
-        test_season=2025,
-        **sampling,
-    )
 
-    h_summary = h_result["summary"]
+    all_hitter_summaries = []
+    for fold in folds:
+        h_result = walk_forward_hitter_sim(
+            train_seasons=fold["train_seasons"],
+            test_season=fold["test_season"],
+            **sampling,
+        )
+        all_hitter_summaries.append(h_result["summary"])
+
+    h_summary = pd.concat(all_hitter_summaries, ignore_index=True)
 
     print(f"\n{'=' * 75}")
     print("  HITTER SEASON SIMULATOR BACKTEST RESULTS")

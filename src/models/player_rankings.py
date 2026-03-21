@@ -255,6 +255,10 @@ def _build_hitter_offense_score(
 ) -> pd.DataFrame:
     """Blend projected and observed offensive value into a single score.
 
+    Prefers sim-derived wRC+ when available (validated r=0.454 vs actuals),
+    blended with observed Statcast quality metrics. Falls back to
+    Bayesian rate percentiles when sim parquet doesn't exist.
+
     Parameters
     ----------
     proj : pd.DataFrame
@@ -278,11 +282,34 @@ def _build_hitter_offense_score(
     if merged.empty:
         return pd.DataFrame(columns=["batter_id", "offense_score"])
 
-    # --- Projected component (Bayesian rates) ---
-    proj_k_score = _inv_pctl(merged["projected_k_rate"])
-    proj_bb_score = _pctl(merged["projected_bb_rate"])
-    proj_hr_score = _pctl(merged["projected_hr_per_fb"])
-    projected = 0.35 * proj_k_score + 0.30 * proj_bb_score + 0.35 * proj_hr_score
+    # --- Sim-based projected component (wRC+ from game sim) ---
+    sim_path = DASHBOARD_DIR / "hitter_counting_sim.parquet"
+    has_sim = False
+    if sim_path.exists():
+        sim_df = pd.read_parquet(sim_path)
+        sim_cols = ["batter_id", "projected_wrc_plus_mean", "projected_woba_mean",
+                     "projected_wraa_mean"]
+        sim_cols = [c for c in sim_cols if c in sim_df.columns]
+        if "projected_wrc_plus_mean" in sim_df.columns:
+            merged = merged.merge(sim_df[sim_cols], on="batter_id", how="left")
+            has_sim = merged["projected_wrc_plus_mean"].notna().any()
+            if has_sim:
+                logger.info("Offense score using sim wRC+ for %d hitters",
+                            merged["projected_wrc_plus_mean"].notna().sum())
+
+    if has_sim:
+        # Sim wRC+ as primary projected signal (r=0.454 validated)
+        sim_wrc = _pctl(merged["projected_wrc_plus_mean"].fillna(100))
+        # Still use Bayesian rate projections as secondary signal
+        proj_k_score = _inv_pctl(merged["projected_k_rate"])
+        proj_bb_score = _pctl(merged["projected_bb_rate"])
+        projected = 0.50 * sim_wrc + 0.25 * proj_k_score + 0.25 * proj_bb_score
+    else:
+        # Fallback: Bayesian rate percentiles only
+        proj_k_score = _inv_pctl(merged["projected_k_rate"])
+        proj_bb_score = _pctl(merged["projected_bb_rate"])
+        proj_hr_score = _pctl(merged["projected_hr_per_fb"])
+        projected = 0.35 * proj_k_score + 0.30 * proj_bb_score + 0.35 * proj_hr_score
 
     # --- Observed component (Statcast + traditional) ---
     obs_woba = _pctl(merged["woba"].fillna(merged["woba"].median()))
@@ -291,14 +318,12 @@ def _build_hitter_offense_score(
     obs_xslg = _pctl(merged["xslg"].fillna(merged["xslg"].median()))
     obs_barrel = _pctl(merged["barrel_pct"].fillna(0))
     obs_hh = _pctl(merged["hard_hit_pct"].fillna(0))
-    # wOBA (overall), xwOBA (expected), xBA (contact quality), xSLG (power),
-    # barrel% (elite contact), hard-hit% (contact strength)
     observed_score = (
         0.25 * obs_woba + 0.20 * obs_xwoba + 0.12 * obs_xba
         + 0.13 * obs_xslg + 0.17 * obs_barrel + 0.13 * obs_hh
     )
 
-    # Dynamic blend: more PA → more observed weight
+    # Dynamic blend: more PA -> more observed weight
     proj_w, obs_w = _dynamic_blend_weights(merged["pa"])
     merged["offense_score"] = proj_w * projected + obs_w * observed_score
 
@@ -308,8 +333,7 @@ def _build_hitter_offense_score(
 def _build_hitter_baserunning_score() -> pd.DataFrame:
     """Score baserunning value from sprint speed and projected SB.
 
-    Blends sprint speed (raw athleticism) with projected stolen bases
-    (actual baserunning production).
+    Prefers sim-based SB projections when available.
 
     Returns
     -------
@@ -317,24 +341,33 @@ def _build_hitter_baserunning_score() -> pd.DataFrame:
         Columns: batter_id, baserunning_score.
     """
     proj = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet")
-    counting = pd.read_parquet(DASHBOARD_DIR / "hitter_counting.parquet")
+
+    # Prefer sim parquet for SB
+    sim_path = DASHBOARD_DIR / "hitter_counting_sim.parquet"
+    old_path = DASHBOARD_DIR / "hitter_counting.parquet"
+    if sim_path.exists():
+        counting = pd.read_parquet(sim_path)
+        sb_col = "total_sb_mean"
+        pa_col = "total_pa_mean" if "total_pa_mean" in counting.columns else "projected_pa_mean"
+    elif old_path.exists():
+        counting = pd.read_parquet(old_path)
+        sb_col = "total_sb_mean"
+        pa_col = "projected_pa_mean"
+    else:
+        return pd.DataFrame(columns=["batter_id", "baserunning_score"])
 
     merged = proj[["batter_id", "sprint_speed"]].merge(
-        counting[["batter_id", "total_sb_mean", "projected_pa_mean"]],
+        counting[["batter_id", sb_col, pa_col]],
         on="batter_id", how="inner",
     )
 
     if merged.empty:
         return pd.DataFrame(columns=["batter_id", "baserunning_score"])
 
-    # Sprint speed percentile (higher = faster)
     speed_score = _pctl(merged["sprint_speed"].fillna(merged["sprint_speed"].median()))
-
-    # SB rate per PA percentile (normalizes for playing time)
-    sb_rate = merged["total_sb_mean"] / merged["projected_pa_mean"].clip(lower=1)
+    sb_rate = merged[sb_col] / merged[pa_col].clip(lower=1)
     sb_score = _pctl(sb_rate)
 
-    # Blend: 60% speed (stable, Statcast-measured), 40% SB production
     merged["baserunning_score"] = 0.60 * speed_score + 0.40 * sb_score
     return merged[["batter_id", "baserunning_score"]]
 
@@ -462,16 +495,37 @@ def _build_catcher_framing_score(season: int = 2025) -> pd.DataFrame:
 def _build_hitter_playing_time_score() -> pd.DataFrame:
     """Score projected playing time from counting projections + health.
 
-    Blends 70% projected PA percentile with 30% health score percentile
-    when health scores are available.
+    Prefers sim-based ``hitter_counting_sim.parquet`` (PA + games from
+    game sim). Falls back to old ``hitter_counting.parquet``.
 
     Returns
     -------
     pd.DataFrame
         Columns: batter_id, pt_score, health_score, health_label.
     """
-    counting = pd.read_parquet(DASHBOARD_DIR / "hitter_counting.parquet")
-    pa_pctl = _pctl(counting["projected_pa_mean"])
+    sim_path = DASHBOARD_DIR / "hitter_counting_sim.parquet"
+    old_path = DASHBOARD_DIR / "hitter_counting.parquet"
+
+    if sim_path.exists():
+        counting = pd.read_parquet(sim_path)
+        pa_col = "total_pa_mean" if "total_pa_mean" in counting.columns else "projected_pa_mean"
+        games_col = "total_games_mean"
+        if pa_col in counting.columns and games_col in counting.columns:
+            pa_pctl = _pctl(counting[pa_col].fillna(0))
+            games_pctl = _pctl(counting[games_col].fillna(0))
+            base_pt = 0.60 * pa_pctl + 0.40 * games_pctl
+        else:
+            base_pt = _pctl(counting[pa_col].fillna(0))
+        logger.info("Playing time score from sim parquet: %d hitters", len(counting))
+    elif old_path.exists():
+        counting = pd.read_parquet(old_path)
+        base_pt = _pctl(counting["projected_pa_mean"])
+    else:
+        return pd.DataFrame(columns=["batter_id", "pt_score"])
+
+    # Rename for downstream compatibility
+    if "projected_pa_mean" not in counting.columns and "total_pa_mean" in counting.columns:
+        counting["projected_pa_mean"] = counting["total_pa_mean"]
 
     # Health scores: prefer columns already on counting parquet,
     # fall back to standalone health_scores.parquet
@@ -493,9 +547,9 @@ def _build_hitter_playing_time_score() -> pd.DataFrame:
         counting["health_score"] = counting["health_score"].fillna(0.85)
         counting["health_label"] = counting["health_label"].fillna("Unknown")
         health_pctl = _pctl(counting["health_score"])
-        counting["pt_score"] = 0.70 * pa_pctl + 0.30 * health_pctl
+        counting["pt_score"] = 0.70 * base_pt + 0.30 * health_pctl
     else:
-        counting["pt_score"] = pa_pctl
+        counting["pt_score"] = base_pt
         counting["health_score"] = np.nan
         counting["health_label"] = ""
 
@@ -657,6 +711,20 @@ def rank_hitters(
     )
     base = base.merge(playing_time, on="batter_id", how="left")
     base = base.merge(trajectory, on="batter_id", how="left")
+
+    # Merge sim-based counting projections for display
+    sim_path = DASHBOARD_DIR / "hitter_counting_sim.parquet"
+    if sim_path.exists():
+        sim_df = pd.read_parquet(sim_path)
+        sim_cols = ["batter_id", "total_k_mean", "total_bb_mean", "total_hr_mean",
+                     "total_h_mean", "total_r_mean", "total_rbi_mean", "total_sb_mean",
+                     "projected_woba_mean", "projected_wrc_plus_mean",
+                     "projected_wraa_mean", "projected_ops_mean", "projected_avg_mean",
+                     "dk_season_mean", "espn_season_mean", "total_games_mean", "total_pa_mean"]
+        sim_cols = [c for c in sim_cols if c in sim_df.columns]
+        base = base.merge(sim_df[sim_cols], on="batter_id", how="left")
+        logger.info("Merged hitter sim projections for %d batters",
+                     base["projected_wrc_plus_mean"].notna().sum() if "projected_wrc_plus_mean" in base.columns else 0)
 
     # Breakout archetype data (GMM-derived)
     breakout_path = DASHBOARD_DIR / "hitter_breakout_candidates.parquet"
@@ -852,6 +920,12 @@ def rank_hitters(
         "breakout_type", "breakout_score", "breakout_tier",
         "breakout_hole", "gmm_fit",
         "prob_power_surge", "prob_diamond_in_the_rough",
+        # Sim-based season projections
+        "total_k_mean", "total_bb_mean", "total_hr_mean", "total_h_mean",
+        "total_r_mean", "total_rbi_mean", "total_sb_mean",
+        "projected_woba_mean", "projected_wrc_plus_mean", "projected_wraa_mean",
+        "projected_ops_mean", "projected_avg_mean",
+        "dk_season_mean", "espn_season_mean", "total_games_mean", "total_pa_mean",
     ]
     available = [c for c in output_cols if c in base.columns]
     result = base[available].sort_values(["position", "pos_rank"])
