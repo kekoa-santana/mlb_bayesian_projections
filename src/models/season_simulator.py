@@ -720,6 +720,17 @@ class HitterSeasonSimResult:
     espn_season: np.ndarray
     n_seasons: int = 0
 
+    # 2024 wOBA linear weights (FanGraphs)
+    _WOBA_BB = 0.69
+    _WOBA_HBP = 0.72
+    _WOBA_1B = 0.88
+    _WOBA_2B = 1.25
+    _WOBA_3B = 1.58
+    _WOBA_HR = 2.03
+    _WOBA_SCALE = 1.21    # wOBA scale factor for wRC+ conversion
+    _LG_WOBA = 0.310      # 2024 league wOBA
+    _LG_R_PER_PA = 0.117  # 2024 league R/PA
+
     def avg_season(self) -> np.ndarray:
         """Batting average = H / AB (AB ~ PA - BB - HBP)."""
         ab = (self.pa_season - self.bb_season - self.hbp_season).clip(1)
@@ -733,6 +744,31 @@ class HitterSeasonSimResult:
         """Slugging percentage."""
         ab = (self.pa_season - self.bb_season - self.hbp_season).clip(1)
         return self.tb_season.astype(float) / ab
+
+    def woba_season(self) -> np.ndarray:
+        """Weighted on-base average from sim's PA outcomes."""
+        numerator = (
+            self._WOBA_BB * self.bb_season.astype(float)
+            + self._WOBA_HBP * self.hbp_season.astype(float)
+            + self._WOBA_1B * self.single_season.astype(float)
+            + self._WOBA_2B * self.double_season.astype(float)
+            + self._WOBA_3B * self.triple_season.astype(float)
+            + self._WOBA_HR * self.hr_season.astype(float)
+        )
+        return numerator / self.pa_season.clip(1).astype(float)
+
+    def wrc_plus_season(self) -> np.ndarray:
+        """wRC+ from sim's wOBA (100 = league average)."""
+        woba = self.woba_season()
+        wrc = (
+            (woba - self._LG_WOBA) / self._WOBA_SCALE + self._LG_R_PER_PA
+        ) / self._LG_R_PER_PA * 100
+        return wrc
+
+    def wraa_season(self) -> np.ndarray:
+        """Weighted runs above average (counting stat version of wOBA)."""
+        woba = self.woba_season()
+        return ((woba - self._LG_WOBA) / self._WOBA_SCALE) * self.pa_season.astype(float)
 
     def summary(self) -> dict[str, dict[str, float]]:
         """Summary statistics for all stats."""
@@ -757,6 +793,9 @@ class HitterSeasonSimResult:
         slg = self.slg_season()
         stats["slg"] = _stat_summary(np.clip(slg, 0, 4))
         stats["ops"] = _stat_summary(np.clip(obp + slg, 0, 5))
+        stats["woba"] = _stat_summary(np.clip(self.woba_season(), 0, 1))
+        stats["wrc_plus"] = _stat_summary(np.clip(self.wrc_plus_season(), 0, 250))
+        stats["wraa"] = _stat_summary(self.wraa_season())
 
         return stats
 
@@ -1008,13 +1047,16 @@ def hitter_season_results_to_dataframe(
                 row[f"{stat_name}_{k}"] = v
 
         # Derived rate distributions
-        for stat_name, arr in [
-            ("projected_avg", sim.avg_season()),
-            ("projected_obp", sim.obp_season()),
-            ("projected_slg", sim.slg_season()),
-            ("projected_ops", sim.obp_season() + sim.slg_season()),
+        for stat_name, arr, lo, hi in [
+            ("projected_avg", sim.avg_season(), 0, 1),
+            ("projected_obp", sim.obp_season(), 0, 1),
+            ("projected_slg", sim.slg_season(), 0, 4),
+            ("projected_ops", sim.obp_season() + sim.slg_season(), 0, 5),
+            ("projected_woba", sim.woba_season(), 0, 1),
+            ("projected_wrc_plus", sim.wrc_plus_season(), 0, 250),
+            ("projected_wraa", sim.wraa_season(), -50, 80),
         ]:
-            summary = _stat_summary(np.clip(arr, 0, 5))
+            summary = _stat_summary(np.clip(arr, lo, hi))
             for k, v in summary.items():
                 row[f"{stat_name}_{k}"] = v
 
