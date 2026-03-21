@@ -795,11 +795,53 @@ def walk_forward_hitter_sim(
     except Exception:
         health_df = None
 
+    # ---- BIP profiles from quality metrics ----
+    t0_bip = time.time()
+    bip_profile_lookup: dict[int, np.ndarray] = {}
+    try:
+        from src.models.game_sim.bip_model import compute_player_bip_probs
+        bip_data = read_sql("""
+            SELECT fp.batter_id,
+                   AVG(sbb.launch_speed) as avg_ev,
+                   AVG(sbb.launch_angle) as avg_la,
+                   AVG(CASE WHEN sbb.launch_angle < 10 THEN 1.0 ELSE 0.0 END) as gb_pct
+            FROM production.fact_pitch fp
+            JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+            JOIN production.sat_batted_balls sbb ON fp.pa_id = sbb.pa_id
+            WHERE dg.game_type = 'R' AND dg.season = :season
+                  AND sbb.launch_speed IS NOT NULL
+            GROUP BY fp.batter_id
+            HAVING COUNT(*) >= 50
+        """, {"season": last_train})
+
+        sprint_data = read_sql("""
+            SELECT player_id as batter_id, sprint_speed
+            FROM staging.statcast_sprint_speed
+            WHERE season = :season AND sprint_speed IS NOT NULL
+        """, {"season": last_train})
+
+        if not bip_data.empty:
+            bip_data = bip_data.merge(sprint_data, on="batter_id", how="left")
+            bip_data["sprint_speed"] = bip_data["sprint_speed"].fillna(27.0)
+            for _, row in bip_data.iterrows():
+                bid = int(row["batter_id"])
+                bip_profile_lookup[bid] = compute_player_bip_probs(
+                    avg_ev=float(row["avg_ev"]),
+                    avg_la=float(row["avg_la"]),
+                    gb_pct=float(row["gb_pct"]),
+                    sprint_speed=float(row["sprint_speed"]),
+                )
+            logger.info("BIP profiles: %d hitters", len(bip_profile_lookup))
+    except Exception as e:
+        logger.warning("BIP profile computation failed: %s", e)
+    timings["bip_profiles"] = time.time() - t0_bip
+
     # ---- Run sim ----
     t0 = time.time()
     sim_proj = project_hitter_counting_sim(
         posteriors=posteriors,
         pa_priors=pa_priors,
+        bip_profiles=bip_profile_lookup if bip_profile_lookup else None,
         sb_rates=sb_rate_lookup,
         health_scores=health_df,
         batter_names=names,
