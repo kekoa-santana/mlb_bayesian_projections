@@ -857,6 +857,8 @@ def simulate_hitter_season(
     batting_order: int = 5,
     babip_adj: float = 0.0,
     bip_probs: np.ndarray | None = None,
+    r_multiplier: float = 1.0,
+    rbi_multiplier: float = 1.0,
     sb_rate: float = 0.0,
     sb_rate_sd: float = 0.0,
     n_seasons: int = 200,
@@ -970,6 +972,12 @@ def simulate_hitter_season(
             # Recompute TB
             tb_out = single_out + 2 * double_out + 3 * triple_out + 4 * hr_out
 
+    # Apply lineup context R/RBI multipliers
+    if r_multiplier != 1.0:
+        r_out = np.round(r_out.astype(float) * r_multiplier).astype(np.int32)
+    if rbi_multiplier != 1.0:
+        rbi_out = np.round(rbi_out.astype(float) * rbi_multiplier).astype(np.int32)
+
     # SB: rate x games (not in game sim)
     sb_draws = rng.normal(sb_rate, max(sb_rate_sd, sb_rate * 0.15 + 0.01), size=n_seasons)
     sb_out = np.clip(np.round(sb_draws * games_per_season), 0, 100).astype(np.int32)
@@ -1001,6 +1009,7 @@ def simulate_all_hitters(
     batting_orders: dict[int, int] | None = None,
     babip_adjs: dict[int, float] | None = None,
     bip_profiles: dict[int, np.ndarray] | None = None,
+    lineup_context: dict[int, tuple[float, float]] | None = None,
     sb_rates: dict[int, tuple[float, float]] | None = None,
     health_scores: pd.DataFrame | None = None,
     n_seasons: int = 200,
@@ -1069,6 +1078,9 @@ def simulate_all_hitters(
         # BIP profile
         player_bip = (bip_profiles or {}).get(bid, None)
 
+        # Lineup context (R/RBI multipliers)
+        r_mult, rbi_mult = (lineup_context or {}).get(bid, (1.0, 1.0))
+
         # SB
         sb_mean, sb_sd = (sb_rates or {}).get(bid, (0.0, 0.0))
 
@@ -1082,6 +1094,8 @@ def simulate_all_hitters(
             batting_order=order,
             babip_adj=babip,
             bip_probs=player_bip,
+            r_multiplier=r_mult,
+            rbi_multiplier=rbi_mult,
             sb_rate=sb_mean,
             sb_rate_sd=sb_sd,
             n_seasons=n_seasons,
