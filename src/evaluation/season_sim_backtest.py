@@ -800,7 +800,8 @@ def walk_forward_hitter_sim(
     bip_profile_lookup: dict[int, np.ndarray] = {}
     try:
         from src.models.game_sim.bip_model import compute_player_bip_probs
-        bip_data = read_sql("""
+        from src.data.db import read_sql as _read_sql_bip
+        bip_data = _read_sql_bip("""
             SELECT fp.batter_id,
                    AVG(sbb.launch_speed) as avg_ev,
                    AVG(sbb.launch_angle) as avg_la,
@@ -814,7 +815,7 @@ def walk_forward_hitter_sim(
             HAVING COUNT(*) >= 50
         """, {"season": last_train})
 
-        sprint_data = read_sql("""
+        sprint_data = _read_sql_bip("""
             SELECT player_id as batter_id, sprint_speed
             FROM staging.statcast_sprint_speed
             WHERE season = :season AND sprint_speed IS NOT NULL
