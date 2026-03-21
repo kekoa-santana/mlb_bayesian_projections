@@ -966,29 +966,47 @@ def add_confidence_tiers(
     pt_conf = (1.0 - pt_cv.clip(0, 1.0)).clip(0, 1)
 
     # ------------------------------------------------------------------
-    # 3. Has-prior-season proxy
+    # 3. MLB track record (penalize players with limited MLB history)
     # ------------------------------------------------------------------
-    # Players with very low SD relative to mean on a Bayesian stat likely
-    # have strong priors from multiple seasons.  Use the first Bayesian
-    # stat's CV as a proxy: CV < 0.30 => has strong prior.
-    bayesian_prefixes = [p for p, b in stat_defs if b]
-    if bayesian_prefixes:
-        first_prefix = bayesian_prefixes[0]
-        m_col = f"{first_prefix}_mean"
-        s_col = f"{first_prefix}_sd"
-        if m_col in sim_df.columns and s_col in sim_df.columns:
-            m = sim_df[m_col].fillna(0).clip(lower=0.01)
-            s = sim_df[s_col].fillna(m * 0.5)
-            has_prior = ((s / m) < 0.30).astype(float)
+    # Query actual MLB PA/BF to distinguish established players from
+    # callups with 50 PA who get artificially tight posteriors.
+    try:
+        from src.data.db import read_sql as _read_sql_conf
+        id_col = "pitcher_id" if player_type == "pitcher" else "batter_id"
+        role = "pitcher" if player_type == "pitcher" else "batter"
+        pa_col_db = "pit_bf" if player_type == "pitcher" else "bat_pa"
+
+        mlb_exp = _read_sql_conf(f"""
+            SELECT player_id as {id_col},
+                   COUNT(DISTINCT season) as mlb_seasons,
+                   SUM({pa_col_db}) as career_pa
+            FROM production.fact_player_game_mlb
+            WHERE player_role = :role AND season BETWEEN 2020 AND 2025
+            GROUP BY player_id
+        """, {"role": role})
+
+        if not mlb_exp.empty:
+            sim_df = sim_df.merge(mlb_exp, on=id_col, how="left")
+            sim_df["mlb_seasons"] = sim_df["mlb_seasons"].fillna(0)
+            sim_df["career_pa"] = sim_df["career_pa"].fillna(0)
+
+            # Experience score: 0 at <100 PA, ramps to 1.0 at 1000+ PA
+            experience = (sim_df["career_pa"] / 1000.0).clip(0, 1)
+            # Season bonus: 3+ MLB seasons = full credit
+            season_bonus = (sim_df["mlb_seasons"] / 3.0).clip(0, 1)
+            track_record = 0.60 * experience + 0.40 * season_bonus
+
+            # Clean up temp columns
+            sim_df = sim_df.drop(columns=["mlb_seasons", "career_pa"], errors="ignore")
         else:
-            has_prior = pd.Series(0.5, index=sim_df.index)
-    else:
-        has_prior = pd.Series(0.5, index=sim_df.index)
+            track_record = pd.Series(0.5, index=sim_df.index)
+    except Exception:
+        track_record = pd.Series(0.5, index=sim_df.index)
 
     # ------------------------------------------------------------------
     # 4. Composite score + tier assignment
     # ------------------------------------------------------------------
-    composite = 0.40 * rate_conf + 0.40 * pt_conf + 0.20 * has_prior
+    composite = 0.35 * rate_conf + 0.35 * pt_conf + 0.30 * track_record
 
     # Tercile boundaries
     t33 = composite.quantile(1 / 3)
