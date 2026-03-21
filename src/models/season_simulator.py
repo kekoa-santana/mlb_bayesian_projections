@@ -88,6 +88,22 @@ class SeasonSimResult:
             - 2.0 * self.k_season.astype(float)
         ) / safe_ip + fip_constant
 
+    def runs_saved_season(self, lg_fip: float = 4.15) -> np.ndarray:
+        """FIP-based runs saved above average.
+
+        Pitcher equivalent of wRAA — measures total run prevention value
+        in the same unit (runs above average). ~10 runs saved per 1 WAR.
+
+        Parameters
+        ----------
+        lg_fip : float
+            League-average FIP (typically 4.10-4.20).
+        """
+        fip = self.fip_era_season()
+        ip = self.ip_season()
+        safe_ip = np.where(ip > 0, ip, np.nan)
+        return (lg_fip - fip) / 9.0 * safe_ip
+
     def whip_season(self) -> np.ndarray:
         """Compute WHIP from BB, H, IP."""
         ip = self.ip_season()
@@ -119,6 +135,10 @@ class SeasonSimResult:
         fip_valid = fip_era[~np.isnan(fip_era)]
         if len(fip_valid) > 0:
             stats["fip_era"] = _stat_summary(np.clip(fip_valid, 0, 15))
+        rs = self.runs_saved_season()
+        rs_valid = rs[~np.isnan(rs)]
+        if len(rs_valid) > 0:
+            stats["runs_saved"] = _stat_summary(rs_valid)
         whip = self.whip_season()
         whip_valid = whip[~np.isnan(whip)]
         if len(whip_valid) > 0:
@@ -682,6 +702,13 @@ def season_results_to_dataframe(
             fip_summary = _stat_summary(np.clip(fip_valid, 0, 15))
             for k, v in fip_summary.items():
                 row[f"projected_fip_era_{k}"] = v
+
+        rs = sim.runs_saved_season()
+        rs_valid = rs[~np.isnan(rs)]
+        if len(rs_valid) > 0:
+            rs_summary = _stat_summary(rs_valid)
+            for k, v in rs_summary.items():
+                row[f"projected_runs_saved_{k}"] = v
 
         rows.append(row)
 
