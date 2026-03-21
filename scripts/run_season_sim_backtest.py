@@ -27,7 +27,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.evaluation.season_sim_backtest import walk_forward_season_sim
+from src.evaluation.season_sim_backtest import walk_forward_season_sim, walk_forward_hitter_sim
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,8 +143,45 @@ def main() -> None:
     # Print timings
     timings = result["timings"]
     total = sum(timings.values())
-    logger.info("Timings: %s", {k: f"{v:.0f}s" for k, v in timings.items()})
-    logger.info("Total: %.0fs (%.1f min)", total, total / 60)
+    logger.info("Pitcher timings: %s", {k: f"{v:.0f}s" for k, v in timings.items()})
+    logger.info("Pitcher total: %.0fs (%.1f min)", total, total / 60)
+
+    # =================================================================
+    # Hitter sim backtest
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Running HITTER sim backtest...")
+    h_result = walk_forward_hitter_sim(
+        train_seasons=list(range(2018, 2025)),
+        test_season=2025,
+        **sampling,
+    )
+
+    h_summary = h_result["summary"]
+
+    print(f"\n{'=' * 75}")
+    print("  HITTER SEASON SIMULATOR BACKTEST RESULTS")
+    print(f"{'=' * 75}")
+
+    for _, r in h_summary.iterrows():
+        stat = r["stat"]
+        mae = f"MAE={r['sim_mae']:5.1f}" if pd.notna(r.get("sim_mae")) else ""
+        bias = f"bias={r['sim_bias']:+5.1f}" if pd.notna(r.get("sim_bias")) else ""
+        corr = f"r={r['sim_corr']:.3f}" if pd.notna(r.get("sim_corr")) else ""
+        cov80 = f"80%CI={r['sim_cov80']:.0%}" if pd.notna(r.get("sim_cov80")) else ""
+        vs_m = ""
+        if pd.notna(r.get("mae_vs_marcel_pct")) and r["mae_vs_marcel_pct"] != 0:
+            vs_m = f"vs Marcel: {r['mae_vs_marcel_pct']:+.1f}%"
+        parts = [p for p in [mae, bias, corr, cov80, vs_m] if p]
+        print(f"  {stat:15s}  {r['n']:3.0f}p  {'  '.join(parts)}")
+
+    h_summary.to_csv(out_dir / "hitter_sim_backtest_summary.csv", index=False)
+    logger.info("Saved hitter summary to outputs/hitter_sim_backtest_summary.csv")
+
+    h_timings = h_result["timings"]
+    h_total = sum(h_timings.values())
+    logger.info("Hitter timings: %s", {k: f"{v:.0f}s" for k, v in h_timings.items()})
+    logger.info("Hitter total: %.0fs (%.1f min)", h_total, h_total / 60)
 
 
 if __name__ == "__main__":

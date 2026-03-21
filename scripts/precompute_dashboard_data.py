@@ -502,6 +502,94 @@ def main() -> None:
         logger.exception("Failed to run sim-based pitcher projections")
 
     # =================================================================
+    # 2d. Sim-based hitter counting stats
+    # =================================================================
+    logger.info("=" * 60)
+    logger.info("Running sim-based hitter season projections...")
+
+    try:
+        from src.models.counting_projections import project_hitter_counting_sim
+        from src.models.hitter_model import extract_rate_samples as extract_hitter_rates
+
+        # Build hitter posteriors
+        logger.info("Building hitter posterior rate samples...")
+        hitter_posteriors: dict[int, dict[str, np.ndarray]] = {}
+        hitter_name_lookup: dict[int, str] = {}
+
+        active_hitters = hitter_ext[
+            (hitter_ext["season"] == FROM_SEASON)
+            & (hitter_ext["pa"] >= 50)
+        ][["batter_id", "batter_name", "pa", "hr", "sb", "games"]].drop_duplicates("batter_id")
+
+        hitter_name_lookup = dict(
+            zip(active_hitters["batter_id"], active_hitters["batter_name"])
+        )
+
+        rng_h = np.random.default_rng(42)
+        for _, hrow in active_hitters.iterrows():
+            bid = int(hrow["batter_id"])
+            rates: dict[str, np.ndarray] = {}
+
+            for stat_key in ["k_rate", "bb_rate"]:
+                if stat_key in hitter_results:
+                    try:
+                        rates[stat_key] = extract_hitter_rates(
+                            hitter_results[stat_key]["trace"],
+                            hitter_results[stat_key]["data"],
+                            batter_id=bid, season=FROM_SEASON,
+                            project_forward=True,
+                        )
+                        continue
+                    except (ValueError, KeyError):
+                        pass
+                if stat_key == "k_rate":
+                    rates[stat_key] = rng_h.beta(5, 18, size=8000)
+                else:
+                    rates[stat_key] = rng_h.beta(3, 30, size=8000)
+
+            # HR: synthetic Beta
+            pa_val = int(hrow["pa"])
+            hr_val = int(hrow.get("hr", pa_val * 0.03))
+            rates["hr_rate"] = rng_h.beta(hr_val + 1, pa_val - hr_val + 1, size=8000)
+
+            hitter_posteriors[bid] = rates
+
+        logger.info("Built hitter posteriors for %d batters", len(hitter_posteriors))
+
+        # SB rates from recent history
+        sb_rates: dict[int, tuple[float, float]] = {}
+        for _, hrow in active_hitters.iterrows():
+            bid = int(hrow["batter_id"])
+            games = max(int(hrow.get("games", 100)), 1)
+            sb = int(hrow.get("sb", 0))
+            sb_per_g = sb / games
+            sb_rates[bid] = (sb_per_g, max(sb_per_g * 0.30, 0.01))
+
+        # Run sim
+        import time as _time
+        t0_h = _time.time()
+        hitter_counting_sim = project_hitter_counting_sim(
+            posteriors=hitter_posteriors,
+            pa_priors=pa_priors,
+            sb_rates=sb_rates,
+            health_scores=health_df,
+            batter_names=hitter_name_lookup,
+            n_seasons=200,
+            random_seed=42,
+        )
+        elapsed_h = _time.time() - t0_h
+        hitter_counting_sim.to_parquet(
+            DASHBOARD_DIR / "hitter_counting_sim.parquet", index=False,
+        )
+        logger.info(
+            "Saved sim-based hitter projections: %d batters in %.1fs",
+            len(hitter_counting_sim), elapsed_h,
+        )
+
+    except Exception:
+        logger.exception("Failed to run sim-based hitter projections")
+
+    # =================================================================
     # 3. Pitcher K% model (for posterior samples → Game K sim)
     # =================================================================
     logger.info("=" * 60)

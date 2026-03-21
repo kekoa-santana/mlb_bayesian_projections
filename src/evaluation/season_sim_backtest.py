@@ -667,3 +667,234 @@ def walk_forward_season_sim(
         "timings": timings,
         "n_pitchers": len(common_ids),
     }
+
+
+# ===================================================================
+# Hitter Season Sim Backtest
+# ===================================================================
+
+def walk_forward_hitter_sim(
+    train_seasons: list[int],
+    test_season: int,
+    min_pa_train: int = 100,
+    min_pa_test: int = 200,
+    n_seasons: int = 200,
+    draws: int = 2000,
+    tune: int = 1000,
+    chains: int = 4,
+    random_seed: int = 42,
+) -> dict[str, Any]:
+    """Walk-forward evaluation of the hitter season simulator."""
+    from src.data.feature_eng import build_multi_season_hitter_extended
+    from src.models.hitter_projections import fit_all_models as fit_hitter_models
+    from src.models.hitter_model import extract_rate_samples as extract_hitter_rates
+    from src.models.pa_model import compute_hitter_pa_priors
+    from src.models.counting_projections import (
+        project_hitter_counting,
+        project_hitter_counting_sim,
+        marcel_counting_hitter,
+    )
+
+    timings: dict[str, float] = {}
+    last_train = max(train_seasons)
+    all_seasons = sorted(set(train_seasons) | {test_season})
+
+    logger.info("=" * 60)
+    logger.info("Hitter sim backtest: train=%s, test=%d", train_seasons, test_season)
+    logger.info("=" * 60)
+
+    # ---- Data ----
+    t0 = time.time()
+    hitter_ext = build_multi_season_hitter_extended(all_seasons, min_pa=1)
+    train_ext = hitter_ext[hitter_ext["season"].isin(train_seasons)]
+    timings["data_build"] = time.time() - t0
+
+    # ---- Fit models ----
+    t0 = time.time()
+    hitter_results = fit_hitter_models(
+        seasons=train_seasons, min_pa=min_pa_train,
+        draws=draws, tune=tune, chains=chains, random_seed=random_seed,
+    )
+    timings["mcmc_fit"] = time.time() - t0
+    logger.info("Hitter MCMC fit: %.1fs", timings["mcmc_fit"])
+
+    # ---- Posteriors ----
+    t0 = time.time()
+    active = hitter_ext[
+        (hitter_ext["season"] == last_train) & (hitter_ext["pa"] >= min_pa_train)
+    ][["batter_id", "batter_name", "pa", "hr", "sb", "games"]].drop_duplicates("batter_id")
+
+    rng = np.random.default_rng(random_seed)
+    posteriors: dict[int, dict[str, np.ndarray]] = {}
+    names: dict[int, str] = {}
+    sb_rate_lookup: dict[int, tuple[float, float]] = {}
+
+    for _, row in active.iterrows():
+        bid = int(row["batter_id"])
+        names[bid] = row.get("batter_name", "")
+        pa_val = int(row["pa"])
+        rates: dict[str, np.ndarray] = {}
+
+        for stat_key in ["k_rate", "bb_rate"]:
+            if stat_key in hitter_results:
+                try:
+                    rates[stat_key] = extract_hitter_rates(
+                        hitter_results[stat_key]["trace"],
+                        hitter_results[stat_key]["data"],
+                        batter_id=bid, season=last_train,
+                        project_forward=True,
+                    )
+                    continue
+                except (ValueError, KeyError):
+                    pass
+            rates[stat_key] = rng.beta(5, 20, size=8000) if stat_key == "k_rate" else rng.beta(3, 30, size=8000)
+
+        hr_val = int(row.get("hr", pa_val * 0.03))
+        rates["hr_rate"] = rng.beta(hr_val + 1, pa_val - hr_val + 1, size=8000)
+        posteriors[bid] = rates
+
+        games = max(int(row.get("games", 100)), 1)
+        sb = int(row.get("sb", 0))
+        sb_rate_lookup[bid] = (sb / games, max(sb / games * 0.30, 0.01))
+
+    timings["posteriors"] = time.time() - t0
+
+    # ---- PA priors ----
+    pa_priors = compute_hitter_pa_priors(
+        train_ext, from_season=last_train, min_pa=min_pa_train,
+    )
+
+    # ---- Health ----
+    try:
+        health_df = compute_health_scores(last_train)
+    except Exception:
+        health_df = None
+
+    # ---- Run sim ----
+    t0 = time.time()
+    sim_proj = project_hitter_counting_sim(
+        posteriors=posteriors,
+        pa_priors=pa_priors,
+        sb_rates=sb_rate_lookup,
+        health_scores=health_df,
+        batter_names=names,
+        n_seasons=n_seasons,
+        random_seed=random_seed,
+    )
+    timings["season_sim"] = time.time() - t0
+    logger.info("Hitter sim: %d batters in %.1fs", len(sim_proj), timings["season_sim"])
+
+    # ---- Old counting baseline ----
+    t0 = time.time()
+    old_proj = project_hitter_counting(
+        rate_model_results=hitter_results,
+        pa_priors=pa_priors,
+        hitter_extended=train_ext,
+        from_season=last_train,
+        n_draws=4000, min_pa=min_pa_train,
+        random_seed=random_seed,
+    )
+    timings["old_counting"] = time.time() - t0
+
+    # ---- Marcel ----
+    marcel_proj = marcel_counting_hitter(
+        train_ext, from_season=last_train, min_pa=min_pa_train,
+    )
+
+    # ---- Test actuals ----
+    from src.data.db import read_sql
+    test_df = hitter_ext[
+        (hitter_ext["season"] == test_season) & (hitter_ext["pa"] >= min_pa_test)
+    ].copy()
+
+    # Add R, RBI, H from game data
+    extra = read_sql("""
+        SELECT player_id as batter_id,
+               SUM(bat_h) as h_actual, SUM(bat_hr) as hr_actual,
+               SUM(bat_r) as r_actual, SUM(bat_rbi) as rbi_actual,
+               SUM(bat_sb) as sb_actual
+        FROM production.fact_player_game_mlb
+        WHERE season = :season AND player_role = 'batter'
+        GROUP BY player_id
+    """, {"season": test_season})
+    if not extra.empty:
+        test_df = test_df.merge(extra, on="batter_id", how="left")
+
+    common_ids = set(sim_proj["batter_id"]) & set(test_df["batter_id"])
+    logger.info("Common hitters: %d", len(common_ids))
+
+    # ---- Metrics ----
+    sim_sub = sim_proj[sim_proj["batter_id"].isin(common_ids)].copy()
+    test_sub = test_df[test_df["batter_id"].isin(common_ids)].copy()
+    old_sub = old_proj[old_proj["batter_id"].isin(common_ids)] if not old_proj.empty else pd.DataFrame()
+    marcel_sub = marcel_proj[marcel_proj["batter_id"].isin(common_ids)] if not marcel_proj.empty else pd.DataFrame()
+
+    summary_rows = []
+
+    eval_stats = [
+        ("total_k", "k", "total_k_mean", "marcel_k", True, True),
+        ("total_bb", "bb", "total_bb_mean", "marcel_bb", True, True),
+        ("total_hr", "hr_actual" if "hr_actual" in test_sub.columns else "hr", "total_hr_mean", "marcel_hr", True, True),
+        ("total_h", "h_actual" if "h_actual" in test_sub.columns else "h", "total_h_mean", None, False, False),
+        ("total_r", "r_actual", "total_r_mean", None, False, False),
+        ("total_rbi", "rbi_actual", "total_rbi_mean", None, False, False),
+        ("total_sb", "sb_actual" if "sb_actual" in test_sub.columns else "sb", "total_sb_mean", "marcel_sb", True, True),
+        ("total_pa", "pa", "total_pa_mean", None, False, False),
+        ("total_games", "games", "total_games_mean", None, False, False),
+    ]
+
+    for stat_prefix, actual_col, sim_mean_col, marcel_col, has_old, has_marcel in eval_stats:
+        if actual_col not in test_sub.columns or sim_mean_col not in sim_sub.columns:
+            continue
+
+        actual_vals = test_sub.set_index("batter_id")[actual_col].reindex(
+            sim_sub["batter_id"].values
+        ).values.astype(float)
+        sim_vals = sim_sub[sim_mean_col].values
+
+        lo_80 = sim_sub.get(f"{stat_prefix}_p10", pd.Series(dtype=float)).values
+        hi_80 = sim_sub.get(f"{stat_prefix}_p90", pd.Series(dtype=float)).values
+        lo_95 = sim_sub.get(f"{stat_prefix}_p2_5", pd.Series(dtype=float)).values
+        hi_95 = sim_sub.get(f"{stat_prefix}_p97_5", pd.Series(dtype=float)).values
+
+        sim_m = _compute_metrics(actual_vals, sim_vals, lo_80, hi_80, lo_95, hi_95)
+
+        marcel_m: dict[str, float] = {}
+        if has_marcel and marcel_col and not marcel_sub.empty and marcel_col in marcel_sub.columns:
+            m_vals = marcel_sub.set_index("batter_id")[marcel_col].reindex(
+                sim_sub["batter_id"].values
+            ).values.astype(float)
+            marcel_m = _compute_metrics(actual_vals, m_vals)
+
+        old_m: dict[str, float] = {}
+        if has_old and not old_sub.empty:
+            old_mean_col = f"{stat_prefix}_mean"
+            if old_mean_col in old_sub.columns:
+                o_vals = old_sub.set_index("batter_id")[old_mean_col].reindex(
+                    sim_sub["batter_id"].values
+                ).values.astype(float)
+                old_m = _compute_metrics(actual_vals, o_vals)
+
+        mae_vs_marcel = 0.0
+        if marcel_m.get("mae", 0) > 0:
+            mae_vs_marcel = (marcel_m["mae"] - sim_m.get("mae", 0)) / marcel_m["mae"] * 100
+
+        summary_rows.append({
+            "stat": stat_prefix, "role": "ALL", "test_season": test_season,
+            "n": sim_m.get("n", 0),
+            "sim_mae": sim_m.get("mae"), "sim_rmse": sim_m.get("rmse"),
+            "sim_bias": sim_m.get("bias"), "sim_corr": sim_m.get("correlation"),
+            "sim_cov80": sim_m.get("coverage_80"), "sim_cov95": sim_m.get("coverage_95"),
+            "old_mae": old_m.get("mae"), "old_corr": old_m.get("correlation"),
+            "marcel_mae": marcel_m.get("mae"), "marcel_corr": marcel_m.get("correlation"),
+            "mae_vs_marcel_pct": mae_vs_marcel,
+            "mae_vs_old_pct": (old_m["mae"] - sim_m.get("mae", 0)) / old_m["mae"] * 100 if old_m.get("mae", 0) > 0 else None,
+        })
+
+    summary = pd.DataFrame(summary_rows)
+    return {
+        "summary": summary,
+        "test_season": test_season,
+        "timings": timings,
+        "n_hitters": len(common_ids),
+    }
