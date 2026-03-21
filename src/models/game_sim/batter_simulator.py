@@ -322,24 +322,28 @@ def simulate_batter_game(
         is_hit = np.isin(outcomes, [PA_SINGLE, PA_DOUBLE, PA_TRIPLE, PA_HOME_RUN])
         h_total[active] += is_hit.astype(np.int32)
 
-        # Simplified R/RBI: HR always scores batter (R+1, RBI+1)
-        # Other hits sometimes score runners — use population averages
+        # R/RBI scoring (calibrated to 2019-2025 league averages)
+        # HR: batter always scores + drives in ~0.4 runners on avg
         is_hr = (outcomes == PA_HOME_RUN)
         r_total[active] += is_hr.astype(np.int32)
         rbi_total[active] += is_hr.astype(np.int32)
+        # HR extra RBI: ~40% chance of driving in an additional runner
+        rbi_total[active] += (is_hr & (rng.random(n_active) < 0.40)).astype(np.int32)
 
-        # Non-HR hits: ~15% chance of scoring a run, ~30% chance of RBI
+        # Non-HR hits: calibrated from actual R/PA and RBI/PA rates
         non_hr_hit = is_hit & ~is_hr
         n_non_hr = non_hr_hit.sum()
         if n_non_hr > 0:
-            r_total[active] += (non_hr_hit & (rng.random(n_active) < 0.15)).astype(np.int32)
-            rbi_total[active] += (non_hr_hit & (rng.random(n_active) < 0.30)).astype(np.int32)
+            r_total[active] += (non_hr_hit & (rng.random(n_active) < 0.36)).astype(np.int32)
+            rbi_total[active] += (non_hr_hit & (rng.random(n_active) < 0.35)).astype(np.int32)
 
-        # BB/HBP: ~10% chance of eventually scoring
+        # BB/HBP: ~18% chance of eventually scoring
         on_base_no_hit = np.isin(outcomes, [PA_WALK, PA_HBP])
         n_ob = on_base_no_hit.sum()
         if n_ob > 0:
-            r_total[active] += (on_base_no_hit & (rng.random(n_active) < 0.10)).astype(np.int32)
+            r_total[active] += (on_base_no_hit & (rng.random(n_active) < 0.18)).astype(np.int32)
+            # RBI on BB/HBP (bases loaded walk): ~3%
+            rbi_total[active] += (on_base_no_hit & (rng.random(n_active) < 0.03)).astype(np.int32)
 
     # Compute total bases
     tb_total = (
