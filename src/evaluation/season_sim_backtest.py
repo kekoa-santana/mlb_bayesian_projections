@@ -837,12 +837,28 @@ def walk_forward_hitter_sim(
         logger.warning("BIP profile computation failed: %s", e)
     timings["bip_profiles"] = time.time() - t0_bip
 
+    # ---- Lineup context (R/RBI multipliers) ----
+    lineup_ctx_lookup: dict[int, tuple[float, float]] = {}
+    try:
+        from src.models.lineup_context import compute_lineup_context
+        ctx = compute_lineup_context(last_train, min_games=30)
+        if not ctx.empty:
+            for _, row in ctx.iterrows():
+                lineup_ctx_lookup[int(row["batter_id"])] = (
+                    float(row["r_multiplier"]),
+                    float(row["rbi_multiplier"]),
+                )
+            logger.info("Lineup context: %d hitters", len(lineup_ctx_lookup))
+    except Exception as e:
+        logger.warning("Lineup context failed: %s", e)
+
     # ---- Run sim ----
     t0 = time.time()
     sim_proj = project_hitter_counting_sim(
         posteriors=posteriors,
         pa_priors=pa_priors,
         bip_profiles=bip_profile_lookup if bip_profile_lookup else None,
+        lineup_context=lineup_ctx_lookup if lineup_ctx_lookup else None,
         sb_rates=sb_rate_lookup,
         health_scores=health_df,
         batter_names=names,
