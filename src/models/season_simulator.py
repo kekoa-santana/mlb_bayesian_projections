@@ -856,6 +856,7 @@ def simulate_hitter_season(
     n_games_sigma: float = 26.0,
     batting_order: int = 5,
     babip_adj: float = 0.0,
+    bip_probs: np.ndarray | None = None,
     sb_rate: float = 0.0,
     sb_rate_sd: float = 0.0,
     n_seasons: int = 200,
@@ -949,6 +950,26 @@ def simulate_hitter_season(
         pa_out[s] = result.pa_samples[idx:end].sum()
         idx = end
 
+    # Redistribute hit types using player-specific BIP profile
+    if bip_probs is not None:
+        # bip_probs = [out, single, double, triple]
+        # Compute hit-type shares (conditional on non-HR hit)
+        hit_total = bip_probs[1] + bip_probs[2] + bip_probs[3]
+        if hit_total > 0:
+            s_share = bip_probs[1] / hit_total
+            d_share = bip_probs[2] / hit_total
+            t_share = bip_probs[3] / hit_total
+            for s in range(n_seasons):
+                non_hr_hits = int(h_out[s] - hr_out[s])
+                if non_hr_hits > 0:
+                    # Redistribute non-HR hits according to player profile
+                    draws = rng.multinomial(non_hr_hits, [s_share, d_share, t_share])
+                    single_out[s] = draws[0]
+                    double_out[s] = draws[1]
+                    triple_out[s] = draws[2]
+            # Recompute TB
+            tb_out = single_out + 2 * double_out + 3 * triple_out + 4 * hr_out
+
     # SB: rate x games (not in game sim)
     sb_draws = rng.normal(sb_rate, max(sb_rate_sd, sb_rate * 0.15 + 0.01), size=n_seasons)
     sb_out = np.clip(np.round(sb_draws * games_per_season), 0, 100).astype(np.int32)
@@ -979,6 +1000,7 @@ def simulate_all_hitters(
     pa_priors: pd.DataFrame,
     batting_orders: dict[int, int] | None = None,
     babip_adjs: dict[int, float] | None = None,
+    bip_profiles: dict[int, np.ndarray] | None = None,
     sb_rates: dict[int, tuple[float, float]] | None = None,
     health_scores: pd.DataFrame | None = None,
     n_seasons: int = 200,
@@ -1044,6 +1066,9 @@ def simulate_all_hitters(
         # BABIP
         babip = (babip_adjs or {}).get(bid, 0.0)
 
+        # BIP profile
+        player_bip = (bip_profiles or {}).get(bid, None)
+
         # SB
         sb_mean, sb_sd = (sb_rates or {}).get(bid, (0.0, 0.0))
 
@@ -1056,6 +1081,7 @@ def simulate_all_hitters(
             n_games_sigma=games_sigma,
             batting_order=order,
             babip_adj=babip,
+            bip_probs=player_bip,
             sb_rate=sb_mean,
             sb_rate_sd=sb_sd,
             n_seasons=n_seasons,
