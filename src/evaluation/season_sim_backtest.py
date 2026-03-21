@@ -659,6 +659,31 @@ def walk_forward_season_sim(
             "mae_vs_marcel_pct": None, "mae_vs_old_pct": None,
         })
 
+    # FIP- and Runs Saved (need actual FIP from DB for comparison)
+    for stat_col, stat_label in [
+        ("projected_fip_minus_mean", "FIP-"),
+        ("projected_runs_saved_mean", "Runs Saved"),
+    ]:
+        if stat_col in sim_sub.columns:
+            p10 = stat_col.replace("_mean", "_p10")
+            p90 = stat_col.replace("_mean", "_p90")
+            p2_5 = stat_col.replace("_mean", "_p2_5")
+            p97_5 = stat_col.replace("_mean", "_p97_5")
+            sim_vals = sim_sub[stat_col].values
+            # No direct actual comparison for these indexed stats,
+            # but record distributions for documentation
+            summary_rows.append({
+                "stat": stat_label, "role": "ALL", "test_season": test_season,
+                "n": len(sim_vals),
+                "sim_mae": None, "sim_rmse": None,
+                "sim_bias": float(np.nanmean(sim_vals)),  # store mean as reference
+                "sim_corr": None,
+                "sim_cov80": None, "sim_cov95": None,
+                "old_mae": None, "old_corr": None,
+                "marcel_mae": None, "marcel_corr": None,
+                "mae_vs_marcel_pct": None, "mae_vs_old_pct": None,
+            })
+
     summary = pd.DataFrame(summary_rows)
 
     return {
@@ -889,6 +914,63 @@ def walk_forward_hitter_sim(
             "marcel_mae": marcel_m.get("mae"), "marcel_corr": marcel_m.get("correlation"),
             "mae_vs_marcel_pct": mae_vs_marcel,
             "mae_vs_old_pct": (old_m["mae"] - sim_m.get("mae", 0)) / old_m["mae"] * 100 if old_m.get("mae", 0) > 0 else None,
+        })
+
+    # ---- wOBA / wRC+ / wRAA validation ----
+    adv_actuals = read_sql("""
+        SELECT batter_id, woba as actual_woba, wrc_plus as actual_wrc_plus
+        FROM production.fact_batting_advanced
+        WHERE season = :season AND pa >= :min_pa
+    """, {"season": test_season, "min_pa": min_pa_test})
+
+    if not adv_actuals.empty:
+        test_sub = test_sub.merge(adv_actuals, on="batter_id", how="left")
+
+        for stat_label, sim_col, actual_col, p10c, p90c, p2_5c, p97_5c in [
+            ("wOBA", "projected_woba_mean", "actual_woba",
+             "projected_woba_p10", "projected_woba_p90",
+             "projected_woba_p2_5", "projected_woba_p97_5"),
+            ("wRC+", "projected_wrc_plus_mean", "actual_wrc_plus",
+             "projected_wrc_plus_p10", "projected_wrc_plus_p90",
+             "projected_wrc_plus_p2_5", "projected_wrc_plus_p97_5"),
+        ]:
+            if sim_col not in sim_sub.columns or actual_col not in test_sub.columns:
+                continue
+
+            actual_vals = test_sub.set_index("batter_id")[actual_col].reindex(
+                sim_sub["batter_id"].values
+            ).values.astype(float)
+            sim_vals = sim_sub[sim_col].values
+            lo_80 = sim_sub.get(p10c, pd.Series(dtype=float)).values
+            hi_80 = sim_sub.get(p90c, pd.Series(dtype=float)).values
+            lo_95 = sim_sub.get(p2_5c, pd.Series(dtype=float)).values
+            hi_95 = sim_sub.get(p97_5c, pd.Series(dtype=float)).values
+
+            m = _compute_metrics(actual_vals, sim_vals, lo_80, hi_80, lo_95, hi_95)
+
+            summary_rows.append({
+                "stat": stat_label, "role": "ALL", "test_season": test_season,
+                "n": m.get("n", 0),
+                "sim_mae": m.get("mae"), "sim_rmse": m.get("rmse"),
+                "sim_bias": m.get("bias"), "sim_corr": m.get("correlation"),
+                "sim_cov80": m.get("coverage_80"), "sim_cov95": m.get("coverage_95"),
+                "old_mae": None, "old_corr": None,
+                "marcel_mae": None, "marcel_corr": None,
+                "mae_vs_marcel_pct": None, "mae_vs_old_pct": None,
+            })
+
+    # wRAA (no direct actual — record distribution for reference)
+    if "projected_wraa_mean" in sim_sub.columns:
+        summary_rows.append({
+            "stat": "wRAA", "role": "ALL", "test_season": test_season,
+            "n": len(sim_sub),
+            "sim_mae": None, "sim_rmse": None,
+            "sim_bias": float(sim_sub["projected_wraa_mean"].mean()),
+            "sim_corr": None,
+            "sim_cov80": None, "sim_cov95": None,
+            "old_mae": None, "old_corr": None,
+            "marcel_mae": None, "marcel_corr": None,
+            "mae_vs_marcel_pct": None, "mae_vs_old_pct": None,
         })
 
     summary = pd.DataFrame(summary_rows)
