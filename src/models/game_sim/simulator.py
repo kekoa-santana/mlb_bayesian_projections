@@ -439,6 +439,9 @@ def predict_game(
     umpire_k_lift: float = 0.0,
     umpire_bb_lift: float = 0.0,
     park_hr_lift: float = 0.0,
+    park_k_lift: float = 0.0,
+    park_bb_lift: float = 0.0,
+    catcher_k_lift: float = 0.0,
     weather_k_lift: float = 0.0,
     n_sims: int = 10_000,
     random_seed: int = 42,
@@ -500,7 +503,10 @@ def predict_game(
         season=season,
     )
 
-    # Run simulation
+    # Run simulation — combine park + catcher + umpire + weather lifts
+    total_k_lift = umpire_k_lift + park_k_lift + catcher_k_lift + weather_k_lift
+    total_bb_lift = umpire_bb_lift + park_bb_lift
+
     result = simulate_game(
         pitcher_k_rate_samples=pitcher_k_rate_samples,
         pitcher_bb_rate_samples=pitcher_bb_rate_samples,
@@ -512,10 +518,10 @@ def predict_game(
         exit_model=exit_model,
         pitcher_avg_pitches=pitcher_avg_pitches,
         babip_adj=babip_adj,
-        umpire_k_lift=umpire_k_lift,
-        umpire_bb_lift=umpire_bb_lift,
+        umpire_k_lift=total_k_lift,
+        umpire_bb_lift=total_bb_lift,
         park_hr_lift=park_hr_lift,
-        weather_k_lift=weather_k_lift,
+        weather_k_lift=0.0,  # already folded into total_k_lift
         n_sims=n_sims,
         random_seed=random_seed,
     )
