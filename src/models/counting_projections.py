@@ -851,3 +851,162 @@ def marcel_counting_pitcher(
         results.append(result_row)
 
     return pd.DataFrame(results)
+
+
+# -----------------------------------------------------------------------
+# Confidence tiers for counting stat projections
+# -----------------------------------------------------------------------
+
+# Stat groups per player type: (column_prefix, is_bayesian)
+_PITCHER_RATE_STATS = [
+    ("total_k", True),
+    ("total_bb", True),
+    ("total_outs", False),
+    ("total_er", False),
+]
+_HITTER_RATE_STATS = [
+    ("total_k", True),
+    ("total_bb", True),
+    ("total_hr", False),
+    ("total_sb", False),
+]
+
+# Playing time columns per player type
+_PT_COL = {
+    "pitcher": "projected_bf_mean",
+    "hitter": "projected_pa_mean",
+}
+
+
+def add_confidence_tiers(
+    sim_df: pd.DataFrame,
+    player_type: str = "pitcher",
+) -> pd.DataFrame:
+    """Compute per-player confidence tiers for counting stat projections.
+
+    Confidence is a composite of three signals:
+      - Rate confidence (40%): inverse CV across the player's Bayesian and
+        shrinkage counting stats.  Lower CV = tighter projection = higher
+        confidence.
+      - Playing-time confidence (40%): inverse CV of the projected playing
+        time distribution (PA for hitters, BF for pitchers).
+      - Has-prior-season flag (20%): 1 if the player has >= 2 seasons of
+        history (proxied by the presence of a non-trivial sd), 0 otherwise.
+
+    Players are binned into thirds: HIGH (top 1/3), MEDIUM (middle 1/3),
+    LOW (bottom 1/3) by composite score.
+
+    Parameters
+    ----------
+    sim_df : pd.DataFrame
+        Output of ``project_*_counting_sim`` or ``project_*_counting``.
+        Must have ``<stat>_mean`` and ``<stat>_sd`` columns.
+    player_type : str
+        ``"pitcher"`` or ``"hitter"``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input dataframe with two new columns: ``confidence_score`` (float
+        in [0, 1]) and ``confidence_tier`` (``"HIGH"`` / ``"MEDIUM"`` /
+        ``"LOW"``).
+    """
+    if sim_df.empty:
+        sim_df["confidence_score"] = pd.Series(dtype=float)
+        sim_df["confidence_tier"] = pd.Series(dtype=str)
+        return sim_df
+
+    stat_defs = _PITCHER_RATE_STATS if player_type == "pitcher" else _HITTER_RATE_STATS
+    pt_col = _PT_COL.get(player_type, "projected_pa_mean")
+
+    # ------------------------------------------------------------------
+    # 1. Rate confidence: mean inverse-CV across counting stats
+    # ------------------------------------------------------------------
+    rate_cvs: list[pd.Series] = []
+    for prefix, _is_bayesian in stat_defs:
+        mean_col = f"{prefix}_mean"
+        sd_col = f"{prefix}_sd"
+        if mean_col in sim_df.columns and sd_col in sim_df.columns:
+            mean_vals = sim_df[mean_col].fillna(0).clip(lower=0.01)
+            sd_vals = sim_df[sd_col].fillna(mean_vals * 0.5)
+            cv = sd_vals / mean_vals
+            rate_cvs.append(cv)
+
+    if rate_cvs:
+        avg_cv = pd.concat(rate_cvs, axis=1).mean(axis=1)
+    else:
+        avg_cv = pd.Series(0.5, index=sim_df.index)
+
+    # Inverse-CV mapped to 0-1 (lower CV = higher confidence)
+    # Typical CV range: 0.05 (very tight) to 1.0+ (very wide)
+    rate_conf = (1.0 - avg_cv.clip(0, 1.0)).clip(0, 1)
+
+    # ------------------------------------------------------------------
+    # 2. Playing-time confidence: inverse CV of projected PT
+    # ------------------------------------------------------------------
+    pt_sd_col = pt_col.replace("_mean", "_sd") if pt_col.endswith("_mean") else None
+    if pt_col in sim_df.columns and pt_sd_col and pt_sd_col in sim_df.columns:
+        pt_mean = sim_df[pt_col].fillna(0).clip(lower=1)
+        pt_sd = sim_df[pt_sd_col].fillna(pt_mean * 0.5)
+        pt_cv = pt_sd / pt_mean
+    elif pt_col in sim_df.columns:
+        # If no explicit SD column, estimate from percentiles
+        pt_mean = sim_df[pt_col].fillna(0).clip(lower=1)
+        p10_col = pt_col.replace("_mean", "_p10")
+        p90_col = pt_col.replace("_mean", "_p90")
+        if p10_col in sim_df.columns and p90_col in sim_df.columns:
+            spread = (sim_df[p90_col] - sim_df[p10_col]).fillna(0).clip(lower=0)
+            approx_sd = spread / 2.56  # p10-p90 ~ 2.56 sigma
+            pt_cv = approx_sd / pt_mean
+        else:
+            pt_cv = pd.Series(0.3, index=sim_df.index)
+    else:
+        pt_cv = pd.Series(0.3, index=sim_df.index)
+
+    pt_conf = (1.0 - pt_cv.clip(0, 1.0)).clip(0, 1)
+
+    # ------------------------------------------------------------------
+    # 3. Has-prior-season proxy
+    # ------------------------------------------------------------------
+    # Players with very low SD relative to mean on a Bayesian stat likely
+    # have strong priors from multiple seasons.  Use the first Bayesian
+    # stat's CV as a proxy: CV < 0.30 => has strong prior.
+    bayesian_prefixes = [p for p, b in stat_defs if b]
+    if bayesian_prefixes:
+        first_prefix = bayesian_prefixes[0]
+        m_col = f"{first_prefix}_mean"
+        s_col = f"{first_prefix}_sd"
+        if m_col in sim_df.columns and s_col in sim_df.columns:
+            m = sim_df[m_col].fillna(0).clip(lower=0.01)
+            s = sim_df[s_col].fillna(m * 0.5)
+            has_prior = ((s / m) < 0.30).astype(float)
+        else:
+            has_prior = pd.Series(0.5, index=sim_df.index)
+    else:
+        has_prior = pd.Series(0.5, index=sim_df.index)
+
+    # ------------------------------------------------------------------
+    # 4. Composite score + tier assignment
+    # ------------------------------------------------------------------
+    composite = 0.40 * rate_conf + 0.40 * pt_conf + 0.20 * has_prior
+
+    # Tercile boundaries
+    t33 = composite.quantile(1 / 3)
+    t67 = composite.quantile(2 / 3)
+
+    tiers = pd.Series("MEDIUM", index=sim_df.index)
+    tiers[composite >= t67] = "HIGH"
+    tiers[composite <= t33] = "LOW"
+
+    sim_df = sim_df.copy()
+    sim_df["confidence_score"] = composite.round(4)
+    sim_df["confidence_tier"] = tiers.values
+
+    logger.info(
+        "Confidence tiers (%s): HIGH=%d, MEDIUM=%d, LOW=%d",
+        player_type,
+        (tiers == "HIGH").sum(),
+        (tiers == "MEDIUM").sum(),
+        (tiers == "LOW").sum(),
+    )
+    return sim_df

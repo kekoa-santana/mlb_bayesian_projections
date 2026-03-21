@@ -62,6 +62,7 @@ from src.data.queries import (
 from src.models.bf_model import compute_pitcher_bf_priors
 from src.models.health_score import compute_health_scores
 from src.models.counting_projections import (
+    add_confidence_tiers,
     project_hitter_counting,
     project_pitcher_counting,
     project_pitcher_counting_sim,
@@ -478,6 +479,10 @@ def main() -> None:
             random_seed=42,
         )
         elapsed = time.time() - t0
+
+        # Add confidence tiers before saving
+        pitcher_counting_sim = add_confidence_tiers(pitcher_counting_sim, player_type="pitcher")
+
         pitcher_counting_sim.to_parquet(
             DASHBOARD_DIR / "pitcher_counting_sim.parquet", index=False,
         )
@@ -652,6 +657,10 @@ def main() -> None:
             random_seed=42,
         )
         elapsed_h = _time.time() - t0_h
+
+        # Add confidence tiers before saving
+        hitter_counting_sim = add_confidence_tiers(hitter_counting_sim, player_type="hitter")
+
         hitter_counting_sim.to_parquet(
             DASHBOARD_DIR / "hitter_counting_sim.parquet", index=False,
         )
