@@ -392,3 +392,101 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# =========================================================================
+# PRECOMPUTE GROUP REFERENCE
+# =========================================================================
+#
+# Usage: python scripts/precompute_dashboard_data.py --include <groups>
+#        Add --quick for faster MCMC (500 draws vs 2000, good for iteration)
+#
+# -------------------------------------------------------------------------
+# GROUP            SECTIONS                    WHAT IT DOES
+# -------------------------------------------------------------------------
+# models           hitter_models,              Bayesian MCMC for K%, BB%,
+#                  pitcher_models              GB%, FB%, HR/FB, wOBA, chase.
+#                                              ~3 min (quick), ~15 min (full).
+#                                              REQUIRED before projections.
+#
+# projections      hitter_proj, pitcher_proj,  Composite projections, counting
+#                  counting, sim_pitcher,      stats (rate x PA), sim-based
+#                  sim_hitter                  season projections with BIP
+#                                              profiles + Marcel HR + BABIP.
+#                                              ~2 min. Needs models.
+#
+# samples          pitcher_samples,            Save posterior rate samples as
+#                  hitter_samples              NPZ for game sim / dashboard.
+#
+# team             team_elo, series_elo,       Full team pipeline: ELO ratings,
+#                  team_profiles, team_power,  profiles (BaseRuns, pitcher-
+#                  team_sim, depth_chart,      defense synergy), power rankings
+#                  roster                      (confidence blend), MC season
+#                                              sim (injury cascade), depth
+#                                              chart, roster export.
+#                                              ~6 min total.
+#
+# rankings         player_rankings, breakouts  Positional player rankings
+#                                              (PA-weighted), breakout scoring.
+#                                              Needs projections + sim.
+#
+# profiles         arsenal, vuln,              Pitch-level player profiles
+#                  archetypes, zones           (arsenal, vulnerability, zone
+#                                              grids). DB-heavy, ~5 min.
+#
+# game_data        player_teams, game_logs,    Game-level data: team mappings,
+#                  bf_priors, umpire, weather  pitcher BF priors, umpire/weather
+#                                              tendencies.
+#
+# traditional      trad_stats, agg_eff         Traditional stats + multi-season
+#                                              historical datasets.
+#
+# glicko           player_glicko              Glicko-2 player ratings from PA
+#                                              outcomes. ~1 min.
+#
+# game_sim         game_sim_data              Exit model, pitch count features,
+#                                              TTO profiles, bullpen rates.
+#                                              DB-heavy, ~2 min.
+#
+# prospects        prospect_data              MiLB translations, readiness
+#                                              model, TDD prospect rankings,
+#                                              prospect-to-MLB comps.
+#
+# health           health_parks               Health/durability scores + park
+#                                              factors. Quick.
+#
+# historical       historical_all             Multi-season historical profiles
+#                                              (all 2018-2025 stacked).
+#
+# snapshots        projection_snapshots       Preseason snapshot + backtest
+#                                              CSV-to-parquet conversion.
+#
+# -------------------------------------------------------------------------
+# COMMON WORKFLOWS
+# -------------------------------------------------------------------------
+#
+# Full rebuild (everything):
+#   python scripts/precompute_dashboard_data.py --quick
+#   ~20-25 min. Run after major model changes or start of new season.
+#
+# Player projections only (after model tweaks):
+#   python scripts/precompute_dashboard_data.py --include models,projections --quick
+#   ~5 min. Regenerates all player-level projections.
+#
+# Team rankings only (after projection changes):
+#   python scripts/precompute_dashboard_data.py --include team
+#   ~6 min. ELO + profiles + power rankings + sim + depth chart.
+#
+# Quick team sim check:
+#   python scripts/precompute_dashboard_data.py --include team_sim,team_power
+#   ~5 min. Just the MC sim + power rankings (needs existing parquets).
+#
+# Player rankings + team (most common after any change):
+#   python scripts/precompute_dashboard_data.py --include rankings,team
+#   ~7 min. Updates player rankings then full team pipeline.
+#
+# Full dashboard update (models + everything downstream):
+#   python scripts/precompute_dashboard_data.py --include models,projections,rankings,team --quick
+#   ~15 min. The "safe" full update.
+#
+# List all groups:
+#   python scripts/precompute_dashboard_data.py --list-groups
