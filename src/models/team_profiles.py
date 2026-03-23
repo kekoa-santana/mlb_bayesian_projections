@@ -775,11 +775,12 @@ def _build_health_depth(
 
     result["roster_continuity"] = result["roster_continuity"].fillna(0.5)
 
-    # Composite: 60% player health + 25% age trajectory + 15% roster stability
+    # Composite: 70% player health + 30% age trajectory
+    # roster_continuity demoted to metadata only — research shows it's not
+    # predictive for one-year forecasts (retained as column for display)
     result["health_depth_score"] = (
-        0.60 * result["player_health"]
-        + 0.25 * result["age_pctl"]
-        + 0.15 * result["roster_continuity"]
+        0.70 * result["player_health"]
+        + 0.30 * result["age_pctl"]
     )
 
     return result
@@ -962,17 +963,102 @@ def build_all_team_profiles(
     logger.info("Building schedule context...")
     schedule = _build_schedule_context(elo_history, team_info)
 
+    # --- BaseRuns: projected RS/RA from counting sims ---
+    # BaseRuns formula: RS = A*B/(B+C) + D
+    # A = H+BB+HBP-HR, B = (1.4*TB - 0.6*H - 3*HR + 0.1*(BB+HBP))*1.02
+    # C = AB-H (outs on BIP), D = HR
+    # Produces forward-looking projected runs, not retrospective
+    try:
+        pt_pid = "batter_id" if "batter_id" in player_teams.columns else "player_id"
+        if hitter_counting is not None and "total_h_mean" in hitter_counting.columns:
+            h_id = "batter_id" if "batter_id" in hitter_counting.columns else "player_id"
+            hc = hitter_counting.merge(
+                player_teams[[pt_pid, "team_id"]].rename(columns={pt_pid: h_id}),
+                on=h_id, how="inner",
+            )
+            team_rs = hc.groupby("team_id").agg(
+                h=("total_h_mean", "sum"),
+                bb=("total_bb_mean", "sum"),
+                hbp=("total_hbp_mean", "sum") if "total_hbp_mean" in hc.columns else ("total_bb_mean", lambda x: 0),
+                hr=("total_hr_mean", "sum"),
+                tb=("total_tb_mean", "sum") if "total_tb_mean" in hc.columns else ("total_hr_mean", lambda x: 0),
+                pa=("total_pa_mean", "sum"),
+            ).reset_index()
+
+            # Estimate TB if not available: TB = 1B + 2*2B + 3*3B + 4*HR
+            if "total_tb_mean" not in hc.columns:
+                tb_cols = {}
+                for c in ["total_1b_mean", "total_2b_mean", "total_3b_mean", "total_hr_mean"]:
+                    if c in hc.columns:
+                        tb_cols[c] = hc.groupby("team_id")[c].sum()
+                if tb_cols:
+                    tb_df = pd.DataFrame(tb_cols).fillna(0)
+                    team_rs["tb"] = (
+                        tb_df.get("total_1b_mean", 0)
+                        + 2 * tb_df.get("total_2b_mean", 0)
+                        + 3 * tb_df.get("total_3b_mean", 0)
+                        + 4 * tb_df.get("total_hr_mean", 0)
+                    ).values
+
+            if "total_hbp_mean" not in hc.columns:
+                team_rs["hbp"] = team_rs["pa"] * 0.008  # ~0.8% of PA
+
+            # BaseRuns
+            A = team_rs["h"] + team_rs["bb"] + team_rs["hbp"] - team_rs["hr"]
+            B = (1.4 * team_rs["tb"] - 0.6 * team_rs["h"] - 3 * team_rs["hr"]
+                 + 0.1 * (team_rs["bb"] + team_rs["hbp"])) * 1.02
+            sf_est = team_rs["pa"] * 0.008
+            C = (team_rs["pa"] - team_rs["bb"] - team_rs["hbp"] - sf_est) - team_rs["h"]
+            D = team_rs["hr"]
+            team_rs["baseruns_rs"] = A * B / (B + C).clip(1) + D
+
+            # Normalize to per-game (standard ~38.5 PA/game for a team)
+            STD_TEAM_PA_PER_GAME = 38.5
+            team_rs["proj_rs_per_game"] = (
+                team_rs["baseruns_rs"] / team_rs["pa"] * STD_TEAM_PA_PER_GAME * 162
+                / 162
+            )
+            offense = offense.merge(
+                team_rs[["team_id", "baseruns_rs", "proj_rs_per_game"]],
+                on="team_id", how="left",
+            )
+            logger.info("BaseRuns RS computed for %d teams (mean=%.0f runs)",
+                        len(team_rs), team_rs["baseruns_rs"].mean())
+
+        # Pitcher side: use simulated runs directly (already calibrated)
+        if pitcher_counting is not None and "total_runs_mean" in pitcher_counting.columns:
+            p_id = "pitcher_id" if "pitcher_id" in pitcher_counting.columns else "player_id"
+            pc = pitcher_counting.merge(
+                player_teams[[pt_pid, "team_id"]].rename(columns={pt_pid: p_id}),
+                on=p_id, how="inner",
+            )
+            team_ra = pc.groupby("team_id").agg(
+                runs_allowed=("total_runs_mean", "sum"),
+                ip=("projected_ip_mean", "sum") if "projected_ip_mean" in pc.columns else ("total_outs_mean", lambda x: x.sum() / 3),
+            ).reset_index()
+            team_ra["proj_ra_per_game"] = team_ra["runs_allowed"] / (team_ra["ip"] / 9).clip(1)
+            pitching = pitching.merge(
+                team_ra[["team_id", "proj_ra_per_game"]],
+                on="team_id", how="left",
+            )
+            logger.info("Projected RA/game computed for %d teams (mean=%.2f)",
+                        len(team_ra), team_ra["proj_ra_per_game"].mean())
+    except Exception as e:
+        logger.warning("BaseRuns computation failed: %s", e)
+
     # Merge all dimensions
     result = offense[["team_id", "offense_score"]].copy()
     for extra_col in ["offense_style", "lineup_depth", "lineup_floor", "rpg", "hr_per_game", "sb_per_game",
-                       "proj_R", "proj_HR", "proj_SB", "avg_hitter_score"]:
+                       "proj_R", "proj_HR", "proj_SB", "avg_hitter_score",
+                       "baseruns_rs", "proj_rs_per_game"]:
         if extra_col in offense.columns:
             result[extra_col] = offense[extra_col]
 
     for df, key_cols in [
         (pitching, ["pitching_score", "rotation_score", "bullpen_score",
                      "rotation_strength", "bullpen_depth",
-                     "pitching_style", "ra_per_game", "k_per_game"]),
+                     "pitching_style", "ra_per_game", "k_per_game",
+                     "proj_ra_per_game"]),
         (defense, ["defense_score", "team_oaa", "catcher_framing_runs"]),
         (org, ["org_score", "pct_homegrown", "farm_avg_score", "n_ranked_prospects", "top_100_count"]),
         (health, ["health_depth_score", "total_il_days", "avg_age", "age_trajectory",

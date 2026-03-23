@@ -27,12 +27,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # ---------------------------------------------------------------------------
 # Composite weights (sum to 1.0)
 # ---------------------------------------------------------------------------
+# Research-aligned weights: rotation + offense are most predictive of
+# one-year-ahead wins; bullpen is volatile (small-sample relievers);
+# health/depth is inherently uncertain. Defense is moderately predictive
+# but requires 3+ years of data for reliability.
 _WEIGHTS = {
-    "offense": 0.30,
-    "rotation": 0.20,
-    "bullpen": 0.15,
+    "offense": 0.35,
+    "rotation": 0.25,
+    "bullpen": 0.10,
     "defense": 0.15,
-    "depth": 0.20,
+    "depth": 0.15,
 }
 
 # Tier thresholds (on 0-1 composite_score)
@@ -123,12 +127,15 @@ def rank_teams(
     # Tier assignment
     df["tier"] = df["composite_score"].apply(_assign_tier)
 
-    # Projected wins from Pythagorean
-    if "rpg" in df.columns and "ra_per_game" in df.columns:
+    # Projected wins from Pythagorean — prefer BaseRuns-projected RS/RA,
+    # fall back to observed 2025 rpg/ra_per_game
+    rs_col = "proj_rs_per_game" if "proj_rs_per_game" in df.columns else "rpg"
+    ra_col = "proj_ra_per_game" if "proj_ra_per_game" in df.columns else "ra_per_game"
+    if rs_col in df.columns and ra_col in df.columns:
         df["projected_wins"] = df.apply(
             lambda r: _pythagorean_wins(
-                r["rpg"] if pd.notna(r.get("rpg")) else 4.5,
-                r["ra_per_game"] if pd.notna(r.get("ra_per_game")) else 4.5,
+                r[rs_col] if pd.notna(r.get(rs_col)) else r.get("rpg", 4.5),
+                r[ra_col] if pd.notna(r.get(ra_col)) else r.get("ra_per_game", 4.5),
             ),
             axis=1,
         )
@@ -797,8 +804,9 @@ def build_power_rankings(
         avg_opp_elo_val = None
         if not prof_df.empty and tid in prof_df["team_id"].values:
             team_prof = prof_df[prof_df["team_id"] == tid].iloc[0]
-            rpg_val = team_prof.get("rpg")
-            ra_val = team_prof.get("ra_per_game")
+            # Prefer BaseRuns-projected RS/RA, fall back to observed
+            rpg_val = team_prof.get("proj_rs_per_game", team_prof.get("rpg"))
+            ra_val = team_prof.get("proj_ra_per_game", team_prof.get("ra_per_game"))
             avg_opp_elo_val = team_prof.get("avg_opp_elo")
         proj_wins = _pythagorean_wins(
             rpg_val if pd.notna(rpg_val) else 4.5,

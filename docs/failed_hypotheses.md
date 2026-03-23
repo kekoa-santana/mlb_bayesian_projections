@@ -209,7 +209,21 @@ Suggestions evaluated during team ranking and Glicko review. Each was investigat
 - **Critique:** CL 1.5x, SU 1.0x, MR 0.5x weights are arbitrary — should use pLI (leverage index).
 - **Why rejected:** Valid in principle, but bullpen is only 15% of total team ranking weight. We lack leverage index data in the current database. The marginal improvement from pLI-based weighting within a 15% weight component doesn't justify the engineering effort of sourcing and integrating leverage data.
 
-### 6e. Platoon advantage profiling for team rankings
+### 6e. Clutch/high-leverage performance as a player ranking factor
+
+- **Hypothesis:** Players who perform well in high-leverage situations (RISP, close games, late innings) have a repeatable skill that should be modeled. Similarly, teams that perform well in high-stakes games (pennant races, elimination scenarios) should get credit.
+- **Why rejected:** Overwhelming research consensus (109 years of data) shows clutch hitting is not a repeatable skill.
+  - YoY correlation of FanGraphs Clutch stat: **r = 0.06** (essentially zero). Source: FanGraphs Clutch Library.
+  - WPA year-to-year R² = 0.27, but **all persistence is from "being a good hitter"**, not the clutch component. Source: FanGraphs "Is WPA Predictive for Batters?"
+  - Team BA/RISP YoY correlation: **21%**. Regresses to overall BA. Source: SABR.
+  - LOB% (pitcher strand rate) YoY R² = **0.048**. Driven by K rate, not a separate "pressure" skill. Source: FanGraphs LOB% Library, Hardball Times xLOB%.
+  - One-run game record: R² = **0.02** between halves of season. Source: Baseball Prospectus.
+  - 109-year study: no meaningful clutch ability detected; elite performers actually show *largest drop-off* in postseason. Source: ScienceDirect (2013).
+  - SABR conclusion: "Clutch hitting is not predictable from year to year."
+- **Exception noted:** High-K pitchers strand more runners because strikeouts are sequencing-independent — but our K% projections already capture this.
+- **Decision:** Do not model clutch/pressure/leverage as a player or team ranking factor. It would add noise, not signal.
+
+### 6f. Platoon advantage profiling for team rankings
 
 - **Critique:** Team rankings should account for platoon advantages in the lineup.
 - **Why rejected:** Platoon effects are already embedded in aggregate wOBA projections (the Bayesian model uses platoon splits) and in the Layer 2 matchup model. Adding explicit platoon profiling at the team level would be marginal incremental value on top of what's already captured in the player-level projections that feed the team aggregation.
