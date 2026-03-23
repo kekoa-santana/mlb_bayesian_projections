@@ -20,14 +20,59 @@ from scipy import stats
 
 logger = logging.getLogger(__name__)
 
-# Population priors by age bucket (from empirical 2018-2025 data, regulars >= 100 PA)
+# Per-age population priors from 2000-2025 empirical data (200+ PA, excl 2020).
+# Computed from fact_player_game_mlb: 4,402 player-seasons across 25 years.
+# Ages with <15 observations use nearest well-estimated age.
+_EMPIRICAL_GAMES_BY_AGE = {
+    20: {"mu": 95, "sigma": 28},
+    21: {"mu": 99, "sigma": 37},
+    22: {"mu": 106, "sigma": 34},
+    23: {"mu": 101, "sigma": 34},
+    24: {"mu": 105, "sigma": 33},
+    25: {"mu": 106, "sigma": 33},
+    26: {"mu": 106, "sigma": 33},
+    27: {"mu": 105, "sigma": 32},
+    28: {"mu": 106, "sigma": 33},
+    29: {"mu": 108, "sigma": 34},
+    30: {"mu": 109, "sigma": 34},
+    31: {"mu": 106, "sigma": 31},
+    32: {"mu": 107, "sigma": 31},
+    33: {"mu": 106, "sigma": 31},
+    34: {"mu": 105, "sigma": 32},
+    35: {"mu": 102, "sigma": 30},
+    36: {"mu": 100, "sigma": 32},
+    37: {"mu": 106, "sigma": 34},
+    38: {"mu": 107, "sigma": 34},
+    39: {"mu": 100, "sigma": 32},
+    40: {"mu": 95, "sigma": 32},
+}
+
+# Legacy 3-bucket mapping (for backward compatibility with age_bucket column)
 POP_GAMES_BY_AGE = {
-    0: {"mu": 130, "sigma": 35},   # young: callups, injury risk
-    1: {"mu": 145, "sigma": 26},   # prime: most durable
-    2: {"mu": 130, "sigma": 37},   # veteran: rest days, DL stints
+    0: {"mu": 104, "sigma": 33},   # young <=25: empirical 2000-2025, 200+ PA
+    1: {"mu": 107, "sigma": 33},   # prime 26-30
+    2: {"mu": 105, "sigma": 31},   # veteran 31+
 }
 
 POP_PA_PER_GAME = {"mu": 3.85, "sigma": 0.40}
+
+
+def _get_age_prior(age: float, pop_games: dict | None = None) -> dict:
+    """Get population games prior for a specific age.
+
+    Uses per-age empirical priors from 2000-2025 data when available,
+    falls back to age-bucket priors.
+    """
+    if pop_games is not None:
+        # Caller provided custom priors (age-bucket keyed)
+        return pop_games
+    age_int = int(round(age))
+    if age_int in _EMPIRICAL_GAMES_BY_AGE:
+        return _EMPIRICAL_GAMES_BY_AGE[age_int]
+    # Clamp to edges
+    if age_int < 20:
+        return _EMPIRICAL_GAMES_BY_AGE[20]
+    return _EMPIRICAL_GAMES_BY_AGE[40]
 
 # Marcel-style weights for recent seasons (most recent first)
 SEASON_WEIGHTS = [5, 4, 3]
@@ -101,8 +146,11 @@ def compute_hitter_pa_priors(
         age_bucket = int(player_latest.get("age_bucket", 1))
         age = player_latest.get("age", 28)
 
-        # Population priors for this age bucket
-        pop_g = pop_games.get(age_bucket, pop_games[1])
+        # Population priors — per-age if available, else age-bucket
+        if pop_games is not None:
+            pop_g = pop_games.get(age_bucket, pop_games.get(1, {"mu": 88, "sigma": 40}))
+        else:
+            pop_g = _get_age_prior(age)
         pop_mu_g = pop_g["mu"]
         pop_sigma_g = pop_g["sigma"]
 
