@@ -58,6 +58,57 @@ season_sim:
   unearned_run_fraction: 0.08
   random_seed: 42
 
+team_elo:
+  initial_rating: 1500
+  home_advantage: 25
+  k_factor_base: 8
+  k_factor_early_season: 12
+  k_factor_early_threshold: 30
+  # Postseason K-factors (elevated for high-signal playoff games)
+  k_factor_wc: 10   # Wild Card
+  k_factor_ds: 14   # Division Series
+  k_factor_cs: 18   # League Championship Series
+  k_factor_ws: 22   # World Series
+  season_regression: 0.40
+  margin_log_base: 1.5
+  sp_weight: 0.40
+  sp_k_factor: 6
+  sp_regression: 0.50
+  # Roster talent adjustment: shift regressed ELO by offseason roster changes
+  roster_adjustment_weight: 15.0   # ELO points per unit of avg tdd_value_score delta
+  roster_adjustment_cap: 40.0      # max ELO shift per team per component
+
+series_elo:
+  initial_rating: 1500
+  k_factor_regular: 8
+  k_factor_wc: 12       # Wild Card (best of 3)
+  k_factor_ds: 16       # Division Series (best of 5)
+  k_factor_cs: 20       # LCS (best of 7)
+  k_factor_ws: 24       # World Series (best of 7)
+  season_regression: 0.35   # lighter than game ELO (0.40) -- series are less noisy
+  margin_bonus: 0.15        # extra K multiplier for sweeps
+  game_elo_blend: 0.55      # weight of game ELO in blended component
+  series_elo_blend: 0.45    # weight of series ELO
+
+power_rankings:
+  elo_weight: 0.25          # blended game+series ELO (historical anchor)
+  projection_weight: 0.20   # 2026 projected roster quality
+  profile_weight: 0.15      # structural: rotation/bullpen/defense/health
+  glicko_weight: 0.10       # opponent-adjusted roster quality
+  wins_weight: 0.30         # BaseRuns projected wins (most direct forward signal)
+  breakout_delta_threshold: 0.03    # K% delta above which player is "breaking out"
+  regression_delta_threshold: -0.03 # K% delta below which player is "regressing"
+
+player_glicko:
+  initial_mu: 1500
+  initial_phi: 350
+  initial_sigma: 0.06
+  phi_floor: 50
+  tau: 0.5
+  season_regression_mu: 0.30
+  season_phi_reset: 200
+  max_inactivity_days: 180
+
 calibration:
   hitter:
     k_rate: 1.0

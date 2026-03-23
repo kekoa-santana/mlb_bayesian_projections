@@ -469,7 +469,8 @@ def build_power_rankings(
     w_elo: float = cfg["elo_weight"]
     w_proj: float = cfg["projection_weight"]
     w_prof: float = cfg["profile_weight"]
-    w_glicko: float = cfg.get("glicko_weight", 0.15)
+    w_glicko: float = cfg.get("glicko_weight", 0.10)
+    w_wins: float = cfg.get("wins_weight", 0.30)
     breakout_thresh: float = cfg["breakout_delta_threshold"]
     regression_thresh: float = cfg["regression_delta_threshold"]
 
@@ -781,7 +782,7 @@ def build_power_rankings(
     # ---------------------------------------------------------------
     # Assemble final power rankings
     # ---------------------------------------------------------------
-    rows: list[dict[str, Any]] = []
+    pre_rows: list[dict[str, Any]] = []
     for tid in sorted(abbr_tid.values()):
         abbr = tid_abbr.get(tid, "???")
         meta = team_meta.get(tid, {})
@@ -791,26 +792,55 @@ def build_power_rankings(
         prof_comp = prof_lookup.get(tid, 0.5)
         glicko_comp = glicko_lookup.get(abbr, 0.5)
 
-        power_score = (
-            w_elo * elo_comp
-            + w_proj * proj_comp
-            + w_prof * prof_comp
-            + w_glicko * glicko_comp
-        )
-
         # Projected wins: use Pythagorean if available from profiles
         rpg_val = None
         ra_val = None
         avg_opp_elo_val = None
         if not prof_df.empty and tid in prof_df["team_id"].values:
             team_prof = prof_df[prof_df["team_id"] == tid].iloc[0]
-            # Prefer BaseRuns-projected RS/RA, fall back to observed
             rpg_val = team_prof.get("proj_rs_per_game", team_prof.get("rpg"))
             ra_val = team_prof.get("proj_ra_per_game", team_prof.get("ra_per_game"))
             avg_opp_elo_val = team_prof.get("avg_opp_elo")
         proj_wins = _pythagorean_wins(
             rpg_val if pd.notna(rpg_val) else 4.5,
             ra_val if pd.notna(ra_val) else 4.5,
+        )
+
+        # Store pre-rows for wins percentile ranking (need all teams first)
+        pre_rows.append({
+            "tid": tid, "abbr": abbr, "meta": meta,
+            "elo_comp": elo_comp, "proj_comp": proj_comp,
+            "prof_comp": prof_comp, "glicko_comp": glicko_comp,
+            "proj_wins": proj_wins, "avg_opp_elo_val": avg_opp_elo_val,
+        })
+
+    # Percentile-rank projected wins across all teams for wins_component
+    all_wins = np.array([r["proj_wins"] for r in pre_rows])
+    if len(all_wins) > 1 and all_wins.std() > 0:
+        from scipy.stats import rankdata
+        wins_pctl = (rankdata(all_wins) - 1) / (len(all_wins) - 1)
+    else:
+        wins_pctl = np.full(len(pre_rows), 0.5)
+
+    rows: list[dict[str, Any]] = []
+    for i, pr in enumerate(pre_rows):
+        tid = pr["tid"]
+        abbr = pr["abbr"]
+        meta = pr["meta"]
+        elo_comp = pr["elo_comp"]
+        proj_comp = pr["proj_comp"]
+        prof_comp = pr["prof_comp"]
+        glicko_comp = pr["glicko_comp"]
+        proj_wins = pr["proj_wins"]
+        avg_opp_elo_val = pr["avg_opp_elo_val"]
+        wins_comp = float(wins_pctl[i])
+
+        power_score = (
+            w_elo * elo_comp
+            + w_proj * proj_comp
+            + w_prof * prof_comp
+            + w_glicko * glicko_comp
+            + w_wins * wins_comp
         )
 
         rows.append({
@@ -824,6 +854,7 @@ def build_power_rankings(
             "projection_component": round(proj_comp, 4),
             "profile_component": round(prof_comp, 4),
             "glicko_component": round(glicko_comp, 4),
+            "wins_component": round(wins_comp, 4),
             "team_batting_glicko": glicko_bat_lookup.get(abbr),
             "team_pitching_glicko": glicko_pit_lookup.get(abbr),
             "projected_wins": proj_wins,
