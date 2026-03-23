@@ -494,8 +494,9 @@ def _build_pitching_profile(
 def _build_defense_profile(
     player_teams: pd.DataFrame,
     season: int,
+    pitcher_rankings: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Defense sub-scores from OAA and catcher framing."""
+    """Defense sub-scores from OAA, catcher framing, and pitcher-defense synergy."""
     from src.data.db import read_sql
 
     teams = player_teams[["team_id"]].drop_duplicates().copy()
@@ -516,6 +517,28 @@ def _build_defense_profile(
         logger.warning("OAA load failed: %s", e)
         teams["team_oaa"] = 0.0
 
+    # Infield vs outfield OAA split
+    try:
+        oaa_split = read_sql("""
+            SELECT
+                dt.team_id,
+                SUM(CASE WHEN f.position IN ('SS','2B','3B','1B')
+                    THEN f.outs_above_average ELSE 0 END) AS infield_oaa,
+                SUM(CASE WHEN f.position IN ('CF','RF','LF')
+                    THEN f.outs_above_average ELSE 0 END) AS outfield_oaa
+            FROM production.fact_fielding_oaa f
+            JOIN production.dim_team dt ON f.team_name = dt.team_name
+            WHERE f.season = :season
+            GROUP BY dt.team_id
+        """, {"season": season})
+        teams = teams.merge(oaa_split, on="team_id", how="left")
+        teams["infield_oaa"] = teams["infield_oaa"].fillna(0)
+        teams["outfield_oaa"] = teams["outfield_oaa"].fillna(0)
+    except Exception as e:
+        logger.warning("OAA split load failed: %s", e)
+        teams["infield_oaa"] = 0.0
+        teams["outfield_oaa"] = 0.0
+
     # Catcher framing
     try:
         framing = read_sql("""
@@ -532,12 +555,80 @@ def _build_defense_profile(
         logger.warning("Catcher framing load failed: %s", e)
         teams["catcher_framing_runs"] = 0.0
 
-    # Defense composite
+    # --- Pitcher-defense synergy ---
+    # GB-heavy staff + strong infield = bonus
+    # FB-heavy staff + strong outfield = bonus
+    # Mismatches = penalty
+    teams["pitcher_defense_synergy"] = 0.0
+    if pitcher_rankings is not None and "gb_pct" in pitcher_rankings.columns:
+        try:
+            pid_col = "pitcher_id" if "pitcher_id" in pitcher_rankings.columns else "player_id"
+            pt_pid = "batter_id" if "batter_id" in player_teams.columns else "player_id"
+            bf_col = "batters_faced" if "batters_faced" in pitcher_rankings.columns else None
+
+            pr_team = pitcher_rankings.merge(
+                player_teams[[pt_pid, "team_id"]].rename(columns={pt_pid: pid_col}),
+                on=pid_col, how="inner",
+            )
+
+            # BF-weighted staff GB%/FB%
+            if bf_col and bf_col in pr_team.columns:
+                w = pr_team[bf_col].fillna(100).clip(10)
+            else:
+                w = pd.Series(1.0, index=pr_team.index)
+
+            pr_team["_w"] = w
+            staff_bb = pr_team.groupby("team_id").apply(
+                lambda g: pd.Series({
+                    "staff_gb_pct": np.average(g["gb_pct"].fillna(0.44), weights=g["_w"]),
+                    "staff_fb_pct": np.average(
+                        g["fb_pct"].fillna(0.35) if "fb_pct" in g.columns
+                        else 1.0 - g["gb_pct"].fillna(0.44),
+                        weights=g["_w"],
+                    ),
+                }),
+                include_groups=False,
+            ).reset_index()
+            teams = teams.merge(staff_bb, on="team_id", how="left")
+            teams["staff_gb_pct"] = teams["staff_gb_pct"].fillna(0.44)
+            teams["staff_fb_pct"] = teams["staff_fb_pct"].fillna(0.35)
+
+            # Percentile-rank infield and outfield OAA
+            if_pctl = _pctl(teams["infield_oaa"])
+            of_pctl = _pctl(teams["outfield_oaa"])
+
+            # Synergy: how well does the staff's batted-ball profile
+            # align with the team's defensive strengths?
+            # GB contribution: staff_gb_pct * infield_oaa_pctl
+            # FB contribution: staff_fb_pct * outfield_oaa_pctl
+            # Normalize so a perfectly aligned team scores ~0.5+
+            gb_alignment = teams["staff_gb_pct"] * if_pctl
+            fb_alignment = teams["staff_fb_pct"] * of_pctl
+            # Weight GB heavier since ground balls are more fieldable
+            raw_synergy = 0.60 * gb_alignment + 0.40 * fb_alignment
+            teams["pitcher_defense_synergy"] = _pctl(raw_synergy)
+
+            logger.info(
+                "Pitcher-defense synergy: staff GB%% range [%.1f%%, %.1f%%], "
+                "synergy range [%.2f, %.2f]",
+                teams["staff_gb_pct"].min() * 100,
+                teams["staff_gb_pct"].max() * 100,
+                teams["pitcher_defense_synergy"].min(),
+                teams["pitcher_defense_synergy"].max(),
+            )
+        except Exception as e:
+            logger.warning("Pitcher-defense synergy failed: %s", e)
+
+    # Defense composite: OAA + framing + synergy
     teams["team_oaa"] = teams["team_oaa"].fillna(0)
     teams["catcher_framing_runs"] = teams["catcher_framing_runs"].fillna(0)
     teams["oaa_pctl"] = _pctl(teams["team_oaa"])
     teams["framing_pctl"] = _pctl(teams["catcher_framing_runs"])
-    teams["defense_score"] = 0.7 * teams["oaa_pctl"] + 0.3 * teams["framing_pctl"]
+    teams["defense_score"] = (
+        0.55 * teams["oaa_pctl"]
+        + 0.25 * teams["framing_pctl"]
+        + 0.20 * teams["pitcher_defense_synergy"]
+    )
 
     return teams
 
@@ -899,6 +990,16 @@ def build_all_team_profiles(
     pitcher_rankings = _safe_load("pitchers_rankings.parquet")
     hitter_counting = _safe_load("hitter_counting_sim.parquet")
     pitcher_roles = _safe_load("pitcher_roles.parquet")
+
+    # Merge GB%/FB% from pitcher_projections into pitcher_rankings for synergy
+    pitcher_proj = _safe_load("pitcher_projections.parquet")
+    if pitcher_rankings is not None and pitcher_proj is not None:
+        pid_col = "pitcher_id" if "pitcher_id" in pitcher_proj.columns else "player_id"
+        gb_cols = [pid_col] + [c for c in ["gb_pct", "fb_pct"] if c in pitcher_proj.columns]
+        if len(gb_cols) > 1:
+            pitcher_rankings = pitcher_rankings.merge(
+                pitcher_proj[gb_cols], on=pid_col, how="left",
+            )
     prospect_rankings = _safe_load("prospect_rankings.parquet")
 
     # Load from DB
@@ -936,7 +1037,7 @@ def build_all_team_profiles(
     )
 
     logger.info("Building defense profile...")
-    defense = _build_defense_profile(player_teams, season)
+    defense = _build_defense_profile(player_teams, season, pitcher_rankings=pitcher_rankings)
 
     logger.info("Building organizational philosophy...")
     org = _build_org_philosophy(season, roster_comp, prospect_rankings)
@@ -1059,7 +1160,9 @@ def build_all_team_profiles(
                      "rotation_strength", "bullpen_depth",
                      "pitching_style", "ra_per_game", "k_per_game",
                      "proj_ra_per_game"]),
-        (defense, ["defense_score", "team_oaa", "catcher_framing_runs"]),
+        (defense, ["defense_score", "team_oaa", "catcher_framing_runs",
+                   "infield_oaa", "outfield_oaa", "staff_gb_pct", "staff_fb_pct",
+                   "pitcher_defense_synergy"]),
         (org, ["org_score", "pct_homegrown", "farm_avg_score", "n_ranked_prospects", "top_100_count"]),
         (health, ["health_depth_score", "total_il_days", "avg_age", "age_trajectory",
                   "roster_continuity", "players_retained", "players_new"]),
