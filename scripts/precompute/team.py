@@ -230,6 +230,12 @@ def run_team_power() -> None:
             _h_rank_pw, _p_rank_pw, _h_proj_pw, _p_proj_pw,
         ]):
             from src.models.team_rankings import build_power_rankings
+            # Load team sim if available (for confidence-weighted win blend)
+            _team_sim = None
+            _sim_path = DASHBOARD_DIR / "team_sim_wins.parquet"
+            if _sim_path.exists():
+                _team_sim = pd.read_parquet(_sim_path)
+
             power_rankings_df = build_power_rankings(
                 elo_ratings=_elo_pre,
                 profiles=_profiles,
@@ -240,6 +246,7 @@ def run_team_power() -> None:
                 pitcher_projections=_p_proj_pw,
                 batter_glicko_path=_bg_path if _bg_path.exists() else None,
                 pitcher_glicko_path=_pg_path if _pg_path.exists() else None,
+                team_sim=_team_sim,
             )
             power_rankings_df.to_parquet(
                 DASHBOARD_DIR / "team_power_rankings.parquet", index=False,

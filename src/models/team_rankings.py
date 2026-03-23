@@ -410,6 +410,7 @@ def build_power_rankings(
     pitcher_projections: pd.DataFrame,
     batter_glicko_path: Path | None = None,
     pitcher_glicko_path: Path | None = None,
+    team_sim: pd.DataFrame | None = None,
     config: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Build projection-integrated power rankings for all 30 teams.
@@ -806,12 +807,34 @@ def build_power_rankings(
             ra_val if pd.notna(ra_val) else 4.5,
         )
 
-        # Store pre-rows for wins percentile ranking (need all teams first)
+        # Blend BaseRuns wins with sim wins using confidence
+        # Confidence = inverse of sim std (deep rosters → trust BaseRuns ceiling)
+        sim_wins_val = None
+        sim_std_val = None
+        blended_wins = proj_wins  # default: BaseRuns only
+
+        if team_sim is not None and not team_sim.empty:
+            sim_row = team_sim[team_sim["team_abbr"] == abbr]
+            if not sim_row.empty:
+                sim_wins_val = float(sim_row.iloc[0]["sim_wins_mean"])
+                sim_std_val = float(sim_row.iloc[0]["sim_wins_std"])
+
+        if sim_wins_val is not None and sim_std_val is not None:
+            # Normalize std to 0-1 confidence: low std = high confidence
+            # Typical range: std 0.5–2.0 → confidence 0.75–0.0
+            confidence = np.clip(1.0 - sim_std_val / 2.0, 0.15, 0.85)
+            blended_wins = confidence * proj_wins + (1 - confidence) * sim_wins_val
+
         pre_rows.append({
             "tid": tid, "abbr": abbr, "meta": meta,
             "elo_comp": elo_comp, "proj_comp": proj_comp,
             "prof_comp": prof_comp, "glicko_comp": glicko_comp,
-            "proj_wins": proj_wins, "avg_opp_elo_val": avg_opp_elo_val,
+            "proj_wins": blended_wins,
+            "baseruns_wins": proj_wins,
+            "sim_wins": sim_wins_val,
+            "sim_std": sim_std_val,
+            "depth_confidence": np.clip(1.0 - (sim_std_val or 1.0) / 2.0, 0.15, 0.85),
+            "avg_opp_elo_val": avg_opp_elo_val,
         })
 
     # Percentile-rank projected wins across all teams for wins_component
@@ -857,7 +880,10 @@ def build_power_rankings(
             "wins_component": round(wins_comp, 4),
             "team_batting_glicko": glicko_bat_lookup.get(abbr),
             "team_pitching_glicko": glicko_pit_lookup.get(abbr),
-            "projected_wins": proj_wins,
+            "projected_wins": pr["proj_wins"],
+            "baseruns_wins": pr.get("baseruns_wins"),
+            "sim_wins": pr.get("sim_wins"),
+            "depth_confidence": pr.get("depth_confidence"),
             "avg_opp_elo": avg_opp_elo_val,
             "breakout_count": breakout_lookup.get(tid, 0),
             "regression_count": regression_lookup.get(tid, 0),
