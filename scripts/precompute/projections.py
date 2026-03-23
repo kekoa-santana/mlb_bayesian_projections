@@ -392,10 +392,29 @@ def run_sim_hitter(
                 else:
                     rates[stat_key] = rng_h.beta(3, 30, size=8000)
 
-            # HR: synthetic Beta
-            pa_val = int(hrow["pa"])
-            hr_val = int(hrow.get("hr", pa_val * 0.03))
-            rates["hr_rate"] = rng_h.beta(hr_val + 1, pa_val - hr_val + 1, size=8000)
+            # HR: Marcel-weighted Beta (5/4/3 across 3 seasons + regression)
+            bid_hist = hitter_ext[
+                (hitter_ext["batter_id"] == bid)
+                & (hitter_ext["season"] >= from_season - 2)
+                & (hitter_ext["season"] <= from_season)
+            ]
+            marcel_weights = {from_season: 5, from_season - 1: 4, from_season - 2: 3}
+            wtd_hr, wtd_pa = 0.0, 0.0
+            for _, hist_row in bid_hist.iterrows():
+                w = marcel_weights.get(int(hist_row["season"]), 1)
+                wtd_hr += w * int(hist_row.get("hr", 0))
+                wtd_pa += w * int(hist_row["pa"])
+            # Regress toward league average (~3% HR/PA) with 200 PA of regression
+            reg_pa = 200
+            league_hr_rate = 0.030
+            reg_hr = wtd_hr + reg_pa * league_hr_rate
+            reg_total = wtd_pa + reg_pa
+            if reg_total > 0:
+                rates["hr_rate"] = rng_h.beta(
+                    max(reg_hr, 0.5), max(reg_total - reg_hr, 0.5), size=8000,
+                ).astype(np.float32)
+            else:
+                rates["hr_rate"] = rng_h.beta(1, 30, size=8000).astype(np.float32)
 
             hitter_posteriors[bid] = rates
 
