@@ -18,7 +18,6 @@ import numpy as np
 import pandas as pd
 
 from src.models.team_sim.depth_cascade import (
-    REPLACEMENT_HITTER_WRC_PLUS,
     cascade_hitter_pa,
     cascade_pitcher_ip,
 )
@@ -62,6 +61,7 @@ def simulate_team_season(
     team_hitters: pd.DataFrame,
     team_pitchers: pd.DataFrame,
     injury_params: pd.DataFrame,
+    position_eligibility: pd.DataFrame | None = None,
     n_sims: int = 1000,
     random_seed: int = 42,
 ) -> dict:
@@ -145,6 +145,28 @@ def simulate_team_season(
             "runs": float(row.get("total_runs_mean", ip * LG_RA_PER_GAME / 9)),
         }
 
+    # Team-specific replacement quality (derived from actual bench players)
+    bench_hitters = team_hitters.sort_values("value_score").head(
+        max(len(team_hitters) - 9, 3)
+    )
+    if len(bench_hitters) > 0 and "total_h_mean" in bench_hitters.columns:
+        # Use worst bench players' actual counting rates
+        bh_pa = bench_hitters["projected_pa"].clip(1)
+        repl_h_rate = (bench_hitters["total_h_mean"] / bh_pa).mean()
+        repl_hr_rate = (bench_hitters["total_hr_mean"] / bh_pa).mean()
+        repl_tb_rate = (bench_hitters["total_tb_mean"] / bh_pa).mean()
+    else:
+        repl_h_rate, repl_hr_rate, repl_tb_rate = 0.200, 0.020, 0.290
+
+    bench_pitchers = team_pitchers.sort_values("value_score").head(
+        max(len(team_pitchers) - 5, 3)
+    )
+    if len(bench_pitchers) > 0 and "total_runs_mean" in bench_pitchers.columns:
+        bp_ip = bench_pitchers["projected_ip"].clip(1)
+        repl_ra_per_9 = (bench_pitchers["total_runs_mean"] / bp_ip * 9).mean()
+    else:
+        repl_ra_per_9 = 5.20
+
     # Simulate
     wins = np.zeros(n_sims)
     rs_arr = np.zeros(n_sims)
@@ -155,7 +177,10 @@ def simulate_team_season(
         sim_injuries = {pid: int(injury_draws[pid][sim]) for pid in pid_list}
 
         # --- Offense: cascade PA and compute BaseRuns ---
-        adj_h = cascade_hitter_pa(h_starters, h_bench, sim_injuries)
+        adj_h = cascade_hitter_pa(
+            h_starters, h_bench, sim_injuries,
+            position_eligibility=position_eligibility,
+        )
 
         total_h, total_hr, total_bb, total_hbp, total_tb, total_pa = 0, 0, 0, 0, 0, 0
         for _, row in adj_h.iterrows():
@@ -165,14 +190,13 @@ def simulate_team_season(
                 continue
 
             if row.get("is_replacement", False):
-                # Replacement level: ~75 wRC+ ≈ league_avg * 0.85
-                scale = 0.85
+                # Team-specific replacement (derived from bench quality)
                 total_pa += adj_pa
-                total_h += adj_pa * 0.230 * scale
-                total_hr += adj_pa * 0.025 * scale
+                total_h += adj_pa * repl_h_rate
+                total_hr += adj_pa * repl_hr_rate
                 total_bb += adj_pa * 0.075
                 total_hbp += adj_pa * 0.008
-                total_tb += adj_pa * 0.340 * scale
+                total_tb += adj_pa * repl_tb_rate
             elif pid in h_stats:
                 s = h_stats[pid]
                 frac = adj_pa / max(s["pa"], 1)
@@ -207,8 +231,8 @@ def simulate_team_season(
                 continue
 
             if row.get("is_replacement", False):
-                # Replacement-level pitcher: ~5.20 ERA
-                total_runs_allowed += adj_ip * 5.20 / 9
+                # Team-specific replacement pitcher quality
+                total_runs_allowed += adj_ip * repl_ra_per_9 / 9
                 total_ip += adj_ip
             elif pid in p_stats:
                 s = p_stats[pid]
@@ -256,6 +280,7 @@ def simulate_all_teams(
         - "hitters": DataFrame with counting projections
         - "pitchers": DataFrame with counting projections
         - "injury_params": DataFrame with il_prob per player
+        - "position_eligibility": DataFrame (optional)
     n_sims : int
     random_seed : int
 
@@ -273,6 +298,7 @@ def simulate_all_teams(
             team_hitters=data["hitters"],
             team_pitchers=data["pitchers"],
             injury_params=data["injury_params"],
+            position_eligibility=data.get("position_eligibility"),
             n_sims=n_sims,
             random_seed=seed,
         )
