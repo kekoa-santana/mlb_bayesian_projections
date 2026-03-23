@@ -182,3 +182,34 @@ A single multiplicative era factor for the 2023 SB rule changes is too blunt. Fa
 ### 5g. Trust the backtest over the theory
 
 Observation-level covariates seemed theoretically inferior to player-level priors but performed better empirically. Always run the walk-forward backtest before committing to a parameterization change.
+
+---
+
+## 6. Rejected Ranking/Rating Critiques (2026-03-23)
+
+Suggestions evaluated during team ranking and Glicko review. Each was investigated and found to be either incorrect, already handled, or not worth the engineering cost.
+
+### 6a. Glicko wOBA scaling cap is lossy
+
+- **Critique:** The `min(woba_value / 2.0, 1.0)` cap in Glicko treats doubles and HRs the same.
+- **Why rejected:** Wrong premise. `woba_value` is a per-PA linear weight (double ~1.24, HR ~2.0), so they score 0.62 and 1.00 respectively after the /2.0 scaling. The cap only clips values above 2.0, which is negligible information loss (essentially capping grand slams). The ordinal ranking of PA outcomes is fully preserved.
+
+### 6b. Age-based Glicko volatility initialization
+
+- **Critique:** Initialize Glicko sigma (phi) differently by age — young players should have higher uncertainty.
+- **Why rejected:** Already handled by the system. New players enter with phi=350 (maximum uncertainty), which naturally decays as they accumulate rated games. A 22-year-old rookie starts at phi=350 and converges after ~20 games. An age-based heuristic would be strictly worse than this data-driven approach.
+
+### 6c. Component double-counting in power rankings
+
+- **Critique:** `tdd_value_score` appears in both the Projection component and the Profile component of power rankings, causing double-counting.
+- **Why rejected:** Technically true but low impact. Each component is percentile-ranked independently across 30 teams, and the Profile component is ~60% non-tdd_value_score signals (Glicko ratings, observed ERA, K-rate, park-adjusted runs). The effective overweight is ~30% vs 20% intended — not worth restructuring the entire power ranking framework to fix.
+
+### 6d. Arbitrary reliever role weights in bullpen scoring
+
+- **Critique:** CL 1.5x, SU 1.0x, MR 0.5x weights are arbitrary — should use pLI (leverage index).
+- **Why rejected:** Valid in principle, but bullpen is only 15% of total team ranking weight. We lack leverage index data in the current database. The marginal improvement from pLI-based weighting within a 15% weight component doesn't justify the engineering effort of sourcing and integrating leverage data.
+
+### 6e. Platoon advantage profiling for team rankings
+
+- **Critique:** Team rankings should account for platoon advantages in the lineup.
+- **Why rejected:** Platoon effects are already embedded in aggregate wOBA projections (the Bayesian model uses platoon splits) and in the Layer 2 matchup model. Adding explicit platoon profiling at the team level would be marginal incremental value on top of what's already captured in the player-level projections that feed the team aggregation.
