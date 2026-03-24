@@ -119,11 +119,18 @@ def _compute_batter_rate_quality(df: pd.DataFrame) -> pd.Series:
     # HR power tool
     hr_pctl = _percentile_rank(df["wtd_hr_pa"].fillna(0))
 
+    # Batted ball profile: GB% (lower = more fly ball, more power upside)
+    if "wtd_gb_pct" in df.columns and df["wtd_gb_pct"].notna().any():
+        gb_pctl = 1.0 - _percentile_rank(df["wtd_gb_pct"].fillna(0.5))
+    else:
+        gb_pctl = 0.5  # neutral if not available
+
     # Weight: K% (contact), BB% (discipline), ISO (power), HR/PA (power),
-    # K-BB spread (hit tool), SB rate (speed)
+    # K-BB spread (hit tool), SB rate (speed), GB% (batted ball profile)
     return (
-        0.22 * k_pctl + 0.18 * bb_pctl + 0.15 * iso_pctl
-        + 0.10 * hr_pctl + 0.20 * kbb_pctl + 0.15 * sb_pctl
+        0.20 * k_pctl + 0.16 * bb_pctl + 0.13 * iso_pctl
+        + 0.09 * hr_pctl + 0.18 * kbb_pctl + 0.13 * sb_pctl
+        + 0.11 * gb_pctl
     )
 
 
@@ -461,13 +468,13 @@ def _compute_composite_scores(
 ) -> pd.Series:
     """Compute weighted composite from component scores.
 
-    Rate quality is age-adjusted: young + good scores higher than
-    treating them independently.
+    Rate quality is age-adjusted using a concave (power-law) form so
+    that extreme age outliers (19 yo at AA) get a larger boost than
+    the old linear 0.85-1.15 range provided.
     """
-    # Age-adjusted rate quality: multiply rate quality by a mild age bonus
-    # Young (age score ~1.0): rate quality boosted by ~15%
-    # Old (age score ~0.0): rate quality reduced by ~15%
-    age_adj = 0.85 + 0.30 * df["comp_age"]  # 0.85 to 1.15
+    # Concave age adjustment: amplifies extreme youth more than linear
+    # age_score ~0.0 (old): adj = 0.80, ~0.5 (avg): adj = 0.99, ~1.0 (young): adj = 1.20
+    age_adj = 0.80 + 0.40 * df["comp_age"] ** 0.7
     adj_rate_quality = (df["comp_rate_quality"] * age_adj).clip(0, 1)
 
     return (
@@ -716,6 +723,19 @@ def rank_prospects(
         df["fg_eta"] = np.nan
 
     # -------------------------------------------------------------------
+    # Scouting grades (20-80 tool grades + diamond rating)
+    # -------------------------------------------------------------------
+    try:
+        from src.models.scouting_grades import grade_prospect_hitter
+        prospect_grades = grade_prospect_hitter(df, season=projection_season - 1)
+        if not prospect_grades.empty:
+            df = df.merge(prospect_grades, on="player_id", how="left")
+            logger.info("Scouting grades computed for %d batting prospects",
+                        prospect_grades["diamond_rating"].notna().sum())
+    except Exception:
+        logger.warning("Could not compute prospect scouting grades", exc_info=True)
+
+    # -------------------------------------------------------------------
     # Select output columns
     # -------------------------------------------------------------------
     output_cols = [
@@ -728,7 +748,8 @@ def rank_prospects(
         "comp_readiness", "comp_rate_quality", "comp_age",
         "comp_trajectory", "comp_positional",
         # Translated stats
-        "wtd_k_pct", "wtd_bb_pct", "wtd_iso", "wtd_hr_pa", "k_bb_diff", "sb_rate",
+        "wtd_k_pct", "wtd_bb_pct", "wtd_iso", "wtd_hr_pa", "wtd_gb_pct",
+        "k_bb_diff", "sb_rate",
         "career_milb_pa", "youngest_age_rel",
         # Sub-trajectory components
         "promotion_resilience", "availability_score",
@@ -739,6 +760,11 @@ def rank_prospects(
         # FanGraphs (display only)
         "fg_future_value", "fg_overall_rank", "fg_org_rank",
         "fg_risk", "fg_eta",
+        # Scouting grades (20-80) — present + future + diamond rating
+        "grade_hit", "grade_power", "grade_speed", "grade_fielding",
+        "grade_discipline", "diamond_rating",
+        "future_hit", "future_power", "future_speed", "future_fielding",
+        "future_discipline",
     ]
     available = [c for c in output_cols if c in df.columns]
     result = df[available].copy()
@@ -895,6 +921,19 @@ def rank_pitching_prospects(
         df["fg_eta"] = np.nan
 
     # -------------------------------------------------------------------
+    # Scouting grades (20-80 tool grades + diamond rating)
+    # -------------------------------------------------------------------
+    try:
+        from src.models.scouting_grades import grade_prospect_pitcher
+        prospect_grades = grade_prospect_pitcher(df, season=projection_season - 1)
+        if not prospect_grades.empty:
+            df = df.merge(prospect_grades, on="player_id", how="left")
+            logger.info("Scouting grades computed for %d pitching prospects",
+                        prospect_grades["diamond_rating"].notna().sum())
+    except Exception:
+        logger.warning("Could not compute pitching prospect scouting grades", exc_info=True)
+
+    # -------------------------------------------------------------------
     # Select output columns
     # -------------------------------------------------------------------
     output_cols = [
@@ -914,6 +953,9 @@ def rank_pitching_prospects(
         # FanGraphs (display only)
         "fg_future_value", "fg_overall_rank", "fg_org_rank",
         "fg_risk", "fg_eta",
+        # Scouting grades (20-80) — present + future + diamond rating
+        "grade_stuff", "grade_command", "grade_durability", "diamond_rating",
+        "future_stuff", "future_command", "future_durability",
     ]
     available = [c for c in output_cols if c in df.columns]
     result = df[available].copy()

@@ -357,7 +357,7 @@ def _identify_hole(row: pd.Series, archetype: str) -> str:
             holes.append((k_pctl, "Contact quality"))
         ev_pctl = row.get("avg_exit_velo_pctl", 0.5)
         if ev_pctl < 0.45:
-            holes.append((1.0 - ev_pctl, "Bat speed"))
+            holes.append((1.0 - ev_pctl, "Exit velocity"))
 
     if not holes:
         return "General development"

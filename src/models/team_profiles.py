@@ -181,16 +181,31 @@ def _build_offense_profile(
                 rank_merged[pa_weight_col].median()
             ).clip(50)
 
+            # Scouting grade columns to aggregate at team level
+            _GRADE_COLS = ["grade_hit", "grade_power", "grade_speed",
+                           "grade_fielding", "grade_discipline", "diamond_rating"]
+
             def _pa_weighted_score(g: pd.DataFrame) -> pd.Series:
                 top9 = g.nlargest(9, score_col)
                 pa_w = top9[pa_weight_col].values
                 scores = top9[score_col].values
                 wtd_avg = float(np.average(scores, weights=pa_w)) if pa_w.sum() > 0 else scores.mean()
-                return pd.Series({
+                result = {
                     "lineup_depth": (g[score_col] >= median_score).sum() / min(len(g), 9),
                     "avg_hitter_score": wtd_avg,
                     "lineup_floor": g.nlargest(min(len(g), 8), score_col)[score_col].iloc[-1] if len(g) >= 7 else 0.0,
-                })
+                }
+                # Aggregate scouting grades for top-9 lineup
+                for gc in _GRADE_COLS:
+                    if gc in top9.columns and top9[gc].notna().any():
+                        vals = top9[gc].dropna()
+                        w = pa_w[:len(vals)] if len(vals) == len(pa_w) else None
+                        key = f"lineup_{gc}" if gc != "diamond_rating" else "lineup_diamond"
+                        result[key] = float(np.average(vals, weights=w)) if w is not None and len(w) > 0 else vals.mean()
+                    else:
+                        key = f"lineup_{gc}" if gc != "diamond_rating" else "lineup_diamond"
+                        result[key] = np.nan
+                return pd.Series(result)
 
             depth = rank_merged.groupby("team_id").apply(
                 _pa_weighted_score, include_groups=False,
@@ -301,19 +316,49 @@ def _build_pitching_profile(
                 pr_merged[ip_weight_col].median()
             ).clip(10)
 
-            # SP rotation (IP-weighted)
+            # SP rotation (IP-weighted) + scouting grade aggregation
             sp_mask = pr_merged[role_col].isin(["SP"]) if role_col in pr_merged.columns else pd.Series(True, index=pr_merged.index)
             sp_data = pr_merged[sp_mask]
 
-            def _ip_weighted_rot(g: pd.DataFrame) -> float:
+            _P_GRADE_COLS = ["grade_stuff", "grade_command", "grade_durability", "diamond_rating"]
+            _REPLACEMENT_GRADE = 4.0  # replacement-level diamond rating
+            _MIN_SP = 5  # every team needs at least 5 SP
+
+            def _ip_weighted_rot(g: pd.DataFrame) -> pd.Series:
                 top5 = g.nlargest(5, score_col)
                 w = top5[ip_weight_col].values
                 s = top5[score_col].values
-                return float(np.average(s, weights=w)) if w.sum() > 0 else s.mean()
+
+                # If fewer than 5 SP, fill with replacement-level grades.
+                # A team with only 2 elite SP still needs 3 more arms.
+                n_actual = len(top5)
+                if n_actual < _MIN_SP:
+                    n_fill = _MIN_SP - n_actual
+                    s = np.append(s, [0.40] * n_fill)  # 0.40 = replacement tdd_value
+                    w = np.append(w, [100.0] * n_fill)  # neutral IP weight
+
+                result = {
+                    "rotation_strength": float(np.average(s, weights=w)) if w.sum() > 0 else s.mean(),
+                    "rotation_sp_count": n_actual,  # track actual SP count
+                }
+                # Aggregate pitcher scouting grades for top-5 rotation
+                for gc in _P_GRADE_COLS:
+                    if gc in top5.columns and top5[gc].notna().any():
+                        vals = list(top5[gc].dropna())
+                        # Fill to 5 with replacement grade
+                        while len(vals) < _MIN_SP:
+                            vals.append(_REPLACEMENT_GRADE if gc == "diamond_rating" else 40)
+                        wv = w[:len(vals)]
+                        key = f"rotation_{gc}" if gc != "diamond_rating" else "rotation_diamond"
+                        result[key] = float(np.average(vals, weights=wv))
+                    else:
+                        key = f"rotation_{gc}" if gc != "diamond_rating" else "rotation_diamond"
+                        result[key] = np.nan
+                return pd.Series(result)
 
             rot_strength = sp_data.groupby("team_id").apply(
                 _ip_weighted_rot, include_groups=False,
-            ).reset_index(name="rotation_strength")
+            ).reset_index()
             teams = teams.merge(rot_strength, on="team_id", how="left")
 
     # --- Bullpen depth (role-weighted quality) ---
@@ -340,10 +385,42 @@ def _build_pitching_profile(
                 roles_merged["role_weight"] = roles_merged[role_w_col].map(role_weights).fillna(0.5)
                 roles_merged["weighted_score"] = roles_merged[score_col_r].fillna(0) * roles_merged["role_weight"]
 
+                # Also merge scouting grades for bullpen aggregation
+                _BP_GRADE_COLS = ["grade_stuff", "grade_command", "diamond_rating"]
+                bp_grade_available = [gc for gc in _BP_GRADE_COLS if gc in pitcher_rankings.columns]
+                if bp_grade_available:
+                    roles_merged = roles_merged.merge(
+                        pitcher_rankings[[pid_col_pr] + bp_grade_available].rename(columns={pid_col_pr: pid_col_r}),
+                        on=pid_col_r, how="left",
+                    )
+
+                _MIN_RP = 5  # minimum relievers for a functional bullpen
+
+                def _bp_agg(g: pd.DataFrame) -> pd.Series:
+                    rw = g["role_weight"]
+                    n_actual = len(g)
+                    result = {
+                        "bullpen_depth": g["weighted_score"].sum() / rw.sum() if rw.sum() > 0 else 0,
+                        "bullpen_rp_count": n_actual,
+                    }
+                    for gc in _BP_GRADE_COLS:
+                        if gc in g.columns and g[gc].notna().any():
+                            vals = list(g[gc].dropna())
+                            w = list(rw.loc[g[gc].notna().values if hasattr(g[gc].notna(), 'values') else g.index])
+                            # Fill to minimum with replacement-level
+                            while len(vals) < _MIN_RP:
+                                vals.append(4.0 if gc == "diamond_rating" else 40)
+                                w.append(0.5)  # MR weight
+                            key = f"bullpen_{gc}" if gc != "diamond_rating" else "bullpen_diamond"
+                            result[key] = float(np.average(vals, weights=w))
+                        else:
+                            key = f"bullpen_{gc}" if gc != "diamond_rating" else "bullpen_diamond"
+                            result[key] = np.nan
+                    return pd.Series(result)
+
                 bp_depth = roles_merged.groupby("team_id").apply(
-                    lambda g: g["weighted_score"].sum() / g["role_weight"].sum() if g["role_weight"].sum() > 0 else 0,
-                    include_groups=False,
-                ).reset_index(name="bullpen_depth")
+                    _bp_agg, include_groups=False,
+                ).reset_index()
                 teams = teams.merge(bp_depth, on="team_id", how="left")
 
     # --- Glicko ratings per role (SP / RP) ---
@@ -624,10 +701,52 @@ def _build_defense_profile(
     teams["catcher_framing_runs"] = teams["catcher_framing_runs"].fillna(0)
     teams["oaa_pctl"] = _pctl(teams["team_oaa"])
     teams["framing_pctl"] = _pctl(teams["catcher_framing_runs"])
+
+    # Positional-weighted team fielding from per-position scouting grades.
+    # A 55-grade fielding SS is more valuable than a 55-grade fielding LF.
+    _POS_FIELDING_MULT = {
+        "C": 1.15, "SS": 1.15,
+        "2B": 1.05, "3B": 1.05, "CF": 1.05,
+        "LF": 0.95, "RF": 0.95,
+        "1B": 0.85, "DH": 0.85,
+    }
+    elig = _safe_load("hitter_position_eligibility.parquet")
+    if elig is not None and "grade_fielding_at_pos" in elig.columns:
+        # Map players to teams
+        pt_pid = "batter_id" if "batter_id" in player_teams.columns else "player_id"
+        elig_team = elig.merge(
+            player_teams[["team_id", pt_pid]].rename(columns={pt_pid: "player_id"}),
+            on="player_id", how="inner",
+        )
+        # Apply positional multiplier
+        elig_team["weighted_grade"] = (
+            elig_team["grade_fielding_at_pos"]
+            * elig_team["position"].map(_POS_FIELDING_MULT).fillna(1.0)
+        )
+        # Primary position only for team aggregation
+        primary = elig_team[elig_team["is_primary"]].copy()
+        if not primary.empty:
+            team_fielding_grade = primary.groupby("team_id")["weighted_grade"].mean().reset_index(
+                name="team_fielding_grade",
+            )
+            teams = teams.merge(team_fielding_grade, on="team_id", how="left")
+            teams["team_fielding_grade"] = teams["team_fielding_grade"].fillna(50)
+            # Percentile-rank for blending into defense_score
+            fielding_grade_pctl = _pctl(teams["team_fielding_grade"])
+        else:
+            fielding_grade_pctl = pd.Series(0.5, index=teams.index)
+            teams["team_fielding_grade"] = 50
+    else:
+        fielding_grade_pctl = pd.Series(0.5, index=teams.index)
+        teams["team_fielding_grade"] = 50
+
+    # Blend: 35% scouting fielding grades (positional-weighted) + 30% raw OAA
+    # + 20% catcher framing + 15% pitcher-defense synergy
     teams["defense_score"] = (
-        0.55 * teams["oaa_pctl"]
-        + 0.25 * teams["framing_pctl"]
-        + 0.20 * teams["pitcher_defense_synergy"]
+        0.35 * fielding_grade_pctl
+        + 0.30 * teams["oaa_pctl"]
+        + 0.20 * teams["framing_pctl"]
+        + 0.15 * teams["pitcher_defense_synergy"]
     )
 
     return teams
@@ -978,6 +1097,21 @@ def build_all_team_profiles(
         logger.error("player_teams.parquet required — cannot build profiles")
         return pd.DataFrame()
 
+    # Filter player_teams by current roster status (active + IL only, exclude
+    # NRI/suspended/unavailable). This ensures team aggregations reflect the
+    # projected Opening Day roster, not everyone who appeared in 2025 boxscores.
+    roster = _safe_load("roster.parquet")
+    if roster is not None and "roster_status" in roster.columns:
+        # Keep active + IL players (IL players are still on the 40-man and expected back)
+        active_mask = roster["roster_status"].isin(["active", "il_7", "il_10", "il_15", "il_60"])
+        active_ids = set(roster.loc[active_mask, "player_id"])
+        before_n = len(player_teams)
+        player_teams = player_teams[player_teams["player_id"].isin(active_ids)].copy()
+        logger.info("Roster filter: %d → %d players (active + IL from roster.parquet)",
+                     before_n, len(player_teams))
+    else:
+        logger.warning("roster.parquet not found — using unfiltered player_teams")
+
     # Map player_teams to include team_id
     if "team_id" not in player_teams.columns and "team_abbr" in player_teams.columns:
         abbr_to_id = dict(zip(team_info["abbreviation"], team_info["team_id"].astype(int)))
@@ -1151,7 +1285,10 @@ def build_all_team_profiles(
     result = offense[["team_id", "offense_score"]].copy()
     for extra_col in ["offense_style", "lineup_depth", "lineup_floor", "rpg", "hr_per_game", "sb_per_game",
                        "proj_R", "proj_HR", "proj_SB", "avg_hitter_score",
-                       "baseruns_rs", "proj_rs_per_game"]:
+                       "baseruns_rs", "proj_rs_per_game",
+                       # Lineup scouting grades
+                       "lineup_diamond", "lineup_grade_hit", "lineup_grade_power",
+                       "lineup_grade_speed", "lineup_grade_fielding", "lineup_grade_discipline"]:
         if extra_col in offense.columns:
             result[extra_col] = offense[extra_col]
 
@@ -1159,10 +1296,15 @@ def build_all_team_profiles(
         (pitching, ["pitching_score", "rotation_score", "bullpen_score",
                      "rotation_strength", "bullpen_depth",
                      "pitching_style", "ra_per_game", "k_per_game",
-                     "proj_ra_per_game"]),
+                     "proj_ra_per_game",
+                     # Rotation + bullpen scouting grades
+                     "rotation_diamond", "rotation_grade_stuff", "rotation_grade_command",
+                     "rotation_grade_durability", "rotation_sp_count",
+                     "bullpen_diamond", "bullpen_grade_stuff", "bullpen_grade_command",
+                     "bullpen_rp_count"]),
         (defense, ["defense_score", "team_oaa", "catcher_framing_runs",
                    "infield_oaa", "outfield_oaa", "staff_gb_pct", "staff_fb_pct",
-                   "pitcher_defense_synergy"]),
+                   "pitcher_defense_synergy", "team_fielding_grade"]),
         (org, ["org_score", "pct_homegrown", "farm_avg_score", "n_ranked_prospects", "top_100_count"]),
         (health, ["health_depth_score", "total_il_days", "avg_age", "age_trajectory",
                   "roster_continuity", "players_retained", "players_new"]),

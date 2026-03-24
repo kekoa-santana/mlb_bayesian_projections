@@ -30,7 +30,16 @@ CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
 _STAT_FEATURES = [
     "wtd_k_pct", "wtd_bb_pct", "wtd_iso", "k_bb_diff", "sb_rate",
     "youngest_age_rel", "avg_age_rel", "min_age",
-    "max_level_num", "levels_played", "career_milb_pa", "career_seasons",
+    "pa_weighted_level",          # continuous level exposure (replaces coarse max_level_num)
+    "max_level_num",              # kept for backward compat — coarse level indicator
+    "games_at_max_level",         # depth of exposure at highest level
+    "pa_at_max_level",            # PA-based exposure at highest level
+    "k_rate_at_max_level",        # performance at hardest level faced
+    "bb_rate_at_max_level",       # discipline at hardest level faced
+    "age_x_level",                # age × level interaction (young + high level = superlinear)
+    "promotion_resilience",       # K% stability across promotions
+    "wtd_gb_pct",                 # batted ball profile (GB tendency)
+    "levels_played", "career_milb_pa", "career_seasons",
 ]
 
 # Position groups (defensive spectrum)
@@ -180,12 +189,61 @@ def _build_prospect_features(
             wtd_hr_pa = (grp["translated_hr_pa"] * grp["pa"]).sum() / total_pa if "translated_hr_pa" in grp.columns else 0
         total_sb = grp["sb"].sum() if "sb" in grp.columns else 0
 
+        # GB rate (confidence-weighted, if available)
+        if "translated_gb_pct" in grp.columns and grp["translated_gb_pct"].notna().any():
+            gb_valid = grp[grp["translated_gb_pct"].notna()]
+            if conf_pa_sum > 0 and not gb_valid.empty:
+                gb_conf_pa = conf[gb_valid.index] * gb_valid["pa"]
+                wtd_gb = (gb_valid["translated_gb_pct"] * gb_conf_pa).sum() / gb_conf_pa.sum() if gb_conf_pa.sum() > 0 else np.nan
+            else:
+                wtd_gb = (gb_valid["translated_gb_pct"] * gb_valid["pa"]).sum() / gb_valid["pa"].sum() if gb_valid["pa"].sum() > 0 else np.nan
+        else:
+            wtd_gb = np.nan
+
+        # --- New features: level-exposure and max-level performance ---
+        max_lvl_num = grp["_lvl_num"].max()
+
+        # PA-weighted level: continuous measure of level exposure
+        pa_weighted_level = (grp["_lvl_num"] * grp["pa"]).sum() / total_pa
+
+        # Stats at highest level reached
+        max_lvl_rows = grp[grp["_lvl_num"] == max_lvl_num]
+        games_at_max = max_lvl_rows["games"].sum() if "games" in max_lvl_rows.columns else 0
+        pa_at_max = max_lvl_rows["pa"].sum()
+        k_at_max = (max_lvl_rows["translated_k_pct"] * max_lvl_rows["pa"]).sum() / pa_at_max if pa_at_max > 0 else wtd_k
+        bb_at_max = (max_lvl_rows["translated_bb_pct"] * max_lvl_rows["pa"]).sum() / pa_at_max if pa_at_max > 0 else wtd_bb
+
+        # Age × level interaction (young + high level = superlinear)
+        youngest_age_rel = grp["age_relative_to_level_avg"].min()
+        age_x_level = youngest_age_rel * max_lvl_num
+
+        # Promotion resilience: K% stability across level transitions
+        if grp["level"].nunique() >= 2:
+            by_level = (
+                grp.groupby("_lvl_num")
+                .apply(
+                    lambda g: np.average(g["translated_k_pct"], weights=g["pa"])
+                    if g["pa"].sum() > 0 else np.nan,
+                    include_groups=False,
+                )
+                .dropna()
+                .sort_index()
+            )
+            if len(by_level) >= 2:
+                avg_k_spike = by_level.diff().dropna().mean()
+                # -0.05 (K% dropped) → 1.0, 0 → 0.75, +0.10 → 0.25
+                promo_resilience = float(np.clip(0.75 - avg_k_spike * 5.0, 0, 1))
+            else:
+                promo_resilience = 0.5
+        else:
+            promo_resilience = 0.5
+
         records.append({
             "player_id": pid,
             "name": best["player_name"],
             "latest_season": int(grp["season"].max()),
             "max_level": best["level"],
-            "max_level_num": grp["_lvl_num"].max(),
+            "max_level_num": max_lvl_num,
             "levels_played": grp["level"].nunique(),
             "career_milb_pa": total_pa,
             "career_seasons": grp["season"].nunique(),
@@ -193,11 +251,20 @@ def _build_prospect_features(
             "wtd_bb_pct": wtd_bb,
             "wtd_iso": wtd_iso,
             "wtd_hr_pa": wtd_hr_pa,
+            "wtd_gb_pct": wtd_gb,
             "k_bb_diff": wtd_k - wtd_bb,
-            "youngest_age_rel": grp["age_relative_to_level_avg"].min(),
+            "youngest_age_rel": youngest_age_rel,
             "avg_age_rel": grp["age_relative_to_level_avg"].mean(),
             "min_age": grp["age_at_level"].min(),
             "sb_rate": total_sb / total_pa,
+            # New features
+            "pa_weighted_level": pa_weighted_level,
+            "games_at_max_level": games_at_max,
+            "pa_at_max_level": pa_at_max,
+            "k_rate_at_max_level": k_at_max,
+            "bb_rate_at_max_level": bb_at_max,
+            "age_x_level": age_x_level,
+            "promotion_resilience": promo_resilience,
         })
 
     df = pd.DataFrame(records)
@@ -244,7 +311,30 @@ def _build_prospect_features(
 
 
 def _get_mlb_first_seasons(seasons: list[int] | None = None) -> dict[int, int]:
-    """Load first MLB season per player from cached season totals."""
+    """Load first MLB season per batter.
+
+    Uses ``staging.batting_boxscores`` (data back to 2000) so that
+    readiness models trained on 2005-2018 MiLB data can identify
+    which prospects eventually debuted.  Falls back to cached parquets
+    if the DB query fails.
+    """
+    try:
+        from src.data.db import read_sql
+        df = read_sql(
+            """
+            SELECT bb.batter_id, MIN(dg.season) AS first_season
+            FROM staging.batting_boxscores bb
+            JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+            WHERE dg.game_type = 'R'
+              AND bb.plate_appearances > 0
+            GROUP BY bb.batter_id
+            """,
+            {},
+        )
+        return dict(zip(df["batter_id"].astype(int), df["first_season"].astype(int)))
+    except Exception:
+        logger.warning("DB query for MLB first seasons failed; falling back to parquets")
+
     if seasons is None:
         seasons = list(range(2018, 2026))
     first: dict[int, int] = {}
@@ -263,7 +353,29 @@ def _get_mlb_stuck_ids(
     seasons: list[int] | None = None,
     min_pa: int = 200,
 ) -> set[int]:
-    """Get player IDs who had at least one season with min_pa."""
+    """Get batter IDs who had at least one MLB season with *min_pa*.
+
+    Uses ``staging.batting_boxscores`` (data back to 2000) for full
+    historical coverage.  Falls back to cached parquets if the DB
+    query fails.
+    """
+    try:
+        from src.data.db import read_sql
+        df = read_sql(
+            """
+            SELECT bb.batter_id
+            FROM staging.batting_boxscores bb
+            JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+            WHERE dg.game_type = 'R'
+            GROUP BY bb.batter_id, dg.season
+            HAVING SUM(bb.plate_appearances) >= :min_pa
+            """,
+            {"min_pa": min_pa},
+        )
+        return set(df["batter_id"].astype(int).unique())
+    except Exception:
+        logger.warning("DB query for MLB stuck IDs failed; falling back to parquets")
+
     if seasons is None:
         seasons = list(range(2018, 2026))
     stuck: set[int] = set()
@@ -278,10 +390,14 @@ def _get_mlb_stuck_ids(
 
 def train_readiness_model(
     milb_df: pd.DataFrame | None = None,
-    max_train_season: int = 2022,
+    max_train_season: int = 2018,
     min_debut_window: int = 2,
 ) -> dict[str, Any]:
     """Train the MLB readiness model on historical MiLB prospects.
+
+    Default training window is 2005-2018 MiLB prospects (labels from
+    MLB data through 2025), validated on 2019-2025 debutants.  This
+    is ~3x the sample of the previous 2018-2022 window.
 
     Parameters
     ----------
@@ -473,13 +589,13 @@ def _get_mlb_pitcher_first_seasons(
 
 def train_pitcher_readiness_model(
     milb_df: pd.DataFrame | None = None,
-    max_train_season: int = 2022,
+    max_train_season: int = 2018,
     min_debut_window: int = 2,
 ) -> dict[str, Any]:
     """Train the MLB readiness model for pitching prospects.
 
-    Follows the same pattern as ``train_readiness_model()`` but uses
-    pitcher-specific features and labels (100+ BF in an MLB season).
+    Default training window is 2005-2018 MiLB prospects (labels from
+    MLB data through 2025), validated on 2019-2025 debutants.
 
     Parameters
     ----------

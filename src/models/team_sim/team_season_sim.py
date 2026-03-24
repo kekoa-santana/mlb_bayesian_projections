@@ -62,7 +62,7 @@ def simulate_team_season(
     team_pitchers: pd.DataFrame,
     injury_params: pd.DataFrame,
     position_eligibility: pd.DataFrame | None = None,
-    n_sims: int = 1000,
+    n_sims: int = 10_000,
     random_seed: int = 42,
 ) -> dict:
     """Run Monte Carlo season simulations for one team.
@@ -268,7 +268,7 @@ def simulate_team_season(
 
 def simulate_all_teams(
     team_rosters: dict[str, dict],
-    n_sims: int = 1000,
+    n_sims: int = 10_000,
     random_seed: int = 42,
 ) -> pd.DataFrame:
     """Run season simulations for all 30 teams.

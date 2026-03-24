@@ -61,6 +61,11 @@ class StatConfig:
     sigma_player_prior: float = 0.5
     # sigma prior for observation noise (normal likelihood only)
     sigma_obs_prior: float = 0.05
+    # AR(1) rho prior: Beta(alpha, beta). Higher mean = more year-to-year
+    # persistence. Stat-specific because stability varies (OOPSY research):
+    # K% most persistent (~0.86), HR/FB least (~0.67).
+    rho_alpha: float = 8.0
+    rho_beta: float = 2.0
 
 
 # Pre-defined stat configs
@@ -79,6 +84,8 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         # empirical logit-scale yr-to-yr SD ≈ 0.24
         sigma_season_mu=0.20,
         sigma_season_floor=0.18,
+        # K% is the most persistent hitter stat (r=0.795 YoY)
+        rho_alpha=9.0, rho_beta=1.5,  # mean ~0.86
     ),
     "bb_rate": StatConfig(
         name="bb_rate",
@@ -94,6 +101,8 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         # empirical logit-scale yr-to-yr SD ≈ 0.33
         sigma_season_mu=0.25,
         sigma_season_floor=0.20,
+        # BB% moderately persistent (r=0.706 YoY) — keep default
+        rho_alpha=8.0, rho_beta=2.0,  # mean ~0.80
     ),
     "gb_rate": StatConfig(
         name="gb_rate",
@@ -108,6 +117,8 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         # empirical logit-scale yr-to-yr SD ≈ 0.20
         sigma_season_mu=0.18,
         sigma_season_floor=0.14,
+        # GB% moderately persistent (r=0.73 YoY)
+        rho_alpha=7.0, rho_beta=2.5,  # mean ~0.74
     ),
     "fb_rate": StatConfig(
         name="fb_rate",
@@ -121,6 +132,8 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         # empirical logit-scale yr-to-yr SD ≈ 0.22
         sigma_season_mu=0.18,
         sigma_season_floor=0.14,
+        # FB% roughly mirrors GB% stability
+        rho_alpha=7.0, rho_beta=2.5,  # mean ~0.74
     ),
     "hr_per_fb": StatConfig(
         name="hr_per_fb",
@@ -129,14 +142,20 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         rate_col="hr_per_fb",
         likelihood="binomial",
         league_avg=LEAGUE_AVG_OVERALL["hr_per_fb"],
-        # No covariates: barrel_pct (r=0.39 YoY) too unstable, and both
-        # barrel_pct + hard_hit_pct are collinear with each other and
-        # partially circular with HR/FB — caused ESS collapse in 2/3 folds.
-        covariates=[],
+        # Power composite (ISO + barrel% + hard_hit% + exit_velo) as single
+        # covariate. Individual barrel_pct (r=0.39 YoY) caused ESS collapse,
+        # but the 4-metric composite is more stable and predicts next-year
+        # barrel% 54% better and ISO 9% better than raw stats (validated
+        # 2019-2024 walk-forward, grade_prior_analysis.py).
+        covariates=[
+            ("power_composite", 0.0, 0.3, "power_z → HR/FB"),
+        ],
         sigma_player_prior=0.5,
         # empirical logit-scale yr-to-yr SD ≈ 0.45 — HR/FB is volatile
         sigma_season_mu=0.35,
         sigma_season_floor=0.28,
+        # HR/FB is the least persistent rate stat — needs most regression
+        rho_alpha=6.0, rho_beta=3.0,  # mean ~0.67
     ),
     "woba": StatConfig(
         name="woba",
@@ -154,6 +173,8 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         sigma_season_floor=0.020,
         sigma_player_prior=0.5,
         sigma_obs_prior=0.04,       # population SD ≈ 0.038
+        # wOBA is a composite metric — moderate persistence
+        rho_alpha=7.0, rho_beta=2.5,  # mean ~0.74
     ),
     "chase_rate": StatConfig(
         name="chase_rate",
@@ -169,6 +190,8 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         # empirical logit-scale yr-to-yr SD ≈ 0.15
         sigma_season_mu=0.13,
         sigma_season_floor=0.10,
+        # Chase rate is the most stable hitter metric (r=0.84 YoY, 87% between-player)
+        rho_alpha=9.0, rho_beta=1.0,  # mean ~0.90
     ),
 }
 
@@ -341,7 +364,7 @@ def build_hitter_model(
             mu=np.log(cfg.sigma_season_mu),
             sigma=0.5,
         )
-        rho = pm.Beta("rho", alpha=8, beta=2)  # high persistence prior (~0.8)
+        rho = pm.Beta("rho", alpha=cfg.rho_alpha, beta=cfg.rho_beta)
 
         if n_seasons > 1:
             innovation = pm.Normal(

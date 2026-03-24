@@ -16,6 +16,7 @@ Dimensions
 """
 from __future__ import annotations
 
+import gc
 import logging
 from typing import Any
 
@@ -81,6 +82,7 @@ def fit_all_models(
     chains: int = 4,
     random_seed: int = 42,
     stats: list[str] | None = None,
+    extract_season: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Fit K% and BB% hitter projection models.
 
@@ -94,12 +96,17 @@ def fit_all_models(
         MCMC parameters.
     stats : list[str] | None
         Stats to fit. Defaults to ALL_STATS (k_rate, bb_rate).
+    extract_season : int | None
+        If set, pre-extract forward-projected rate samples for all hitters
+        in this season immediately after fitting, then free the MCMC trace
+        to save memory.  Results stored in ``results[stat]["rate_samples"]``.
 
     Returns
     -------
     dict[str, dict]
-        Keyed by stat name, each containing:
-        "data", "trace", "convergence", "posteriors".
+        Keyed by stat name.  Always contains "data", "convergence",
+        "posteriors".  Contains "rate_samples" (dict[int, ndarray]) when
+        *extract_season* is set, otherwise "trace" (InferenceData).
     """
     if stats is None:
         stats = ALL_STATS
@@ -124,12 +131,50 @@ def fit_all_models(
         conv = check_convergence(trace, stat)
         posteriors = extract_posteriors(trace, data)
 
+        # Pre-extract rate samples so we can free the trace entirely
+        rate_samples: dict[int, np.ndarray] | None = None
+        if extract_season is not None:
+            rate_samples = {}
+            stat_df = data["df"]
+            id_col = "batter_id" if "batter_id" in stat_df.columns else "pitcher_id"
+            active_ids = stat_df[
+                stat_df["season"] == extract_season
+            ][id_col].unique()
+            for pid in active_ids:
+                try:
+                    rate_samples[int(pid)] = extract_rate_samples(
+                        trace, data,
+                        batter_id=int(pid),
+                        season=extract_season,
+                        project_forward=True,
+                        random_seed=random_seed,
+                    )
+                except ValueError:
+                    continue
+            logger.info(
+                "Pre-extracted %s samples for %d hitters",
+                stat, len(rate_samples),
+            )
+
         results[stat] = {
             "data": data,
-            "trace": trace,
             "convergence": conv,
             "posteriors": posteriors,
         }
+        if rate_samples is not None:
+            results[stat]["rate_samples"] = rate_samples
+        else:
+            # Keep stripped trace for backward compat (backtests etc.)
+            for group in ("posterior_predictive", "sample_stats", "observed_data"):
+                if hasattr(trace, group):
+                    delattr(trace, group)
+            results[stat]["trace"] = trace
+
+        # Free model + trace (if pre-extracted) to reclaim memory
+        del model
+        if rate_samples is not None:
+            del trace
+        gc.collect()
 
         logger.info(
             "%s: converged=%s, r_hat=%.4f",
@@ -223,7 +268,7 @@ def _compute_composite(base: pd.DataFrame) -> pd.DataFrame:
 def project_forward(
     model_results: dict[str, dict[str, Any]],
     from_season: int,
-    min_pa: int = 200,
+    min_pa: int = 150,
     random_seed: int = 42,
     calibration_t: dict[str, float] | None = None,
 ) -> pd.DataFrame:
@@ -273,7 +318,8 @@ def project_forward(
     for stat, res in model_results.items():
         cfg = STAT_CONFIGS[stat]
         data = res["data"]
-        trace = res["trace"]
+        pre_extracted = res.get("rate_samples") or {}
+        trace = res.get("trace")
 
         stat_df = data["df"]
         stat_season = stat_df[stat_df["season"] == from_season]
@@ -311,10 +357,15 @@ def project_forward(
 
         for batter_id in base["batter_id"]:
             try:
-                samples = extract_rate_samples(
-                    trace, data, batter_id, from_season,
-                    project_forward=True, random_seed=random_seed,
-                )
+                if batter_id in pre_extracted:
+                    samples = pre_extracted[batter_id].copy()
+                elif trace is not None:
+                    samples = extract_rate_samples(
+                        trace, data, batter_id, from_season,
+                        project_forward=True, random_seed=random_seed,
+                    )
+                else:
+                    continue
                 if _cal_t != 1.0:
                     from src.evaluation.metrics import calibrate_posterior_samples
                     samples = calibrate_posterior_samples(samples, _cal_t)

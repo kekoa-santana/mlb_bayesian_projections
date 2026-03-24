@@ -27,24 +27,27 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # ---------------------------------------------------------------------------
 # Composite weights (sum to 1.0)
 # ---------------------------------------------------------------------------
-# Research-aligned weights: rotation + offense are most predictive of
-# one-year-ahead wins; bullpen is volatile (small-sample relievers);
-# health/depth is inherently uncertain. Defense is moderately predictive
-# but requires 3+ years of data for reliability.
-_WEIGHTS = {
-    "offense": 0.35,
-    "rotation": 0.25,
-    "bullpen": 0.10,
-    "defense": 0.15,
-    "depth": 0.15,
+# Scouting grade component weights (sum to 0.55 — the talent portion)
+_TALENT_WEIGHTS = {
+    "offense": 0.20,     # Lineup diamond (starters + bench)
+    "rotation": 0.15,    # Top 5 SP diamond
+    "bullpen": 0.05,     # Role-weighted RP diamond
+    "defense": 0.10,     # OAA + framing
+    "depth": 0.05,       # Health/depth
 }
+# Performance + projection signal (sum to 0.45)
+# Projections (BaseRuns wins) are the stronger guardrail (r=0.814 residual
+# after talent). ELO adds moderate momentum signal (r=0.399) but offense
+# ELO is nearly useless (r=0.066). Projections get more weight.
+_ELO_WEIGHT = 0.15       # Recent game performance — light momentum/culture signal
+_PROJ_WEIGHT = 0.30       # Pythagorean projected wins (BaseRuns) — primary guardrail
 
-# Tier thresholds (on 0-1 composite_score)
+# Tier thresholds on 1-10 TDD score (league-relative each year)
 _TIERS = [
-    (0.85, "Elite"),
-    (0.65, "Contender"),
-    (0.40, "Competitive"),
-    (0.00, "Rebuilding"),
+    (8.0, "Elite"),
+    (5.5, "Contender"),
+    (3.5, "Competitive"),
+    (0.0, "Rebuilding"),
 ]
 
 PYTH_EXP = 1.83  # Baseball Pythagorean exponent
@@ -115,20 +118,7 @@ def rank_teams(
                 "pitching_score", "defense_score", "health_depth_score"]:
         df[col] = df[col].fillna(df[col].median())
 
-    # Composite score (weighted average of sub-scores)
-    df["composite_score"] = (
-        _WEIGHTS["offense"] * df["offense_score"]
-        + _WEIGHTS["rotation"] * df["rotation_score"]
-        + _WEIGHTS["bullpen"] * df["bullpen_score"]
-        + _WEIGHTS["defense"] * df["defense_score"]
-        + _WEIGHTS["depth"] * df["health_depth_score"]
-    )
-
-    # Tier assignment
-    df["tier"] = df["composite_score"].apply(_assign_tier)
-
-    # Projected wins from Pythagorean — prefer BaseRuns-projected RS/RA,
-    # fall back to observed 2025 rpg/ra_per_game
+    # ── Projected wins (Pythagorean from BaseRuns) ──
     rs_col = "proj_rs_per_game" if "proj_rs_per_game" in df.columns else "rpg"
     ra_col = "proj_ra_per_game" if "proj_ra_per_game" in df.columns else "ra_per_game"
     if rs_col in df.columns and ra_col in df.columns:
@@ -142,20 +132,15 @@ def rank_teams(
     else:
         df["projected_wins"] = 81.0
 
-    # Schedule-adjusted wins: teams with easier schedules project more wins
-    # avg_opp_elo centered on ~1500; each point above means harder schedule
+    # Schedule-adjusted wins
     if "avg_opp_elo" in df.columns:
-        # Convert opponent ELO to a wins adjustment
-        # avg_opp_elo of 1500 = neutral (0 adjustment)
-        # avg_opp_elo of 1520 = harder schedule (-2 wins)
-        # avg_opp_elo of 1480 = easier schedule (+2 wins)
         elo_diff = df["avg_opp_elo"].fillna(1500) - 1500
-        schedule_adjustment = -elo_diff * 0.10  # ~1 win per 10 ELO points
+        schedule_adjustment = -elo_diff * 0.10
         df["schedule_adjusted_wins"] = (df["projected_wins"] + schedule_adjustment).round(1)
     else:
         df["schedule_adjusted_wins"] = df["projected_wins"]
 
-    # Merge ELO if available
+    # ── Merge ELO ──
     if elo_ratings is not None and not elo_ratings.empty:
         elo_cols = ["team_id", "composite_elo", "composite_rank",
                     "offense_elo", "pitching_elo"]
@@ -167,13 +152,65 @@ def rank_teams(
         df["composite_elo"] = None
         df["elo_rank"] = None
 
-    # Final rank by composite_score
-    df["rank"] = df["composite_score"].rank(ascending=False, method="min").astype(int)
+    # ── Composite score: talent (55%) + ELO (20%) + projections (25%) ──
+    # Talent component: scouting diamond ratings when available, else old sub-scores
+    has_diamonds = all(
+        c in df.columns and df[c].notna().any()
+        for c in ["lineup_diamond", "rotation_diamond", "bullpen_diamond"]
+    )
+    if has_diamonds:
+        talent = (
+            _TALENT_WEIGHTS["offense"] * (df["lineup_diamond"].fillna(5.0) / 10.0)
+            + _TALENT_WEIGHTS["rotation"] * (df["rotation_diamond"].fillna(5.0) / 10.0)
+            + _TALENT_WEIGHTS["bullpen"] * (df["bullpen_diamond"].fillna(5.0) / 10.0)
+            + _TALENT_WEIGHTS["defense"] * df["defense_score"]
+            + _TALENT_WEIGHTS["depth"] * df["health_depth_score"]
+        )
+    else:
+        talent = (
+            _TALENT_WEIGHTS["offense"] * df["offense_score"]
+            + _TALENT_WEIGHTS["rotation"] * df["rotation_score"]
+            + _TALENT_WEIGHTS["bullpen"] * df["bullpen_score"]
+            + _TALENT_WEIGHTS["defense"] * df["defense_score"]
+            + _TALENT_WEIGHTS["depth"] * df["health_depth_score"]
+        )
+
+    # ELO component: normalize composite_elo to 0-1 (1400-1600 range)
+    if "composite_elo" in df.columns and df["composite_elo"].notna().any():
+        elo_norm = ((df["composite_elo"].fillna(1500) - 1400) / 200).clip(0, 1)
+        elo_component = _ELO_WEIGHT * elo_norm
+    else:
+        # No ELO: redistribute weight to talent
+        elo_component = 0.0
+        talent = talent * (1.0 + _ELO_WEIGHT / sum(_TALENT_WEIGHTS.values()))
+
+    # Projection component: normalize projected wins to 0-1 (70-110 range)
+    proj_norm = ((df["projected_wins"].fillna(81) - 70) / 40).clip(0, 1)
+    proj_component = _PROJ_WEIGHT * proj_norm
+
+    raw_composite = talent + elo_component + proj_component
+    df["composite_score"] = raw_composite  # keep raw for backward compat
+
+    # Map composite to TDD Score (1-10). Rescale so the actual worst
+    # team = 1.0 and best team = 10.0 — relative to the league this year.
+    raw_min = raw_composite.min()
+    raw_max = raw_composite.max()
+    if raw_max - raw_min > 1e-9:
+        df["tdd_score"] = (1.0 + (raw_composite - raw_min) / (raw_max - raw_min) * 9.0).round(1)
+    else:
+        df["tdd_score"] = 5.5
+
+    # Tier assignment (on 0-10 TDD score)
+    df["tier"] = df["tdd_score"].apply(_assign_tier)
+
+    # Final rank by tdd_score
+    df["rank"] = df["tdd_score"].rank(ascending=False, method="min").astype(int)
 
     # Sort and select output columns
     output_cols = [
         "team_id", "abbreviation", "team_name", "division", "league",
-        "rank", "composite_score", "tier", "projected_wins", "schedule_adjusted_wins",
+        "rank", "tdd_score", "composite_score", "tier",
+        "projected_wins", "schedule_adjusted_wins",
         "offense_score", "pitching_score", "rotation_score", "bullpen_score",
         "defense_score", "health_depth_score",
     ]
@@ -187,6 +224,13 @@ def rank_teams(
         "total_il_days", "avg_age",
         "composite_elo", "elo_rank", "offense_elo", "pitching_elo",
         "projected_wins",
+        # Scouting grade team diamonds
+        "lineup_diamond", "rotation_diamond", "bullpen_diamond",
+        "lineup_grade_hit", "lineup_grade_power", "lineup_grade_speed",
+        "lineup_grade_fielding", "lineup_grade_discipline",
+        "rotation_grade_stuff", "rotation_grade_command", "rotation_grade_durability",
+        "bullpen_grade_stuff", "bullpen_grade_command",
+        "team_fielding_grade",
     ]
     for col in optional:
         if col in df.columns and col not in output_cols:

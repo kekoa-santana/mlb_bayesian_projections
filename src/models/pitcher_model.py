@@ -58,6 +58,9 @@ class PitcherStatConfig:
     sigma_season_mu: float = 0.15
     sigma_season_floor: float = 0.0
     sigma_player_prior: float = 0.5
+    # AR(1) rho prior: Beta(alpha, beta). Stat-specific persistence.
+    rho_alpha: float = 8.0
+    rho_beta: float = 2.0
 
 
 # Empirical year-to-year volatility (logit scale) from 2018-2025 pitcher data:
@@ -74,6 +77,8 @@ PITCHER_STAT_CONFIGS: dict[str, PitcherStatConfig] = {
         season_decay=1.0,  # no decay (tested 0.6, 0.8 — neither improves MAE)
         sigma_season_mu=0.22,
         sigma_season_floor=0.18,
+        # K% most persistent pitcher stat
+        rho_alpha=9.0, rho_beta=1.5,  # mean ~0.86
     ),
     "bb_rate": PitcherStatConfig(
         name="bb_rate",
@@ -87,6 +92,8 @@ PITCHER_STAT_CONFIGS: dict[str, PitcherStatConfig] = {
         ],
         sigma_season_mu=0.28,
         sigma_season_floor=0.22,
+        # BB% moderately persistent — keep default
+        rho_alpha=8.0, rho_beta=2.0,  # mean ~0.80
     ),
     "hr_per_bf": PitcherStatConfig(
         name="hr_per_bf",
@@ -101,6 +108,8 @@ PITCHER_STAT_CONFIGS: dict[str, PitcherStatConfig] = {
         sigma_player_prior=0.8,
         sigma_season_mu=0.40,
         sigma_season_floor=0.35,
+        # HR/BF least persistent pitcher rate (r=0.267 YoY)
+        rho_alpha=6.0, rho_beta=3.0,  # mean ~0.67
     ),
 }
 
@@ -284,7 +293,7 @@ def build_pitcher_model(
             mu=np.log(cfg.sigma_season_mu),
             sigma=0.5,
         )
-        rho = pm.Beta("rho", alpha=8, beta=2)  # high persistence prior (~0.8)
+        rho = pm.Beta("rho", alpha=cfg.rho_alpha, beta=cfg.rho_beta)
 
         if n_seasons > 1:
             innovation = pm.Normal(

@@ -39,12 +39,17 @@ MIN_MLB_BF = 50
 def _get_batter_overlap_data() -> pd.DataFrame:
     """Find batters who played MiLB level X in season N and MLB in N or N+1.
 
+    Uses ``staging.batting_boxscores`` for the MLB side (data back to 2000)
+    instead of ``production.fact_pa`` (2018+ only), giving ~2.7x more
+    overlap player-seasons when MiLB data starts from 2005.
+
     Returns
     -------
     pd.DataFrame
         Columns: player_id, milb_season, level, milb_pa, milb_ab, milb_k,
-        milb_bb, milb_hr, milb_h, milb_tb, milb_sb, mlb_season, mlb_pa,
-        mlb_k, mlb_bb, mlb_hr, mlb_h, mlb_ab, mlb_tb, mlb_sb
+        milb_bb, milb_hr, milb_h, milb_tb, milb_sb, milb_ground_outs,
+        milb_air_outs, mlb_season, mlb_pa, mlb_k, mlb_bb, mlb_hr, mlb_h,
+        mlb_ab, mlb_tb, mlb_sb, mlb_ground_outs, mlb_air_outs
     """
     query = """
     WITH milb_agg AS (
@@ -59,7 +64,9 @@ def _get_batter_overlap_data() -> pd.DataFrame:
             SUM(home_runs)         AS milb_hr,
             SUM(hits)              AS milb_h,
             SUM(total_bases)       AS milb_tb,
-            SUM(sb)                AS milb_sb
+            SUM(sb)                AS milb_sb,
+            SUM(ground_outs)       AS milb_ground_outs,
+            SUM(air_outs)          AS milb_air_outs
         FROM staging.milb_batting_game_logs
         WHERE level IN ('AAA', 'AA', 'A+', 'A')
         GROUP BY batter_id, season, level
@@ -67,30 +74,23 @@ def _get_batter_overlap_data() -> pd.DataFrame:
     ),
     mlb_agg AS (
         SELECT
-            fp.batter_id             AS player_id,
+            bb.batter_id            AS player_id,
             dg.season                AS mlb_season,
-            COUNT(*)                 AS mlb_pa,
-            SUM(CASE WHEN fp.events = 'strikeout' THEN 1 ELSE 0 END) AS mlb_k,
-            SUM(CASE WHEN fp.events = 'walk' THEN 1 ELSE 0 END)      AS mlb_bb,
-            SUM(CASE WHEN fp.events = 'home_run' THEN 1 ELSE 0 END)  AS mlb_hr,
-            SUM(CASE WHEN fp.events IN (
-                'single','double','triple','home_run'
-            ) THEN 1 ELSE 0 END) AS mlb_h,
-            SUM(CASE WHEN fp.events NOT IN (
-                'walk','hit_by_pitch','sac_fly','sac_bunt',
-                'sac_fly_double_play','catcher_interf'
-            ) THEN 1 ELSE 0 END) AS mlb_ab,
-            SUM(CASE WHEN fp.events = 'single' THEN 1
-                      WHEN fp.events = 'double' THEN 2
-                      WHEN fp.events = 'triple' THEN 3
-                      WHEN fp.events = 'home_run' THEN 4
-                      ELSE 0 END) AS mlb_tb,
-            SUM(CASE WHEN fp.events = 'stolen_base' THEN 1 ELSE 0 END) AS mlb_sb
-        FROM production.fact_pa fp
-        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+            SUM(bb.plate_appearances) AS mlb_pa,
+            SUM(bb.strikeouts)       AS mlb_k,
+            SUM(bb.walks)            AS mlb_bb,
+            SUM(bb.home_runs)        AS mlb_hr,
+            SUM(bb.hits)             AS mlb_h,
+            SUM(bb.at_bats)          AS mlb_ab,
+            SUM(bb.total_bases)      AS mlb_tb,
+            SUM(bb.sb)               AS mlb_sb,
+            SUM(bb.ground_outs)      AS mlb_ground_outs,
+            SUM(bb.air_outs)         AS mlb_air_outs
+        FROM staging.batting_boxscores bb
+        JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
         WHERE dg.game_type = 'R'
-        GROUP BY fp.batter_id, dg.season
-        HAVING COUNT(*) >= :min_mlb_pa
+        GROUP BY bb.batter_id, dg.season
+        HAVING SUM(bb.plate_appearances) >= :min_mlb_pa
     )
     SELECT
         m.player_id,
@@ -98,16 +98,18 @@ def _get_batter_overlap_data() -> pd.DataFrame:
         m.level,
         m.milb_pa, m.milb_ab, m.milb_k, m.milb_bb,
         m.milb_hr, m.milb_h, m.milb_tb, m.milb_sb,
+        m.milb_ground_outs, m.milb_air_outs,
         b.mlb_season,
         b.mlb_pa, b.mlb_k, b.mlb_bb, b.mlb_hr,
-        b.mlb_h, b.mlb_ab, b.mlb_tb, b.mlb_sb
+        b.mlb_h, b.mlb_ab, b.mlb_tb, b.mlb_sb,
+        b.mlb_ground_outs, b.mlb_air_outs
     FROM milb_agg m
     JOIN mlb_agg b
       ON m.player_id = b.player_id
      AND b.mlb_season BETWEEN m.milb_season AND m.milb_season + 1
     ORDER BY m.level, m.milb_season, m.player_id
     """
-    logger.info("Fetching batter MiLB↔MLB overlap data")
+    logger.info("Fetching batter MiLB↔MLB overlap data (2005+)")
     return read_sql(query, {
         "min_milb_pa": MIN_MILB_PA,
         "min_mlb_pa": MIN_MLB_PA,
@@ -177,6 +179,9 @@ def _get_pitcher_overlap_data() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Step 2: Derive translation factors
 # ---------------------------------------------------------------------------
+_TIME_WEIGHT_HALF_LIFE: float = 5.0  # years; recent data weighted ~2x vs 5yr-old data
+
+
 def _compute_rate_factor(
     milb_values: pd.Series,
     mlb_values: pd.Series,
@@ -213,26 +218,82 @@ def _compute_rate_factor(
     }
 
 
-def derive_batter_translation_factors(
-    overlap_df: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
-    """Derive batter translation factors by level, pooled across all years.
+def _compute_time_weighted_factor(
+    milb_values: pd.Series,
+    mlb_values: pd.Series,
+    seasons: pd.Series,
+    *,
+    reference_season: int | None = None,
+    half_life: float = _TIME_WEIGHT_HALF_LIFE,
+    clip_lo: float = 0.3,
+    clip_hi: float = 3.0,
+) -> dict:
+    """Compute time-weighted median ratio of MLB rate / MiLB rate.
+
+    More recent overlap seasons contribute more via exponential decay.
+    EDA showed BB% and ISO translation ratios shifted significantly
+    post-2021 (e.g. AAA BB% ratio: 0.81 → 0.69), so flat pooling
+    across 20 years misweights stale data.
 
     Parameters
     ----------
-    overlap_df : pd.DataFrame, optional
-        Pre-fetched overlap data. If None, fetches from DB.
+    milb_values, mlb_values : pd.Series
+        Rate values for each overlap player-season.
+    seasons : pd.Series
+        MiLB season for each overlap row (used for time weighting).
+    reference_season : int or None
+        Anchor year for decay.  Defaults to ``seasons.max()``.
+    half_life : float
+        Half-life in years for exponential decay (default 5).
+    clip_lo, clip_hi : float
+        Clip individual ratios to avoid extreme outliers.
 
     Returns
     -------
-    pd.DataFrame
-        One row per (level, stat). Columns: level, stat, factor, n, std, p25, p75
+    dict
+        Keys: factor, n, std, p25, p75 (factor is weighted median).
     """
-    if overlap_df is None:
-        overlap_df = _get_batter_overlap_data()
+    mask = (
+        (milb_values > 0)
+        & (mlb_values > 0)
+        & milb_values.notna()
+        & mlb_values.notna()
+        & seasons.notna()
+    )
+    if mask.sum() < 5:
+        return {"factor": np.nan, "n": int(mask.sum())}
 
-    # Compute rates
-    df = overlap_df.copy()
+    ratios = (mlb_values[mask] / milb_values[mask]).clip(clip_lo, clip_hi)
+    s = seasons[mask].astype(float)
+    if reference_season is None:
+        reference_season = int(s.max())
+    decay = np.exp(-np.log(2) * (reference_season - s) / half_life)
+
+    # Weighted median via sorted cumulative weights
+    order = ratios.argsort()
+    sorted_ratios = ratios.iloc[order].values
+    sorted_weights = decay.iloc[order].values
+    cum = np.cumsum(sorted_weights)
+    median_idx = np.searchsorted(cum, cum[-1] / 2.0)
+    w_median = float(sorted_ratios[min(median_idx, len(sorted_ratios) - 1)])
+
+    # Weighted std (for diagnostics)
+    w_total = decay.sum()
+    w_mean = float((ratios * decay).sum() / w_total)
+    w_var = float(((ratios - w_mean) ** 2 * decay).sum() / w_total)
+
+    return {
+        "factor": w_median,
+        "mean": w_mean,
+        "std": float(np.sqrt(w_var)),
+        "n": int(mask.sum()),
+        "p25": float(ratios.quantile(0.25)),
+        "p75": float(ratios.quantile(0.75)),
+    }
+
+
+def _add_batter_rates(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute MiLB and MLB rate columns on overlap DataFrame."""
     df["milb_k_pct"] = df["milb_k"] / df["milb_pa"]
     df["mlb_k_pct"] = df["mlb_k"] / df["mlb_pa"]
     df["milb_bb_pct"] = df["milb_bb"] / df["milb_pa"]
@@ -242,7 +303,41 @@ def derive_batter_translation_factors(
     df["milb_hr_pa"] = df["milb_hr"] / df["milb_pa"]
     df["mlb_hr_pa"] = df["mlb_hr"] / df["mlb_pa"]
 
-    stats = ["k_pct", "bb_pct", "iso", "hr_pa"]
+    milb_bip = df["milb_ground_outs"] + df["milb_air_outs"]
+    mlb_bip = df["mlb_ground_outs"] + df["mlb_air_outs"]
+    df["milb_gb_pct"] = df["milb_ground_outs"] / milb_bip.replace(0, np.nan)
+    df["mlb_gb_pct"] = df["mlb_ground_outs"] / mlb_bip.replace(0, np.nan)
+    return df
+
+
+def derive_batter_translation_factors(
+    overlap_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Derive batter translation factors by level.
+
+    Produces both **time-weighted pooled** factors (used for application)
+    and **per-year** factors (for trend diagnostics).  Time-weighting uses
+    exponential decay with a 5-year half-life so that recent overlap
+    seasons contribute more.  EDA showed BB% and ISO ratios shifted
+    significantly post-2021 while K% remained stable.
+
+    Parameters
+    ----------
+    overlap_df : pd.DataFrame, optional
+        Pre-fetched overlap data. If None, fetches from DB.
+
+    Returns
+    -------
+    pd.DataFrame
+        Rows with ``pooled=True`` are the time-weighted factors to use.
+        Per-year rows (``pooled=False``) included for diagnostics.
+    """
+    if overlap_df is None:
+        overlap_df = _get_batter_overlap_data()
+
+    df = _add_batter_rates(overlap_df.copy())
+
+    stats = ["k_pct", "bb_pct", "iso", "hr_pa", "gb_pct"]
     rows = []
 
     for level in MILB_LEVELS:
@@ -250,8 +345,13 @@ def derive_batter_translation_factors(
         if len(ldf) == 0:
             continue
 
+        # Time-weighted pooled factor (primary)
         for stat in stats:
-            result = _compute_rate_factor(ldf[f"milb_{stat}"], ldf[f"mlb_{stat}"])
+            result = _compute_time_weighted_factor(
+                ldf[f"milb_{stat}"],
+                ldf[f"mlb_{stat}"],
+                ldf["milb_season"],
+            )
             rows.append({"level": level, "stat": stat, **result})
 
         # Per-year breakdown for trend detection
@@ -267,11 +367,10 @@ def derive_batter_translation_factors(
                 })
 
     factors_df = pd.DataFrame(rows)
-    # Separate pooled (no season) from per-year (has season)
     factors_df["pooled"] = factors_df.get("season", pd.Series(dtype=float)).isna()
 
     logger.info(
-        "Derived batter translation factors: %d pooled, %d per-year",
+        "Derived batter translation factors: %d pooled (time-weighted), %d per-year",
         factors_df["pooled"].sum(),
         (~factors_df["pooled"]).sum(),
     )
@@ -281,7 +380,7 @@ def derive_batter_translation_factors(
 def derive_pitcher_translation_factors(
     overlap_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """Derive pitcher translation factors by level, pooled across all years.
+    """Derive pitcher translation factors by level (time-weighted).
 
     Parameters
     ----------
@@ -291,7 +390,8 @@ def derive_pitcher_translation_factors(
     Returns
     -------
     pd.DataFrame
-        One row per (level, stat). Columns: level, stat, factor, n, std, p25, p75
+        Rows with ``pooled=True`` are the time-weighted factors to use.
+        Per-year rows (``pooled=False``) included for diagnostics.
     """
     if overlap_df is None:
         overlap_df = _get_pitcher_overlap_data()
@@ -312,10 +412,16 @@ def derive_pitcher_translation_factors(
         if len(ldf) == 0:
             continue
 
+        # Time-weighted pooled factor (primary)
         for stat in stats:
-            result = _compute_rate_factor(ldf[f"milb_{stat}"], ldf[f"mlb_{stat}"])
+            result = _compute_time_weighted_factor(
+                ldf[f"milb_{stat}"],
+                ldf[f"mlb_{stat}"],
+                ldf["milb_season"],
+            )
             rows.append({"level": level, "stat": stat, **result})
 
+        # Per-year for diagnostics
         for season in sorted(ldf["milb_season"].unique()):
             sdf = ldf[ldf["milb_season"] == season]
             for stat in stats:
@@ -331,7 +437,7 @@ def derive_pitcher_translation_factors(
     factors_df["pooled"] = factors_df.get("season", pd.Series(dtype=float)).isna()
 
     logger.info(
-        "Derived pitcher translation factors: %d pooled, %d per-year",
+        "Derived pitcher translation factors: %d pooled (time-weighted), %d per-year",
         factors_df["pooled"].sum(),
         (~factors_df["pooled"]).sum(),
     )
@@ -348,6 +454,16 @@ def _get_pooled_factors(factors_df: pd.DataFrame) -> dict[tuple[str, str], float
         (row["level"], row["stat"]): row["factor"]
         for _, row in pooled.iterrows()
         if pd.notna(row["factor"])
+    }
+
+
+def _get_pooled_factor_n(factors_df: pd.DataFrame) -> dict[tuple[str, str], int]:
+    """Extract overlap sample sizes as {(level, stat): n} dict."""
+    pooled = factors_df[factors_df["pooled"]].copy()
+    return {
+        (row["level"], row["stat"]): int(row.get("n", 0))
+        for _, row in pooled.iterrows()
+        if pd.notna(row.get("n", 0))
     }
 
 
@@ -404,6 +520,8 @@ def translate_batter_season(
         translated_iso, translated_hr_pa, translation_confidence
     """
     factors = _get_pooled_factors(factors_df)
+    # Build overlap-N lookup for factor reliability
+    factor_n = _get_pooled_factor_n(factors_df)
     df = raw_df.copy()
 
     # Raw rates
@@ -412,26 +530,42 @@ def translate_batter_season(
     df["raw_iso"] = (df["tb"] - df["h"]) / df["ab"].replace(0, np.nan)
     df["raw_hr_pa"] = df["hr"] / df["pa"]
 
+    # GB rate from ground_outs/air_outs (if available)
+    if "ground_outs" in df.columns and "air_outs" in df.columns:
+        bip_total = df["ground_outs"] + df["air_outs"]
+        df["raw_gb_pct"] = df["ground_outs"] / bip_total.replace(0, np.nan)
+    else:
+        df["raw_gb_pct"] = np.nan
+
     # Apply factors
     stat_map = {
         "k_pct": "translated_k_pct",
         "bb_pct": "translated_bb_pct",
         "iso": "translated_iso",
         "hr_pa": "translated_hr_pa",
+        "gb_pct": "translated_gb_pct",
     }
 
     for stat, col in stat_map.items():
         df[col] = df.apply(
-            lambda row: row[f"raw_{stat}"] * _interpolate_factor(factors, row["level"], stat),
+            lambda row: row.get(f"raw_{stat}", np.nan) * _interpolate_factor(factors, row["level"], stat)
+            if pd.notna(row.get(f"raw_{stat}", np.nan)) else np.nan,
             axis=1,
         )
 
-    # Translation confidence: based on PA and level reliability
+    # Translation confidence: level × PA × factor reliability
     level_reliability = {"AAA": 0.90, "AA": 0.70, "A+": 0.50, "A": 0.35}
     df["level_reliability"] = df["level"].map(level_reliability).fillna(0.2)
-    # PA reliability: ramps from 0 at 0 PA to 1.0 at 200 PA
     df["pa_reliability"] = (df["pa"] / 200.0).clip(0.0, 1.0)
-    df["translation_confidence"] = df["level_reliability"] * df["pa_reliability"]
+
+    # Factor reliability: penalize levels with few overlap seasons
+    # Uses K% factor N as proxy (most important stat)
+    df["factor_reliability"] = df["level"].map(
+        lambda lvl: min(factor_n.get((lvl, "k_pct"), 10) / 100.0, 1.0)
+    )
+    df["translation_confidence"] = (
+        df["level_reliability"] * df["pa_reliability"] * df["factor_reliability"]
+    )
 
     return df
 
@@ -456,11 +590,19 @@ def translate_pitcher_season(
         Original columns plus translated rates and translation_confidence.
     """
     factors = _get_pooled_factors(factors_df)
+    factor_n = _get_pooled_factor_n(factors_df)
     df = raw_df.copy()
 
     df["raw_k_pct"] = df["k"] / df["bf"]
     df["raw_bb_pct"] = df["bb"] / df["bf"]
     df["raw_hr_bf"] = df["hr"] / df["bf"]
+
+    # GB rate from ground_outs/air_outs (if available)
+    if "ground_outs" in df.columns and "air_outs" in df.columns:
+        bip_total = df["ground_outs"] + df["air_outs"]
+        df["raw_gb_pct"] = df["ground_outs"] / bip_total.replace(0, np.nan)
+    else:
+        df["raw_gb_pct"] = np.nan
 
     stat_map = {
         "k_pct": "translated_k_pct",
@@ -474,10 +616,20 @@ def translate_pitcher_season(
             axis=1,
         )
 
+    # GB rate: pass through raw (no translation needed — GB% is level-stable)
+    df["translated_gb_pct"] = df["raw_gb_pct"]
+
     level_reliability = {"AAA": 0.90, "AA": 0.70, "A+": 0.50, "A": 0.35}
     df["level_reliability"] = df["level"].map(level_reliability).fillna(0.2)
     df["pa_reliability"] = (df["bf"] / 200.0).clip(0.0, 1.0)
-    df["translation_confidence"] = df["level_reliability"] * df["pa_reliability"]
+
+    # Factor reliability from overlap sample size
+    df["factor_reliability"] = df["level"].map(
+        lambda lvl: min(factor_n.get((lvl, "k_pct"), 10) / 100.0, 1.0)
+    )
+    df["translation_confidence"] = (
+        df["level_reliability"] * df["pa_reliability"] * df["factor_reliability"]
+    )
 
     return df
 
@@ -485,8 +637,12 @@ def translate_pitcher_season(
 # ---------------------------------------------------------------------------
 # Step 4: Age-relative-to-level context
 # ---------------------------------------------------------------------------
-# Average age at each level (approximate MLB norms)
-LEVEL_AVG_AGE = {"A": 20.5, "A+": 21.5, "AA": 23.0, "AAA": 25.5, "ROK": 19.0}
+# Typical prospect age at each level — P25 of the empirical age
+# distribution (61K player-level-seasons, 2005-2025).  P25 is used
+# instead of the median because the median is inflated by veterans and
+# AAAA players who are not the prospect population of interest.
+# Empirical medians for reference: ROK 19.2, A 22.1, A+ 23.2, AA 24.6, AAA 27.3
+LEVEL_AVG_AGE = {"ROK": 18.2, "A": 20.8, "A+": 22.2, "AA": 23.4, "AAA": 25.2}
 
 
 def add_age_context(

@@ -49,6 +49,7 @@ player_profiles/
 │   │   ├── league_baselines.py  # Per (pitch_type/archetype, batter_stand) baselines
 │   │   ├── pitch_archetypes.py  # KMeans k=8 pitch shape clustering
 │   │   ├── milb_translation.py  # MiLB-to-MLB translation factors
+│   │   ├── team_queries.py      # Team-level SQL queries (game results, park factors, roster comp)
 │   │   ├── schedule.py          # MLB Stats API schedule/lineup fetcher
 │   │   └── data_qa.py           # Data quality / sanity reports
 │   ├── models/
@@ -63,6 +64,9 @@ player_profiles/
 │   │   ├── matchup.py               # Pitch-type & archetype matchup scoring
 │   │   ├── bf_model.py              # Batters-faced workload model
 │   │   ├── game_k_model.py          # Game-level K posterior (Layer 3)
+│   │   ├── team_elo.py              # Component ELO engine (offense/pitching/SP)
+│   │   ├── team_profiles.py         # Team profile builder (6 dimensions)
+│   │   ├── team_rankings.py         # Composite team rankings + tiers
 │   │   └── in_season_updater.py     # Beta-Binomial conjugate updating
 │   ├── utils/
 │   │   └── constants.py         # Pitch maps, whiff defs, zone boundaries, league avgs
@@ -76,7 +80,8 @@ player_profiles/
 │   │   ├── ensemble.py              # Bayes-Marcel ensemble blending
 │   │   ├── metrics.py               # CRPS, ECE, temperature scaling
 │   │   ├── counting_backtest.py     # Counting stat validation
-│   │   └── game_prop_validation.py  # Complete game prop framework
+│   │   ├── game_prop_validation.py  # Complete game prop framework
+│   │   └── team_elo_validation.py   # Walk-forward ELO validation
 │   └── viz/
 │       ├── theme.py                 # The Data Diamond brand theme
 │       ├── projections.py           # K% mover cards, individual pitcher cards
@@ -89,6 +94,7 @@ player_profiles/
 │   ├── run_pitcher_backtest.py        # Multi-stat pitcher backtest runner
 │   ├── run_counting_backtest.py       # Counting stat backtest runner
 │   ├── run_game_k_backtest.py         # Game-level K backtest runner
+│   ├── run_team_elo_backtest.py       # Team ELO calibration runner
 │   ├── run_game_prop_backtest.py      # Game prop validation runner
 │   ├── generate_preseason_content.py  # 2026 K% mover cards
 │   ├── generate_composite_cards.py    # Composite breakout/regression cards
@@ -293,6 +299,13 @@ Every model must be evaluated with:
 28. [x] AR(1) process replacement for random walk (rho ~ Beta(8,2) in hitter_model, pitcher_model, pitcher_k_rate_model)
 29. [ ] wOBA projection (replacing xwOBA)
 30. [ ] Enhanced season evolution modeling
+
+### Phase 9: Team Intelligence — COMPLETE
+31. [x] Component ELO system (offense/pitching/SP, 61K games, 55.2% accuracy)
+32. [x] Team profiles (6 dimensions: offense, pitching, defense, org, health, schedule)
+33. [x] Composite team rankings with tier labels + Pythagorean projected wins
+34. [x] Walk-forward ELO validation (2021-2025, +2.1% over baseline)
+35. [x] Precompute integration (team_elo, team_profiles, team_rankings parquets)
 
 ### Remaining
 - [ ] Betting edge finder and tracker (Kelly sizing)

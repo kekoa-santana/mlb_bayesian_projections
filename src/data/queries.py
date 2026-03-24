@@ -2027,6 +2027,53 @@ def get_pitcher_location_grid(season: int) -> pd.DataFrame:
     return read_sql(query, {"season": season})
 
 
+def get_pitcher_pitch_locations(season: int) -> pd.DataFrame:
+    """Raw pitch coordinates for all qualified pitchers in a season.
+
+    Returns one row per pitch with plate_x, plate_z — no grid binning.
+    Used for KDE pitch density visualizations.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, pitch_type, batter_stand, plate_x, plate_z.
+    """
+    query = """
+    WITH pitcher_filter AS (
+        SELECT fp.pitcher_id
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season = :season AND dg.game_type = 'R'
+          AND fp.pitch_type IS NOT NULL
+        GROUP BY fp.pitcher_id
+        HAVING COUNT(*) >= 500
+    )
+    SELECT
+        fp.pitcher_id,
+        fp.pitch_type,
+        fp.batter_stand,
+        fp.plate_x,
+        fp.plate_z
+    FROM production.fact_pitch fp
+    JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+    JOIN pitcher_filter pf ON fp.pitcher_id = pf.pitcher_id
+    WHERE dg.season = :season
+      AND dg.game_type = 'R'
+      AND fp.pitch_type IS NOT NULL
+      AND fp.plate_x IS NOT NULL AND fp.plate_z IS NOT NULL
+      AND CAST(fp.plate_x AS text) != 'NaN'
+      AND CAST(fp.plate_z AS text) != 'NaN'
+    ORDER BY fp.pitcher_id, fp.pitch_type
+    """
+    logger.info("Fetching raw pitcher pitch locations for %d", season)
+    return read_sql(query, {"season": season})
+
+
 def get_hitter_zone_grid(season: int) -> pd.DataFrame:
     """Hitter zone grid with whiff and batted-ball metrics per cell.
 
@@ -2686,6 +2733,8 @@ def get_milb_batter_season_totals(season: int) -> pd.DataFrame:
         SUM(total_bases)       AS tb,
         SUM(runs)              AS r,
         SUM(rbi)               AS rbi,
+        SUM(ground_outs)       AS ground_outs,
+        SUM(air_outs)          AS air_outs,
         COUNT(DISTINCT game_pk) AS games
     FROM staging.milb_batting_game_logs
     WHERE season = :season
@@ -2731,7 +2780,10 @@ def get_milb_pitcher_season_totals(season: int) -> pd.DataFrame:
         SUM(saves)            AS sv,
         SUM(holds)            AS hld,
         COUNT(DISTINCT game_pk) AS games,
-        SUM(CASE WHEN is_starter THEN 1 ELSE 0 END) AS games_started
+        SUM(CASE WHEN is_starter THEN 1 ELSE 0 END) AS games_started,
+        SUM(ground_outs)       AS ground_outs,
+        SUM(air_outs)          AS air_outs,
+        SUM(fly_outs)          AS fly_outs
     FROM staging.milb_pitching_game_logs
     WHERE season = :season
       AND level IN ('AAA', 'AA', 'A+', 'A')
@@ -3886,4 +3938,55 @@ def get_lineup_priors(season: int) -> pd.DataFrame:
     df["is_primary"] = False
     df.loc[idx, "is_primary"] = True
 
+    return df
+
+
+# ---------------------------------------------------------------------------
+# PA-level outcomes (for Glicko-2 player ratings)
+# ---------------------------------------------------------------------------
+
+def get_pa_outcomes(
+    seasons: list[int] | None = None,
+) -> pd.DataFrame:
+    """PA-level data with woba_value for Glicko-2 rating computation.
+
+    Joins ``fact_pa`` with ``sat_batted_balls`` (for BIP woba_value)
+    and ``dim_game`` (for chronological ordering).
+
+    Parameters
+    ----------
+    seasons : list[int], optional
+        Seasons to include.  Defaults to all available.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: game_pk, game_date, season, batter_id, pitcher_id,
+        events, woba_value (NULL for non-BIP).
+        Sorted by game_date, game_pk, at_bat_number.
+    """
+    where = "dg.game_type = 'R' AND fp.events IS NOT NULL"
+    params: dict = {}
+    if seasons:
+        where += " AND dg.season = ANY(:seasons)"
+        params["seasons"] = seasons
+
+    query = f"""
+    SELECT fp.game_pk, dg.game_date, dg.season,
+           fp.batter_id, fp.pitcher_id, fp.events,
+           sbb.woba_value
+    FROM production.fact_pa fp
+    JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+    LEFT JOIN production.sat_batted_balls sbb ON fp.pa_id = sbb.pa_id
+    WHERE {where}
+    ORDER BY dg.game_date, fp.game_pk, fp.game_counter
+    """
+
+    logger.info("Fetching PA outcomes for Glicko-2%s",
+                f" (seasons {seasons})" if seasons else "")
+    df = read_sql(query, params)
+    logger.info("PA outcomes: %d rows, %d batters, %d pitchers",
+                len(df),
+                df["batter_id"].nunique() if not df.empty else 0,
+                df["pitcher_id"].nunique() if not df.empty else 0)
     return df

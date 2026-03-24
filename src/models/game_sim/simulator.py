@@ -145,7 +145,7 @@ def simulate_game(
     umpire_bb_lift: float = 0.0,
     park_hr_lift: float = 0.0,
     weather_k_lift: float = 0.0,
-    n_sims: int = 10_000,
+    n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> SimulationResult:
     """Run vectorized Monte Carlo game simulation.
@@ -443,7 +443,7 @@ def predict_game(
     park_bb_lift: float = 0.0,
     catcher_k_lift: float = 0.0,
     weather_k_lift: float = 0.0,
-    n_sims: int = 10_000,
+    n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> dict[str, Any]:
     """High-level game prediction interface.
