@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import pandas as pd
 
 from src.data.db import read_sql
@@ -3941,6 +3942,100 @@ def get_lineup_priors(season: int) -> pd.DataFrame:
     return df
 
 
+def get_lineup_priors_by_hand(season: int) -> pd.DataFrame:
+    """Get per-player position/batting-order history split by opposing pitcher hand.
+
+    Same structure as ``get_lineup_priors`` but with an additional ``vs_hand``
+    column ('L' or 'R') indicating the opposing starting pitcher's throwing hand.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: player_id, position, vs_hand, starts, batting_order_mode,
+        bo_games, pct, is_primary.
+    """
+    query = """
+    WITH opp_pitcher AS (
+        -- Starting pitcher for each team in each game
+        SELECT fl.game_pk, fl.team_id, dp.pitch_hand
+        FROM production.fact_lineup fl
+        JOIN production.dim_player dp ON fl.player_id = dp.player_id
+        WHERE fl.position = 'P'
+          AND fl.is_starter = true
+    ),
+    pos_starts AS (
+        SELECT
+            fl.player_id,
+            fl.position,
+            op.pitch_hand AS vs_hand,
+            COUNT(*) AS starts
+        FROM production.fact_lineup fl
+        JOIN production.dim_game dg ON fl.game_pk = dg.game_pk
+        -- Join to opposing team's starting pitcher
+        JOIN opp_pitcher op
+          ON op.game_pk = fl.game_pk
+         AND op.team_id != fl.team_id
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+          AND fl.is_starter = true
+          AND fl.position NOT IN ('P', 'PR', 'PH')
+          AND op.pitch_hand IN ('L', 'R')
+        GROUP BY fl.player_id, fl.position, op.pitch_hand
+    ),
+    bo_starts AS (
+        SELECT
+            fl.player_id,
+            fl.position,
+            op.pitch_hand AS vs_hand,
+            fl.batting_order,
+            COUNT(*) AS bo_games,
+            ROW_NUMBER() OVER (
+                PARTITION BY fl.player_id, fl.position, op.pitch_hand
+                ORDER BY COUNT(*) DESC
+            ) AS rn
+        FROM production.fact_lineup fl
+        JOIN production.dim_game dg ON fl.game_pk = dg.game_pk
+        JOIN opp_pitcher op
+          ON op.game_pk = fl.game_pk
+         AND op.team_id != fl.team_id
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+          AND fl.is_starter = true
+          AND fl.position NOT IN ('P', 'PR', 'PH')
+          AND op.pitch_hand IN ('L', 'R')
+        GROUP BY fl.player_id, fl.position, op.pitch_hand, fl.batting_order
+    )
+    SELECT
+        ps.player_id,
+        ps.position,
+        ps.vs_hand,
+        ps.starts,
+        bs.batting_order AS batting_order_mode,
+        bs.bo_games
+    FROM pos_starts ps
+    JOIN bo_starts bs
+      ON ps.player_id = bs.player_id
+     AND ps.position = bs.position
+     AND ps.vs_hand = bs.vs_hand
+     AND bs.rn = 1
+    ORDER BY ps.player_id, ps.vs_hand, ps.starts DESC
+    """
+    logger.info("Fetching lineup priors by hand for %d", season)
+    df = read_sql(query, {"season": season})
+
+    if df.empty:
+        return df
+
+    # Compute pct and is_primary within each hand split
+    totals = df.groupby(["player_id", "vs_hand"])["starts"].transform("sum")
+    df["pct"] = df["starts"] / totals
+    idx = df.groupby(["player_id", "vs_hand"])["starts"].idxmax()
+    df["is_primary"] = False
+    df.loc[idx, "is_primary"] = True
+
+    return df
+
+
 # ---------------------------------------------------------------------------
 # PA-level outcomes (for Glicko-2 player ratings)
 # ---------------------------------------------------------------------------
@@ -3990,3 +4085,503 @@ def get_pa_outcomes(
                 df["batter_id"].nunique() if not df.empty else 0,
                 df["pitcher_id"].nunique() if not df.empty else 0)
     return df
+
+
+# ---------------------------------------------------------------------------
+# 42. Hitter breakout features (tiered: T1 boxscore 2000+, T2 Statcast 2018+,
+#     T3 MiLB for young players)
+# ---------------------------------------------------------------------------
+def get_hitter_breakout_features(
+    season: int,
+    min_pa: int = 200,
+) -> pd.DataFrame:
+    """Consolidated hitter feature set for breakout model training/scoring.
+
+    Returns one row per qualified batter with three feature tiers:
+    - **T1 (2000+):** boxscore rates (K%, BB%, ISO, BABIP, OPS, etc.)
+    - **T2 (2018+):** Statcast advanced (barrel%, xwOBA, chase, EV, etc.)
+    - **T3 (young players):** translated MiLB rates, prospect pedigree
+
+    Tier 2/3 columns are NaN when data is unavailable.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+    min_pa : int
+        Minimum plate appearances to qualify.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns documented inline (30 features + metadata).
+    """
+    # --- T1: Boxscore base (2000+) ---
+    box = read_sql("""
+        SELECT
+            bb.batter_id,
+            dp.player_name  AS batter_name,
+            dg.season,
+            COUNT(DISTINCT bb.game_pk) AS games,
+            SUM(bb.plate_appearances) AS pa,
+            SUM(bb.at_bats)           AS ab,
+            SUM(bb.hits)              AS hits,
+            SUM(bb.doubles)           AS doubles,
+            SUM(bb.triples)           AS triples,
+            SUM(bb.home_runs)         AS hr,
+            SUM(bb.walks)             AS bb,
+            SUM(bb.intentional_walks) AS ibb,
+            SUM(bb.hit_by_pitch)      AS hbp,
+            SUM(bb.strikeouts)        AS k,
+            SUM(bb.total_bases)       AS total_bases,
+            SUM(bb.sb)                AS sb,
+            SUM(bb.caught_stealing)   AS cs,
+            SUM(bb.ground_outs)       AS ground_outs,
+            SUM(bb.air_outs)          AS air_outs
+        FROM staging.batting_boxscores bb
+        JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+        LEFT JOIN production.dim_player dp ON bb.batter_id = dp.player_id
+        WHERE dg.season = :season AND dg.game_type = 'R'
+        GROUP BY bb.batter_id, dp.player_name, dg.season
+        HAVING SUM(bb.plate_appearances) >= :min_pa
+    """, {"season": season, "min_pa": min_pa})
+
+    if box.empty:
+        logger.warning("No qualified hitters for breakout features (season=%d)", season)
+        return pd.DataFrame()
+
+    # Derived T1 rates
+    ab = box["ab"].replace(0, np.nan)
+    pa = box["pa"].replace(0, np.nan)
+    box["k_pct"] = box["k"] / pa
+    box["bb_pct"] = box["bb"] / pa
+    box["avg"] = box["hits"] / ab
+    box["slg"] = box["total_bases"] / ab
+    box["iso"] = box["slg"] - box["avg"]
+    box["hr_ab"] = box["hr"] / ab
+    obp_den = (box["ab"] + box["bb"] + box["hbp"]).replace(0, np.nan)
+    box["obp"] = (box["hits"] + box["bb"] + box["hbp"]) / obp_den
+    box["ops"] = box["obp"] + box["slg"]
+    box["go_ao"] = box["ground_outs"] / box["air_outs"].replace(0, np.nan)
+
+    # BABIP from boxscores: (H - HR) / (AB - K - HR)
+    babip_den = (box["ab"] - box["k"] - box["hr"]).replace(0, np.nan)
+    box["babip"] = (box["hits"] - box["hr"]) / babip_den
+
+    # est_wOBA from linear weights (works for all eras)
+    non_ibb = box["bb"] - box["ibb"]
+    singles = box["hits"] - box["doubles"] - box["triples"] - box["hr"]
+    woba_num = (
+        0.69 * non_ibb + 0.72 * box["hbp"]
+        + 0.88 * singles + 1.27 * box["doubles"]
+        + 1.62 * box["triples"] + 2.10 * box["hr"]
+    )
+    woba_den = (box["ab"] + non_ibb + box["hbp"]).replace(0, np.nan)
+    box["est_woba"] = woba_num / woba_den
+
+    # Demographics (age)
+    demo = read_sql("""
+        SELECT player_id AS batter_id,
+               (:season - EXTRACT(YEAR FROM birth_date))::int AS age,
+               bat_side AS batter_stand
+        FROM production.dim_player
+    """, {"season": season})
+    box = box.merge(demo, on="batter_id", how="left")
+    box["age"] = box["age"].fillna(28)
+
+    # MLB service time (seasons with 50+ PA)
+    svc = read_sql("""
+        SELECT bb.batter_id, COUNT(DISTINCT dg.season) AS mlb_seasons
+        FROM staging.batting_boxscores bb
+        JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+        WHERE dg.game_type = 'R' AND dg.season < :season
+        GROUP BY bb.batter_id
+        HAVING SUM(bb.plate_appearances) >= 50
+    """, {"season": season})
+    box = box.merge(svc, on="batter_id", how="left")
+    box["mlb_seasons"] = box["mlb_seasons"].fillna(0).astype(int)
+
+    # YoY deltas from prior season
+    prior = season - 1 if season != 2021 else 2019  # skip 2020
+    prior_df = read_sql("""
+        SELECT bb.batter_id,
+            SUM(bb.strikeouts)::float / NULLIF(SUM(bb.plate_appearances), 0)
+                AS k_prior,
+            SUM(bb.walks)::float / NULLIF(SUM(bb.plate_appearances), 0)
+                AS bb_prior,
+            (SUM(bb.total_bases)::float / NULLIF(SUM(bb.at_bats), 0))
+            - (SUM(bb.hits)::float / NULLIF(SUM(bb.at_bats), 0))
+                AS iso_prior
+        FROM staging.batting_boxscores bb
+        JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+        WHERE dg.season = :prior AND dg.game_type = 'R'
+        GROUP BY bb.batter_id
+        HAVING SUM(bb.plate_appearances) >= 100
+    """, {"prior": prior})
+    box = box.merge(prior_df, on="batter_id", how="left")
+    box["delta_k_pct"] = box["k_pct"] - box["k_prior"]
+    box["delta_bb_pct"] = box["bb_pct"] - box["bb_prior"]
+    box["delta_iso"] = box["iso"] - box["iso_prior"]
+    box.drop(columns=["k_prior", "bb_prior", "iso_prior"],
+             inplace=True, errors="ignore")
+
+    # --- T2: Statcast advanced (2018+, NaN otherwise) ---
+    try:
+        adv = read_sql("""
+            SELECT batter_id, woba, xwoba, wrc_plus, barrel_pct, hard_hit_pct
+            FROM production.fact_batting_advanced
+            WHERE season = :season AND pa >= :min_pa
+        """, {"season": season, "min_pa": min_pa})
+        if not adv.empty:
+            box = box.merge(adv, on="batter_id", how="left")
+            box["xwoba_minus_woba"] = box["xwoba"] - box["woba"]
+    except Exception:
+        logger.debug("No fact_batting_advanced for %d (pre-Statcast)", season)
+
+    for col in ["woba", "xwoba", "wrc_plus", "barrel_pct", "hard_hit_pct",
+                "xwoba_minus_woba"]:
+        if col not in box.columns:
+            box[col] = np.nan
+
+    # Observed profile: whiff, chase, z_contact, exit velo
+    try:
+        obs = get_hitter_observed_profile(season)
+        if not obs.empty:
+            obs_cols = ["batter_id", "whiff_rate", "chase_rate",
+                        "z_contact_pct", "avg_exit_velo"]
+            obs_avail = [c for c in obs_cols if c in obs.columns]
+            box = box.merge(obs[obs_avail], on="batter_id", how="left")
+    except Exception:
+        logger.debug("No observed profile for %d", season)
+
+    for col in ["whiff_rate", "chase_rate", "z_contact_pct", "avg_exit_velo"]:
+        if col not in box.columns:
+            box[col] = np.nan
+
+    # Sprint speed
+    try:
+        sprint = get_sprint_speed(season)
+        if not sprint.empty:
+            box = box.merge(
+                sprint[["player_id", "sprint_speed"]].rename(
+                    columns={"player_id": "batter_id"}),
+                on="batter_id", how="left",
+            )
+    except Exception:
+        pass
+    if "sprint_speed" not in box.columns:
+        box["sprint_speed"] = np.nan
+
+    # OAA
+    try:
+        oaa = read_sql("""
+            SELECT player_id AS batter_id,
+                   SUM(outs_above_average) AS oaa
+            FROM production.fact_fielding_oaa
+            WHERE season = :season
+            GROUP BY player_id
+        """, {"season": season})
+        if not oaa.empty:
+            box = box.merge(oaa, on="batter_id", how="left")
+    except Exception:
+        pass
+    if "oaa" not in box.columns:
+        box["oaa"] = np.nan
+    box["oaa"] = box["oaa"].fillna(0).astype(float)
+
+    # --- T3: MiLB features (young/new players) ---
+    # Only attach for players with <= 3 MLB seasons or age <= 26
+    from pathlib import Path
+    cache_dir = Path("data/cached")
+    milb_path = cache_dir / "milb_translated_batters.parquet"
+    if milb_path.exists():
+        try:
+            milb = pd.read_parquet(milb_path)
+            # Take the most recent MiLB season per player
+            milb_latest = (
+                milb.sort_values("season", ascending=False)
+                .drop_duplicates("player_id", keep="first")
+                .rename(columns={
+                    "player_id": "batter_id",
+                    "translated_k_pct": "milb_translated_k_pct",
+                    "translated_bb_pct": "milb_translated_bb_pct",
+                    "translated_iso": "milb_translated_iso",
+                })
+            )
+            milb_cols = ["batter_id", "milb_translated_k_pct",
+                         "milb_translated_bb_pct", "milb_translated_iso"]
+            milb_avail = [c for c in milb_cols if c in milb_latest.columns]
+            # Age-relative-to-level if available
+            if "age_relative_to_level_avg" in milb_latest.columns:
+                milb_latest = milb_latest.rename(
+                    columns={"age_relative_to_level_avg": "milb_age_relative"})
+                milb_avail.append("milb_age_relative")
+
+            eligible = (box["mlb_seasons"] <= 3) | (box["age"] <= 26)
+            eligible_ids = set(box.loc[eligible, "batter_id"])
+            milb_sub = milb_latest[
+                milb_latest["batter_id"].isin(eligible_ids)
+            ][milb_avail]
+            box = box.merge(milb_sub, on="batter_id", how="left")
+        except Exception as e:
+            logger.debug("Could not load MiLB translations: %s", e)
+
+    for col in ["milb_translated_k_pct", "milb_translated_bb_pct",
+                "milb_translated_iso", "milb_age_relative"]:
+        if col not in box.columns:
+            box[col] = np.nan
+
+    # FG Future Value
+    try:
+        fv = read_sql("""
+            SELECT player_id AS batter_id,
+                   MAX(future_value) AS fg_future_value
+            FROM production.dim_prospect_ranking
+            GROUP BY player_id
+        """, {})
+        if not fv.empty:
+            eligible = (box["mlb_seasons"] <= 3) | (box["age"] <= 26)
+            eligible_ids = set(box.loc[eligible, "batter_id"])
+            fv_sub = fv[fv["batter_id"].isin(eligible_ids)]
+            box = box.merge(fv_sub, on="batter_id", how="left")
+    except Exception:
+        pass
+    if "fg_future_value" not in box.columns:
+        box["fg_future_value"] = np.nan
+
+    logger.info(
+        "Hitter breakout features for %d: %d players, T2=%d, T3=%d",
+        season, len(box),
+        box["barrel_pct"].notna().sum(),
+        box["milb_translated_k_pct"].notna().sum(),
+    )
+    return box
+
+
+# ---------------------------------------------------------------------------
+# 43. Pitcher breakout features (tiered)
+# ---------------------------------------------------------------------------
+def get_pitcher_breakout_features(
+    season: int,
+    min_bf: int = 200,
+) -> pd.DataFrame:
+    """Consolidated pitcher feature set for breakout model training/scoring.
+
+    Returns one row per qualified pitcher with three feature tiers:
+    - **T1 (2000+):** boxscore rates (K%, BB%, ERA, FIP, WHIP, etc.)
+    - **T2 (2018+):** Statcast advanced (whiff%, SwStr%, CSW%, velo, etc.)
+    - **T3 (young pitchers):** translated MiLB rates
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+    min_bf : int
+        Minimum batters faced to qualify.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns documented inline (27 features + metadata).
+    """
+    # --- T1: Boxscore base (2000+) ---
+    box = read_sql("""
+        SELECT
+            pb.pitcher_id,
+            dp.player_name  AS pitcher_name,
+            dp.pitch_hand,
+            dg.season,
+            COUNT(DISTINCT pb.game_pk) AS games,
+            SUM(pb.is_starter::int)    AS starts,
+            SUM(pb.innings_pitched)    AS ip,
+            SUM(pb.batters_faced)      AS bf,
+            SUM(pb.strike_outs)        AS k,
+            SUM(pb.walks + pb.intentional_walks) AS bb,
+            SUM(pb.home_runs)          AS hr_allowed,
+            SUM(pb.earned_runs)        AS er,
+            SUM(pb.hits)               AS hits_allowed,
+            SUM(pb.hit_by_pitch)       AS hbp,
+            SUM(pb.ground_outs)        AS ground_outs,
+            SUM(pb.air_outs)           AS air_outs
+        FROM staging.pitching_boxscores pb
+        JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+        LEFT JOIN production.dim_player dp ON pb.pitcher_id = dp.player_id
+        WHERE dg.season = :season AND dg.game_type = 'R'
+        GROUP BY pb.pitcher_id, dp.player_name, dp.pitch_hand, dg.season
+        HAVING SUM(pb.batters_faced) >= :min_bf
+    """, {"season": season, "min_bf": min_bf})
+
+    if box.empty:
+        logger.warning("No qualified pitchers for breakout features (season=%d)", season)
+        return pd.DataFrame()
+
+    ip = box["ip"].replace(0, np.nan)
+    bf = box["bf"].replace(0, np.nan)
+
+    box["k_pct"] = box["k"] / bf
+    box["bb_pct"] = box["bb"] / bf
+    box["hr_bf"] = box["hr_allowed"] / bf
+    box["era"] = (box["er"] / ip) * 9
+    box["whip"] = (box["hits_allowed"] + box["bb"]) / ip
+    box["k_per_9"] = (box["k"] / ip) * 9
+    box["bb_per_9"] = (box["bb"] / ip) * 9
+    box["go_ao"] = box["ground_outs"] / box["air_outs"].replace(0, np.nan)
+
+    # FIP
+    cfip = 3.20
+    box["fip"] = (
+        (13 * box["hr_allowed"] + 3 * (box["bb"] + box["hbp"]) - 2 * box["k"])
+        / ip
+    ) + cfip
+
+    box["is_starter"] = (box["starts"] >= 3).astype(int)
+
+    # Demographics
+    demo = read_sql("""
+        SELECT player_id AS pitcher_id,
+               (:season - EXTRACT(YEAR FROM birth_date))::int AS age
+        FROM production.dim_player
+    """, {"season": season})
+    box = box.merge(demo, on="pitcher_id", how="left")
+    box["age"] = box["age"].fillna(28)
+
+    # MLB service time
+    svc = read_sql("""
+        SELECT pb.pitcher_id, COUNT(DISTINCT dg.season) AS mlb_seasons
+        FROM staging.pitching_boxscores pb
+        JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+        WHERE dg.game_type = 'R' AND dg.season < :season
+        GROUP BY pb.pitcher_id
+        HAVING SUM(pb.batters_faced) >= 50
+    """, {"season": season})
+    box = box.merge(svc, on="pitcher_id", how="left")
+    box["mlb_seasons"] = box["mlb_seasons"].fillna(0).astype(int)
+
+    # YoY deltas
+    prior = season - 1 if season != 2021 else 2019
+    prior_df = read_sql("""
+        SELECT pb.pitcher_id,
+            SUM(pb.strike_outs)::float / NULLIF(SUM(pb.batters_faced), 0)
+                AS k_prior,
+            (SUM(pb.walks + pb.intentional_walks))::float
+                / NULLIF(SUM(pb.batters_faced), 0) AS bb_prior,
+            SUM(pb.earned_runs) * 9.0
+                / NULLIF(SUM(pb.innings_pitched), 0) AS era_prior
+        FROM staging.pitching_boxscores pb
+        JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+        WHERE dg.season = :prior AND dg.game_type = 'R'
+        GROUP BY pb.pitcher_id
+        HAVING SUM(pb.batters_faced) >= 100
+    """, {"prior": prior})
+    box = box.merge(prior_df, on="pitcher_id", how="left")
+    box["delta_k_pct"] = box["k_pct"] - box["k_prior"]
+    box["delta_bb_pct"] = box["bb_pct"] - box["bb_prior"]
+    box["delta_era"] = box["era"] - box["era_prior"]
+    box.drop(columns=["k_prior", "bb_prior", "era_prior"],
+             inplace=True, errors="ignore")
+
+    # --- T2: Statcast advanced (2018+) ---
+    try:
+        adv = read_sql("""
+            SELECT pitcher_id, swstr_pct, csw_pct, zone_pct, chase_pct,
+                   contact_pct, xwoba_against, barrel_pct_against
+            FROM production.fact_pitching_advanced
+            WHERE season = :season AND batters_faced >= :min_bf
+        """, {"season": season, "min_bf": min_bf})
+        if not adv.empty:
+            box = box.merge(adv, on="pitcher_id", how="left")
+    except Exception:
+        logger.debug("No fact_pitching_advanced for %d", season)
+
+    # Observed profile: whiff_rate, avg_velo
+    try:
+        obs = get_pitcher_observed_profile(season)
+        if not obs.empty:
+            obs_cols = ["pitcher_id", "whiff_rate", "avg_velo"]
+            obs_avail = [c for c in obs_cols if c in obs.columns]
+            box = box.merge(obs[obs_avail], on="pitcher_id", how="left")
+    except Exception:
+        pass
+
+    # HR/FB
+    try:
+        fb = get_pitcher_fly_ball_data(season)
+        if not fb.empty and "hr_per_fb" in fb.columns:
+            box = box.merge(
+                fb[["pitcher_id", "hr_per_fb"]], on="pitcher_id", how="left")
+    except Exception:
+        pass
+
+    # Efficiency: first_strike_pct, putaway_rate
+    try:
+        eff = get_pitcher_efficiency(season)
+        if not eff.empty:
+            eff_cols = [c for c in ["pitcher_id", "first_strike_pct", "putaway_rate"]
+                        if c in eff.columns]
+            box = box.merge(eff[eff_cols], on="pitcher_id", how="left")
+    except Exception:
+        pass
+
+    # ERA - xFIP
+    if "fip" in box.columns:
+        # Approximate xFIP by adjusting HR component to league avg HR/FB
+        fb_col = box.get("hr_per_fb")
+        if fb_col is not None and fb_col.notna().any():
+            lg_hr_fb = 0.10  # league average fallback
+            box["era_minus_xfip"] = box["era"] - box["fip"]  # approximate
+        else:
+            box["era_minus_xfip"] = np.nan
+
+    for col in ["whiff_rate", "swstr_pct", "csw_pct", "avg_velo",
+                "xwoba_against", "barrel_pct_against", "zone_pct",
+                "chase_pct", "hr_per_fb", "era_minus_xfip",
+                "first_strike_pct", "putaway_rate"]:
+        if col not in box.columns:
+            box[col] = np.nan
+
+    # --- T3: MiLB features (young pitchers) ---
+    from pathlib import Path
+    cache_dir = Path("data/cached")
+    milb_path = cache_dir / "milb_translated_pitchers.parquet"
+    if milb_path.exists():
+        try:
+            milb = pd.read_parquet(milb_path)
+            milb_latest = (
+                milb.sort_values("season", ascending=False)
+                .drop_duplicates("player_id", keep="first")
+                .rename(columns={
+                    "player_id": "pitcher_id",
+                    "translated_k_pct": "milb_translated_k_pct",
+                    "translated_bb_pct": "milb_translated_bb_pct",
+                    "translated_hr_bf": "milb_translated_hr_bf",
+                })
+            )
+            milb_cols = ["pitcher_id", "milb_translated_k_pct",
+                         "milb_translated_bb_pct", "milb_translated_hr_bf"]
+            milb_avail = [c for c in milb_cols if c in milb_latest.columns]
+            if "age_relative_to_level_avg" in milb_latest.columns:
+                milb_latest = milb_latest.rename(
+                    columns={"age_relative_to_level_avg": "milb_age_relative"})
+                milb_avail.append("milb_age_relative")
+
+            eligible = (box["mlb_seasons"] <= 3) | (box["age"] <= 26)
+            eligible_ids = set(box.loc[eligible, "pitcher_id"])
+            milb_sub = milb_latest[
+                milb_latest["pitcher_id"].isin(eligible_ids)
+            ][milb_avail]
+            box = box.merge(milb_sub, on="pitcher_id", how="left")
+        except Exception as e:
+            logger.debug("Could not load MiLB pitcher translations: %s", e)
+
+    for col in ["milb_translated_k_pct", "milb_translated_bb_pct",
+                "milb_translated_hr_bf", "milb_age_relative"]:
+        if col not in box.columns:
+            box[col] = np.nan
+
+    logger.info(
+        "Pitcher breakout features for %d: %d players, T2=%d, T3=%d",
+        season, len(box),
+        box["whiff_rate"].notna().sum(),
+        box["milb_translated_k_pct"].notna().sum(),
+    )
+    return box

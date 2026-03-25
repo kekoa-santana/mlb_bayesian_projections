@@ -91,13 +91,20 @@ series_elo:
   series_elo_blend: 0.45    # weight of series ELO
 
 power_rankings:
-  elo_weight: 0.25          # blended game+series ELO (historical anchor)
-  projection_weight: 0.20   # 2026 projected roster quality
-  profile_weight: 0.15      # structural: rotation/bullpen/defense/health
-  glicko_weight: 0.10       # opponent-adjusted roster quality
-  wins_weight: 0.30         # BaseRuns projected wins (most direct forward signal)
-  breakout_delta_threshold: 0.03    # K% delta above which player is "breaking out"
-  regression_delta_threshold: -0.03 # K% delta below which player is "regressing"
+  # Phase 4: De-correlated orthogonal components
+  # Each component captures genuinely different information.
+  projected_wins_weight: 0.50   # BaseRuns/sim projected wins (additive run/win, Phase 6)
+  recent_form_weight: 0.20      # ELO (backward-looking momentum only)
+  depth_fragility_weight: 0.20  # Downside risk, roster concentration, bench quality
+  trajectory_weight: 0.10       # Net breakouts - regressions (team is improving/declining)
+  # Legacy weights retained for backward compat but not used in new path
+  elo_weight: 0.25
+  projection_weight: 0.20
+  profile_weight: 0.15
+  glicko_weight: 0.10
+  wins_weight: 0.30
+  breakout_delta_threshold: 0.03
+  regression_delta_threshold: -0.03
 
 player_glicko:
   initial_mu: 1500
@@ -108,6 +115,52 @@ player_glicko:
   season_regression_mu: 0.30
   season_phi_reset: 200
   max_inactivity_days: 180
+
+breakout:
+  hitter:
+    min_pa: 200
+    woba_gain_threshold: 0.020
+    woba_outcome_floor: 0.300
+    n_archetypes: 2
+    age_window: [24, 27]
+  pitcher:
+    min_bf: 200
+    era_drop_threshold: 0.75
+    era_outcome_ceiling: 4.00
+    n_archetypes: 3
+    age_window: [23, 27]
+  folds_start: 2001
+  folds_end: 2025
+  skip_covid_deltas: true   # skip 2019->2020 and 2020->2021 folds
+  xgb:
+    n_estimators: 200
+    max_depth: 4
+    learning_rate: 0.05
+    reg_alpha: 1.0
+    reg_lambda: 5.0
+    subsample: 0.8
+    colsample_bytree: 0.7
+    min_child_weight: 15
+    random_state: 42
+
+rankings:
+  # Two-score architecture: scouting blend weights
+  # current_value_score: production-dominant, for team rankings and wins
+  # talent_upside_score: scouting-dominant, for dynasty/prospect evaluation
+  # These are initial defaults — Phase 2 walk-forward validation will learn
+  # the optimal values. Do not treat these as ground truth.
+  hitter:
+    scout_weight_floor: 0.10    # scouting weight at max PA (600+)
+    scout_weight_ceil: 0.30     # scouting weight at min PA (150)
+    upside_scout_weight: 0.55   # scouting weight in talent_upside_score
+    pa_ramp_min: 150            # PA where scouting is at ceiling weight
+    pa_ramp_max: 600            # PA where scouting is at floor weight
+  pitcher:
+    scout_weight_floor: 0.10    # scouting weight at max BF (500+)
+    scout_weight_ceil: 0.30     # scouting weight at min BF (100)
+    upside_scout_weight: 0.55   # scouting weight in talent_upside_score
+    bf_ramp_min: 100            # BF where scouting is at ceiling weight
+    bf_ramp_max: 500            # BF where scouting is at floor weight
 
 calibration:
   hitter:

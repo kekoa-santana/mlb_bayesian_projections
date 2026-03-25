@@ -45,10 +45,17 @@ PA_OUT = 7
 # League average HBP rate (near-constant, not worth modeling individually)
 LEAGUE_HBP_RATE = 0.011
 
+# Sim calibration offsets (logit scale).
+# Walk-forward backtest (2025) showed K over-predicted by +7.26 per player
+# (residual after PA adjustment) and BB under-predicted by -3.59.
+# These offsets correct the systematic bias from stacked logit lifts.
+_CALIBRATION_K_OFFSET = -0.06   # reduce K logit to fix over-prediction
+_CALIBRATION_BB_OFFSET = 0.03   # increase BB logit to fix under-prediction
+
 # Fatigue adjustment thresholds and slopes (logit scale)
 _FATIGUE_PITCH_THRESHOLD = 85
 _FATIGUE_K_SLOPE = -0.003    # K logit drops per pitch above threshold
-_FATIGUE_BB_SLOPE = 0.002    # BB logit increases per pitch above threshold
+_FATIGUE_BB_SLOPE = 0.00239  # BB logit increases per pitch above threshold
 _FATIGUE_HR_SLOPE = 0.001    # HR logit increases per pitch above threshold
 
 
@@ -150,19 +157,21 @@ class PAOutcomeModel:
         dict[str, float | np.ndarray]
             Keys: 'k', 'bb', 'hbp', 'hr', 'bip'. Values: probabilities.
         """
-        # K probability
+        # K probability (with calibration offset to correct sim bias)
         k_logit = (
             self._safe_logit(pitcher_k_rate)
             + matchup_k_lift + tto_k_lift + fatigue_k_lift
             + umpire_k_lift + weather_k_lift
+            + _CALIBRATION_K_OFFSET
         )
         k_prob = expit(k_logit)
 
-        # BB probability
+        # BB probability (with calibration offset)
         bb_logit = (
             self._safe_logit(pitcher_bb_rate)
             + matchup_bb_lift + tto_bb_lift + fatigue_bb_lift
             + umpire_bb_lift
+            + _CALIBRATION_BB_OFFSET
         )
         bb_prob = expit(bb_logit)
 

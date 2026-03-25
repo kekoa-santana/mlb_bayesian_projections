@@ -295,7 +295,7 @@ def run_sim_pitcher(
             starter_priors=starter_priors_df,
             health_scores=health_df,
             pitcher_names=pitcher_name_lookup,
-            n_seasons=200,
+            n_seasons=10_000,
             random_seed=42,
         )
         elapsed = time.time() - t0
@@ -624,7 +624,7 @@ def run_sim_hitter(
             sb_rates=sb_rates,
             health_scores=health_df,
             batter_names=hitter_name_lookup,
-            n_seasons=200,
+            n_seasons=10_000,
             random_seed=42,
         )
         elapsed_h = time.time() - t0_h

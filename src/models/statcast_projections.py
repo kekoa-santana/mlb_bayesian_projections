@@ -272,13 +272,26 @@ def fit_statcast_model(
         sigma_obs = pm.HalfNormal("sigma_obs", sigma=0.05)
         pm.Normal("y", mu=mu_obs, sigma=sigma_obs, observed=y_obs)
 
-    # Sample
+    # Sample — prefer nutpie (Rust backend, no g++ needed) over PyMC NUTS
     with model:
-        trace = pm.sample(
-            draws=draws, tune=tune, chains=chains,
-            random_seed=random_seed, progressbar=False,
-            cores=1,  # Windows compatibility — avoid multiprocessing fork issues
-        )
+        try:
+            import nutpie
+            logger.info("Using nutpie sampler (Rust backend)")
+            compiled = nutpie.compile_pymc_model(model)
+            trace = nutpie.sample(
+                compiled,
+                draws=draws,
+                tune=tune,
+                chains=chains,
+                seed=random_seed,
+            )
+        except (ImportError, Exception) as e:
+            logger.info("nutpie unavailable (%s), falling back to PyMC NUTS", e)
+            trace = pm.sample(
+                draws=draws, tune=tune, chains=chains,
+                random_seed=random_seed, progressbar=False,
+                cores=1,  # Windows compatibility
+            )
 
     # Check convergence
     try:

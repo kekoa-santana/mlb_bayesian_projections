@@ -41,12 +41,12 @@ POP_FOUL_RATE = 0.370
 
 # Shrinkage constant for pitcher/batter adjustments
 _SHRINKAGE_K_PITCHER = 150  # PA needed for full weight on pitcher adj
-_SHRINKAGE_K_BATTER = 150   # PA needed for full weight on batter adj
+_SHRINKAGE_K_BATTER = 178   # PA needed for full weight on batter adj
 
 # Sensitivity: how much a 1-unit deviation in the feature shifts mean P/PA
 # These are calibrated from the data: pitchers at 25th vs 75th percentile
 # of putaway rate differ by ~0.3 P/PA.
-_PUTAWAY_SENSITIVITY = -3.0   # Higher putaway → fewer pitches
+_PUTAWAY_SENSITIVITY = -2.662  # Higher putaway → fewer pitches
 _FOUL_RATE_SENSITIVITY = 2.5  # Higher foul rate → more pitches
 _CONTACT_SENSITIVITY = -1.0   # Higher contact rate → fewer pitches (fewer deep counts)
 

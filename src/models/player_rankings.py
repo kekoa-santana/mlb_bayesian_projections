@@ -7,8 +7,17 @@ and projected playing time.
 
 Positions: C, 1B, 2B, 3B, SS, LF, CF, RF, DH, SP, RP.
 
-Blend: ~40% Bayesian projection / ~60% recent observed for 2026 value,
-since the season starts in ~10 days.
+Two-score architecture:
+  - ``current_value_score``: production-dominant, feeds team rankings and
+    projected wins.  Scouting grades are a minor input that shrinks as
+    sample size grows (configurable via config/model.yaml ``rankings:``).
+  - ``talent_upside_score``: scouting-dominant, feeds dynasty rankings and
+    prospect evaluation.  Uses the same regressed diamond rating blend that
+    was previously the sole ``tdd_value_score``.
+
+``tdd_value_score`` is retained as a backward-compatible alias for
+``current_value_score`` so that team profiles / team rankings / power
+rankings continue to work without modification.
 """
 from __future__ import annotations
 
@@ -17,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +34,79 @@ CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
 DASHBOARD_DIR = Path("C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/data/dashboard")
 
 # ---------------------------------------------------------------------------
+# Load ranking blend config (defaults if file/section missing)
+# ---------------------------------------------------------------------------
+_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "model.yaml"
+
+def _load_ranking_config() -> dict:
+    """Load rankings section from model.yaml with safe defaults."""
+    defaults = {
+        "hitter": {
+            "scout_weight_floor": 0.10,
+            "scout_weight_ceil": 0.30,
+            "upside_scout_weight": 0.55,
+            "pa_ramp_min": 150,
+            "pa_ramp_max": 600,
+        },
+        "pitcher": {
+            "scout_weight_floor": 0.10,
+            "scout_weight_ceil": 0.30,
+            "upside_scout_weight": 0.55,
+            "bf_ramp_min": 100,
+            "bf_ramp_max": 500,
+        },
+    }
+    try:
+        with open(_CONFIG_PATH) as f:
+            cfg = yaml.safe_load(f).get("rankings", {})
+        for role in ("hitter", "pitcher"):
+            for k, v in defaults[role].items():
+                defaults[role][k] = cfg.get(role, {}).get(k, v)
+    except Exception:
+        logger.debug("Could not load rankings config; using defaults")
+    return defaults
+
+_RANK_CFG = _load_ranking_config()
+
+
+def _exposure_conditioned_scouting_weight(
+    exposure: pd.Series | float,
+    min_exp: float,
+    max_exp: float,
+    weight_ceil: float,
+    weight_floor: float,
+) -> pd.Series | float:
+    """Compute scouting blend weight that decreases as sample grows.
+
+    At *min_exp*: weight = *weight_ceil*  (lean on tools for small samples).
+    At *max_exp*: weight = *weight_floor* (lean on production for large samples).
+
+    Parameters
+    ----------
+    exposure : pd.Series | float
+        PA (hitters) or BF (pitchers).
+    min_exp, max_exp : float
+        Ramp endpoints.
+    weight_ceil, weight_floor : float
+        Scouting weight at min/max exposure.
+
+    Returns
+    -------
+    pd.Series | float
+        Per-player scouting weight (higher = more scouting influence).
+    """
+    ramp = ((exposure - min_exp) / (max_exp - min_exp))
+    if isinstance(ramp, pd.Series):
+        ramp = ramp.clip(0, 1)
+    else:
+        ramp = max(0.0, min(1.0, ramp))
+    return weight_ceil - ramp * (weight_ceil - weight_floor)
+
+# ---------------------------------------------------------------------------
 # Hitter sub-component weights (sum to 1.0)
 # ---------------------------------------------------------------------------
 _HITTER_WEIGHTS = {
-    "offense": 0.42,
+    "offense": 0.52,
     "baserunning": 0.07,
     "fielding": 0.16,
     "health": 0.07,
@@ -35,7 +114,6 @@ _HITTER_WEIGHTS = {
     "trajectory": 0.10,
     "versatility": 0.03,
     "roster_value": 0.01,
-    "glicko": 0.10,
 }
 
 # Offense sub-weights: dynamic blend based on PA (see _dynamic_blend_weights)
@@ -46,21 +124,28 @@ _OBS_WEIGHT_BASE = 0.60
 # Pitcher sub-component weights by role (sum to 1.0)
 # ---------------------------------------------------------------------------
 _SP_WEIGHTS = {
-    "stuff": 0.28,
-    "command": 0.18,
-    "workload": 0.22,
-    "health": 0.07,
-    "role": 0.05,
-    "trajectory": 0.10,
+    # Walk-forward validated 2022-2025 (ranking_validation.py).
+    # Workload dropped from 0.22 → 0.05 (doesn't predict next-year quality).
+    # Trajectory raised from 0.10 → 0.25 (strongest forward signal).
+    # Command raised from 0.18 → 0.22.  Health raised from 0.07 → 0.11.
+    # Glicko kept at 0.10 (not in validation sub-scores, orthogonal signal).
+    "stuff": 0.27,
+    "command": 0.22,
+    "workload": 0.05,
+    "health": 0.11,
+    "role": 0.00,
+    "trajectory": 0.25,
     "glicko": 0.10,
 }
 _RP_WEIGHTS = {
-    "stuff": 0.38,
-    "command": 0.20,
-    "workload": 0.05,
-    "health": 0.07,
-    "role": 0.05,
-    "trajectory": 0.15,
+    # RP: stuff stays dominant; trajectory/command boosted same direction
+    # as SP validation.  Workload minimal for relievers.
+    "stuff": 0.32,
+    "command": 0.22,
+    "workload": 0.03,
+    "health": 0.10,
+    "role": 0.00,
+    "trajectory": 0.23,
     "glicko": 0.10,
 }
 
@@ -386,15 +471,40 @@ def _assign_pitcher_roles() -> pd.DataFrame:
 # Hitter ranking
 # ===================================================================
 
+def _stat_family_trust(
+    pa: pd.Series,
+    min_pa: float,
+    full_pa: float,
+) -> pd.Series:
+    """Stat-family reliability ramp: 0 at *min_pa*, 1 at *full_pa*.
+
+    Different stat families stabilize at different rates.  Contact skill
+    (K%) stabilizes faster (~150 PA) than damage metrics (~300 PA).
+    This ramp controls how much to trust observed data vs projections
+    within each skill bucket.
+    """
+    return ((pa - min_pa) / (full_pa - min_pa)).clip(0, 1)
+
+
 def _build_hitter_offense_score(
     proj: pd.DataFrame,
     observed: pd.DataFrame,
+    aggressiveness: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Blend projected and observed offensive value into a single score.
+    """Decomposed hitter offense: contact + decisions + damage.
 
-    Prefers sim-derived wRC+ when available (validated r=0.454 vs actuals),
-    blended with observed Statcast quality metrics. Falls back to
-    Bayesian rate percentiles when sim parquet doesn't exist.
+    Three skill buckets, each with its own reliability curve:
+
+    1. **Contact skill** (stabilizes ~150 PA): K% projected, K% observed.
+       Fast-stabilizing — the most projectable hitter trait.
+    2. **Swing decisions** (stabilizes ~200 PA): BB% projected, chase rate,
+       two-strike whiff rate.  Medium stability — discipline metrics.
+    3. **Damage on contact** (stabilizes ~300 PA): xwOBA, barrel%, hard_hit%,
+       sweet_spot%.  Slow-stabilizing — requires more BIP for signal.
+
+    Each bucket blends projected + observed using its own trust ramp, then
+    buckets are combined.  Replaces the old monolithic offense blend that
+    mixed all signals at one global PA reliability.
 
     Parameters
     ----------
@@ -402,82 +512,174 @@ def _build_hitter_offense_score(
         Hitter projections (from dashboard parquet).
     observed : pd.DataFrame
         Observed season stats from ``fact_batting_advanced``.
+    aggressiveness : pd.DataFrame, optional
+        From ``get_hitter_aggressiveness()`` — chase_rate, two_strike_whiff_rate.
 
     Returns
     -------
     pd.DataFrame
-        player_id + offense_score columns.
+        batter_id + offense_score + sub-bucket columns.
     """
     # Merge projection + observed on batter_id
+    obs_cols = ["batter_id", "pa", "k_pct", "bb_pct", "woba", "wrc_plus",
+                "barrel_pct", "hard_hit_pct", "xwoba", "sweet_spot_pct"]
+    obs_cols = [c for c in obs_cols if c in observed.columns]
     merged = proj[["batter_id", "projected_k_rate", "projected_bb_rate",
                     "projected_hr_per_fb", "composite_score"]].merge(
-        observed[["batter_id", "pa", "k_pct", "bb_pct", "woba", "wrc_plus",
-                   "barrel_pct", "hard_hit_pct", "xwoba", "xba", "xslg"]],
+        observed[obs_cols],
         on="batter_id", how="inner",
     )
 
     if merged.empty:
-        return pd.DataFrame(columns=["batter_id", "offense_score"])
+        return pd.DataFrame(columns=["batter_id", "offense_score",
+                                      "contact_skill", "decision_skill",
+                                      "damage_skill", "production_skill"])
 
-    # --- Sim-based projected component (wRC+ from game sim) ---
+    pa = merged["pa"]
+
+    # Merge aggressiveness (chase, 2-strike whiff) if provided
+    if aggressiveness is not None and not aggressiveness.empty:
+        agg_cols = ["batter_id"]
+        for c in ("chase_rate", "two_strike_whiff_rate"):
+            if c in aggressiveness.columns:
+                agg_cols.append(c)
+        if len(agg_cols) > 1:
+            merged = merged.merge(aggressiveness[agg_cols], on="batter_id", how="left")
+
+    # Optionally load sim wRC+ for damage bucket
     sim_path = DASHBOARD_DIR / "hitter_counting_sim.parquet"
     has_sim = False
     if sim_path.exists():
         sim_df = pd.read_parquet(sim_path)
-        sim_cols = ["batter_id", "projected_wrc_plus_mean", "projected_woba_mean",
-                     "projected_wraa_mean"]
-        sim_cols = [c for c in sim_cols if c in sim_df.columns]
         if "projected_wrc_plus_mean" in sim_df.columns:
-            merged = merged.merge(sim_df[sim_cols], on="batter_id", how="left")
+            merged = merged.merge(
+                sim_df[["batter_id", "projected_wrc_plus_mean"]],
+                on="batter_id", how="left",
+            )
             has_sim = merged["projected_wrc_plus_mean"].notna().any()
             if has_sim:
-                logger.info("Offense score using sim wRC+ for %d hitters",
+                logger.info("Offense using sim wRC+ for damage bucket (%d hitters)",
                             merged["projected_wrc_plus_mean"].notna().sum())
 
-    if has_sim:
-        # Sim wRC+ as primary projected signal — use z-score to preserve
-        # magnitude (rank-based pctl compresses 210 wRC+ vs 131 wRC+).
-        sim_wrc = _zscore_pctl(merged["projected_wrc_plus_mean"].fillna(100))
-        # Bayesian rate projections as secondary signal
-        proj_k_score = _inv_zscore_pctl(merged["projected_k_rate"])
-        proj_bb_score = _zscore_pctl(merged["projected_bb_rate"])
-        projected = 0.50 * sim_wrc + 0.25 * proj_k_score + 0.25 * proj_bb_score
-    else:
-        # Fallback: Bayesian rate percentiles only
-        proj_k_score = _inv_zscore_pctl(merged["projected_k_rate"])
-        proj_bb_score = _zscore_pctl(merged["projected_bb_rate"])
-        proj_hr_score = _zscore_pctl(merged["projected_hr_per_fb"])
-        projected = 0.35 * proj_k_score + 0.30 * proj_bb_score + 0.35 * proj_hr_score
+    # =================================================================
+    # Bucket 1: CONTACT SKILL (stabilizes ~150 PA)
+    # Projected K% is the most stable hitter stat (r=0.80 YoY).
+    # Observed K% confirms or challenges the projection quickly.
+    # =================================================================
+    proj_contact = _inv_zscore_pctl(merged["projected_k_rate"])
+    obs_k = _inv_zscore_pctl(merged["k_pct"]) if "k_pct" in merged.columns else proj_contact
 
-    # --- Observed component (Statcast + traditional) ---
-    # Use z-score percentiles to preserve magnitude at the tails.
-    obs_woba = _zscore_pctl(merged["woba"].fillna(merged["woba"].median()))
-    obs_xwoba = _zscore_pctl(merged["xwoba"].fillna(merged["xwoba"].median()))
-    obs_xba = _zscore_pctl(merged["xba"].fillna(merged["xba"].median()))
-    obs_xslg = _zscore_pctl(merged["xslg"].fillna(merged["xslg"].median()))
-    obs_barrel = _zscore_pctl(merged["barrel_pct"].fillna(0))
-    obs_hh = _zscore_pctl(merged["hard_hit_pct"].fillna(0))
-    observed_score = (
-        0.25 * obs_woba + 0.20 * obs_xwoba + 0.12 * obs_xba
-        + 0.13 * obs_xslg + 0.17 * obs_barrel + 0.13 * obs_hh
+    contact_trust = _stat_family_trust(pa, min_pa=100, full_pa=350)
+    merged["contact_skill"] = (1 - contact_trust) * proj_contact + contact_trust * obs_k
+
+    # =================================================================
+    # Bucket 2: SWING DECISIONS (stabilizes ~200 PA)
+    # BB% projection + observed chase/discipline metrics.
+    # Chase rate is extremely stable (r=0.84 YoY).
+    # =================================================================
+    proj_decisions = _zscore_pctl(merged["projected_bb_rate"])
+
+    obs_decision_parts = [proj_decisions]  # fallback: just projection
+    obs_decision_weights = [1.0]
+
+    if "chase_rate" in merged.columns:
+        obs_chase = _inv_zscore_pctl(merged["chase_rate"].fillna(
+            merged["chase_rate"].median()))
+        obs_decision_parts = [obs_chase]
+        obs_decision_weights = [0.55]
+        if "two_strike_whiff_rate" in merged.columns:
+            obs_2s = _inv_zscore_pctl(merged["two_strike_whiff_rate"].fillna(
+                merged["two_strike_whiff_rate"].median()))
+            obs_decision_parts.append(obs_2s)
+            obs_decision_weights.append(0.45)
+
+    obs_decisions = sum(w * p for w, p in zip(obs_decision_weights, obs_decision_parts))
+
+    decision_trust = _stat_family_trust(pa, min_pa=150, full_pa=450)
+    merged["decision_skill"] = (1 - decision_trust) * proj_decisions + decision_trust * obs_decisions
+
+    # =================================================================
+    # Bucket 3: DAMAGE ON CONTACT (stabilizes ~300 PA)
+    # xwOBA + barrel% + hard_hit% + sweet_spot%.  Noisier metrics
+    # that need more BIP to stabilize.  Sim wRC+ serves as projected
+    # anchor when available; falls back to HR/FB projection.
+    # Removed xBA and xSLG (redundant with xwOBA, ~80% shared variance).
+    # =================================================================
+    if has_sim:
+        proj_damage = _zscore_pctl(merged["projected_wrc_plus_mean"].fillna(100))
+    else:
+        proj_damage = _zscore_pctl(merged["projected_hr_per_fb"])
+
+    obs_damage_parts = []
+    obs_damage_weights = []
+    if "xwoba" in merged.columns:
+        obs_damage_parts.append(_zscore_pctl(merged["xwoba"].fillna(merged["xwoba"].median())))
+        obs_damage_weights.append(0.35)
+    if "barrel_pct" in merged.columns:
+        obs_damage_parts.append(_zscore_pctl(merged["barrel_pct"].fillna(0)))
+        obs_damage_weights.append(0.30)
+    if "hard_hit_pct" in merged.columns:
+        obs_damage_parts.append(_zscore_pctl(merged["hard_hit_pct"].fillna(0)))
+        obs_damage_weights.append(0.20)
+    if "sweet_spot_pct" in merged.columns:
+        obs_damage_parts.append(_zscore_pctl(merged["sweet_spot_pct"].fillna(0)))
+        obs_damage_weights.append(0.15)
+
+    if obs_damage_parts:
+        # Renormalize weights in case some columns are missing
+        total_w = sum(obs_damage_weights)
+        obs_damage = sum(
+            (w / total_w) * p for w, p in zip(obs_damage_weights, obs_damage_parts)
+        )
+    else:
+        obs_damage = proj_damage
+
+    damage_trust = _stat_family_trust(pa, min_pa=200, full_pa=550)
+    merged["damage_skill"] = (1 - damage_trust) * proj_damage + damage_trust * obs_damage
+
+    # =================================================================
+    # Bucket 4: PRODUCTION (stabilizes ~250 PA)
+    # Observed wRC+ — the bottom line.  Anchors the score to actual
+    # run production so that high-process / low-results players
+    # (e.g. low-K% / low-chase but .280 wOBA) cannot score elite.
+    # Projected component uses sim wRC+ when available.
+    # =================================================================
+    if has_sim:
+        proj_production = _zscore_pctl(merged["projected_wrc_plus_mean"].fillna(100))
+    else:
+        proj_production = pd.Series(0.5, index=merged.index)
+
+    if "wrc_plus" in merged.columns:
+        obs_production = _zscore_pctl(merged["wrc_plus"].fillna(100))
+    else:
+        obs_production = proj_production
+
+    production_trust = _stat_family_trust(pa, min_pa=150, full_pa=500)
+    merged["production_skill"] = (
+        (1 - production_trust) * proj_production
+        + production_trust * obs_production
     )
 
-    # Dynamic blend: more PA -> more observed weight
-    proj_w, obs_w = _dynamic_blend_weights(merged["pa"])
-    merged["offense_score"] = proj_w * projected + obs_w * observed_score
+    # =================================================================
+    # Combine buckets into offense_score
+    # Production anchor (35%) ensures actual run output dominates.
+    # Contact + decisions (25%) reward projectable skills but can't
+    # carry a player whose results don't follow.
+    # =================================================================
+    merged["offense_score"] = (
+        0.15 * merged["contact_skill"]
+        + 0.10 * merged["decision_skill"]
+        + 0.40 * merged["damage_skill"]
+        + 0.35 * merged["production_skill"]
+    )
 
-    # Additional skepticism for small samples near the PA floor.
-    # Players at 150 PA should be pulled toward league average (0.50) more
-    # than players at 400+ PA. This prevents hot-streak fringe players
-    # (e.g., 150 PA with 166 wRC+) from ranking alongside established stars.
-    pa_confidence = ((merged["pa"] - 150) / (400 - 150)).clip(0, 1)
-    # At 150 PA: confidence=0.0 → 50% pull toward 0.50
-    # At 275 PA: confidence=0.5 → 25% pull toward 0.50
-    # At 400+ PA: confidence=1.0 → no dampening
-    dampening = 0.50 * (1.0 - pa_confidence)  # max 50% pull at floor
+    # Small-sample dampening toward league average (same as before)
+    pa_confidence = ((pa - 150) / (400 - 150)).clip(0, 1)
+    dampening = 0.50 * (1.0 - pa_confidence)
     merged["offense_score"] = merged["offense_score"] * (1 - dampening) + 0.50 * dampening
 
-    return merged[["batter_id", "offense_score"]]
+    return merged[["batter_id", "offense_score", "contact_skill",
+                    "decision_skill", "damage_skill", "production_skill"]]
 
 
 def _build_hitter_baserunning_score() -> pd.DataFrame:
@@ -703,8 +905,9 @@ def _build_hitter_fielding_score(season: int = 2025) -> pd.DataFrame:
     result["reliability"] = result["n_seasons"] / (result["n_seasons"] + result["k"])
     result["regressed_oaa"] = result["weighted_oaa"] * result["reliability"]
 
-    # Percentile rank the regressed OAA
-    result["fielding_score"] = _pctl(result["regressed_oaa"])
+    # Percentile rank the regressed OAA, with floor so worst defenders
+    # aren't zeroed out (even -15 OAA provides some value vs empty position)
+    result["fielding_score"] = _pctl(result["regressed_oaa"]).clip(lower=0.10)
 
     return result.reset_index()[["player_id", "fielding_score"]]
 
@@ -1011,7 +1214,7 @@ def rank_hitters(
     aggressiveness = get_hitter_aggressiveness(season)
 
     # Build sub-scores
-    offense = _build_hitter_offense_score(proj, observed)
+    offense = _build_hitter_offense_score(proj, observed, aggressiveness=aggressiveness)
     baserunning = _build_hitter_baserunning_score()
     platoon = _build_hitter_platoon_modifier(season=season)
     fielding = _build_hitter_fielding_score(season=season)
@@ -1135,7 +1338,7 @@ def rank_hitters(
         base["health_label"] = ""
 
     # --- Health & role scores (replace old playing_time composite) ---
-    base["health_adj"] = base["health_score"].fillna(0.70)
+    base["health_adj"] = base["health_score"].fillna(0.50)
     # Role score: everyday (140+ games) = 1.0, platoon (70) = 0.5, bench (30) = 0.21
     if "total_games_mean" in base.columns:
         base["role_score"] = (base["total_games_mean"].fillna(0) / 140).clip(0, 1)
@@ -1180,10 +1383,8 @@ def rank_hitters(
         + _HITTER_WEIGHTS["trajectory"] * base["trajectory_score"]
         + _HITTER_WEIGHTS["versatility"] * base["versatility_score"]
         + _HITTER_WEIGHTS["roster_value"] * base["roster_value_score"]
-        + _HITTER_WEIGHTS["glicko"] * base["glicko_score"]
     )
-    # DH composite: fielding weight redistributed to offense/baserunning,
-    # health/role/versatility/glicko stay at their weights
+    # DH composite: fielding weight redistributed to offense/baserunning
     base.loc[is_dh, "tdd_value_score"] = (
         dh_offense_wt * base.loc[is_dh, "offense_score"]
         + dh_baserunning_wt * base.loc[is_dh, "baserunning_score"]
@@ -1192,7 +1393,6 @@ def rank_hitters(
         + _HITTER_WEIGHTS["trajectory"] * base.loc[is_dh, "trajectory_score"]
         + _HITTER_WEIGHTS["versatility"] * base.loc[is_dh, "versatility_score"]
         + _HITTER_WEIGHTS["roster_value"] * base.loc[is_dh, "roster_value_score"]
-        + _HITTER_WEIGHTS["glicko"] * base.loc[is_dh, "glicko_score"]
     )
 
     # --- Two-way player bonus ---
@@ -1270,7 +1470,16 @@ def rank_hitters(
 
     base["tdd_value_score"] = base["tdd_value_score"] + base["two_way_bonus"]
 
-    # --- Scouting grades (20-80 tool grades + diamond rating) ---
+    # --- Two-score architecture: current_value + talent_upside ---
+    # Save the production composite before scouting blending.
+    # This is the weighted sum of offense, fielding, trajectory, health,
+    # role, glicko, etc. — the "what has he done / what will he do" signal.
+    production_composite = base["tdd_value_score"].copy()
+
+    # Initialize both scores to production composite (scouting may fail)
+    base["current_value_score"] = production_composite
+    base["talent_upside_score"] = production_composite
+
     try:
         from src.models.scouting_grades import grade_hitter_tools
         scouting = grade_hitter_tools(base, season=season)
@@ -1278,31 +1487,79 @@ def rank_hitters(
             base = base.merge(scouting, on="batter_id", how="left")
             logger.info("Scouting grades computed for %d hitters", scouting["diamond_rating"].notna().sum())
 
-            # tdd_value_score IS the diamond rating (normalized 0-1 for compat)
-            # This replaces the old 9-component composite with the scouting-grade-
-            # derived diamond rating, which is grounded in the 6 tool grades
-            # (Hit, Power, Speed, Fielding, Discipline) with proper weights.
-            base["tdd_value_score"] = (base["diamond_rating"] / 10.0).clip(0, 1)
+            # Regress diamond rating by PA reliability (same for both scores)
+            dr_norm = (base["diamond_rating"] / 10.0).clip(0, 1)
+
+            pa_col = base["pa"] if "pa" in base.columns else base.get("total_pa", 400)
+            cfg = _RANK_CFG["hitter"]
+            reliability = ((pa_col - cfg["pa_ramp_min"]) / (cfg["pa_ramp_max"] - cfg["pa_ramp_min"])).clip(0, 1)
+
+            # Low-PA players: regress diamond rating toward 0.50 (league avg)
+            dr_regressed = reliability * dr_norm + (1 - reliability) * 0.50
+
+            # Health penalty: injury-prone players get DR dampened
+            health = base["health_adj"] if "health_adj" in base.columns else 0.50
+            health_penalty = np.where(health < 0.40, 0.70 + 0.75 * health, 1.0)
+            dr_regressed = dr_regressed * health_penalty
+
+            # ----- talent_upside_score: scouting-dominant -----
+            # This is the dynasty/prospect-oriented score where tool grades
+            # carry heavy weight.  Identical to the old tdd_value_score blend.
+            upside_w = cfg["upside_scout_weight"]
+            base["talent_upside_score"] = (
+                upside_w * dr_regressed + (1 - upside_w) * production_composite
+            )
+
+            # ----- current_value_score: production-dominant -----
+            # Scouting grades are a feature, not the override.  The weight
+            # shrinks with sample size: 30% at 150 PA → 10% at 600+ PA.
+            # These defaults are configurable in config/model.yaml and will
+            # be learned by Phase 2 walk-forward validation.
+            scout_w = _exposure_conditioned_scouting_weight(
+                pa_col,
+                min_exp=cfg["pa_ramp_min"],
+                max_exp=cfg["pa_ramp_max"],
+                weight_ceil=cfg["scout_weight_ceil"],
+                weight_floor=cfg["scout_weight_floor"],
+            )
+            base["current_value_score"] = (
+                scout_w * dr_regressed + (1 - scout_w) * production_composite
+            )
+
+            n_scouted = scouting["diamond_rating"].notna().sum()
+            logger.info(
+                "Two-score split: %d hitters — scout weight range [%.0f%%, %.0f%%]",
+                n_scouted, cfg["scout_weight_floor"] * 100, cfg["scout_weight_ceil"] * 100,
+            )
     except Exception:
         logger.warning("Could not compute hitter scouting grades", exc_info=True)
 
+    # tdd_value_score = current_value_score (backward compat for team consumption)
+    base["tdd_value_score"] = base["current_value_score"]
+
     # --- Rank within each position (no positional adjustment) ---
-    base = base.sort_values("tdd_value_score", ascending=False)
+    base = base.sort_values("current_value_score", ascending=False)
     base["pos_rank"] = base.groupby("position").cumcount() + 1
 
     # --- Overall rank uses positional adjustment (10%) ---
     base["pos_adjustment"] = base["position"].map(_POS_ADJUSTMENT).fillna(0.50)
-    base["overall_score"] = 0.90 * base["tdd_value_score"] + 0.10 * base["pos_adjustment"]
+    base["overall_score"] = 0.90 * base["current_value_score"] + 0.10 * base["pos_adjustment"]
     base["overall_rank"] = base["overall_score"].rank(ascending=False, method="min").astype(int)
+
+    # --- Talent-based ranking (scouting-dominant, no positional adj) ---
+    base["talent_rank"] = base["talent_upside_score"].rank(ascending=False, method="min").astype(int)
 
     # Select output columns
     output_cols = [
-        "pos_rank", "overall_rank", "batter_id", "batter_name", "position",
+        "pos_rank", "overall_rank", "talent_rank",
+        "batter_id", "batter_name", "position",
         "age", "batter_stand", "is_two_way",
-        # Composite
+        # Two-score architecture
+        "current_value_score", "talent_upside_score",
         "tdd_value_score", "overall_score", "pos_adjustment",
         # Sub-scores
-        "offense_score", "baserunning_score", "platoon_score",
+        "offense_score", "contact_skill", "decision_skill", "damage_skill", "production_skill",
+        "baserunning_score", "platoon_score",
         "fielding_combined", "framing_score", "pt_score",
         "health_adj", "role_score", "versatility_score", "roster_value_score",
         "trajectory_score", "two_way_bonus",
@@ -1901,7 +2158,7 @@ def rank_pitchers(
         base["health_label"] = ""
 
     # --- Health & role scores ---
-    base["health_adj"] = base["health_score"].fillna(0.70)
+    base["health_adj"] = base["health_score"].fillna(0.50)
     # Role score: SP uses starts (min(starts/30, 1)), RP uses appearances (min(apps/60, 1))
     if "total_games_mean" in base.columns:
         # SP: projected games ~= starts for starters, use /30 target
@@ -1980,12 +2237,12 @@ def rank_pitchers(
             + _SP_WEIGHTS["glicko"] * base.loc[neither, "glicko_score"]
         )
 
-    # --- Scouting grades (20-80 tool grades + diamond rating) ---
-    # Diamond rating already uses SP/RP-specific weights internally
-    # (SP: Stuff 45% + Command 35% + Durability 20%,
-    #  RP: Stuff 55% + Command 35% + Durability 10%).
-    # This replaces the old multi-component composite with the scouting-grade-
-    # derived diamond rating as the single tdd_value_score.
+    # --- Two-score architecture: current_value + talent_upside ---
+    # Save production composite before scouting blending.
+    production_composite = base["tdd_value_score"].copy()
+    base["current_value_score"] = production_composite
+    base["talent_upside_score"] = production_composite
+
     try:
         from src.models.scouting_grades import grade_pitcher_tools
         scouting = grade_pitcher_tools(base, season=season)
@@ -1993,23 +2250,67 @@ def rank_pitchers(
             base = base.merge(scouting, on="pitcher_id", how="left")
             logger.info("Scouting grades computed for %d pitchers", scouting["diamond_rating"].notna().sum())
 
-            # tdd_value_score IS the diamond rating (normalized 0-1)
-            base["tdd_value_score"] = (base["diamond_rating"] / 10.0).clip(0, 1)
+            # Regress diamond rating by BF reliability (same for both scores)
+            dr_norm = (base["diamond_rating"] / 10.0).clip(0, 1)
+
+            cfg = _RANK_CFG["pitcher"]
+            bf_col = base["batters_faced"] if "batters_faced" in base.columns else 400
+            reliability = ((bf_col - cfg["bf_ramp_min"]) / (cfg["bf_ramp_max"] - cfg["bf_ramp_min"])).clip(0, 1)
+
+            # Low-IP pitchers: regress diamond rating toward 0.50
+            dr_regressed = reliability * dr_norm + (1 - reliability) * 0.50
+
+            # Health penalty: injury-prone pitchers get DR dampened.
+            health = base["health_adj"] if "health_adj" in base.columns else 0.50
+            health_penalty = np.where(health < 0.40, 0.70 + 0.75 * health, 1.0)
+            dr_regressed = dr_regressed * health_penalty
+
+            # ----- talent_upside_score: scouting-dominant -----
+            upside_w = cfg["upside_scout_weight"]
+            base["talent_upside_score"] = (
+                upside_w * dr_regressed + (1 - upside_w) * production_composite
+            )
+
+            # ----- current_value_score: production-dominant -----
+            scout_w = _exposure_conditioned_scouting_weight(
+                bf_col,
+                min_exp=cfg["bf_ramp_min"],
+                max_exp=cfg["bf_ramp_max"],
+                weight_ceil=cfg["scout_weight_ceil"],
+                weight_floor=cfg["scout_weight_floor"],
+            )
+            base["current_value_score"] = (
+                scout_w * dr_regressed + (1 - scout_w) * production_composite
+            )
+
+            n_scouted = scouting["diamond_rating"].notna().sum()
+            logger.info(
+                "Two-score split: %d pitchers — scout weight range [%.0f%%, %.0f%%]",
+                n_scouted, cfg["scout_weight_floor"] * 100, cfg["scout_weight_ceil"] * 100,
+            )
     except Exception:
         logger.warning("Could not compute pitcher scouting grades", exc_info=True)
 
+    # tdd_value_score = current_value_score (backward compat for team consumption)
+    base["tdd_value_score"] = base["current_value_score"]
+
     # Rank within role
-    base = base.sort_values("tdd_value_score", ascending=False)
+    base = base.sort_values("current_value_score", ascending=False)
     base["role_rank"] = base.groupby("role").cumcount() + 1
 
     # Overall pitcher rank
-    base["overall_rank"] = base["tdd_value_score"].rank(ascending=False, method="min").astype(int)
+    base["overall_rank"] = base["current_value_score"].rank(ascending=False, method="min").astype(int)
+
+    # Talent-based ranking (scouting-dominant)
+    base["talent_rank"] = base["talent_upside_score"].rank(ascending=False, method="min").astype(int)
 
     # Select output
     output_cols = [
-        "role_rank", "overall_rank", "pitcher_id", "pitcher_name", "role",
+        "role_rank", "overall_rank", "talent_rank",
+        "pitcher_id", "pitcher_name", "role",
         "role_detail", "age", "pitch_hand",
-        # Composite
+        # Two-score architecture
+        "current_value_score", "talent_upside_score",
         "tdd_value_score",
         # Sub-scores
         "stuff_score", "arsenal_stuff_plus", "command_score", "workload_score",

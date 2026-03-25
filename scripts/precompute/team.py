@@ -438,7 +438,7 @@ def run_depth_chart(
     Pass 4 — DH: First assign any player whose effective primary is DH,
         then fall back to best remaining bat.
     """
-    from src.data.queries import get_lineup_priors
+    from src.data.queries import get_lineup_priors, get_lineup_priors_by_hand
 
     logger.info("=" * 60)
     logger.info("Computing probable starters...")
@@ -447,6 +447,7 @@ def run_depth_chart(
 
         # Get lineup priors (position + batting order history for all players)
         lineup_priors = get_lineup_priors(from_season)
+        lineup_priors_by_hand = get_lineup_priors_by_hand(from_season)
 
         # Get current active roster with secondary positions
         roster = _read_sql("""
@@ -559,218 +560,226 @@ def run_depth_chart(
                 "roster_status": prow.get("roster_status", "active"),
             }
 
-        all_starters: list[dict] = []
-
-        for team_abbr, team_roster in roster.groupby("team_abbr"):
-            team_pids = set(team_roster["player_id"])
-            team_roster = team_roster.copy()
-            team_roster["_avail_pen"] = team_roster.apply(
-                _availability_penalty, axis=1,
-            )
-
-            elig_map: dict[int, list[str]] = {}
-            roster_rows: dict[int, pd.Series] = {}
-            for _, prow in team_roster.iterrows():
-                pid = int(prow["player_id"])
-                elig_map[pid] = _player_eligible_positions(prow)
-                roster_rows[pid] = prow
-
-            # Build lineup-prior lookups for this team's players
-            # (uses data from ANY team — catches traded players)
-            team_priors = (
-                lineup_priors[lineup_priors["player_id"].isin(team_pids)].copy()
-                if not lineup_priors.empty
-                else pd.DataFrame()
-            )
-
-            bo_lookup: dict[int, int] = {}
-            # Per-player per-position starts: {(player_id, position): starts}
-            starts_at_pos: dict[tuple[int, str], int] = {}
-            # Effective primary = position with most starts in prior season
-            effective_primary: dict[int, str] = {}
-            # All positions played per player, sorted by starts desc
-            positions_by_starts: dict[int, list[str]] = {}
-
-            if not team_priors.empty:
-                for _, pr in team_priors.drop_duplicates("player_id").iterrows():
-                    pid = int(pr["player_id"])
-                    bo_lookup[pid] = int(pr.get("batting_order_mode", 5))
-
-                # Build starts_at_pos and positions_by_starts
-                pos_rows = team_priors[
-                    team_priors["position"].isin(ALL_POSITIONS)
-                ].sort_values("starts", ascending=False)
-
-                for _, pr in pos_rows.iterrows():
-                    pid = int(pr["player_id"])
-                    pos = pr["position"]
-                    starts = int(pr["starts"])
-                    starts_at_pos[(pid, pos)] = starts
-
-                    if pid not in positions_by_starts:
-                        positions_by_starts[pid] = []
-                    positions_by_starts[pid].append(pos)
-
-                # First entry per player is their most-started position
-                top_pos = pos_rows.drop_duplicates("player_id")
-                for _, pr in top_pos.iterrows():
-                    effective_primary[int(pr["player_id"])] = pr["position"]
-
-            # ── Pass 1: Build candidate lists per field position ──────
-            # For each position, collect all RANKED players who have starts
-            # there from lineup priors.
-            pos_candidates: dict[str, list[int]] = {p: [] for p in FIELD_POSITIONS}
-
-            ranked_pids = {
-                pid for pid in team_pids if pid in quality_lookup
-            }
-
-            for pid in ranked_pids:
-                for pos in positions_by_starts.get(pid, []):
-                    if pos in FIELD_POSITIONS:
-                        pos_candidates[pos].append(pid)
-
-            # Sort candidates per position by starts at that position (desc)
-            for pos in FIELD_POSITIONS:
-                pos_candidates[pos].sort(
-                    key=lambda p: starts_at_pos.get((p, pos), 0),
-                    reverse=True,
+        def _assign_starters(
+            roster_df: pd.DataFrame,
+            priors_df: pd.DataFrame,
+        ) -> list[dict]:
+            """Run multi-pass lineup assignment for all teams given a set of priors."""
+            starters: list[dict] = []
+            for team_abbr, team_roster in roster_df.groupby("team_abbr"):
+                team_pids = set(team_roster["player_id"])
+                team_roster = team_roster.copy()
+                team_roster["_avail_pen"] = team_roster.apply(
+                    _availability_penalty, axis=1,
                 )
 
-            # ── Pass 2: Resolve conflicts with position-specific scoring ─
-            # Score = 60% offense + 30% position OAA pctl + 10% experience
-            assigned: set[int] = set()
-            position_filled: dict[str, dict] = {}
+                elig_map: dict[int, list[str]] = {}
+                roster_rows: dict[int, pd.Series] = {}
+                for _, prow in team_roster.iterrows():
+                    pid = int(prow["player_id"])
+                    elig_map[pid] = _player_eligible_positions(prow)
+                    roster_rows[pid] = prow
 
-            # Compute max starts per position for experience normalization
-            max_starts_at_pos: dict[str, int] = {}
-            for pos in FIELD_POSITIONS:
-                starts_vals = [
-                    starts_at_pos.get((pid, pos), 0)
-                    for pid in pos_candidates[pos]
-                ]
-                max_starts_at_pos[pos] = max(starts_vals) if starts_vals else 1
+                # Build lineup-prior lookups for this team's players
+                # (uses data from ANY team — catches traded players)
+                team_priors = (
+                    priors_df[priors_df["player_id"].isin(team_pids)].copy()
+                    if not priors_df.empty
+                    else pd.DataFrame()
+                )
 
-            def _position_score(pid: int, pos: str) -> float:
-                """Score a player AT a specific position."""
-                off = offense_lookup.get(pid, 0.0) + roster_rows[pid]["_avail_pen"]
-                oaa_pct = oaa_lookup.get((pid, pos), _OAA_DEFAULT)
-                exp_starts = starts_at_pos.get((pid, pos), 0)
-                max_s = max_starts_at_pos.get(pos, 1)
-                exp = exp_starts / max_s if max_s > 0 else 0.0
-                return 0.60 * off + 0.30 * oaa_pct + 0.10 * exp
+                bo_lookup: dict[int, int] = {}
+                # Per-player per-position starts: {(player_id, position): starts}
+                starts_at_pos: dict[tuple[int, str], int] = {}
+                # Effective primary = position with most starts in prior season
+                effective_primary: dict[int, str] = {}
+                # All positions played per player, sorted by starts desc
+                positions_by_starts: dict[int, list[str]] = {}
 
-            # Process positions in order.  When a player loses a contest
-            # they cascade to their next-most-played position.
-            # We iterate until no more assignments can be made.
-            unresolved = set(FIELD_POSITIONS)
-            max_iters = len(FIELD_POSITIONS) * 2  # safety cap
-            for _ in range(max_iters):
-                if not unresolved:
-                    break
-                made_assignment = False
-                still_unresolved: set[str] = set()
-                for pos in sorted(unresolved):
-                    # Remove already-assigned players from candidates
-                    pos_candidates[pos] = [
-                        p for p in pos_candidates[pos] if p not in assigned
-                    ]
-                    candidates = pos_candidates[pos]
-                    if not candidates:
-                        still_unresolved.add(pos)
-                        continue
-                    if len(candidates) == 1:
-                        # Uncontested — assign
-                        winner = candidates[0]
-                    else:
-                        # Contested — score each candidate at this position
-                        scored = [
-                            (pid, _position_score(pid, pos))
-                            for pid in candidates
-                        ]
-                        scored.sort(key=lambda x: x[1], reverse=True)
-                        winner = scored[0][0]
+                if not team_priors.empty:
+                    for _, pr in team_priors.drop_duplicates("player_id").iterrows():
+                        pid = int(pr["player_id"])
+                        bo_lookup[pid] = int(pr.get("batting_order_mode", 5))
 
-                    assigned.add(winner)
-                    position_filled[pos] = _make_entry(
-                        team_abbr, pos, roster_rows[winner], bo_lookup,
-                    )
-                    made_assignment = True
+                    # Build starts_at_pos and positions_by_starts
+                    pos_rows = team_priors[
+                        team_priors["position"].isin(ALL_POSITIONS)
+                    ].sort_values("starts", ascending=False)
 
-                    # Losers stay in other positions' candidate lists
-                    # (they were never removed from those)
+                    for _, pr in pos_rows.iterrows():
+                        pid = int(pr["player_id"])
+                        pos = pr["position"]
+                        starts = int(pr["starts"])
+                        starts_at_pos[(pid, pos)] = starts
 
-                unresolved = still_unresolved
-                if not made_assignment:
-                    break  # no progress — remaining positions have no candidates
+                        if pid not in positions_by_starts:
+                            positions_by_starts[pid] = []
+                        positions_by_starts[pid].append(pos)
 
-            # ── Pass 3: Fill remaining from secondary eligibility ─────
-            # Any unfilled field position gets the best remaining unassigned
-            # player who has that position in their secondary_positions list.
-            # Score by offense only (no OAA data for positions they haven't
-            # played).
-            for pos in FIELD_POSITIONS:
-                if pos in position_filled:
-                    continue
-                best_pid: int | None = None
-                best_off = -999.0
+                    # First entry per player is their most-started position
+                    top_pos = pos_rows.drop_duplicates("player_id")
+                    for _, pr in top_pos.iterrows():
+                        effective_primary[int(pr["player_id"])] = pr["position"]
+
+                # ── Pass 1: Build candidate lists per field position ──────
+                # For each position, collect all RANKED players who have starts
+                # there from lineup priors.
+                pos_candidates: dict[str, list[int]] = {p: [] for p in FIELD_POSITIONS}
+
+                ranked_pids = {
+                    pid for pid in team_pids if pid in quality_lookup
+                }
+
                 for pid in ranked_pids:
-                    if pid in assigned:
+                    for pos in positions_by_starts.get(pid, []):
+                        if pos in FIELD_POSITIONS:
+                            pos_candidates[pos].append(pid)
+
+                # Sort candidates per position by starts at that position (desc)
+                for pos in FIELD_POSITIONS:
+                    pos_candidates[pos].sort(
+                        key=lambda p: starts_at_pos.get((p, pos), 0),
+                        reverse=True,
+                    )
+
+                # ── Pass 2: Resolve conflicts with position-specific scoring ─
+                # Score = 60% offense + 30% position OAA pctl + 10% experience
+                assigned: set[int] = set()
+                position_filled: dict[str, dict] = {}
+
+                # Compute max starts per position for experience normalization
+                max_starts_at_pos: dict[str, int] = {}
+                for pos in FIELD_POSITIONS:
+                    starts_vals = [
+                        starts_at_pos.get((pid, pos), 0)
+                        for pid in pos_candidates[pos]
+                    ]
+                    max_starts_at_pos[pos] = max(starts_vals) if starts_vals else 1
+
+                def _position_score(pid: int, pos: str) -> float:
+                    """Score a player AT a specific position."""
+                    off = offense_lookup.get(pid, 0.0) + roster_rows[pid]["_avail_pen"]
+                    oaa_pct = oaa_lookup.get((pid, pos), _OAA_DEFAULT)
+                    exp_starts = starts_at_pos.get((pid, pos), 0)
+                    max_s = max_starts_at_pos.get(pos, 1)
+                    exp = exp_starts / max_s if max_s > 0 else 0.0
+                    return 0.60 * off + 0.30 * oaa_pct + 0.10 * exp
+
+                # Process positions in order.  When a player loses a contest
+                # they cascade to their next-most-played position.
+                # We iterate until no more assignments can be made.
+                unresolved = set(FIELD_POSITIONS)
+                max_iters = len(FIELD_POSITIONS) * 2  # safety cap
+                for _ in range(max_iters):
+                    if not unresolved:
+                        break
+                    made_assignment = False
+                    still_unresolved: set[str] = set()
+                    for pos in sorted(unresolved):
+                        # Remove already-assigned players from candidates
+                        pos_candidates[pos] = [
+                            p for p in pos_candidates[pos] if p not in assigned
+                        ]
+                        candidates = pos_candidates[pos]
+                        if not candidates:
+                            still_unresolved.add(pos)
+                            continue
+                        if len(candidates) == 1:
+                            # Uncontested — assign
+                            winner = candidates[0]
+                        else:
+                            # Contested — score each candidate at this position
+                            scored = [
+                                (pid, _position_score(pid, pos))
+                                for pid in candidates
+                            ]
+                            scored.sort(key=lambda x: x[1], reverse=True)
+                            winner = scored[0][0]
+
+                        assigned.add(winner)
+                        position_filled[pos] = _make_entry(
+                            team_abbr, pos, roster_rows[winner], bo_lookup,
+                        )
+                        made_assignment = True
+
+                        # Losers stay in other positions' candidate lists
+                        # (they were never removed from those)
+
+                    unresolved = still_unresolved
+                    if not made_assignment:
+                        break  # no progress — remaining positions have no candidates
+
+                # ── Pass 3: Fill remaining from secondary eligibility ─────
+                # Any unfilled field position gets the best remaining unassigned
+                # player who has that position in their secondary_positions list.
+                # Score by offense only (no OAA data for positions they haven't
+                # played).
+                for pos in FIELD_POSITIONS:
+                    if pos in position_filled:
                         continue
-                    if pos in elig_map.get(pid, []):
+                    best_pid: int | None = None
+                    best_off = -999.0
+                    for pid in ranked_pids:
+                        if pid in assigned:
+                            continue
+                        if pos in elig_map.get(pid, []):
+                            off = (
+                                offense_lookup.get(pid, 0.0)
+                                + roster_rows[pid]["_avail_pen"]
+                            )
+                            if off > best_off:
+                                best_off = off
+                                best_pid = pid
+                    # Also check unranked players
+                    if best_pid is None:
+                        for _, prow in team_roster.iterrows():
+                            pid = int(prow["player_id"])
+                            if pid in assigned:
+                                continue
+                            if pos in elig_map.get(pid, []):
+                                best_pid = pid
+                                break
+                    if best_pid is not None:
+                        assigned.add(best_pid)
+                        position_filled[pos] = _make_entry(
+                            team_abbr, pos, roster_rows[best_pid], bo_lookup,
+                        )
+
+                # ── Pass 4: DH — effective DH primary first, then best bat ─
+                if "DH" not in position_filled:
+                    # First: anyone whose effective primary IS DH
+                    for pid in ranked_pids - assigned:
+                        eff_pos = effective_primary.get(pid, "")
+                        if eff_pos == "DH":
+                            assigned.add(pid)
+                            position_filled["DH"] = _make_entry(
+                                team_abbr, "DH", roster_rows[pid], bo_lookup,
+                            )
+                            break
+                if "DH" not in position_filled:
+                    # Fallback: best remaining unassigned hitter by offense
+                    best_pid = None
+                    best_off = -999.0
+                    for pid in team_pids - assigned:
                         off = (
                             offense_lookup.get(pid, 0.0)
-                            + roster_rows[pid]["_avail_pen"]
+                            + roster_rows.get(pid, pd.Series({"_avail_pen": 0}))
+                            .get("_avail_pen", 0.0)
                         )
                         if off > best_off:
                             best_off = off
                             best_pid = pid
-                # Also check unranked players
-                if best_pid is None:
-                    for _, prow in team_roster.iterrows():
-                        pid = int(prow["player_id"])
-                        if pid in assigned:
-                            continue
-                        if pos in elig_map.get(pid, []):
-                            best_pid = pid
-                            break
-                if best_pid is not None:
-                    assigned.add(best_pid)
-                    position_filled[pos] = _make_entry(
-                        team_abbr, pos, roster_rows[best_pid], bo_lookup,
-                    )
-
-            # ── Pass 4: DH — effective DH primary first, then best bat ─
-            if "DH" not in position_filled:
-                # First: anyone whose effective primary IS DH
-                for pid in ranked_pids - assigned:
-                    eff_pos = effective_primary.get(pid, "")
-                    if eff_pos == "DH":
-                        assigned.add(pid)
+                    if best_pid is not None:
+                        assigned.add(best_pid)
                         position_filled["DH"] = _make_entry(
-                            team_abbr, "DH", roster_rows[pid], bo_lookup,
+                            team_abbr, "DH", roster_rows[best_pid], bo_lookup,
                         )
-                        break
-            if "DH" not in position_filled:
-                # Fallback: best remaining unassigned hitter by offense
-                best_pid = None
-                best_off = -999.0
-                for pid in team_pids - assigned:
-                    off = (
-                        offense_lookup.get(pid, 0.0)
-                        + roster_rows.get(pid, pd.Series({"_avail_pen": 0}))
-                        .get("_avail_pen", 0.0)
-                    )
-                    if off > best_off:
-                        best_off = off
-                        best_pid = pid
-                if best_pid is not None:
-                    assigned.add(best_pid)
-                    position_filled["DH"] = _make_entry(
-                        team_abbr, "DH", roster_rows[best_pid], bo_lookup,
-                    )
 
-            all_starters.extend(position_filled.values())
+                starters.extend(position_filled.values())
+            return starters
+
+        # --- Run assignment: overall (default) ---
+        all_starters = _assign_starters(roster, lineup_priors)
 
         probable_df = pd.DataFrame(all_starters)
         if not probable_df.empty:
@@ -783,6 +792,30 @@ def run_depth_chart(
             )
         else:
             logger.warning("No probable starters computed")
+
+        # --- Run assignment: by opposing pitcher hand (vs RHP / vs LHP) ---
+        if not lineup_priors_by_hand.empty:
+            hand_starters: list[dict] = []
+            for vs_hand in ["R", "L"]:
+                hand_priors = lineup_priors_by_hand[
+                    lineup_priors_by_hand["vs_hand"] == vs_hand
+                ].copy()
+                entries = _assign_starters(roster, hand_priors)
+                for e in entries:
+                    e["vs_hand"] = vs_hand
+                hand_starters.extend(entries)
+
+            hand_df = pd.DataFrame(hand_starters)
+            if not hand_df.empty:
+                hand_df.to_parquet(
+                    DASHBOARD_DIR / "probable_starters_by_hand.parquet", index=False,
+                )
+                logger.info(
+                    "Saved platoon starters: %d entries (%d vs RHP, %d vs LHP)",
+                    len(hand_df),
+                    (hand_df["vs_hand"] == "R").sum(),
+                    (hand_df["vs_hand"] == "L").sum(),
+                )
 
         if not lineup_priors.empty:
             lineup_priors.to_parquet(

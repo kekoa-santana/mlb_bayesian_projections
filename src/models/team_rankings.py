@@ -29,11 +29,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # ---------------------------------------------------------------------------
 # Scouting grade component weights (sum to 0.55 — the talent portion)
 _TALENT_WEIGHTS = {
-    "offense": 0.20,     # Lineup diamond (starters + bench)
-    "rotation": 0.15,    # Top 5 SP diamond
-    "bullpen": 0.05,     # Role-weighted RP diamond
-    "defense": 0.10,     # OAA + framing
-    "depth": 0.05,       # Health/depth
+    # Walk-forward validated 2022-2025 (team_ranking_validation.py).
+    # Rotation and defense were massively underweighted; offense overweighted.
+    # Depth signal is real but noisy — keeps a modest weight.
+    "offense": 0.18,     # Lineup diamond (starters + bench)
+    "rotation": 0.30,    # Top 5 SP diamond — strongest validated signal
+    "bullpen": 0.12,     # Role-weighted RP diamond
+    "defense": 0.25,     # OAA + framing — second strongest validated signal
+    "depth": 0.15,       # Health/depth + roster concentration/gaps
 }
 # Performance + projection signal (sum to 0.45)
 # Projections (BaseRuns wins) are the stronger guardrail (r=0.814 residual
@@ -50,7 +53,7 @@ _TIERS = [
     (0.0, "Rebuilding"),
 ]
 
-PYTH_EXP = 1.83  # Baseball Pythagorean exponent
+PYTH_EXP = 1.83  # Fallback static exponent (used if RPG unavailable)
 
 
 def _pctl(series: pd.Series) -> pd.Series:
@@ -70,11 +73,24 @@ def _pythagorean_wins(
     rpg: float,
     ra_per_game: float,
     games: int = 162,
-    exp: float = PYTH_EXP,
+    exp: float | None = None,
 ) -> float:
-    """Projected wins from Pythagorean formula."""
+    """Projected wins via PythagenPat (dynamic exponent).
+
+    PythagenPat sets the exponent based on the run environment:
+    ``exp = ((RS + RA) / G) ^ 0.287``.  In higher-scoring environments
+    the exponent is larger (more regression to .500); in lower-scoring
+    it is smaller (extreme teams separate more).  Falls back to the
+    static 1.83 exponent if RPG data is unavailable.
+
+    Reference: Davenport & Woolner (Baseball Prospectus), Smyth/Patriot.
+    """
     if rpg <= 0 or ra_per_game <= 0:
         return games / 2
+    if exp is None:
+        # PythagenPat: dynamic exponent from run environment
+        total_rpg = rpg + ra_per_game
+        exp = total_rpg ** 0.287
     wpct = rpg ** exp / (rpg ** exp + ra_per_game ** exp)
     return round(wpct * games, 1)
 
@@ -131,6 +147,11 @@ def rank_teams(
         )
     else:
         df["projected_wins"] = 81.0
+
+    # Normalize projected wins to sum to 2430
+    _raw_total = df["projected_wins"].sum()
+    if _raw_total > 0 and abs(_raw_total - 2430) > 1:
+        df["projected_wins"] = (df["projected_wins"] * 2430 / _raw_total).round(1)
 
     # Schedule-adjusted wins
     if "avg_opp_elo" in df.columns:
@@ -587,16 +608,24 @@ def build_power_rankings(
     # ---------------------------------------------------------------
     _pitcher_positions = {"SP", "RP", "P"}
 
-    # Build player -> quality lookups
+    # Build player -> quality lookups (prefer current_value_score for team usage)
+    h_score_col = next(
+        (c for c in ("current_value_score", "tdd_value_score")
+         if c in hitter_rankings.columns), None
+    )
     h_quality: dict[int, float] = {}
-    if "batter_id" in hitter_rankings.columns and "tdd_value_score" in hitter_rankings.columns:
-        valid = hitter_rankings.dropna(subset=["tdd_value_score"])
-        h_quality = dict(zip(valid["batter_id"].astype(int), valid["tdd_value_score"]))
+    if "batter_id" in hitter_rankings.columns and h_score_col:
+        valid = hitter_rankings.dropna(subset=[h_score_col])
+        h_quality = dict(zip(valid["batter_id"].astype(int), valid[h_score_col]))
 
+    p_score_col = next(
+        (c for c in ("current_value_score", "tdd_value_score")
+         if c in pitcher_rankings.columns), None
+    )
     p_quality: dict[int, float] = {}
-    if "pitcher_id" in pitcher_rankings.columns and "tdd_value_score" in pitcher_rankings.columns:
-        valid = pitcher_rankings.dropna(subset=["tdd_value_score"])
-        p_quality = dict(zip(valid["pitcher_id"].astype(int), valid["tdd_value_score"]))
+    if "pitcher_id" in pitcher_rankings.columns and p_score_col:
+        valid = pitcher_rankings.dropna(subset=[p_score_col])
+        p_quality = dict(zip(valid["pitcher_id"].astype(int), valid[p_score_col]))
 
     # PA/IP weight lookups from counting sim (projected playing time)
     h_pa_weights: dict[int, float] = {}
@@ -761,11 +790,11 @@ def build_power_rankings(
         prof_df[col] = prof_df[col].fillna(prof_df[col].median())
 
     prof_df["profile_raw"] = (
-        _WEIGHTS["offense"] * prof_df["offense_score"]
-        + _WEIGHTS["rotation"] * prof_df["rotation_score"]
-        + _WEIGHTS["bullpen"] * prof_df["bullpen_score"]
-        + _WEIGHTS["defense"] * prof_df["defense_score"]
-        + _WEIGHTS["depth"] * prof_df["health_depth_score"]
+        _TALENT_WEIGHTS["offense"] * prof_df["offense_score"]
+        + _TALENT_WEIGHTS["rotation"] * prof_df["rotation_score"]
+        + _TALENT_WEIGHTS["bullpen"] * prof_df["bullpen_score"]
+        + _TALENT_WEIGHTS["defense"] * prof_df["defense_score"]
+        + _TALENT_WEIGHTS["depth"] * prof_df["health_depth_score"]
     )
     prof_df["profile_component"] = _pctl(prof_df["profile_raw"])
     prof_lookup: dict[int, float] = dict(
@@ -825,19 +854,39 @@ def build_power_rankings(
         w_glicko = 0.0
 
     # ---------------------------------------------------------------
-    # Assemble final power rankings
+    # Phase 4+6: De-correlated orthogonal assembly
+    #
+    # Four genuinely independent components:
+    #   1. Projected Wins (50%) -- additive run/win from BaseRuns + sim
+    #   2. Recent Form (20%) -- ELO momentum (what talent alone can't see)
+    #   3. Depth/Fragility (20%) -- downside risk, roster resilience
+    #   4. Trajectory (10%) -- net breakouts minus regressions
+    #
+    # Old correlated components (projection, profile, glicko) are merged
+    # into Projected Wins via the run-based framework.
     # ---------------------------------------------------------------
+    w_wins = cfg.get("projected_wins_weight", 0.50)
+    w_form = cfg.get("recent_form_weight", 0.20)
+    w_depth = cfg.get("depth_fragility_weight", 0.20)
+    w_traj = cfg.get("trajectory_weight", 0.10)
+
+    # Normalize sim wins to sum to 2430 (independent team sims don't
+    # enforce zero-sum, so every team's RS can exceed RA simultaneously)
+    if team_sim is not None and not team_sim.empty and "sim_wins_mean" in team_sim.columns:
+        raw_sum = team_sim["sim_wins_mean"].sum()
+        if raw_sum > 0:
+            sim_scale = (81.0 * len(team_sim)) / raw_sum
+            team_sim = team_sim.copy()
+            team_sim["sim_wins_mean"] = team_sim["sim_wins_mean"] * sim_scale
+            logger.info("Sim wins normalized: %.0f → %.0f (scale=%.3f)",
+                        raw_sum, team_sim["sim_wins_mean"].sum(), sim_scale)
+
     pre_rows: list[dict[str, Any]] = []
     for tid in sorted(abbr_tid.values()):
         abbr = tid_abbr.get(tid, "???")
         meta = team_meta.get(tid, {})
 
-        elo_comp = elo_lookup.get(tid, 0.5)
-        proj_comp = proj_lookup.get(tid, 0.5)
-        prof_comp = prof_lookup.get(tid, 0.5)
-        glicko_comp = glicko_lookup.get(abbr, 0.5)
-
-        # Projected wins: use Pythagorean if available from profiles
+        # --- Component 1: Projected Wins (additive run/win) ---
         rpg_val = None
         ra_val = None
         avg_opp_elo_val = None
@@ -846,68 +895,104 @@ def build_power_rankings(
             rpg_val = team_prof.get("proj_rs_per_game", team_prof.get("rpg"))
             ra_val = team_prof.get("proj_ra_per_game", team_prof.get("ra_per_game"))
             avg_opp_elo_val = team_prof.get("avg_opp_elo")
-        proj_wins = _pythagorean_wins(
+        baseruns_wins = _pythagorean_wins(
             rpg_val if pd.notna(rpg_val) else 4.5,
             ra_val if pd.notna(ra_val) else 4.5,
         )
 
-        # Blend BaseRuns wins with sim wins using confidence
-        # Confidence = inverse of sim std (deep rosters → trust BaseRuns ceiling)
+        # Blend with sim wins if available
         sim_wins_val = None
         sim_std_val = None
-        blended_wins = proj_wins  # default: BaseRuns only
-
+        blended_wins = baseruns_wins
         if team_sim is not None and not team_sim.empty:
             sim_row = team_sim[team_sim["team_abbr"] == abbr]
             if not sim_row.empty:
                 sim_wins_val = float(sim_row.iloc[0]["sim_wins_mean"])
                 sim_std_val = float(sim_row.iloc[0]["sim_wins_std"])
-
         if sim_wins_val is not None and sim_std_val is not None:
-            # Normalize std to 0-1 confidence: low std = high confidence
-            # Typical range: std 0.5–2.0 → confidence 0.75–0.0
             confidence = np.clip(1.0 - sim_std_val / 2.0, 0.15, 0.85)
-            blended_wins = confidence * proj_wins + (1 - confidence) * sim_wins_val
+            blended_wins = confidence * baseruns_wins + (1 - confidence) * sim_wins_val
+
+        # --- Component 2: Recent Form (ELO only) ---
+        elo_comp = elo_lookup.get(tid, 0.5)
+
+        # --- Component 3: Depth/Fragility ---
+        # Use health_depth_score from profiles (now includes concentration,
+        # replacement gaps, bench quality from Phase 5)
+        depth_comp = 0.5
+        if not prof_df.empty and tid in prof_df["team_id"].values:
+            tp = prof_df[prof_df["team_id"] == tid].iloc[0]
+            depth_comp = float(tp.get("health_depth_score", 0.5))
+
+        # --- Component 4: Trajectory (net improvement direction) ---
+        breakout_n = breakout_lookup.get(tid, 0)
+        regression_n = regression_lookup.get(tid, 0)
+        # Net trajectory: +3 breakouts and -1 regression = net +2
+        net_trajectory = breakout_n - regression_n
 
         pre_rows.append({
             "tid": tid, "abbr": abbr, "meta": meta,
-            "elo_comp": elo_comp, "proj_comp": proj_comp,
-            "prof_comp": prof_comp, "glicko_comp": glicko_comp,
+            "elo_comp": elo_comp,
+            "depth_comp": depth_comp,
             "proj_wins": blended_wins,
-            "baseruns_wins": proj_wins,
+            "baseruns_wins": baseruns_wins,
             "sim_wins": sim_wins_val,
             "sim_std": sim_std_val,
-            "depth_confidence": np.clip(1.0 - (sim_std_val or 1.0) / 2.0, 0.15, 0.85),
+            "net_trajectory": net_trajectory,
+            "breakout_count": breakout_n,
+            "regression_count": regression_n,
             "avg_opp_elo_val": avg_opp_elo_val,
+            # Legacy: keep for display
+            "proj_comp": proj_lookup.get(tid, 0.5),
+            "prof_comp": prof_lookup.get(tid, 0.5),
+            "glicko_comp": glicko_lookup.get(abbr, 0.5),
         })
 
-    # Percentile-rank projected wins across all teams for wins_component
+    # ---------------------------------------------------------------
+    # Normalize projected wins to sum to exactly 2430
+    # (30 teams x 162 games / 2 = 2430 total wins in MLB).
+    # Without this constraint, optimistic player projections and the
+    # inflated season sim produce impossible win totals (e.g. avg 88+).
+    # Every serious projection system (FanGraphs, PECOTA) does this.
+    # ---------------------------------------------------------------
+    REQUIRED_TOTAL_WINS = 30 * 162 / 2  # 2430
+    raw_total = sum(r["proj_wins"] for r in pre_rows)
+    if raw_total > 0 and abs(raw_total - REQUIRED_TOTAL_WINS) > 1:
+        scale = REQUIRED_TOTAL_WINS / raw_total
+        for r in pre_rows:
+            r["proj_wins"] = r["proj_wins"] * scale
+        logger.info(
+            "Win normalization: raw total %.0f -> %.0f (scale %.3f)",
+            raw_total, REQUIRED_TOTAL_WINS, scale,
+        )
+
+    # Percentile-rank each component across all 30 teams
+    from scipy.stats import rankdata
+
     all_wins = np.array([r["proj_wins"] for r in pre_rows])
-    if len(all_wins) > 1 and all_wins.std() > 0:
-        from scipy.stats import rankdata
-        wins_pctl = (rankdata(all_wins) - 1) / (len(all_wins) - 1)
-    else:
-        wins_pctl = np.full(len(pre_rows), 0.5)
+    all_traj = np.array([r["net_trajectory"] for r in pre_rows], dtype=float)
+    all_depth = np.array([r["depth_comp"] for r in pre_rows])
+
+    wins_pctl = (rankdata(all_wins) - 1) / max(len(all_wins) - 1, 1)
+    traj_pctl = (rankdata(all_traj) - 1) / max(len(all_traj) - 1, 1)
+    depth_pctl = (rankdata(all_depth) - 1) / max(len(all_depth) - 1, 1)
 
     rows: list[dict[str, Any]] = []
     for i, pr in enumerate(pre_rows):
         tid = pr["tid"]
         abbr = pr["abbr"]
         meta = pr["meta"]
-        elo_comp = pr["elo_comp"]
-        proj_comp = pr["proj_comp"]
-        prof_comp = pr["prof_comp"]
-        glicko_comp = pr["glicko_comp"]
-        proj_wins = pr["proj_wins"]
-        avg_opp_elo_val = pr["avg_opp_elo_val"]
+
         wins_comp = float(wins_pctl[i])
+        form_comp = pr["elo_comp"]
+        frag_comp = float(depth_pctl[i])
+        traj_comp = float(traj_pctl[i])
 
         power_score = (
-            w_elo * elo_comp
-            + w_proj * proj_comp
-            + w_prof * prof_comp
-            + w_glicko * glicko_comp
-            + w_wins * wins_comp
+            w_wins * wins_comp
+            + w_form * form_comp
+            + w_depth * frag_comp
+            + w_traj * traj_comp
         )
 
         rows.append({
@@ -917,20 +1002,27 @@ def build_power_rankings(
             "division": meta.get("division", ""),
             "league": meta.get("league", ""),
             "power_score": round(power_score, 4),
-            "elo_component": round(elo_comp, 4),
-            "projection_component": round(proj_comp, 4),
-            "profile_component": round(prof_comp, 4),
-            "glicko_component": round(glicko_comp, 4),
+            # New orthogonal components
             "wins_component": round(wins_comp, 4),
-            "team_batting_glicko": glicko_bat_lookup.get(abbr),
-            "team_pitching_glicko": glicko_pit_lookup.get(abbr),
+            "form_component": round(form_comp, 4),
+            "depth_component": round(frag_comp, 4),
+            "trajectory_component": round(traj_comp, 4),
+            # Legacy components (for display / backward compat)
+            "elo_component": round(pr["elo_comp"], 4),
+            "projection_component": round(pr["proj_comp"], 4),
+            "profile_component": round(pr["prof_comp"], 4),
+            "glicko_component": round(pr["glicko_comp"], 4),
+            # Projected wins detail
             "projected_wins": pr["proj_wins"],
             "baseruns_wins": pr.get("baseruns_wins"),
             "sim_wins": pr.get("sim_wins"),
-            "depth_confidence": pr.get("depth_confidence"),
-            "avg_opp_elo": avg_opp_elo_val,
-            "breakout_count": breakout_lookup.get(tid, 0),
-            "regression_count": regression_lookup.get(tid, 0),
+            "depth_confidence": np.clip(1.0 - (pr.get("sim_std") or 1.0) / 2.0, 0.15, 0.85),
+            "avg_opp_elo": pr["avg_opp_elo_val"],
+            "breakout_count": pr["breakout_count"],
+            "regression_count": pr["regression_count"],
+            "net_trajectory": pr["net_trajectory"],
+            "team_batting_glicko": glicko_bat_lookup.get(abbr),
+            "team_pitching_glicko": glicko_pit_lookup.get(abbr),
         })
 
     result = pd.DataFrame(rows)
@@ -953,7 +1045,18 @@ def build_power_rankings(
         .rank(ascending=False, method="min")
         .astype(int)
     )
-    result["power_tier"] = result["power_score"].apply(_assign_tier)
+    # Power tiers use rank-based assignment (top 6 = Elite, next 8 = Contender, etc.)
+    # because power_score is on a 0-1 scale, not the 1-10 TDD scale.
+    def _power_tier(rank: int) -> str:
+        if rank <= 6:
+            return "Elite"
+        if rank <= 14:
+            return "Contender"
+        if rank <= 22:
+            return "Competitive"
+        return "Rebuilding"
+
+    result["power_tier"] = result["power_rank"].apply(_power_tier)
 
     # Sort by rank
     result = result.sort_values("power_rank").reset_index(drop=True)

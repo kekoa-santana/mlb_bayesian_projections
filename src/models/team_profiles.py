@@ -157,7 +157,12 @@ def _build_offense_profile(
     # --- Lineup depth from hitter rankings ---
     if hitter_rankings is not None:
         pid_col = "player_id" if "player_id" in hitter_rankings.columns else "batter_id"
-        score_col = "tdd_value_score" if "tdd_value_score" in hitter_rankings.columns else "composite_score"
+        # Use offense_score (not overall composite) so team offense
+        # measures actual hitting quality, not fielding/versatility
+        score_col = next(
+                (c for c in ("offense_score", "current_value_score", "tdd_value_score", "composite_score")
+                 if c in hitter_rankings.columns), "composite_score"
+            )
         if score_col in hitter_rankings.columns:
             pt_pid = "batter_id" if "batter_id" in player_teams.columns else "player_id"
             rank_merged = hitter_rankings.merge(
@@ -293,7 +298,10 @@ def _build_pitching_profile(
     pr_merged = None  # keep reference for Glicko/ERA joins below
     if pitcher_rankings is not None:
         pid_col = "player_id" if "player_id" in pitcher_rankings.columns else "pitcher_id"
-        score_col = "tdd_value_score" if "tdd_value_score" in pitcher_rankings.columns else "composite_score"
+        score_col = next(
+            (c for c in ("current_value_score", "tdd_value_score", "composite_score")
+             if c in pitcher_rankings.columns), "composite_score"
+        )
         role_col = "role" if "role" in pitcher_rankings.columns else "position"
 
         if score_col in pitcher_rankings.columns:
@@ -370,7 +378,10 @@ def _build_pitching_profile(
             how="inner",
         )
         # Join value scores
-        score_col_r = "tdd_value_score" if "tdd_value_score" in pitcher_rankings.columns else "composite_score"
+        score_col_r = next(
+            (c for c in ("current_value_score", "tdd_value_score", "composite_score")
+             if c in pitcher_rankings.columns), "composite_score"
+        )
         pid_col_pr = "player_id" if "player_id" in pitcher_rankings.columns else "pitcher_id"
         if score_col_r in pitcher_rankings.columns:
             roles_merged = roles_merged.merge(
@@ -394,7 +405,7 @@ def _build_pitching_profile(
                         on=pid_col_r, how="left",
                     )
 
-                _MIN_RP = 5  # minimum relievers for a functional bullpen
+                _STANDARD_RP = 7  # standardize all bullpens to 7 relievers
 
                 def _bp_agg(g: pd.DataFrame) -> pd.Series:
                     rw = g["role_weight"]
@@ -407,8 +418,15 @@ def _build_pitching_profile(
                         if gc in g.columns and g[gc].notna().any():
                             vals = list(g[gc].dropna())
                             w = list(rw.loc[g[gc].notna().values if hasattr(g[gc].notna(), 'values') else g.index])
-                            # Fill to minimum with replacement-level
-                            while len(vals) < _MIN_RP:
+                            # Standardize to _STANDARD_RP relievers:
+                            # - If fewer, pad with replacement-level (penalizes thin pens)
+                            # - If more, use only top _STANDARD_RP by role weight
+                            if len(vals) > _STANDARD_RP:
+                                # Sort by value descending, keep top N
+                                paired = sorted(zip(vals, w), key=lambda x: x[0], reverse=True)
+                                vals = [p[0] for p in paired[:_STANDARD_RP]]
+                                w = [p[1] for p in paired[:_STANDARD_RP]]
+                            while len(vals) < _STANDARD_RP:
                                 vals.append(4.0 if gc == "diamond_rating" else 40)
                                 w.append(0.5)  # MR weight
                             key = f"bullpen_{gc}" if gc != "diamond_rating" else "bullpen_diamond"
@@ -985,12 +1003,122 @@ def _build_health_depth(
 
     result["roster_continuity"] = result["roster_continuity"].fillna(0.5)
 
-    # Composite: 70% player health + 30% age trajectory
-    # roster_continuity demoted to metadata only — research shows it's not
-    # predictive for one-year forecasts (retained as column for display)
+    # ── 6. Roster depth metrics (concentration, gaps, bench quality) ──
+    # Measures roster resilience: how much does the team fall when
+    # starters go down?  Walk-forward validation (2022-2025) showed
+    # this is a real but noisy signal — keeps a modest weight.
+    try:
+        player_teams_df = pd.read_parquet(DASHBOARD_DIR / "player_teams.parquet")
+        hitter_r = pd.read_parquet(DASHBOARD_DIR / "hitters_rankings.parquet")
+        pitcher_r = pd.read_parquet(DASHBOARD_DIR / "pitchers_rankings.parquet")
+
+        from src.data.db import read_sql as _rs3
+        _tm3 = _rs3("SELECT team_id, abbreviation FROM production.dim_team")
+        _abbr_tid3 = dict(zip(_tm3["abbreviation"], _tm3["team_id"]))
+
+        h_score_col = next(
+            (c for c in ("current_value_score", "tdd_value_score")
+             if c in hitter_r.columns), None
+        )
+        p_score_col = next(
+            (c for c in ("current_value_score", "tdd_value_score")
+             if c in pitcher_r.columns), None
+        )
+
+        depth_rows = []
+        if h_score_col and p_score_col:
+            # Map hitters/pitchers to teams
+            h_pid = "batter_id" if "batter_id" in hitter_r.columns else "player_id"
+            p_pid = "pitcher_id" if "pitcher_id" in pitcher_r.columns else "player_id"
+            pt_pid = "batter_id" if "batter_id" in player_teams_df.columns else "player_id"
+
+            h_teams = hitter_r[[h_pid, h_score_col]].merge(
+                player_teams_df[[pt_pid, "team_abbr"]].rename(columns={pt_pid: h_pid}),
+                on=h_pid, how="inner",
+            )
+            p_teams = pitcher_r[[p_pid, p_score_col]].merge(
+                player_teams_df[["player_id", "team_abbr"]].rename(
+                    columns={"player_id": p_pid}),
+                on=p_pid, how="inner",
+            )
+
+            for abbr in h_teams["team_abbr"].unique():
+                tid = _abbr_tid3.get(abbr)
+                if tid is None:
+                    continue
+
+                # Hitter depth
+                h_vals = (
+                    h_teams[h_teams["team_abbr"] == abbr][h_score_col]
+                    .sort_values(ascending=False).values
+                )
+                n_h = len(h_vals)
+
+                if n_h >= 5:
+                    top3_share = h_vals[:3].sum() / (h_vals.sum() + 1e-9)
+                    starter_avg = h_vals[:min(9, n_h)].mean()
+                    bench_avg = h_vals[9:min(15, n_h)].mean() if n_h > 9 else 0.30
+                    h_gap = starter_avg - bench_avg
+                    h_bench_q = bench_avg
+                else:
+                    top3_share = 0.33
+                    h_gap = 0.20
+                    h_bench_q = 0.30
+
+                # Pitcher depth
+                p_vals = (
+                    p_teams[p_teams["team_abbr"] == abbr][p_score_col]
+                    .sort_values(ascending=False).values
+                )
+                n_p = len(p_vals)
+                p_bench_q = p_vals[5:min(10, n_p)].mean() if n_p > 5 else 0.30
+                roster_breadth = n_h + n_p
+
+                depth_rows.append({
+                    "team_id": tid,
+                    "concentration": top3_share,
+                    "replacement_gap": h_gap,
+                    "bench_quality": h_bench_q,
+                    "pitcher_bench": p_bench_q,
+                    "roster_breadth": roster_breadth,
+                })
+
+        if depth_rows:
+            depth_df = pd.DataFrame(depth_rows)
+            conc_pctl = 1.0 - _pctl(depth_df["concentration"])
+            gap_pctl = 1.0 - _pctl(depth_df["replacement_gap"])
+            bench_pctl = _pctl(depth_df["bench_quality"])
+            pbench_pctl = _pctl(depth_df["pitcher_bench"])
+            breadth_pctl = _pctl(depth_df["roster_breadth"])
+
+            depth_df["roster_depth_score"] = (
+                0.30 * conc_pctl
+                + 0.25 * gap_pctl
+                + 0.20 * bench_pctl
+                + 0.15 * pbench_pctl
+                + 0.10 * breadth_pctl
+            )
+            result = result.merge(
+                depth_df[["team_id", "roster_depth_score", "concentration",
+                          "replacement_gap", "bench_quality", "pitcher_bench",
+                          "roster_breadth"]],
+                on="team_id", how="left",
+            )
+            logger.info("Roster depth computed for %d teams", len(depth_df))
+    except Exception as e:
+        logger.warning("Could not compute roster depth metrics: %s", e)
+
+    if "roster_depth_score" not in result.columns:
+        result["roster_depth_score"] = 0.50
+    result["roster_depth_score"] = result["roster_depth_score"].fillna(0.50)
+
+    # Composite: health (50%) + age (20%) + roster depth (30%)
+    # Walk-forward validation (2022-2025) showed depth adds signal
+    # beyond simple health + age, especially for mid-tier teams.
     result["health_depth_score"] = (
-        0.70 * result["player_health"]
-        + 0.30 * result["age_pctl"]
+        0.50 * result["player_health"]
+        + 0.20 * result["age_pctl"]
+        + 0.30 * result["roster_depth_score"]
     )
 
     return result
@@ -1261,17 +1389,39 @@ def build_all_team_profiles(
                         len(team_rs), team_rs["baseruns_rs"].mean())
 
         # Pitcher side: use simulated runs directly (already calibrated)
+        # Pad missing IP to a full 162-game season with replacement-level pitching
+        # so that teams with fewer projected arms aren't artificially deflated.
         if pitcher_counting is not None and "total_runs_mean" in pitcher_counting.columns:
+            SEASON_IP = 162.0 * 9  # 1458 innings per team-season
+            REPLACEMENT_RA_PER_9 = 5.50  # replacement-level total runs/9 IP
+
             p_id = "pitcher_id" if "pitcher_id" in pitcher_counting.columns else "player_id"
             pc = pitcher_counting.merge(
                 player_teams[[pt_pid, "team_id"]].rename(columns={pt_pid: p_id}),
                 on=p_id, how="inner",
             )
+            ip_col = "projected_ip_mean" if "projected_ip_mean" in pc.columns else None
             team_ra = pc.groupby("team_id").agg(
                 runs_allowed=("total_runs_mean", "sum"),
-                ip=("projected_ip_mean", "sum") if "projected_ip_mean" in pc.columns else ("total_outs_mean", lambda x: x.sum() / 3),
+                ip=(ip_col, "sum") if ip_col else ("total_outs_mean", lambda x: x.sum() / 3),
             ).reset_index()
-            team_ra["proj_ra_per_game"] = team_ra["runs_allowed"] / (team_ra["ip"] / 9).clip(1)
+
+            # Pad missing innings with replacement-level pitching
+            missing_ip = (SEASON_IP - team_ra["ip"]).clip(lower=0)
+            team_ra["runs_allowed"] += missing_ip / 9 * REPLACEMENT_RA_PER_9
+            team_ra["ip"] = team_ra["ip"].clip(lower=SEASON_IP)
+
+            team_ra["proj_ra_per_game"] = team_ra["runs_allowed"] / 162.0
+
+            # Force league-mean RA to equal league-mean RS so total W sums to 2430
+            if "proj_rs_per_game" in offense.columns:
+                lg_rs = offense["proj_rs_per_game"].mean()
+                lg_ra = team_ra["proj_ra_per_game"].mean()
+                if lg_ra > 0 and lg_rs > 0:
+                    team_ra["proj_ra_per_game"] *= lg_rs / lg_ra
+                    logger.info("Normalized RA/game: lg_rs=%.3f, raw_ra=%.3f, scale=%.3f",
+                                lg_rs, lg_ra, lg_rs / lg_ra)
+
             pitching = pitching.merge(
                 team_ra[["team_id", "proj_ra_per_game"]],
                 on="team_id", how="left",
@@ -1306,7 +1456,10 @@ def build_all_team_profiles(
                    "infield_oaa", "outfield_oaa", "staff_gb_pct", "staff_fb_pct",
                    "pitcher_defense_synergy", "team_fielding_grade"]),
         (org, ["org_score", "pct_homegrown", "farm_avg_score", "n_ranked_prospects", "top_100_count"]),
-        (health, ["health_depth_score", "total_il_days", "avg_age", "age_trajectory",
+        (health, ["health_depth_score", "roster_depth_score",
+                  "concentration", "replacement_gap", "bench_quality",
+                  "pitcher_bench", "roster_breadth",
+                  "total_il_days", "avg_age", "age_trajectory",
                   "roster_continuity", "players_retained", "players_new"]),
         (schedule, ["schedule_score", "avg_opp_elo", "big_game_pct", "div_avg_elo"]),
     ]:
@@ -1319,6 +1472,17 @@ def build_all_team_profiles(
         team_info[["team_id", "abbreviation", "team_name", "division", "league"]],
         on="team_id", how="left",
     )
+
+    # Rescale lineup/rotation/bullpen diamond ratings to use the full 1-10 range.
+    # Raw averages compress to ~4-6 since individual DRs cluster around 5.
+    # Min-max rescale across teams so the best lineup = 10, worst = 1.
+    for col in ("lineup_diamond", "rotation_diamond", "bullpen_diamond"):
+        if col in result.columns:
+            vals = result[col].dropna()
+            if len(vals) > 1:
+                lo, hi = vals.min(), vals.max()
+                if hi > lo:
+                    result[col] = 1.0 + 9.0 * (result[col] - lo) / (hi - lo)
 
     logger.info("Team profiles built: %d teams", len(result))
     return result
