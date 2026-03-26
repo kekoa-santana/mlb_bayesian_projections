@@ -325,18 +325,287 @@ def _pitcher_age_factor(age: pd.Series) -> pd.Series:
 # Position assignment
 # ===================================================================
 
-def _assign_hitter_positions(season: int = 2025, min_starts: int = 20) -> pd.DataFrame:
-    """Assign primary position to each hitter based on lineup starts.
+def _get_career_weighted_positions(season: int = 2025) -> pd.DataFrame:
+    """Query career position starts with recency weighting.
 
-    Uses MODE of started positions in the most recent season. Falls back
-    to ``dim_player.primary_position_code`` for players with few starts.
+    Weighting scheme (by game recency within each player):
+      - Last 50 games:  3x  (catches recent position switches)
+      - Games 51-162:   2x  (recent full season)
+      - Games 163+:     1x  (career history)
+
+    If 80%+ of the last 50 games are at a single position that differs
+    from the career-weighted primary, the recent position overrides
+    (e.g., Bichette: career SS but playing 3B for the Mets in 2026).
 
     Parameters
     ----------
     season : int
-        Season to determine positions from.
+        Most recent completed season (lineup data through this season
+        plus any spring training / early games from season + 1).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: player_id, position, weighted_games, is_primary,
+        recent_position (position from last 50 games if override applies).
+    """
+    from src.data.db import read_sql
+
+    # Career starts with row number for recency weighting
+    raw = read_sql(f"""
+        WITH numbered AS (
+            SELECT player_id, position, season,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY player_id
+                       ORDER BY season DESC, game_pk DESC
+                   ) AS rn
+            FROM production.fact_lineup
+            WHERE is_starter = true
+              AND position NOT IN ('P', 'PR', 'PH', 'EH')
+              AND season <= {season + 1}
+        )
+        SELECT player_id, position, rn
+        FROM numbered
+    """, {})
+
+    if raw.empty:
+        return pd.DataFrame(columns=[
+            "player_id", "position", "weighted_games", "is_primary",
+        ])
+
+    # Recency weights
+    raw["weight"] = np.where(
+        raw["rn"] <= 50, 3.0,
+        np.where(raw["rn"] <= 162, 2.0, 1.0),
+    )
+
+    # Weighted games per player-position
+    weighted = (
+        raw.groupby(["player_id", "position"])["weight"]
+        .sum()
+        .reset_index()
+        .rename(columns={"weight": "weighted_games"})
+    )
+
+    # --- Override 1: Current season (season+1) position ---
+    # If a player has 10+ games in ST / early season and 80%+ are at a
+    # NEW position, override.  Catches mid-career switches that show up
+    # in spring training before the career data has enough weight
+    # (e.g., Bichette SS→3B when traded to the Mets).
+    next_season = raw.merge(
+        raw.groupby("player_id")["rn"].min().reset_index().rename(columns={"rn": "min_rn"}),
+        on="player_id",
+    )
+    # Games in the most recent season are those with smallest rn values
+    # Use the fact that rn is ordered by season DESC, game_pk DESC
+    # Get games from season+1 by checking if rn is within the count of season+1 games
+    from src.data.db import read_sql as _read_next
+    next_season_counts = _read_next(f"""
+        SELECT player_id, position, COUNT(*) as games
+        FROM production.fact_lineup
+        WHERE season = {season + 1} AND is_starter = true
+          AND position NOT IN ('P', 'PR', 'PH', 'EH')
+        GROUP BY player_id, position
+    """, {})
+
+    current_override = pd.DataFrame(columns=["player_id", "recent_position"])
+    if not next_season_counts.empty:
+        ns_totals = next_season_counts.groupby("player_id")["games"].sum().reset_index(name="total")
+        ns_top = next_season_counts.sort_values("games", ascending=False).groupby("player_id").first().reset_index()
+        ns_top = ns_top.merge(ns_totals, on="player_id")
+        ns_top["pct"] = ns_top["games"] / ns_top["total"]
+        current_override = ns_top[
+            (ns_top["games"] >= 10) & (ns_top["pct"] >= 0.80)
+        ][["player_id", "position"]].rename(columns={"position": "recent_position"})
+
+    # --- Override 2: Last 50 games ---
+    # Broader check across seasons: if 80%+ of last 50 games are at one
+    # position, override.  Catches switches that span a season boundary.
+    recent = raw[raw["rn"] <= 50].copy()
+    recent_counts = (
+        recent.groupby(["player_id", "position"])
+        .size()
+        .reset_index(name="recent_games")
+    )
+    recent_totals = recent.groupby("player_id").size().reset_index(name="total_recent")
+    recent_counts = recent_counts.merge(recent_totals, on="player_id")
+    recent_counts["recent_pct"] = recent_counts["recent_games"] / recent_counts["total_recent"]
+
+    recent_primary = (
+        recent_counts
+        .sort_values("recent_games", ascending=False)
+        .groupby("player_id")
+        .first()
+        .reset_index()
+    )
+    last50_override = recent_primary[recent_primary["recent_pct"] >= 0.80][
+        ["player_id", "position"]
+    ].rename(columns={"position": "recent_position"})
+
+    # Merge overrides: current season takes priority over last-50
+    recent_override = pd.concat([last50_override, current_override], ignore_index=True)
+    recent_override = recent_override.drop_duplicates(subset="player_id", keep="last")
+
+    # Career-weighted primary = highest weighted_games
+    weighted["is_primary"] = (
+        weighted["weighted_games"]
+        == weighted.groupby("player_id")["weighted_games"].transform("max")
+    )
+
+    # Apply last-50 override: if recent position differs from career primary
+    primary = weighted[weighted["is_primary"]].merge(
+        recent_override, on="player_id", how="left",
+    )
+    overrides = primary[
+        primary["recent_position"].notna()
+        & (primary["position"] != primary["recent_position"])
+    ][["player_id", "recent_position"]]
+
+    if not overrides.empty:
+        override_map = dict(zip(overrides["player_id"], overrides["recent_position"]))
+        # Flip primary flag: old primary → False, new recent position → True
+        for pid, new_pos in override_map.items():
+            mask = weighted["player_id"] == pid
+            weighted.loc[mask, "is_primary"] = (
+                weighted.loc[mask, "position"] == new_pos
+            )
+            # If the new position doesn't exist in career data, add it
+            if not (mask & (weighted["position"] == new_pos)).any():
+                weighted = pd.concat([weighted, pd.DataFrame([{
+                    "player_id": pid,
+                    "position": new_pos,
+                    "weighted_games": 50 * 3,  # assume 50 recent games
+                    "is_primary": True,
+                }])], ignore_index=True)
+                # Unflag old primary
+                old_primary = mask & weighted["is_primary"] & (weighted["position"] != new_pos)
+                weighted.loc[old_primary, "is_primary"] = False
+        logger.info(
+            "Position override (last 50 games): %d players — %s",
+            len(override_map),
+            ", ".join(
+                f"{pid}→{pos}" for pid, pos in list(override_map.items())[:5]
+            ) + ("..." if len(override_map) > 5 else ""),
+        )
+
+    return weighted.sort_values(
+        ["player_id", "weighted_games"], ascending=[True, False],
+    ).reset_index(drop=True)
+
+
+def _verify_positions_mlb_api(
+    positions: pd.DataFrame,
+    season: int = 2026,
+) -> pd.DataFrame:
+    """Cross-check position assignments against the MLB Stats API.
+
+    Fetches current rosters from the API and uses the API's
+    ``primaryPosition`` as a final sanity check.  Only overrides when
+    the API position is a fielding position and our assignment differs.
+
+    Parameters
+    ----------
+    positions : pd.DataFrame
+        Must have ``player_id`` and ``position`` (primary only).
+    season : int
+        Season for roster lookup.
+
+    Returns
+    -------
+    pd.DataFrame
+        Same as input with positions corrected where API disagrees.
+    """
+    import requests
+
+    MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
+    FIELDING_POSITIONS = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"}
+
+    # Fetch all 30 teams
+    try:
+        teams_resp = requests.get(
+            f"{MLB_API_BASE}/teams",
+            params={"season": season, "sportId": 1},
+            timeout=10,
+        )
+        teams_resp.raise_for_status()
+        team_ids = [t["id"] for t in teams_resp.json().get("teams", [])]
+    except Exception as e:
+        logger.warning("MLB API teams fetch failed: %s", e)
+        return positions
+
+    api_positions: dict[int, str] = {}
+    api_teams: dict[int, str] = {}
+    for tid in team_ids:
+        try:
+            resp = requests.get(
+                f"{MLB_API_BASE}/teams/{tid}/roster",
+                params={"season": season, "rosterType": "fullSeason"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            roster = resp.json().get("roster", [])
+            # Get team abbreviation
+            team_resp = requests.get(
+                f"{MLB_API_BASE}/teams/{tid}",
+                timeout=10,
+            )
+            team_data = team_resp.json().get("teams", [{}])[0]
+            team_abbr = team_data.get("abbreviation", "")
+
+            for player in roster:
+                pid = player.get("person", {}).get("id")
+                pos_abbr = player.get("position", {}).get("abbreviation", "")
+                if pid and pos_abbr in FIELDING_POSITIONS:
+                    api_positions[pid] = pos_abbr
+                    api_teams[pid] = team_abbr
+        except Exception:
+            continue  # skip team on error, don't block
+
+    if not api_positions:
+        logger.warning("MLB API returned no roster data — skipping verification")
+        return positions
+
+    # Compare and override where API disagrees
+    positions = positions.copy()
+    n_fixed = 0
+    for idx, row in positions.iterrows():
+        pid = row["player_id"]
+        if pid in api_positions:
+            api_pos = api_positions[pid]
+            if api_pos != row["position"] and api_pos in FIELDING_POSITIONS:
+                logger.debug(
+                    "API override: %d %s → %s (%s)",
+                    pid, row["position"], api_pos,
+                    api_teams.get(pid, "?"),
+                )
+                positions.at[idx, "position"] = api_pos
+                n_fixed += 1
+
+    logger.info(
+        "MLB API verification: %d players checked, %d positions corrected",
+        len(api_positions), n_fixed,
+    )
+    return positions
+
+
+def _assign_hitter_positions(season: int = 2025, min_starts: int = 20) -> pd.DataFrame:
+    """Assign primary position to each hitter using career-weighted data.
+
+    Uses career lineup starts with recency weighting (last 50 games 3x,
+    recent season 2x, career 1x).  Overrides with last-50-games position
+    if 80%+ of recent games are at a new position (catches mid-career
+    switches like Bichette SS→3B).  Verifies against the MLB Stats API
+    as a final sanity check.
+
+    Falls back to ``dim_player.primary_position`` for players with no
+    lineup history.
+
+    Parameters
+    ----------
+    season : int
+        Most recent completed season.
     min_starts : int
-        Minimum starts at a position to qualify.
+        Minimum weighted games to qualify.
 
     Returns
     -------
@@ -345,16 +614,17 @@ def _assign_hitter_positions(season: int = 2025, min_starts: int = 20) -> pd.Dat
     """
     from src.data.db import read_sql
 
-    # Primary method: most-started position from lineup data
-    lineup_pos = read_sql(f"""
-        SELECT player_id,
-               MODE() WITHIN GROUP (ORDER BY position) as position,
-               count(*) as starts
-        FROM production.fact_lineup
-        WHERE season = {season} AND is_starter = true AND position != 'P'
-        GROUP BY player_id
-        HAVING count(*) >= {min_starts}
-    """, {})
+    # Career-weighted positions with recency bias
+    career = _get_career_weighted_positions(season)
+
+    if not career.empty:
+        primary = career[career["is_primary"]][["player_id", "position"]].copy()
+        # Filter by minimum weighted games
+        top_weighted = career.groupby("player_id")["weighted_games"].max().reset_index()
+        qualified = top_weighted[top_weighted["weighted_games"] >= min_starts]["player_id"]
+        primary = primary[primary["player_id"].isin(qualified)]
+    else:
+        primary = pd.DataFrame(columns=["player_id", "position"])
 
     # Fallback: dim_player for players not in lineup data
     fallback = read_sql("""
@@ -364,13 +634,21 @@ def _assign_hitter_positions(season: int = 2025, min_starts: int = 20) -> pd.Dat
           AND active = true
     """, {})
 
-    if not lineup_pos.empty:
-        assigned = lineup_pos[["player_id", "position"]].copy()
-        # Add fallback players not in lineup
-        missing = fallback[~fallback["player_id"].isin(assigned["player_id"])]
-        assigned = pd.concat([assigned, missing[["player_id", "position"]]], ignore_index=True)
+    if not primary.empty:
+        missing = fallback[~fallback["player_id"].isin(primary["player_id"])]
+        assigned = pd.concat(
+            [primary, missing[["player_id", "position"]]],
+            ignore_index=True,
+        )
     else:
         assigned = fallback[["player_id", "position"]].copy()
+
+    # MLB API verification (final pass)
+    try:
+        assigned = _verify_positions_mlb_api(assigned, season=season + 1)
+    except Exception:
+        logger.warning("MLB API verification failed — using lineup-based positions",
+                       exc_info=True)
 
     return assigned
 
@@ -378,18 +656,18 @@ def _assign_hitter_positions(season: int = 2025, min_starts: int = 20) -> pd.Dat
 def get_hitter_position_eligibility(
     season: int = 2025, min_starts: int = 10,
 ) -> pd.DataFrame:
-    """Return all positions each hitter is eligible for.
+    """Return all positions each hitter is eligible for using career data.
 
-    A player qualifies at a position with ``min_starts`` or more starts
-    there in the given season.  Falls back to ``dim_player`` primary
-    position for players with no lineup data.
+    Uses career-weighted lineup starts (recency-biased) rather than a
+    single season.  A player qualifies at a position with ``min_starts``
+    or more weighted games there.
 
     Parameters
     ----------
     season : int
-        Season to pull lineup starts from.
+        Most recent completed season.
     min_starts : int
-        Minimum starts at a position to be eligible.
+        Minimum weighted games at a position to be eligible.
 
     Returns
     -------
@@ -398,18 +676,9 @@ def get_hitter_position_eligibility(
     """
     from src.data.db import read_sql
 
-    # All position starts per player
-    starts = read_sql(f"""
-        SELECT player_id, position, count(*) as starts
-        FROM production.fact_lineup
-        WHERE season = {season} AND is_starter = true
-              AND position NOT IN ('P', 'PR', 'PH')
-        GROUP BY player_id, position
-        HAVING count(*) >= {min_starts}
-    """, {})
+    career = _get_career_weighted_positions(season)
 
-    if starts.empty:
-        # Fallback only
+    if career.empty:
         fallback = read_sql("""
             SELECT player_id, primary_position as position
             FROM production.dim_player
@@ -421,17 +690,15 @@ def get_hitter_position_eligibility(
         fallback["is_primary"] = True
         return fallback
 
-    # Compute percentage of each player's total starts
+    # Filter by minimum weighted games
+    starts = career[career["weighted_games"] >= min_starts].copy()
+    starts = starts.rename(columns={"weighted_games": "starts"})
+
+    # Compute percentage of each player's total
     totals = starts.groupby("player_id")["starts"].transform("sum")
     starts["pct"] = starts["starts"] / totals
 
-    # Mark primary (most starts)
-    starts["is_primary"] = (
-        starts["starts"]
-        == starts.groupby("player_id")["starts"].transform("max")
-    )
-
-    # Add fallback for players not in lineup data
+    # Add fallback for players not in career data
     fallback = read_sql("""
         SELECT player_id, primary_position as position
         FROM production.dim_player
@@ -524,8 +791,11 @@ def _build_hitter_offense_score(
     obs_cols = ["batter_id", "pa", "k_pct", "bb_pct", "woba", "wrc_plus",
                 "barrel_pct", "hard_hit_pct", "xwoba", "sweet_spot_pct"]
     obs_cols = [c for c in obs_cols if c in observed.columns]
-    merged = proj[["batter_id", "projected_k_rate", "projected_bb_rate",
-                    "projected_hr_per_fb", "composite_score"]].merge(
+    proj_cols = ["batter_id", "projected_k_rate", "projected_bb_rate",
+                  "projected_hr_per_fb", "composite_score"]
+    if "age" in proj.columns:
+        proj_cols.append("age")
+    merged = proj[proj_cols].merge(
         observed[obs_cols],
         on="batter_id", how="inner",
     )
@@ -634,7 +904,29 @@ def _build_hitter_offense_score(
     else:
         obs_damage = proj_damage
 
-    damage_trust = _stat_family_trust(pa, min_pa=200, full_pa=550)
+    # Age discount on observed stats: older players' outlier seasons get
+    # less trust, regressing more toward projections.  A 36-year-old's
+    # career-best is far more likely regression-bound than a 26-year-old's.
+    # Applies to damage + production (the two observation-heavy buckets).
+    # Contact + decisions are already projection-anchored via K%/BB%.
+    age = merged["age"].fillna(28)
+    age_trust = (1.0 - ((age - 30).clip(0) * 0.04)).clip(0.50, 1.0)
+    # age 30: 1.00, age 33: 0.88, age 35: 0.80, age 38: 0.68 (floor 0.50)
+
+    # Projection-deviation dampening: when observed stats diverge sharply
+    # from the Bayesian projection, reduce trust in observed.  The model
+    # has multi-year context — a huge deviation signals an outlier season
+    # (positive or negative) that is unlikely to repeat.
+    # Works both ways: a career-worst year for a good player AND a
+    # career-best year for an aging player both get dampened.
+    #
+    # Computed on RAW stat scale (not percentiles) to avoid tail
+    # compression — a 44-point wRC+ gap is meaningful even if both
+    # values are above the 90th percentile.
+    damage_deviation = (obs_damage - proj_damage).abs()
+    damage_dev_trust = (1.0 - damage_deviation).clip(0.50, 1.0)
+
+    damage_trust = _stat_family_trust(pa, min_pa=200, full_pa=550) * age_trust * damage_dev_trust
     merged["damage_skill"] = (1 - damage_trust) * proj_damage + damage_trust * obs_damage
 
     # =================================================================
@@ -654,7 +946,23 @@ def _build_hitter_offense_score(
     else:
         obs_production = proj_production
 
-    production_trust = _stat_family_trust(pa, min_pa=150, full_pa=500)
+    # Production deviation: use raw wRC+ gap normalized by population SD.
+    # Percentile deviation compresses the tails (165 vs 121 wRC+ both map
+    # to >93rd pctl, hiding the 44-point gap).  Raw z-score preserves it.
+    if has_sim and "wrc_plus" in merged.columns:
+        raw_wrc_gap = (merged["wrc_plus"].fillna(100) - merged["projected_wrc_plus_mean"].fillna(100)).abs()
+        wrc_std = merged["wrc_plus"].std()
+        if wrc_std > 0:
+            production_deviation_z = raw_wrc_gap / wrc_std
+        else:
+            production_deviation_z = pd.Series(0.0, index=merged.index)
+        # z=0: trust 1.0, z=1 (~30 wRC+ gap): 0.70, z=1.67+: 0.50 floor
+        production_dev_trust = (1.0 - production_deviation_z * 0.30).clip(0.50, 1.0)
+    else:
+        production_dev_trust = pd.Series(1.0, index=merged.index)
+
+    production_trust = _stat_family_trust(pa, min_pa=150, full_pa=500) * age_trust * production_dev_trust
+
     merged["production_skill"] = (
         (1 - production_trust) * proj_production
         + production_trust * obs_production
@@ -1321,16 +1629,21 @@ def rank_hitters(
     base["pt_score"] = base["pt_score"].fillna(0.50)
     base["trajectory_score"] = base["trajectory_score"].fillna(0.50)
 
-    # Blend breakout potential into trajectory.
-    # Breakout model's room_to_grow is the strongest predictive signal
-    # (r=0.24 vs wOBA improvement, validated 2.5x lift on 3 folds).
-    # Trajectory already captures certainty + age + trends; breakout adds
-    # archetype fit × skills-production gap.  35% blend avoids double-counting
-    # age/trend while adding genuine new signal.
+    # Sustain/upside blend into trajectory.
+    # Replaces pure breakout blend which penalized elite established players
+    # (Soto, Judge) who have no "room to break out" by definition.
+    # sustain_upside = max(breakout_pctl, offense_score):
+    #   - Developing players (Elly, J-Rod): breakout_pctl drives the score
+    #   - Elite players (Soto, Judge): offense_score provides a high floor
+    # Net effect: trajectory rewards both paths to value — improving OR
+    # sustaining elite production.  Minor offense double-counting (~3.5%
+    # of total composite) is acceptable.
     base["breakout_score"] = base["breakout_score"].fillna(0.0)
     breakout_pctl = _pctl(base["breakout_score"].clip(lower=0))
+    raw_trajectory = base["trajectory_score"].copy()  # save for upside calc
+    sustain_upside = np.maximum(breakout_pctl, base["offense_score"])
     base["trajectory_score"] = (
-        0.65 * base["trajectory_score"] + 0.35 * breakout_pctl
+        0.65 * base["trajectory_score"] + 0.35 * sustain_upside
     )
 
     if "health_score" not in base.columns:
@@ -1373,18 +1686,29 @@ def rank_hitters(
     dh_offense_wt = _HITTER_WEIGHTS["offense"] + _HITTER_WEIGHTS["fielding"] * 0.70
     dh_baserunning_wt = _HITTER_WEIGHTS["baserunning"] + _HITTER_WEIGHTS["fielding"] * 0.30
 
+    # Dynamic fielding dampening for elite hitters.
+    # If you're so good with the bat, teams will hide you at DH/1B/corner OF.
+    # Worst fielder costs ~-15 runs; best hitter adds ~+50 runs — fielding
+    # range is ~30% of offense range, so elite bats should have reduced
+    # fielding penalty.  Kicks in above 0.70 offense, halves fielding
+    # weight at 1.00 offense.  Redistributed weight goes to offense.
+    offense_excess = (base["offense_score"] - 0.70).clip(0) / 0.30
+    fielding_dampening = 0.50 * offense_excess
+    eff_fielding_wt = _HITTER_WEIGHTS["fielding"] * (1 - fielding_dampening)
+    eff_offense_boost = _HITTER_WEIGHTS["fielding"] * fielding_dampening
+
     # Standard composite (non-DH)
     base["tdd_value_score"] = (
-        _HITTER_WEIGHTS["offense"] * base["offense_score"]
+        (_HITTER_WEIGHTS["offense"] + eff_offense_boost) * base["offense_score"]
         + _HITTER_WEIGHTS["baserunning"] * base["baserunning_score"]
-        + _HITTER_WEIGHTS["fielding"] * base["fielding_combined"]
+        + eff_fielding_wt * base["fielding_combined"]
         + _HITTER_WEIGHTS["health"] * base["health_adj"]
         + _HITTER_WEIGHTS["role"] * base["role_score"]
         + _HITTER_WEIGHTS["trajectory"] * base["trajectory_score"]
         + _HITTER_WEIGHTS["versatility"] * base["versatility_score"]
         + _HITTER_WEIGHTS["roster_value"] * base["roster_value_score"]
     )
-    # DH composite: fielding weight redistributed to offense/baserunning
+    # DH composite: fielding weight fully redistributed (no dampening needed)
     base.loc[is_dh, "tdd_value_score"] = (
         dh_offense_wt * base.loc[is_dh, "offense_score"]
         + dh_baserunning_wt * base.loc[is_dh, "baserunning_score"]
@@ -1533,6 +1857,21 @@ def rank_hitters(
             )
     except Exception:
         logger.warning("Could not compute hitter scouting grades", exc_info=True)
+
+    # --- Upside adjustments: breakout trajectory + harsher age curve ---
+    # talent_upside_score is the 2-3yr forward view (dynasty rankings).
+    # Swap sustain trajectory for breakout: developing players should be
+    # rewarded for room to improve, not penalized for not being elite yet.
+    # Apply harsher age curve: 2-3yr horizon amplifies decline risk.
+    upside_trajectory = 0.65 * raw_trajectory + 0.35 * breakout_pctl
+    traj_swap = _HITTER_WEIGHTS["trajectory"] * (upside_trajectory - base["trajectory_score"])
+    base["talent_upside_score"] = base["talent_upside_score"] + traj_swap
+
+    # Harsher age: peak 25-27, young players boosted, 30+ penalized on forward horizon
+    age = base["age"].fillna(28)
+    upside_age_mult = (1.0 + (26 - age) * 0.02).clip(0.76, 1.10)
+    # age 21: 1.10, age 24: 1.04, age 26: 1.00, age 30: 0.92, age 33: 0.86, age 38: 0.76
+    base["talent_upside_score"] = base["talent_upside_score"] * upside_age_mult
 
     # tdd_value_score = current_value_score (backward compat for team consumption)
     base["tdd_value_score"] = base["current_value_score"]

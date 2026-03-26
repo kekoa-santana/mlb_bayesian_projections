@@ -46,11 +46,12 @@ PA_OUT = 7
 LEAGUE_HBP_RATE = 0.011
 
 # Sim calibration offsets (logit scale).
-# Walk-forward backtest (2025) showed K over-predicted by +7.26 per player
-# (residual after PA adjustment) and BB under-predicted by -3.59.
-# These offsets correct the systematic bias from stacked logit lifts.
-_CALIBRATION_K_OFFSET = -0.06   # reduce K logit to fix over-prediction
-_CALIBRATION_BB_OFFSET = 0.03   # increase BB logit to fix under-prediction
+# After exit model calibration fix (-0.35 logit offset), residual biases are:
+#   K: ~-0.18/game (still slightly under-predicted by stacked logit lifts)
+#   BB: ~+0.33/game (over-predicted)
+# These offsets fine-tune the per-PA rates.
+_CALIBRATION_K_OFFSET = -0.02   # slight K logit reduction (was -0.06, reduced after exit fix)
+_CALIBRATION_BB_OFFSET = 0.01   # slight BB logit increase (was 0.03, reduced after exit fix)
 
 # Fatigue adjustment thresholds and slopes (logit scale)
 _FATIGUE_PITCH_THRESHOLD = 85

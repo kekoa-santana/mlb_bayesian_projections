@@ -368,12 +368,17 @@ def build_batter_sim_predictions(
             "expected_bb": summary["bb"]["mean"],
             "expected_h": summary["h"]["mean"],
             "expected_hr": summary["hr"]["mean"],
+            "expected_double": summary["double"]["mean"],
+            "expected_triple": summary["triple"]["mean"],
             "expected_tb": summary["tb"]["mean"],
+            "std_tb": summary["tb"]["std"],
             "expected_pa": summary["pa"]["mean"],
             "actual_k": int(row["bat_k"]),
             "actual_bb": int(row["bat_bb"]),
             "actual_h": int(row["bat_h"]),
             "actual_hr": int(row["bat_hr"]),
+            "actual_double": int(row["bat_2b"]),
+            "actual_triple": int(row["bat_3b"]),
             "actual_tb": int(row["bat_tb"]),
             "actual_pa": int(row["bat_pa"]),
         }
@@ -394,6 +399,21 @@ def build_batter_sim_predictions(
             col = f"p_hr_over_{prow['line']:.1f}".replace(".", "_")
             rec[col] = prow["p_over"]
 
+        tb_over = sim_result.over_probs("tb", [0.5, 1.5, 2.5, 3.5])
+        for _, prow in tb_over.iterrows():
+            col = f"p_tb_over_{prow['line']:.1f}".replace(".", "_")
+            rec[col] = prow["p_over"]
+
+        double_over = sim_result.over_probs("double", [0.5])
+        for _, prow in double_over.iterrows():
+            col = f"p_double_over_{prow['line']:.1f}".replace(".", "_")
+            rec[col] = prow["p_over"]
+
+        triple_over = sim_result.over_probs("triple", [0.5])
+        for _, prow in triple_over.iterrows():
+            col = f"p_triple_over_{prow['line']:.1f}".replace(".", "_")
+            rec[col] = prow["p_over"]
+
         results.append(rec)
 
     logger.info("Completed: %d batter-games predicted, %d skipped",
@@ -411,10 +431,10 @@ def compute_batter_sim_metrics(
 
     metrics: dict[str, Any] = {"n_games": n}
 
-    for stat in ("k", "bb", "h", "hr", "tb"):
+    for stat in ("k", "bb", "h", "hr", "double", "triple", "tb"):
         exp_col = f"expected_{stat}"
         act_col = f"actual_{stat}"
-        if exp_col not in predictions.columns:
+        if exp_col not in predictions.columns or act_col not in predictions.columns:
             continue
 
         expected = predictions[exp_col].values.astype(float)
@@ -435,10 +455,16 @@ def compute_batter_sim_metrics(
         "h_0.5": ("p_h_over_0_5", "actual_h", 0.5),
         "h_1.5": ("p_h_over_1_5", "actual_h", 1.5),
         "hr_0.5": ("p_hr_over_0_5", "actual_hr", 0.5),
+        "tb_0.5": ("p_tb_over_0_5", "actual_tb", 0.5),
+        "tb_1.5": ("p_tb_over_1_5", "actual_tb", 1.5),
+        "tb_2.5": ("p_tb_over_2_5", "actual_tb", 2.5),
+        "tb_3.5": ("p_tb_over_3_5", "actual_tb", 3.5),
+        "double_0.5": ("p_double_over_0_5", "actual_double", 0.5),
+        "triple_0.5": ("p_triple_over_0_5", "actual_triple", 0.5),
     }
     brier_scores = {}
     for label, (prob_col, act_col, line) in prop_cols.items():
-        if prob_col in predictions.columns:
+        if prob_col in predictions.columns and act_col in predictions.columns:
             y_true = (predictions[act_col] > line).astype(float).values
             y_prob = predictions[prob_col].values
             brier_scores[label] = float(brier_score_loss(y_true, y_prob))
@@ -497,25 +523,55 @@ def run_full_batter_sim_backtest(
         metrics = compute_batter_sim_metrics(predictions)
 
         fold_rec = {"test_season": test_season, "n_games": metrics["n_games"]}
-        for stat in ("k", "bb", "h", "hr", "tb"):
-            for m in ("rmse", "mae", "corr"):
+        for stat in ("k", "bb", "h", "hr", "double", "triple", "tb"):
+            for m in ("rmse", "mae", "bias", "corr"):
                 key = f"{stat}_{m}"
                 if key in metrics:
                     fold_rec[key] = metrics[key]
+
+        # Brier scores
+        if "brier_scores" in metrics:
+            for label, score in metrics["brier_scores"].items():
+                fold_rec[f"brier_{label}"] = score
 
         fold_results.append(fold_rec)
         predictions["fold_test_season"] = test_season
         all_predictions.append(predictions)
 
         logger.info(
-            "Batter fold: K RMSE=%.3f, H RMSE=%.3f, HR RMSE=%.3f, n=%d",
+            "Batter fold: K RMSE=%.3f, H RMSE=%.3f, HR RMSE=%.3f, "
+            "2B RMSE=%.3f, 3B RMSE=%.3f, TB RMSE=%.3f, n=%d",
             fold_rec.get("k_rmse", np.nan),
             fold_rec.get("h_rmse", np.nan),
             fold_rec.get("hr_rmse", np.nan),
+            fold_rec.get("double_rmse", np.nan),
+            fold_rec.get("triple_rmse", np.nan),
+            fold_rec.get("tb_rmse", np.nan),
             metrics["n_games"],
         )
 
     summary = pd.DataFrame(fold_results)
     pred_df = pd.concat(all_predictions, ignore_index=True) if all_predictions else pd.DataFrame()
+
+    # Overall metrics
+    if len(pred_df) > 0:
+        overall = compute_batter_sim_metrics(pred_df)
+        logger.info("=" * 60)
+        logger.info("OVERALL BATTER RESULTS (%d batter-games)", overall["n_games"])
+        for stat in ("k", "bb", "h", "hr", "double", "triple", "tb"):
+            rmse_key = f"{stat}_rmse"
+            if rmse_key in overall:
+                logger.info(
+                    "  %s: RMSE=%.3f, MAE=%.3f, bias=%.3f, corr=%.3f",
+                    stat.upper(),
+                    overall[rmse_key],
+                    overall.get(f"{stat}_mae", np.nan),
+                    overall.get(f"{stat}_bias", np.nan),
+                    overall.get(f"{stat}_corr", np.nan),
+                )
+        if "brier_scores" in overall:
+            logger.info("  Brier scores:")
+            for label, score in sorted(overall["brier_scores"].items()):
+                logger.info("    %s: %.4f", label, score)
 
     return summary, pred_df

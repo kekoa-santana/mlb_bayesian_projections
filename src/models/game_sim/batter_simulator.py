@@ -147,7 +147,7 @@ def simulate_batter_game(
     umpire_bb_lift: float = 0.0,
     park_hr_lift: float = 0.0,
     weather_k_lift: float = 0.0,
-    n_sims: int = 10_000,
+    n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> BatterSimulationResult:
     """Run vectorized Monte Carlo batter game simulation.

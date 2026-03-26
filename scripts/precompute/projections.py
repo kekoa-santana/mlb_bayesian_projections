@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -226,6 +227,45 @@ def run_sim_pitcher(
         starter_ids = set(
             active_pitchers[active_pitchers["is_starter"] == 1]["pitcher_id"]
         )
+
+        # Query actual avg pitches per starter (weighted recent seasons)
+        from src.data.db import read_sql as _read_pitches
+        _pitch_counts = _read_pitches("""
+            SELECT player_id as pitcher_id, season,
+                   AVG(pit_pitches) as avg_pitches,
+                   COUNT(*) as starts
+            FROM production.fact_player_game_mlb
+            WHERE pit_is_starter = true AND pit_pitches > 0
+              AND season >= :min_season
+            GROUP BY player_id, season
+        """, {"min_season": from_season - 2})
+        # Weighted avg (5/4/3) across recent seasons
+        _pitch_lookup: dict[int, float] = {}
+        _POP_AVG_PITCHES = 88.0
+        if not _pitch_counts.empty:
+            for pid in starter_ids:
+                ph = _pitch_counts[
+                    _pitch_counts["pitcher_id"] == pid
+                ].sort_values("season", ascending=False).head(3)
+                if ph.empty:
+                    continue
+                wts = [5, 4, 3][:len(ph)]
+                wtd = sum(
+                    a * s * w
+                    for a, s, w in zip(ph["avg_pitches"], ph["starts"], wts)
+                ) / sum(s * w for s, w in zip(ph["starts"], wts))
+                # Regress toward population mean (more starts = more trust)
+                total_starts = ph["starts"].sum()
+                rel = min(total_starts / (total_starts + 15), 1.0)
+                _pitch_lookup[pid] = rel * wtd + (1 - rel) * _POP_AVG_PITCHES
+            logger.info(
+                "Pitcher avg pitches: %d starters, range %.0f-%.0f (pop=%.0f)",
+                len(_pitch_lookup),
+                min(_pitch_lookup.values()) if _pitch_lookup else 0,
+                max(_pitch_lookup.values()) if _pitch_lookup else 0,
+                _POP_AVG_PITCHES,
+            )
+
         starter_prior_rows = []
         for _, prow in active_pitchers.iterrows():
             pid = int(prow["pitcher_id"])
@@ -243,7 +283,7 @@ def run_sim_pitcher(
                     "pitcher_id": pid,
                     "n_starts_mu": 30.0,
                     "n_starts_sigma": 6.0,
-                    "avg_pitches": 88.0,
+                    "avg_pitches": _pitch_lookup.get(pid, _POP_AVG_PITCHES),
                 })
                 continue
 
@@ -269,7 +309,7 @@ def run_sim_pitcher(
                 "pitcher_id": pid,
                 "n_starts_mu": mu,
                 "n_starts_sigma": sigma,
-                "avg_pitches": 88.0,
+                "avg_pitches": _pitch_lookup.get(pid, _POP_AVG_PITCHES),
             })
 
         starter_priors_df = pd.DataFrame(starter_prior_rows) if starter_prior_rows else None
@@ -277,13 +317,19 @@ def run_sim_pitcher(
         # Train exit model
         logger.info("Training exit model for season sim...")
         sim_exit_model = ExitModel()
+        _exit_model_path = Path("data/cached/exit_model.pkl")
         try:
             exit_training_data = get_exit_model_training_data(seasons)
             exit_tend = get_pitcher_exit_tendencies(seasons)
             sim_exit_model.train(exit_training_data, exit_tend)
-            logger.info("Exit model trained for season sim")
+            sim_exit_model.save(_exit_model_path)
+            logger.info("Exit model trained and saved to %s", _exit_model_path)
         except Exception as e:
             logger.warning("Exit model training failed, using fallback: %s", e)
+            # Try loading a previously saved model
+            if _exit_model_path.exists():
+                sim_exit_model.load(_exit_model_path)
+                logger.info("Loaded cached exit model from %s", _exit_model_path)
 
         # Run sim-based projections
         t0 = time.time()

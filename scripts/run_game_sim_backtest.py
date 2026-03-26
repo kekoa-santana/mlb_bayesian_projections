@@ -109,12 +109,13 @@ def _print_results(
     print("\n--- Per-Fold Results ---")
     for _, row in summary.iterrows():
         print(f"\nTest Season {int(row['test_season'])} ({int(row['n_games'])} games):")
-        for stat in ("k", "bb", "h", "hr"):
+        for stat in ("k", "bb", "h", "hr", "outs"):
             rmse_key = f"{stat}_rmse"
             mae_key = f"{stat}_mae"
             corr_key = f"{stat}_corr"
             if rmse_key in row:
-                line = f"  {stat.upper():>3s}: RMSE={row[rmse_key]:.3f}"
+                label = stat.upper() if stat != "outs" else "OUTS"
+                line = f"  {label:>4s}: RMSE={row[rmse_key]:.3f}"
                 if mae_key in row:
                     line += f"  MAE={row[mae_key]:.3f}"
                 if corr_key in row and pd.notna(row[corr_key]):
@@ -123,11 +124,18 @@ def _print_results(
 
         if "k_avg_brier" in row and pd.notna(row["k_avg_brier"]):
             print(f"  K Brier: {row['k_avg_brier']:.4f}")
+        if "outs_avg_brier" in row and pd.notna(row["outs_avg_brier"]):
+            print(f"  Outs Brier: {row['outs_avg_brier']:.4f}")
 
         for ci in ("50", "80", "90"):
             key = f"k_coverage_{ci}"
             if key in row and pd.notna(row[key]):
                 print(f"  K Coverage {ci}%: {row[key]:.1%}")
+
+        for ci in ("50", "80", "90"):
+            key = f"outs_coverage_{ci}"
+            if key in row and pd.notna(row[key]):
+                print(f"  Outs Coverage {ci}%: {row[key]:.1%}")
 
         if "ip_rmse" in row and pd.notna(row["ip_rmse"]):
             print(f"   IP: RMSE={row['ip_rmse']:.3f}  MAE={row.get('ip_mae', 0):.3f}")
@@ -137,14 +145,17 @@ def _print_results(
 
     # Overall averages
     print("\n--- Overall Averages ---")
-    for stat in ("k", "bb", "h", "hr"):
+    for stat in ("k", "bb", "h", "hr", "outs"):
         rmse_key = f"{stat}_rmse"
         if rmse_key in summary.columns:
-            print(f"  {stat.upper():>3s}: RMSE={summary[rmse_key].mean():.3f}  "
+            label = stat.upper() if stat != "outs" else "OUTS"
+            print(f"  {label:>4s}: RMSE={summary[rmse_key].mean():.3f}  "
                   f"MAE={summary[f'{stat}_mae'].mean():.3f}")
 
     if "k_avg_brier" in summary.columns:
         print(f"  K Avg Brier: {summary['k_avg_brier'].mean():.4f}")
+    if "outs_avg_brier" in summary.columns:
+        print(f"  Outs Avg Brier: {summary['outs_avg_brier'].mean():.4f}")
 
     # Comparison targets
     print("\n--- vs Current Layer 3 Baseline ---")

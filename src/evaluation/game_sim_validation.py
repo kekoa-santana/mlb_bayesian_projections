@@ -577,8 +577,15 @@ def build_game_sim_predictions(
 
         summary = sim_result.summary()
 
+        # Derive actual outs from IP (baseball notation: 6.1 = 19 outs)
+        actual_outs = int(actual_ip) * 3 + round((actual_ip % 1) * 10)
+
         # Build K over-prob columns
         k_over = sim_result.over_probs("k", [3.5, 4.5, 5.5, 6.5, 7.5])
+        # Outs prop lines (14.5 ~ 5.0 IP, 17.5 ~ 6.0 IP, etc.)
+        outs_over = sim_result.over_probs(
+            "outs", [14.5, 15.5, 16.5, 17.5, 18.5],
+        )
 
         rec = {
             "game_pk": game_pk,
@@ -596,6 +603,7 @@ def build_game_sim_predictions(
             "expected_bf": summary["bf"]["mean"],
             "expected_pitches": summary["pitch_count"]["mean"],
             "expected_outs": summary["outs"]["mean"],
+            "std_outs": summary["outs"]["std"],
             "expected_ip": float(np.mean(sim_result.ip_samples())),
             "expected_runs": summary["runs"]["mean"],
             # Actuals
@@ -606,11 +614,17 @@ def build_game_sim_predictions(
             "actual_bf": actual_bf,
             "actual_pitches": actual_pitches,
             "actual_ip": actual_ip,
+            "actual_outs": actual_outs,
         }
 
         # K prop line probabilities
         for _, prow in k_over.iterrows():
             col = f"p_over_{prow['line']:.1f}".replace(".", "_")
+            rec[col] = prow["p_over"]
+
+        # Outs prop line probabilities
+        for _, prow in outs_over.iterrows():
+            col = f"p_outs_over_{prow['line']:.1f}".replace(".", "_")
             rec[col] = prow["p_over"]
 
         results.append(rec)
@@ -689,6 +703,22 @@ def compute_game_sim_metrics(
     if brier_scores:
         metrics["k_avg_brier"] = float(np.mean(list(brier_scores.values())))
 
+    # Outs Brier scores
+    outs_lines = [14.5, 15.5, 16.5, 17.5, 18.5]
+    outs_brier: dict[float, float] = {}
+    for line in outs_lines:
+        col = f"p_outs_over_{line:.1f}".replace(".", "_")
+        if col not in predictions.columns:
+            continue
+        if "actual_outs" not in predictions.columns:
+            break
+        y_true = (predictions["actual_outs"] > line).astype(float).values
+        y_prob = predictions[col].values
+        outs_brier[line] = float(brier_score_loss(y_true, y_prob))
+    metrics["outs_brier_scores"] = outs_brier
+    if outs_brier:
+        metrics["outs_avg_brier"] = float(np.mean(list(outs_brier.values())))
+
     # K coverage
     if "std_k" in predictions.columns:
         expected_k = predictions["expected_k"].values
@@ -700,6 +730,19 @@ def compute_game_sim_metrics(
             hi = expected_k + z * std_k
             metrics[f"k_coverage_{ci_name}"] = float(
                 np.mean((actual_k >= lo) & (actual_k <= hi))
+            )
+
+    # Outs coverage
+    if "std_outs" in predictions.columns and "actual_outs" in predictions.columns:
+        expected_outs = predictions["expected_outs"].values
+        std_outs = predictions["std_outs"].values
+        actual_outs_arr = predictions["actual_outs"].values
+
+        for ci_name, z in [("50", 0.6745), ("80", 1.2816), ("90", 1.6449)]:
+            lo = expected_outs - z * std_outs
+            hi = expected_outs + z * std_outs
+            metrics[f"outs_coverage_{ci_name}"] = float(
+                np.mean((actual_outs_arr >= lo) & (actual_outs_arr <= hi))
             )
 
     # IP metrics
@@ -798,6 +841,14 @@ def run_full_game_sim_backtest(
             if key in metrics:
                 fold_rec[key] = metrics[key]
 
+        # Outs-specific
+        if "outs_avg_brier" in metrics:
+            fold_rec["outs_avg_brier"] = metrics["outs_avg_brier"]
+        for ci in ("50", "80", "90"):
+            key = f"outs_coverage_{ci}"
+            if key in metrics:
+                fold_rec[key] = metrics[key]
+
         # IP
         for m in ("ip_rmse", "ip_mae"):
             if m in metrics:
@@ -810,12 +861,15 @@ def run_full_game_sim_backtest(
         # Log summary
         logger.info(
             "Fold results: K RMSE=%.3f, K Brier=%.4f, BB RMSE=%.3f, "
-            "H RMSE=%.3f, HR RMSE=%.3f, IP RMSE=%.3f, n=%d",
+            "H RMSE=%.3f, HR RMSE=%.3f, Outs RMSE=%.3f, Outs Brier=%.4f, "
+            "IP RMSE=%.3f, n=%d",
             fold_rec.get("k_rmse", np.nan),
             fold_rec.get("k_avg_brier", np.nan),
             fold_rec.get("bb_rmse", np.nan),
             fold_rec.get("h_rmse", np.nan),
             fold_rec.get("hr_rmse", np.nan),
+            fold_rec.get("outs_rmse", np.nan),
+            fold_rec.get("outs_avg_brier", np.nan),
             fold_rec.get("ip_rmse", np.nan),
             metrics["n_games"],
         )
@@ -831,7 +885,7 @@ def run_full_game_sim_backtest(
         overall = compute_game_sim_metrics(pred_df)
         logger.info("=" * 60)
         logger.info("OVERALL RESULTS (%d games)", overall["n_games"])
-        for stat in ("k", "bb", "h", "hr", "bf", "pitches"):
+        for stat in ("k", "bb", "h", "hr", "outs", "bf", "pitches"):
             rmse_key = f"{stat}_rmse"
             if rmse_key in overall:
                 logger.info(
@@ -843,6 +897,8 @@ def run_full_game_sim_backtest(
                 )
         if "k_avg_brier" in overall:
             logger.info("  K Avg Brier: %.4f", overall["k_avg_brier"])
+        if "outs_avg_brier" in overall:
+            logger.info("  Outs Avg Brier: %.4f", overall["outs_avg_brier"])
         if "ip_rmse" in overall:
             logger.info("  IP: RMSE=%.3f", overall["ip_rmse"])
 

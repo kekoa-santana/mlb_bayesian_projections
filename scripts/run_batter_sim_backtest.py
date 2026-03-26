@@ -82,10 +82,11 @@ def main() -> None:
 
     for _, row in summary.iterrows():
         print(f"\nTest Season {int(row['test_season'])} ({int(row['n_games'])} games):")
-        for stat in ("k", "bb", "h", "hr", "tb"):
+        for stat, label in [("k", "K"), ("bb", "BB"), ("h", "H"), ("hr", "HR"),
+                            ("double", "2B"), ("triple", "3B"), ("tb", "TB")]:
             rmse_key = f"{stat}_rmse"
             if rmse_key in row and not pd.isna(row[rmse_key]):
-                line = f"  {stat.upper():>3s}: RMSE={row[rmse_key]:.3f}"
+                line = f"  {label:>3s}: RMSE={row[rmse_key]:.3f}"
                 mae_key = f"{stat}_mae"
                 if mae_key in row:
                     line += f"  MAE={row[mae_key]:.3f}"
@@ -94,12 +95,27 @@ def main() -> None:
                     line += f"  corr={row[corr_key]:.3f}"
                 print(line)
 
+        # Brier scores
+        brier_labels = [
+            ("brier_tb_0.5", "TB>0.5"), ("brier_tb_1.5", "TB>1.5"),
+            ("brier_tb_2.5", "TB>2.5"), ("brier_double_0.5", "2B>0.5"),
+            ("brier_triple_0.5", "3B>0.5"),
+        ]
+        printed_brier = False
+        for key, label in brier_labels:
+            if key in row and not pd.isna(row[key]):
+                if not printed_brier:
+                    print("  Brier:")
+                    printed_brier = True
+                print(f"    {label}: {row[key]:.4f}")
+
     if len(summary) > 0:
         print("\n--- Averages ---")
-        for stat in ("k", "bb", "h", "hr", "tb"):
+        for stat, label in [("k", "K"), ("bb", "BB"), ("h", "H"), ("hr", "HR"),
+                            ("double", "2B"), ("triple", "3B"), ("tb", "TB")]:
             rmse_key = f"{stat}_rmse"
             if rmse_key in summary.columns:
-                print(f"  {stat.upper():>3s}: RMSE={summary[rmse_key].mean():.3f}  "
+                print(f"  {label:>3s}: RMSE={summary[rmse_key].mean():.3f}  "
                       f"MAE={summary[f'{stat}_mae'].mean():.3f}")
 
 

@@ -35,7 +35,7 @@ from precompute import (
 )
 from precompute import models, projections, samples, team, profiles
 from precompute import rankings, game_data, traditional, game_sim
-from precompute import prospects, snapshots, glicko
+from precompute import prospects, snapshots, glicko, confident_picks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +57,7 @@ _SECTION_GROUPS: dict[str, list[str]] = {
     "glicko":      ["player_glicko"],
     "historical":  ["historical_all"],
     "game_sim":    ["game_sim_data"],
+    "picks":       ["confident_picks"],
     "prospects":   ["prospect_data"],
     "health":      ["health_parks"],
     "snapshots":   ["projection_snapshots"],
@@ -366,6 +367,12 @@ def main() -> None:
         game_sim.run(seasons=SEASONS, from_season=FROM_SEASON)
 
     # =================================================================
+    # 9g. Confident picks (daily game-level prop picks)
+    # =================================================================
+    if should_run("confident_picks"):
+        confident_picks.run(n_sims=10_000)
+
+    # =================================================================
     # 8 (reordered). Depth chart
     # =================================================================
     if should_run("depth_chart"):
@@ -446,6 +453,11 @@ if __name__ == "__main__":
 # game_sim         game_sim_data              Exit model, pitch count features,
 #                                              TTO profiles, bullpen rates.
 #                                              DB-heavy, ~2 min.
+#
+# picks            confident_picks            Daily confident prop picks from
+#                                              pitcher + batter game sims.
+#                                              Requires schedule from MLB API.
+#                                              ~5 min (10K sims per game).
 #
 # prospects        prospect_data              MiLB translations, readiness
 #                                              model, TDD prospect rankings,

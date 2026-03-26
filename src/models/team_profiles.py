@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 
 DASHBOARD_DIR = Path("C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/data/dashboard")
 
+# When a player is on IL, their roster slot is filled by a replacement.
+# Effective contribution = availability * their_score + (1-avail) * replacement.
+# These represent approximate replacement-level scores (0-1 scale).
+_REPLACEMENT_HITTER = 0.30
+_REPLACEMENT_PITCHER = 0.30
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -165,11 +171,24 @@ def _build_offense_profile(
             )
         if score_col in hitter_rankings.columns:
             pt_pid = "batter_id" if "batter_id" in player_teams.columns else "player_id"
+            merge_cols = [pt_pid, "team_id"]
+            if "availability" in player_teams.columns:
+                merge_cols.append("availability")
             rank_merged = hitter_rankings.merge(
-                player_teams[[pt_pid, "team_id"]].rename(columns={pt_pid: pid_col}),
+                player_teams[merge_cols].rename(columns={pt_pid: pid_col}),
                 on=pid_col,
                 how="inner",
             )
+
+            # Blend IL player scores with replacement level.
+            # IL-60: 10% their score + 90% replacement — someone else fills
+            # the slot, but they'll return and add value when healthy.
+            if "availability" in rank_merged.columns:
+                avail = rank_merged["availability"]
+                rank_merged[score_col] = (
+                    avail * rank_merged[score_col]
+                    + (1 - avail) * _REPLACEMENT_HITTER
+                )
             median_score = rank_merged[score_col].median()
 
             # Merge projected PA for weighting (from counting sim)
@@ -266,13 +285,25 @@ def _build_offense_profile(
         style_cols = [c for c in style_cols if c in recent.columns]
         teams = teams.merge(recent[style_cols], on="team_id", how="left")
 
-    # Offense composite score (percentile-based)
-    score_cols = [c for c in ["lineup_depth", "avg_hitter_score", "rpg", "lineup_floor"] if c in teams.columns]
+    # Offense composite score (percentile-based, weighted)
+    # avg_hitter_score and rpg capture actual offensive quality;
+    # lineup_floor and lineup_depth are tiebreakers, not drivers.
+    _OFF_WEIGHTS = {
+        "avg_hitter_score": 0.40,
+        "rpg": 0.30,
+        "lineup_floor": 0.20,
+        "lineup_depth": 0.10,
+    }
+    score_cols = [c for c in _OFF_WEIGHTS if c in teams.columns]
     if score_cols:
         for c in score_cols:
             teams[f"{c}_pctl"] = _pctl(teams[c].fillna(teams[c].median()))
+        weights = np.array([_OFF_WEIGHTS[c] for c in score_cols])
+        weights = weights / weights.sum()  # renormalize if any cols missing
         pctl_cols = [f"{c}_pctl" for c in score_cols]
-        teams["offense_score"] = teams[pctl_cols].mean(axis=1)
+        teams["offense_score"] = sum(
+            w * teams[pc] for w, pc in zip(weights, pctl_cols)
+        )
     else:
         teams["offense_score"] = 0.5
 
@@ -305,11 +336,23 @@ def _build_pitching_profile(
         role_col = "role" if "role" in pitcher_rankings.columns else "position"
 
         if score_col in pitcher_rankings.columns:
+            merge_cols = ["team_id", pt_pid]
+            if "availability" in player_teams.columns:
+                merge_cols.append("availability")
             pr_merged = pitcher_rankings.merge(
-                player_teams[["team_id", pt_pid]].rename(columns={pt_pid: pid_col}),
+                player_teams[merge_cols].rename(columns={pt_pid: pid_col}),
                 on=pid_col,
                 how="inner",
             )
+
+            # Blend IL pitcher scores with replacement level
+            if "availability" in pr_merged.columns:
+                avail = pr_merged["availability"]
+                pr_merged[score_col] = (
+                    avail * pr_merged[score_col]
+                    + (1 - avail) * _REPLACEMENT_PITCHER
+                )
+
             # Merge projected IP for weighting
             ip_weight_col = "projected_ip_mean"
             if pitcher_counting is not None and ip_weight_col in pitcher_counting.columns:
@@ -372,8 +415,11 @@ def _build_pitching_profile(
     # --- Bullpen depth (role-weighted quality) ---
     if pitcher_roles is not None and pitcher_rankings is not None:
         pid_col_r = "pitcher_id" if "pitcher_id" in pitcher_roles.columns else "player_id"
+        bp_merge_cols = ["team_id", pt_pid]
+        if "availability" in player_teams.columns:
+            bp_merge_cols.append("availability")
         roles_merged = pitcher_roles.merge(
-            player_teams[["team_id", pt_pid]].rename(columns={pt_pid: pid_col_r}),
+            player_teams[bp_merge_cols].rename(columns={pt_pid: pid_col_r}),
             on=pid_col_r,
             how="inner",
         )
@@ -389,6 +435,13 @@ def _build_pitching_profile(
                 on=pid_col_r,
                 how="left",
             )
+            # Blend IL bullpen scores with replacement level
+            if "availability" in roles_merged.columns:
+                avail = roles_merged["availability"]
+                roles_merged[score_col_r] = (
+                    avail * roles_merged[score_col_r]
+                    + (1 - avail) * _REPLACEMENT_PITCHER
+                )
             # Role weights: CL 1.5x, SU 1.0x, MR 0.5x
             role_w_col = "role" if "role" in roles_merged.columns else "predicted_role"
             if role_w_col in roles_merged.columns:
@@ -1003,14 +1056,14 @@ def _build_health_depth(
 
     result["roster_continuity"] = result["roster_continuity"].fillna(0.5)
 
-    # ── 6. Roster depth metrics (concentration, gaps, bench quality) ──
-    # Measures roster resilience: how much does the team fall when
-    # starters go down?  Walk-forward validation (2022-2025) showed
-    # this is a real but noisy signal — keeps a modest weight.
+    # ── 6. Roster depth metrics (positional coverage + gaps + bench) ──
+    # Uses career-weighted position eligibility and per-position OAA to
+    # build a realistic depth chart, then scores roster resilience.
     try:
         player_teams_df = pd.read_parquet(DASHBOARD_DIR / "player_teams.parquet")
         hitter_r = pd.read_parquet(DASHBOARD_DIR / "hitters_rankings.parquet")
         pitcher_r = pd.read_parquet(DASHBOARD_DIR / "pitchers_rankings.parquet")
+        elig = pd.read_parquet(DASHBOARD_DIR / "hitter_position_eligibility.parquet")
 
         from src.data.db import read_sql as _rs3
         _tm3 = _rs3("SELECT team_id, abbreviation FROM production.dim_team")
@@ -1025,14 +1078,17 @@ def _build_health_depth(
              if c in pitcher_r.columns), None
         )
 
+        FIELDING_POSITIONS = ["C", "1B", "2B", "3B", "SS", "LF", "CF", "RF"]
+        ALL_LINEUP_SPOTS = FIELDING_POSITIONS + ["DH"]
+
         depth_rows = []
         if h_score_col and p_score_col:
-            # Map hitters/pitchers to teams
             h_pid = "batter_id" if "batter_id" in hitter_r.columns else "player_id"
             p_pid = "pitcher_id" if "pitcher_id" in pitcher_r.columns else "player_id"
             pt_pid = "batter_id" if "batter_id" in player_teams_df.columns else "player_id"
 
-            h_teams = hitter_r[[h_pid, h_score_col]].merge(
+            # Map players to teams
+            h_teams = hitter_r.merge(
                 player_teams_df[[pt_pid, "team_abbr"]].rename(columns={pt_pid: h_pid}),
                 on=h_pid, how="inner",
             )
@@ -1042,18 +1098,127 @@ def _build_health_depth(
                 on=p_pid, how="inner",
             )
 
+            # Build per-player position eligibility with OAA
+            elig_pid = "batter_id" if "batter_id" in elig.columns else "player_id"
+            if elig_pid != "player_id":
+                elig = elig.rename(columns={elig_pid: "player_id"})
+            oaa_col = "oaa" if "oaa" in elig.columns else None
+
             for abbr in h_teams["team_abbr"].unique():
                 tid = _abbr_tid3.get(abbr)
                 if tid is None:
                     continue
 
-                # Hitter depth
-                h_vals = (
-                    h_teams[h_teams["team_abbr"] == abbr][h_score_col]
-                    .sort_values(ascending=False).values
-                )
-                n_h = len(h_vals)
+                team_h = h_teams[h_teams["team_abbr"] == abbr].copy()
+                team_pids = set(team_h[h_pid])
 
+                # Player eligibility for this team
+                team_elig = elig[elig["player_id"].isin(team_pids)].copy()
+
+                # Build score + OAA lookup per (player, position)
+                score_lookup = dict(zip(team_h[h_pid], team_h[h_score_col]))
+                oaa_lookup = {}
+                if oaa_col and not team_elig.empty:
+                    for _, erow in team_elig.iterrows():
+                        oaa_lookup[(erow["player_id"], erow["position"])] = (
+                            erow[oaa_col] if pd.notna(erow[oaa_col]) else 0
+                        )
+
+                # Eligibility sets: which positions can each player play?
+                player_positions: dict[int, set[str]] = {}
+                for _, erow in team_elig.iterrows():
+                    pid = erow["player_id"]
+                    pos = erow["position"]
+                    if pos in ALL_LINEUP_SPOTS:
+                        player_positions.setdefault(pid, set()).add(pos)
+                # Add DH eligibility for everyone
+                for pid in team_pids:
+                    player_positions.setdefault(pid, set()).add("DH")
+
+                # --- Positional assignment (3-pass) ---
+                assigned: dict[str, int] = {}    # position -> player_id
+                used: set[int] = set()
+
+                # Pass 1: Lock single-fielding-position players
+                for pid, positions in player_positions.items():
+                    field_pos = positions & set(FIELDING_POSITIONS)
+                    if len(field_pos) == 1:
+                        pos = field_pos.pop()
+                        if pos not in assigned:
+                            assigned[pos] = pid
+                            used.add(pid)
+                        elif score_lookup.get(pid, 0) > score_lookup.get(assigned[pos], 0):
+                            # Better player bumps the existing one
+                            old = assigned[pos]
+                            assigned[pos] = pid
+                            used.discard(old)
+                            used.add(pid)
+
+                # Pass 2: Fill remaining positions by best OAA at each spot
+                open_positions = [p for p in FIELDING_POSITIONS if p not in assigned]
+                for pos in open_positions:
+                    candidates = [
+                        pid for pid, positions in player_positions.items()
+                        if pos in positions and pid not in used
+                    ]
+                    if not candidates:
+                        continue
+                    # Sort by OAA at this position (desc), then by value (desc)
+                    candidates.sort(key=lambda pid: (
+                        oaa_lookup.get((pid, pos), 0),
+                        score_lookup.get(pid, 0),
+                    ), reverse=True)
+                    assigned[pos] = candidates[0]
+                    used.add(candidates[0])
+
+                # Pass 3: DH = best remaining bat
+                if "DH" not in assigned:
+                    remaining = [
+                        pid for pid in team_pids if pid not in used
+                    ]
+                    if remaining:
+                        remaining.sort(
+                            key=lambda pid: score_lookup.get(pid, 0),
+                            reverse=True,
+                        )
+                        assigned["DH"] = remaining[0]
+                        used.add(remaining[0])
+
+                # --- Scoring ---
+                # Positional coverage: starter value at each filled position
+                pos_values = [
+                    score_lookup.get(assigned.get(pos), 0)
+                    for pos in ALL_LINEUP_SPOTS
+                ]
+                filled = sum(1 for v in pos_values if v > 0)
+                positional_avg = np.mean(pos_values) if pos_values else 0
+                weakest_link = min(pos_values) if pos_values else 0
+                coverage_pct = filled / len(ALL_LINEUP_SPOTS)
+
+                # Multi-position backup: positions with a qualified backup
+                backup_count = 0
+                multi_pos_players = 0
+                for pos in FIELDING_POSITIONS:
+                    starter = assigned.get(pos)
+                    backups = [
+                        pid for pid, positions in player_positions.items()
+                        if pos in positions and pid != starter
+                        and pid in team_pids
+                    ]
+                    if backups:
+                        backup_count += 1
+                for pid, positions in player_positions.items():
+                    field_pos = positions & set(FIELDING_POSITIONS)
+                    if len(field_pos) >= 2:
+                        multi_pos_players += 1
+                versatility = (
+                    0.60 * (backup_count / len(FIELDING_POSITIONS))
+                    + 0.40 * min(multi_pos_players / 5, 1.0)
+                )
+
+                # Traditional depth metrics (keep existing)
+                h_vals = team_h[h_score_col].sort_values(ascending=False).values
+                n_h = len(h_vals)
                 if n_h >= 5:
                     top3_share = h_vals[:3].sum() / (h_vals.sum() + 1e-9)
                     starter_avg = h_vals[:min(9, n_h)].mean()
@@ -1076,35 +1241,64 @@ def _build_health_depth(
 
                 depth_rows.append({
                     "team_id": tid,
+                    # Traditional
                     "concentration": top3_share,
                     "replacement_gap": h_gap,
                     "bench_quality": h_bench_q,
                     "pitcher_bench": p_bench_q,
                     "roster_breadth": roster_breadth,
+                    # Positional
+                    "positional_avg": positional_avg,
+                    "weakest_link": weakest_link,
+                    "coverage_pct": coverage_pct,
+                    "versatility": versatility,
                 })
 
         if depth_rows:
             depth_df = pd.DataFrame(depth_rows)
+
+            # Traditional depth percentiles
             conc_pctl = 1.0 - _pctl(depth_df["concentration"])
             gap_pctl = 1.0 - _pctl(depth_df["replacement_gap"])
             bench_pctl = _pctl(depth_df["bench_quality"])
             pbench_pctl = _pctl(depth_df["pitcher_bench"])
-            breadth_pctl = _pctl(depth_df["roster_breadth"])
 
-            depth_df["roster_depth_score"] = (
-                0.30 * conc_pctl
-                + 0.25 * gap_pctl
-                + 0.20 * bench_pctl
-                + 0.15 * pbench_pctl
-                + 0.10 * breadth_pctl
+            # Positional depth percentiles
+            posavg_pctl = _pctl(depth_df["positional_avg"])
+            weakest_pctl = _pctl(depth_df["weakest_link"])
+            coverage_pctl = _pctl(depth_df["coverage_pct"])
+            versatility_pctl = _pctl(depth_df["versatility"])
+
+            # Positional coverage sub-score
+            depth_df["positional_fit"] = (
+                0.50 * posavg_pctl
+                + 0.30 * weakest_pctl
+                + 0.20 * coverage_pctl
             )
+
+            # Combined roster depth: traditional (40%) + positional (40%) + versatility (20%)
+            depth_df["roster_depth_score"] = (
+                # Traditional (40%)
+                0.12 * conc_pctl
+                + 0.10 * gap_pctl
+                + 0.10 * bench_pctl
+                + 0.08 * pbench_pctl
+                # Positional fit (40%)
+                + 0.40 * depth_df["positional_fit"]
+                # Bench versatility (20%)
+                + 0.20 * versatility_pctl
+            )
+
             result = result.merge(
                 depth_df[["team_id", "roster_depth_score", "concentration",
                           "replacement_gap", "bench_quality", "pitcher_bench",
-                          "roster_breadth"]],
+                          "roster_breadth", "positional_fit", "versatility"]],
                 on="team_id", how="left",
             )
-            logger.info("Roster depth computed for %d teams", len(depth_df))
+            logger.info(
+                "Roster depth computed for %d teams (positional + traditional)",
+                len(depth_df),
+            )
     except Exception as e:
         logger.warning("Could not compute roster depth metrics: %s", e)
 
@@ -1228,17 +1422,42 @@ def build_all_team_profiles(
     # Filter player_teams by current roster status (active + IL only, exclude
     # NRI/suspended/unavailable). This ensures team aggregations reflect the
     # projected Opening Day roster, not everyone who appeared in 2025 boxscores.
+    #
+    # IL availability weighting: players on IL contribute less to team strength.
+    # IL-60 players (Strider, etc.) are essentially unavailable for months and
+    # should not inflate a team's projected pitching/offense scores.
+    _IL_AVAILABILITY = {
+        "active": 1.0,
+        "il_7": 0.90,    # back in ~1 week
+        "il_10": 0.75,   # back in ~2 weeks
+        "il_15": 0.50,   # back in ~3 weeks
+        "il_60": 0.10,   # out for months, minimal contribution
+    }
     roster = _safe_load("roster.parquet")
     if roster is not None and "roster_status" in roster.columns:
-        # Keep active + IL players (IL players are still on the 40-man and expected back)
-        active_mask = roster["roster_status"].isin(["active", "il_7", "il_10", "il_15", "il_60"])
-        active_ids = set(roster.loc[active_mask, "player_id"])
+        active_mask = roster["roster_status"].isin(_IL_AVAILABILITY.keys())
+        roster_filtered = roster.loc[active_mask, ["player_id", "roster_status"]].copy()
+        roster_filtered["availability"] = roster_filtered["roster_status"].map(_IL_AVAILABILITY)
+
+        active_ids = set(roster_filtered["player_id"])
         before_n = len(player_teams)
         player_teams = player_teams[player_teams["player_id"].isin(active_ids)].copy()
-        logger.info("Roster filter: %d → %d players (active + IL from roster.parquet)",
-                     before_n, len(player_teams))
+
+        # Merge availability weight into player_teams
+        player_teams = player_teams.merge(
+            roster_filtered[["player_id", "availability", "roster_status"]],
+            on="player_id", how="left",
+        )
+        player_teams["availability"] = player_teams["availability"].fillna(1.0)
+
+        n_il = (player_teams["availability"] < 1.0).sum()
+        logger.info(
+            "Roster filter: %d -> %d players (%d on IL with reduced availability)",
+            before_n, len(player_teams), n_il,
+        )
     else:
         logger.warning("roster.parquet not found — using unfiltered player_teams")
+        player_teams["availability"] = 1.0
 
     # Map player_teams to include team_id
     if "team_id" not in player_teams.columns and "team_abbr" in player_teams.columns:
@@ -1459,6 +1678,7 @@ def build_all_team_profiles(
         (health, ["health_depth_score", "roster_depth_score",
                   "concentration", "replacement_gap", "bench_quality",
                   "pitcher_bench", "roster_breadth",
+                  "positional_fit", "versatility",
                   "total_il_days", "avg_age", "age_trajectory",
                   "roster_continuity", "players_retained", "players_new"]),
         (schedule, ["schedule_score", "avg_opp_elo", "big_game_pct", "div_avg_elo"]),

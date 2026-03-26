@@ -43,6 +43,11 @@ _CLIP_HI = 1 - 1e-6
 # Maximum PA per game (safety valve)
 MAX_PA_PER_GAME = 45
 
+# Default exit model calibration offset (logit scale).
+# The exit model over-predicts exit probability, pulling pitchers ~1.4 BF early.
+# This offset reduces exit probability to match observed BF distribution.
+_DEFAULT_EXIT_CALIBRATION_OFFSET = -0.35
+
 
 @dataclass
 class SimulationResult:
@@ -145,6 +150,7 @@ def simulate_game(
     umpire_bb_lift: float = 0.0,
     park_hr_lift: float = 0.0,
     weather_k_lift: float = 0.0,
+    exit_calibration_offset: float = _DEFAULT_EXIT_CALIBRATION_OFFSET,
     n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> SimulationResult:
@@ -185,6 +191,9 @@ def simulate_game(
         Park HR logit lift.
     weather_k_lift : float
         Weather K logit lift.
+    exit_calibration_offset : float
+        Logit-scale offset for exit model probabilities. Negative values
+        reduce exit probability (pitcher stays in longer).
     n_sims : int
         Number of Monte Carlo simulations.
     random_seed : int
@@ -400,6 +409,12 @@ def simulate_game(
             pitcher_avg_pitches=pitcher_avg_pitches,
         )
 
+        # Apply calibration offset (logit scale)
+        if exit_calibration_offset != 0.0:
+            exit_prob = np.clip(exit_prob, _CLIP_LO, _CLIP_HI)
+            exit_logit = logit(exit_prob) + exit_calibration_offset
+            exit_prob = expit(exit_logit)
+
         # Draw exit decisions
         exit_draw = rng.random(n_active) < exit_prob
         exits = force_exit | exit_draw
@@ -533,4 +548,5 @@ def predict_game(
         "bb_over_probs": result.over_probs("bb"),
         "h_over_probs": result.over_probs("h"),
         "hr_over_probs": result.over_probs("hr"),
+        "outs_over_probs": result.over_probs("outs"),
     }

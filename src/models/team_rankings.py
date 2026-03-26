@@ -32,10 +32,10 @@ _TALENT_WEIGHTS = {
     # Walk-forward validated 2022-2025 (team_ranking_validation.py).
     # Rotation and defense were massively underweighted; offense overweighted.
     # Depth signal is real but noisy — keeps a modest weight.
-    "offense": 0.18,     # Lineup diamond (starters + bench)
+    "offense": 0.25,     # Lineup diamond (starters + bench)
     "rotation": 0.30,    # Top 5 SP diamond — strongest validated signal
     "bullpen": 0.12,     # Role-weighted RP diamond
-    "defense": 0.25,     # OAA + framing — second strongest validated signal
+    "defense": 0.18,     # OAA + framing
     "depth": 0.15,       # Health/depth + roster concentration/gaps
 }
 # Performance + projection signal (sum to 0.45)
