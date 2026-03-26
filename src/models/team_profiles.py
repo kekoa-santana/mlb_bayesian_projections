@@ -180,6 +180,9 @@ def _build_offense_profile(
                 how="inner",
             )
 
+            # Save raw (full-health) score for ceiling calculation
+            rank_merged["_raw_score"] = rank_merged[score_col].copy()
+
             # Blend IL player scores with replacement level.
             # IL-60: 10% their score + 90% replacement — someone else fills
             # the slot, but they'll return and add value when healthy.
@@ -219,6 +222,15 @@ def _build_offense_profile(
                     "avg_hitter_score": wtd_avg,
                     "lineup_floor": g.nlargest(min(len(g), 8), score_col)[score_col].iloc[-1] if len(g) >= 7 else 0.0,
                 }
+                # Ceiling: full-health top-9 (no IL discount)
+                if "_raw_score" in g.columns:
+                    top9_ceil = g.nlargest(9, "_raw_score")
+                    ceil_scores = top9_ceil["_raw_score"].values
+                    ceil_w = top9_ceil[pa_weight_col].values
+                    result["avg_hitter_score_ceiling"] = (
+                        float(np.average(ceil_scores, weights=ceil_w))
+                        if ceil_w.sum() > 0 else ceil_scores.mean()
+                    )
                 # Aggregate scouting grades for top-9 lineup
                 for gc in _GRADE_COLS:
                     if gc in top9.columns and top9[gc].notna().any():
@@ -307,6 +319,34 @@ def _build_offense_profile(
     else:
         teams["offense_score"] = 0.5
 
+    # Offense ceiling: same formula but using full-health avg_hitter_score
+    if "avg_hitter_score_ceiling" in teams.columns:
+        ceil_weights = _OFF_WEIGHTS.copy()
+        ceil_weights["avg_hitter_score"] = ceil_weights.pop("avg_hitter_score")
+        teams["_ceil_hitter_pctl"] = _pctl(
+            teams["avg_hitter_score_ceiling"].fillna(teams["avg_hitter_score_ceiling"].median())
+        )
+        # Use ceiling hitter score + same rpg/floor/depth
+        ceil_pctls = []
+        ceil_w = []
+        for c, w in _OFF_WEIGHTS.items():
+            if c == "avg_hitter_score":
+                ceil_pctls.append(teams["_ceil_hitter_pctl"])
+            elif f"{c}_pctl" in teams.columns:
+                ceil_pctls.append(teams[f"{c}_pctl"])
+            else:
+                continue
+            ceil_w.append(w)
+        if ceil_pctls:
+            cw = np.array(ceil_w)
+            cw = cw / cw.sum()
+            teams["offense_ceiling"] = sum(
+                w * p for w, p in zip(cw, ceil_pctls)
+            )
+        teams.drop(columns=["_ceil_hitter_pctl"], inplace=True, errors="ignore")
+    else:
+        teams["offense_ceiling"] = teams["offense_score"]
+
     return teams
 
 
@@ -344,6 +384,9 @@ def _build_pitching_profile(
                 on=pid_col,
                 how="inner",
             )
+
+            # Save raw for ceiling
+            pr_merged["_raw_score"] = pr_merged[score_col].copy()
 
             # Blend IL pitcher scores with replacement level
             if "availability" in pr_merged.columns:
@@ -390,8 +433,21 @@ def _build_pitching_profile(
 
                 result = {
                     "rotation_strength": float(np.average(s, weights=w)) if w.sum() > 0 else s.mean(),
-                    "rotation_sp_count": n_actual,  # track actual SP count
+                    "rotation_sp_count": n_actual,
                 }
+
+                # Ceiling: full-health rotation
+                if "_raw_score" in g.columns:
+                    ceil_top5 = g.nlargest(5, "_raw_score")
+                    cs = ceil_top5["_raw_score"].values
+                    cw = ceil_top5[ip_weight_col].values
+                    n_c = len(ceil_top5)
+                    if n_c < _MIN_SP:
+                        cs = np.append(cs, [0.40] * (_MIN_SP - n_c))
+                        cw = np.append(cw, [100.0] * (_MIN_SP - n_c))
+                    result["rotation_strength_ceiling"] = (
+                        float(np.average(cs, weights=cw)) if cw.sum() > 0 else cs.mean()
+                    )
                 # Aggregate pitcher scouting grades for top-5 rotation
                 for gc in _P_GRADE_COLS:
                     if gc in top5.columns and top5[gc].notna().any():
@@ -632,6 +688,19 @@ def _build_pitching_profile(
 
     # --- Pitching composite (backward compat) ---
     teams["pitching_score"] = 0.55 * teams["rotation_score"] + 0.45 * teams["bullpen_score"]
+
+    # Pitching ceiling: use full-health rotation strength
+    if "rotation_strength_ceiling" in teams.columns:
+        # Recompute rotation_score_ceiling from raw ceiling strength
+        if "rotation_strength" in teams.columns:
+            ceil_rot_pctl = _pctl(teams["rotation_strength_ceiling"].fillna(
+                teams["rotation_strength_ceiling"].median()
+            ))
+            teams["pitching_ceiling"] = 0.55 * ceil_rot_pctl + 0.45 * teams["bullpen_score"]
+        else:
+            teams["pitching_ceiling"] = teams["pitching_score"]
+    else:
+        teams["pitching_ceiling"] = teams["pitching_score"]
 
     return teams
 
@@ -1652,7 +1721,8 @@ def build_all_team_profiles(
 
     # Merge all dimensions
     result = offense[["team_id", "offense_score"]].copy()
-    for extra_col in ["offense_style", "lineup_depth", "lineup_floor", "rpg", "hr_per_game", "sb_per_game",
+    for extra_col in ["offense_ceiling",
+                       "offense_style", "lineup_depth", "lineup_floor", "rpg", "hr_per_game", "sb_per_game",
                        "proj_R", "proj_HR", "proj_SB", "avg_hitter_score",
                        "baseruns_rs", "proj_rs_per_game",
                        # Lineup scouting grades
@@ -1662,8 +1732,10 @@ def build_all_team_profiles(
             result[extra_col] = offense[extra_col]
 
     for df, key_cols in [
-        (pitching, ["pitching_score", "rotation_score", "bullpen_score",
-                     "rotation_strength", "bullpen_depth",
+        (pitching, ["pitching_score", "pitching_ceiling",
+                     "rotation_score", "bullpen_score",
+                     "rotation_strength", "rotation_strength_ceiling",
+                     "bullpen_depth",
                      "pitching_style", "ra_per_game", "k_per_game",
                      "proj_ra_per_game",
                      # Rotation + bullpen scouting grades

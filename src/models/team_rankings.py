@@ -237,9 +237,11 @@ def rank_teams(
     ]
     # Add optional enrichment columns
     optional = [
+        "offense_ceiling", "pitching_ceiling",
         "offense_style", "pitching_style", "age_trajectory",
         "rpg", "ra_per_game", "hr_per_game", "k_per_game",
-        "rotation_strength", "bullpen_depth", "lineup_depth",
+        "rotation_strength", "rotation_strength_ceiling",
+        "bullpen_depth", "lineup_depth",
         "team_oaa", "catcher_framing_runs",
         "pct_homegrown", "farm_avg_score", "n_ranked_prospects", "top_100_count",
         "total_il_days", "avg_age",

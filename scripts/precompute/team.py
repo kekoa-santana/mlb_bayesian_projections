@@ -248,9 +248,55 @@ def run_team_power() -> None:
                 pitcher_glicko_path=_pg_path if _pg_path.exists() else None,
                 team_sim=_team_sim,
             )
+            # Save power rankings standalone (backward compat)
             power_rankings_df.to_parquet(
                 DASHBOARD_DIR / "team_power_rankings.parquet", index=False,
             )
+
+            # Merge power ranking columns INTO team_rankings.parquet
+            # so the dashboard gets one unified file with:
+            #   - Power rank/tier/score (overall ranking)
+            #   - All sub-scores (offense, pitching, defense, etc.)
+            #   - Current + ceiling scores
+            #   - Diamond grades, scouting grades
+            _tr_path = DASHBOARD_DIR / "team_rankings.parquet"
+            if _tr_path.exists():
+                tr = pd.read_parquet(_tr_path)
+                # Columns from power rankings to merge in
+                power_cols = [
+                    "team_id", "power_score", "power_rank", "power_tier",
+                    "wins_component", "form_component", "depth_component",
+                    "trajectory_component", "elo_component",
+                    "projection_component", "profile_component",
+                    "glicko_component", "breakout_count", "regression_count",
+                    "net_trajectory", "baseruns_wins", "sim_wins",
+                    "depth_confidence", "team_batting_glicko",
+                    "team_pitching_glicko",
+                ]
+                power_cols = [c for c in power_cols if c in power_rankings_df.columns]
+                tr = tr.merge(
+                    power_rankings_df[power_cols],
+                    on="team_id", how="left", suffixes=("", "_pw"),
+                )
+                # Use power ranking as THE rank
+                if "power_rank" in tr.columns:
+                    tr["rank"] = tr["power_rank"]
+                    tr["tier"] = tr["power_tier"]
+                    # Re-derive TDD score (1-10) from power_score
+                    ps = tr["power_score"]
+                    ps_min, ps_max = ps.min(), ps.max()
+                    if ps_max - ps_min > 1e-9:
+                        tr["tdd_score"] = (
+                            1.0 + (ps - ps_min) / (ps_max - ps_min) * 9.0
+                        ).round(1)
+                    tr = tr.sort_values("rank").reset_index(drop=True)
+
+                tr.to_parquet(_tr_path, index=False)
+                logger.info(
+                    "Merged power rankings into team_rankings.parquet: %d teams",
+                    len(tr),
+                )
+
             logger.info("Saved team_power_rankings.parquet: %d teams", len(power_rankings_df))
             for _, row in power_rankings_df.head(10).iterrows():
                 logger.info(
