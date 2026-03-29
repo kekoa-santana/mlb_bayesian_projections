@@ -35,7 +35,7 @@ from src.data.queries import (
     get_weather_effects,
 )
 from src.models.game_sim.exit_model import ExitModel
-from src.models.game_sim.simulator import simulate_game
+from src.models.game_sim.simulator import simulate_game, compute_stamina_offset
 from src.models.game_sim.tto_model import build_all_tto_lifts
 from src.models.matchup import score_matchup_for_stat
 from src.models.pitcher_k_rate_model import (
@@ -507,8 +507,16 @@ def build_game_sim_predictions(
         ]
         if len(tend_row) > 0:
             avg_pitches = float(tend_row.iloc[0]["avg_pitches"])
+            avg_ip = (
+                float(tend_row.iloc[0]["avg_ip"])
+                if "avg_ip" in tend_row.columns
+                and pd.notna(tend_row.iloc[0].get("avg_ip"))
+                else 5.28
+            )
         else:
             avg_pitches = 88.0
+            avg_ip = 5.2
+        stamina_offset = compute_stamina_offset(avg_ip)
 
         # Context lifts
         ump_k = umpire_lifts["k"].get(game_pk, 0.0)
@@ -538,6 +546,7 @@ def build_game_sim_predictions(
                 batter_ppa_adjs=batter_adjs,
                 exit_model=exit_model,
                 pitcher_avg_pitches=avg_pitches,
+                exit_calibration_offset=stamina_offset,
                 umpire_k_lift=ump_k,
                 umpire_bb_lift=ump_bb,
                 park_hr_lift=park_hr,
@@ -604,7 +613,7 @@ def build_game_sim_predictions(
             "expected_pitches": summary["pitch_count"]["mean"],
             "expected_outs": summary["outs"]["mean"],
             "std_outs": summary["outs"]["std"],
-            "expected_ip": float(np.mean(sim_result.ip_samples())),
+            "expected_ip": float(np.mean(sim_result.outs_samples)) / 3.0,
             "expected_runs": summary["runs"]["mean"],
             # Actuals
             "actual_k": actual_k,

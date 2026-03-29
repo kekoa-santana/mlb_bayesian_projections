@@ -61,6 +61,10 @@ _LEVEL_MAP = {"A": 1, "A+": 2, "AA": 3, "AAA": 4}
 # PA scaling by level (same as augmentation)
 _LEVEL_PA_SCALE = {"AAA": 0.80, "AA": 0.55, "A+": 0.40, "A": 0.30}
 
+# Recency decay half-life for MiLB aggregation (years).
+# Matches prospect_ranking.py — 2yr half-life so current data dominates.
+_RECENCY_HALF_LIFE = 2.0
+
 
 def _load_org_depth() -> pd.DataFrame:
     """Load or build organizational depth data from prospect snapshots.
@@ -173,9 +177,14 @@ def _build_prospect_features(
         if total_pa < min_pa:
             continue
 
-        # Weight by translation confidence * PA (AAA data counts more than A-ball)
+        # Weight by translation confidence * PA * recency decay
+        # (AAA data counts more than A-ball; recent seasons count more than old ones)
         conf = grp["translation_confidence"].fillna(0.5) if "translation_confidence" in grp.columns else pd.Series(0.5, index=grp.index)
-        conf_pa = conf * grp["pa"]
+        max_season = grp["season"].max()
+        recency = np.exp(
+            -np.log(2) * (max_season - grp["season"]) / _RECENCY_HALF_LIFE
+        )
+        conf_pa = conf * grp["pa"] * recency
         conf_pa_sum = conf_pa.sum()
         if conf_pa_sum > 0:
             wtd_k = (grp["translated_k_pct"] * conf_pa).sum() / conf_pa_sum
@@ -189,11 +198,11 @@ def _build_prospect_features(
             wtd_hr_pa = (grp["translated_hr_pa"] * grp["pa"]).sum() / total_pa if "translated_hr_pa" in grp.columns else 0
         total_sb = grp["sb"].sum() if "sb" in grp.columns else 0
 
-        # GB rate (confidence-weighted, if available)
+        # GB rate (confidence × recency weighted, if available)
         if "translated_gb_pct" in grp.columns and grp["translated_gb_pct"].notna().any():
             gb_valid = grp[grp["translated_gb_pct"].notna()]
             if conf_pa_sum > 0 and not gb_valid.empty:
-                gb_conf_pa = conf[gb_valid.index] * gb_valid["pa"]
+                gb_conf_pa = conf[gb_valid.index] * gb_valid["pa"] * recency[gb_valid.index]
                 wtd_gb = (gb_valid["translated_gb_pct"] * gb_conf_pa).sum() / gb_conf_pa.sum() if gb_conf_pa.sum() > 0 else np.nan
             else:
                 wtd_gb = (gb_valid["translated_gb_pct"] * gb_valid["pa"]).sum() / gb_valid["pa"].sum() if gb_valid["pa"].sum() > 0 else np.nan

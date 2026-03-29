@@ -680,3 +680,155 @@ def add_age_context(
 
     df.drop(columns=["birth_date", "level_avg_age"], inplace=True)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Step 5: FV-conditioned translation adjustments
+# ---------------------------------------------------------------------------
+# Population-level translation factors assume all prospects translate the same
+# way.  Empirical analysis shows that FanGraphs Future Value (FV) grade
+# predicts differential translation for certain stat/level combos:
+#
+# Batters:
+#   - ISO at AAA: FV 60+ retains 83% of power vs 72% for FV 50-55 (+14%)
+#   - ISO at AA:  FV 60+ retains 81% vs 77% pooled (+5%)
+#   - K% at AA:   FV 60+ K ratio 1.207 vs 1.258 pooled (-4%, elite K less)
+#
+# Pitchers:
+#   - K% at AA:  FV 60+ retains 82% of K% vs 78% pooled (+6%)
+#   - K% at A+:  FV 60+ retains 83% vs 73% pooled (+7%, small n=12)
+#   - K% at AAA: NOT conditioned — selection bias reverses signal
+#
+# Multipliers are applied on top of the pooled factor:
+#   adjusted_rate = translated_rate * fv_multiplier
+#
+# Stats/levels without a clear signal keep multiplier = 1.0 (no adjustment).
+
+_FV_PITCHER_K_MULT: dict[str, dict[str, float]] = {
+    # level: {fv_tier: multiplier vs pooled}
+    "AA":  {"high": 1.06, "mid": 0.96, "low": 1.00},
+    "A+":  {"high": 1.07, "mid": 0.96, "low": 1.00},
+    # AAA omitted: selection bias reverses the signal (n=30, ratio 0.741)
+    # A omitted: insufficient FV 60+ sample
+}
+
+_FV_BATTER_ISO_MULT: dict[str, dict[str, float]] = {
+    "AAA": {"high": 1.14, "mid": 0.99, "low": 1.00},
+    "AA":  {"high": 1.05, "mid": 1.02, "low": 1.00},
+    "A+":  {"high": 1.04, "mid": 0.89, "low": 1.00},
+}
+
+_FV_BATTER_K_MULT: dict[str, dict[str, float]] = {
+    "AA":  {"high": 0.96, "mid": 0.99, "low": 1.00},
+    "AAA": {"high": 0.99, "mid": 1.02, "low": 1.00},
+}
+
+
+def _fv_to_tier(fv: float | int | None) -> str:
+    """Map FV grade to tier for multiplier lookup.
+
+    high: FV >= 60  (elite prospects)
+    mid:  FV 50–55  (solid prospects)
+    low:  FV <= 45 or unknown  (population baseline, multiplier = 1.0)
+    """
+    if fv is None or (isinstance(fv, float) and np.isnan(fv)):
+        return "low"
+    if fv >= 60:
+        return "high"
+    if fv >= 50:
+        return "mid"
+    return "low"
+
+
+def apply_fv_adjustments(
+    df: pd.DataFrame,
+    fv_map: dict[int, float],
+    player_type: str = "pitcher",
+) -> pd.DataFrame:
+    """Apply FV-conditioned multipliers to translated MiLB rates.
+
+    Adjusts the ``translated_*`` columns in-place based on each prospect's
+    FanGraphs Future Value grade.  Only stat/level combos with empirically
+    validated signal get adjusted; all others keep multiplier = 1.0.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Translated MiLB data (per-level rows).  Must have ``player_id``,
+        ``level``, and the relevant ``translated_*`` columns.
+    fv_map : dict[int, float]
+        ``{player_id: FV_grade}`` lookup.
+    player_type : {'pitcher', 'batter'}
+        Selects which multiplier tables to apply.
+
+    Returns
+    -------
+    pd.DataFrame
+        Same shape, translated rates adjusted where applicable.
+    """
+    df = df.copy()
+    df["_fv_tier"] = df["player_id"].map(fv_map).apply(_fv_to_tier)
+
+    n_adjusted = 0
+
+    if player_type == "pitcher":
+        col = "translated_k_pct"
+        for level, mults in _FV_PITCHER_K_MULT.items():
+            for tier, mult in mults.items():
+                if mult == 1.0:
+                    continue
+                mask = (df["level"] == level) & (df["_fv_tier"] == tier)
+                count = mask.sum()
+                if count > 0:
+                    df.loc[mask, col] *= mult
+                    n_adjusted += count
+
+    elif player_type == "batter":
+        # ISO adjustment
+        if "translated_iso" in df.columns:
+            for level, mults in _FV_BATTER_ISO_MULT.items():
+                for tier, mult in mults.items():
+                    if mult == 1.0:
+                        continue
+                    mask = (df["level"] == level) & (df["_fv_tier"] == tier)
+                    count = mask.sum()
+                    if count > 0:
+                        df.loc[mask, "translated_iso"] *= mult
+                        n_adjusted += count
+
+        # K% adjustment
+        for level, mults in _FV_BATTER_K_MULT.items():
+            for tier, mult in mults.items():
+                if mult == 1.0:
+                    continue
+                mask = (df["level"] == level) & (df["_fv_tier"] == tier)
+                count = mask.sum()
+                if count > 0:
+                    df.loc[mask, "translated_k_pct"] *= mult
+                    n_adjusted += count
+
+        # Update hr_pa from ISO if available (ISO drives HR translation)
+        if "translated_iso" in df.columns and "translated_hr_pa" in df.columns:
+            # HR/PA scales roughly proportionally with ISO adjustments
+            for level, mults in _FV_BATTER_ISO_MULT.items():
+                for tier, mult in mults.items():
+                    if mult == 1.0:
+                        continue
+                    mask = (df["level"] == level) & (df["_fv_tier"] == tier)
+                    if mask.any():
+                        df.loc[mask, "translated_hr_pa"] *= mult
+
+    if n_adjusted > 0:
+        tier_counts = df["_fv_tier"].value_counts()
+        logger.info(
+            "Applied FV adjustments to %d %s rows "
+            "(high=%d, mid=%d, low=%d [unchanged])",
+            n_adjusted,
+            player_type,
+            tier_counts.get("high", 0),
+            tier_counts.get("mid", 0),
+            tier_counts.get("low", 0),
+        )
+
+    df.drop(columns=["_fv_tier"], inplace=True)
+    return df

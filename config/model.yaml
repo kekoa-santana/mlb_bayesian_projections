@@ -69,11 +69,11 @@ team_elo:
   k_factor_ds: 14   # Division Series
   k_factor_cs: 18   # League Championship Series
   k_factor_ws: 22   # World Series
-  season_regression: 0.40
+  season_regression: 0.15     # light regression; roster adjustment carries turnover signal
   margin_log_base: 1.5
   sp_weight: 0.40
   sp_k_factor: 6
-  sp_regression: 0.50
+  sp_regression: 0.25       # SP regression lighter too; individual track records are stable
   # Roster talent adjustment: shift regressed ELO by offseason roster changes
   roster_adjustment_weight: 15.0   # ELO points per unit of avg tdd_value_score delta
   roster_adjustment_cap: 40.0      # max ELO shift per team per component
@@ -85,7 +85,7 @@ series_elo:
   k_factor_ds: 16       # Division Series (best of 5)
   k_factor_cs: 20       # LCS (best of 7)
   k_factor_ws: 24       # World Series (best of 7)
-  season_regression: 0.35   # lighter than game ELO (0.40) -- series are less noisy
+  season_regression: 0.15     # aligned with game ELO; roster adjustment handles turnover
   margin_bonus: 0.15        # extra K multiplier for sweeps
   game_elo_blend: 0.55      # weight of game ELO in blended component
   series_elo_blend: 0.45    # weight of series ELO
@@ -93,10 +93,10 @@ series_elo:
 power_rankings:
   # Phase 4: De-correlated orthogonal components
   # Each component captures genuinely different information.
-  projected_wins_weight: 0.50   # BaseRuns/sim projected wins (additive run/win, Phase 6)
-  recent_form_weight: 0.20      # ELO (backward-looking momentum only)
-  depth_fragility_weight: 0.20  # Downside risk, roster concentration, bench quality
-  trajectory_weight: 0.10       # Net breakouts - regressions (team is improving/declining)
+  projected_wins_weight: 0.60   # Blended RS/RA Pythagorean wins — primary driver
+  recent_form_weight: 0.15      # ELO (backward-looking momentum only)
+  depth_fragility_weight: 0.10  # Downside risk (reduced until depth metric enriched)
+  trajectory_weight: 0.15       # Net breakouts - regressions (team is improving/declining)
   # Legacy weights retained for backward compat but not used in new path
   elo_weight: 0.25
   projection_weight: 0.20

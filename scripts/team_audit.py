@@ -81,7 +81,7 @@ for _, team_row in teams_sorted.iterrows():
     if team_h.empty:
         print("  [No hitters found for this team]")
     else:
-        team_h = team_h.sort_values("diamond_rating", ascending=False)
+        team_h = team_h.sort_values("tools_rating", ascending=False)
         print(f"  LINEUP ({len(team_h)} hitters on active roster)")
         print(f"  {'Name':22s} {'Pos':3s} {'Age':>3s} {'DR':>4s}  {'H':>3s} {'P':>3s} {'Sp':>3s} {'F':>3s} {'D':>3s}  {'PA':>4s} {'wRC+':>5s} {'ProjwRC+':>8s} {'Flag':s}")
 
@@ -96,26 +96,26 @@ for _, team_row in teams_sorted.iterrows():
             flags = []
             if pa < 300:
                 flags.append(f"LOW PA({pa})")
-            if pd.notna(wrc) and pd.notna(r.get("diamond_rating")):
-                if wrc > 140 and r["diamond_rating"] < 6.0:
+            if pd.notna(wrc) and pd.notna(r.get("tools_rating")):
+                if wrc > 140 and r["tools_rating"] < 6.0:
                     flags.append("UNDERGRADED")
-                if wrc < 90 and r["diamond_rating"] > 6.5:
+                if wrc < 90 and r["tools_rating"] > 6.5:
                     flags.append("OVERGRADED")
             flag_s = " ".join(flags)
 
             marker = "*" if i < 9 else " "  # top 9 = starters
-            print(f"  {marker}{r['batter_name']:21s} {r['position']:3s} {int(r['age']):3d} {r['diamond_rating']:4.1f}  {int(r['grade_hit']):3d} {int(r['grade_power']):3d} {int(r['grade_speed']):3d} {int(r['grade_fielding']):3d} {int(r['grade_discipline']):3d}  {pa:4d} {wrc_s:>5s} {proj_s:>8s} {flag_s}")
+            print(f"  {marker}{r['batter_name']:21s} {r['position']:3s} {int(r['age']):3d} {r['tools_rating']:4.1f}  {int(r['grade_hit']):3d} {int(r['grade_power']):3d} {int(r['grade_speed']):3d} {int(r['grade_fielding']):3d} {int(r['grade_discipline']):3d}  {pa:4d} {wrc_s:>5s} {proj_s:>8s} {flag_s}")
 
         # Top booster / worst drag
         if len(team_h) >= 2:
             best = team_h.iloc[0]
             worst_starter = team_h.head(9).iloc[-1] if len(team_h) >= 9 else team_h.iloc[-1]
-            avg_dr = team_h.head(9)["diamond_rating"].mean()
-            print(f"  >> Lineup avg DR: {avg_dr:.1f} | Best: {best['batter_name']} ({best['diamond_rating']:.1f}) | Floor: {worst_starter['batter_name']} ({worst_starter['diamond_rating']:.1f})")
+            avg_dr = team_h.head(9)["tools_rating"].mean()
+            print(f"  >> Lineup avg DR: {avg_dr:.1f} | Best: {best['batter_name']} ({best['tools_rating']:.1f}) | Floor: {worst_starter['batter_name']} ({worst_starter['tools_rating']:.1f})")
 
     # === ROTATION ===
     team_sp = p_team[(p_team["team_abbr"] == abbr) & (p_team["role"] == "SP")].copy()
-    team_sp = team_sp.sort_values("diamond_rating", ascending=False)
+    team_sp = team_sp.sort_values("tools_rating", ascending=False)
     print()
     print(f"  ROTATION ({len(team_sp)} SP)")
     print(f"  {'Name':22s} {'Age':>3s} {'DR':>4s}  {'St':>3s} {'Cm':>3s} {'Du':>3s}  {'K%':>5s} {'BB%':>5s} {'ERA':>5s} {'Stuff+':>6s} {'Flag':s}")
@@ -124,20 +124,20 @@ for _, team_row in teams_sorted.iterrows():
         era = f"{r['projected_era']:.2f}" if pd.notna(r.get("projected_era")) else "--"
         sp = f"{r['arsenal_stuff_plus']:.0f}" if pd.notna(r.get("arsenal_stuff_plus")) else "--"
         flags = []
-        if pd.notna(r.get("projected_era")) and r["projected_era"] < 3.0 and r["diamond_rating"] < 6.0:
+        if pd.notna(r.get("projected_era")) and r["projected_era"] < 3.0 and r["tools_rating"] < 6.0:
             flags.append("UNDERGRADED")
-        if pd.notna(r.get("projected_era")) and r["projected_era"] > 5.0 and r["diamond_rating"] > 6.5:
+        if pd.notna(r.get("projected_era")) and r["projected_era"] > 5.0 and r["tools_rating"] > 6.5:
             flags.append("OVERGRADED")
         flag_s = " ".join(flags)
-        print(f"  {r['pitcher_name']:22s} {int(r['age']):3d} {r['diamond_rating']:4.1f}  {int(r['grade_stuff']):3d} {int(r['grade_command']):3d} {int(r['grade_durability']):3d}  {r['k_pct']:.1%} {r['bb_pct']:.1%} {era:>5s} {sp:>6s} {flag_s}")
+        print(f"  {r['pitcher_name']:22s} {int(r['age']):3d} {r['tools_rating']:4.1f}  {int(r['grade_stuff']):3d} {int(r['grade_command']):3d} {int(r['grade_durability']):3d}  {r['k_pct']:.1%} {r['bb_pct']:.1%} {era:>5s} {sp:>6s} {flag_s}")
 
     if len(team_sp) >= 2:
-        avg_sp = team_sp.head(5)["diamond_rating"].mean()
+        avg_sp = team_sp.head(5)["tools_rating"].mean()
         print(f"  >> Rotation avg DR: {avg_sp:.1f}")
 
     # === BULLPEN ===
     team_rp = p_team[(p_team["team_abbr"] == abbr) & (p_team["role"] == "RP")].copy()
-    team_rp = team_rp.sort_values("diamond_rating", ascending=False)
+    team_rp = team_rp.sort_values("tools_rating", ascending=False)
     print()
     print(f"  BULLPEN ({len(team_rp)} RP)")
     print(f"  {'Name':22s} {'Role':4s} {'Age':>3s} {'DR':>4s}  {'St':>3s} {'Cm':>3s}  {'K%':>5s} {'BB%':>5s}")
@@ -146,10 +146,10 @@ for _, team_row in teams_sorted.iterrows():
         role_d = r.get("role_detail", "RP")
         if pd.isna(role_d):
             role_d = "RP"
-        print(f"  {r['pitcher_name']:22s} {str(role_d):4s} {int(r['age']):3d} {r['diamond_rating']:4.1f}  {int(r['grade_stuff']):3d} {int(r['grade_command']):3d}  {r['k_pct']:.1%} {r['bb_pct']:.1%}")
+        print(f"  {r['pitcher_name']:22s} {str(role_d):4s} {int(r['age']):3d} {r['tools_rating']:4.1f}  {int(r['grade_stuff']):3d} {int(r['grade_command']):3d}  {r['k_pct']:.1%} {r['bb_pct']:.1%}")
 
     if len(team_rp) >= 2:
-        avg_rp = team_rp.head(5)["diamond_rating"].mean()
+        avg_rp = team_rp.head(5)["tools_rating"].mean()
         print(f"  >> Bullpen avg DR: {avg_rp:.1f}")
 
     print()

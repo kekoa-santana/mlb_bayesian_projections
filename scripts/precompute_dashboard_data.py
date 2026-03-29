@@ -49,7 +49,7 @@ _SECTION_GROUPS: dict[str, list[str]] = {
     "models":      ["hitter_models", "pitcher_models"],
     "projections": ["hitter_proj", "pitcher_proj", "counting", "sim_pitcher", "sim_hitter"],
     "samples":     ["pitcher_samples", "hitter_samples"],
-    "team":        ["team_elo", "series_elo", "team_profiles", "team_power", "team_sim", "depth_chart", "roster"],
+    "team":        ["team_elo", "series_elo", "team_profiles", "league_sim", "team_power", "team_sim", "depth_chart", "roster"],
     "profiles":    ["arsenal", "vuln", "archetypes", "zones"],
     "rankings":    ["player_rankings", "breakouts"],
     "game_data":   ["player_teams", "game_logs", "bf_priors", "umpire", "weather"],
@@ -328,13 +328,20 @@ def main() -> None:
         )
 
     # =================================================================
-    # 6m. Power rankings
+    # 6m. League season simulator (zero-sum Bernoulli on actual schedule)
+    #     Must run BEFORE power rankings so league_sim.parquet exists.
+    # =================================================================
+    if should_run("league_sim"):
+        team.run_league_sim(n_sims=1000)
+
+    # =================================================================
+    # 6n. Power rankings (uses league sim wins as primary input)
     # =================================================================
     if should_run("team_power"):
         team.run_team_power()
 
     # =================================================================
-    # 6n. Team season simulator (injury cascading)
+    # 6o. Team season simulator (injury cascading, per-team MC)
     # =================================================================
     if should_run("team_sim"):
         team.run_team_sim(n_sims=1000)

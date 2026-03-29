@@ -186,6 +186,7 @@ def simulate_starter_season(
     n_starts_mu: float = 30.0,
     n_starts_sigma: float = 6.0,
     pitcher_avg_pitches: float = 88.0,
+    pitcher_avg_ip: float = 5.28,
     babip_adj: float = 0.0,
     n_seasons: int = 200,
     random_seed: int = 42,
@@ -235,6 +236,10 @@ def simulate_starter_season(
     no_lifts = {"k": np.zeros(9), "bb": np.zeros(9), "hr": np.zeros(9)}
     no_tto_lifts = {"k": np.zeros(3), "bb": np.zeros(3), "hr": np.zeros(3)}
 
+    # Per-pitcher stamina offset
+    from src.models.game_sim.simulator import compute_stamina_offset
+    stamina_offset = compute_stamina_offset(pitcher_avg_ip)
+
     # Run all games in one batch
     result = simulate_game(
         pitcher_k_rate_samples=k_rate_samples,
@@ -246,6 +251,7 @@ def simulate_starter_season(
         batter_ppa_adjs=np.zeros(9),
         exit_model=exit_model,
         pitcher_avg_pitches=pitcher_avg_pitches,
+        exit_calibration_offset=stamina_offset,
         babip_adj=babip_adj,
         n_sims=total_sims,
         random_seed=random_seed,
@@ -549,6 +555,7 @@ def simulate_all_pitchers(
                 "n_starts_mu": float(row.get("n_starts_mu", POP_STARTER_N_STARTS)),
                 "n_starts_sigma": float(row.get("n_starts_sigma", POP_STARTER_N_STARTS_SD)),
                 "avg_pitches": float(row.get("avg_pitches", 88.0)),
+                "avg_ip": float(row.get("avg_ip", 5.28)),
             }
 
     # Health adjustment lookup
@@ -574,6 +581,7 @@ def simulate_all_pitchers(
             mu = priors.get("n_starts_mu", POP_STARTER_N_STARTS)
             sigma = priors.get("n_starts_sigma", POP_STARTER_N_STARTS_SD)
             avg_pitches = priors.get("avg_pitches", 88.0)
+            avg_ip = priors.get("avg_ip", 5.28)
 
             # Health adjustment
             h = health_lookup.get(pid, 0.85)
@@ -592,6 +600,7 @@ def simulate_all_pitchers(
                 n_starts_mu=mu,
                 n_starts_sigma=sigma,
                 pitcher_avg_pitches=avg_pitches,
+                pitcher_avg_ip=avg_ip,
                 babip_adj=pitcher_babip,
                 n_seasons=n_seasons,
                 random_seed=seed,

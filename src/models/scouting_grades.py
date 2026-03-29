@@ -454,7 +454,7 @@ def _grade_discipline(df: pd.DataFrame, pop: dict) -> pd.Series:
     return raw.apply(lambda x: _round_to_5(np.clip(x, GRADE_MIN, GRADE_MAX))).astype(int)
 
 
-def _diamond_rating(grades: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
+def _tools_rating(grades: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
     """Compute 0-10 Diamond Rating from tool grades.
 
     Formula: (weighted_avg - 20) / 60 * 10, rounded to 1 decimal.
@@ -494,7 +494,7 @@ def grade_hitter_tools(
     -------
     pd.DataFrame
         Columns: batter_id, grade_hit, grade_power, grade_speed,
-        grade_fielding, grade_discipline, diamond_rating.
+        grade_fielding, grade_discipline, tools_rating.
     """
     pop = _compute_hitter_pop_stats(season)
 
@@ -600,24 +600,27 @@ def grade_hitter_tools(
     result["grade_fielding"] = _grade_fielding(enriched)
     result["grade_discipline"] = _grade_discipline(enriched, pop)
 
-    # Diamond rating: position-specific tool weights.
-    # The bat outweighs defense at corner/DH positions; defense matters
-    # more at premium positions (C, SS, CF). Each player is graded using
-    # the weights for their primary position.
+    # Diamond rating: UNIFORM tool weights for cross-position comparison.
+    # All players graded on the same scale so a 7.0 at CF means the same
+    # raw talent as a 7.0 at 1B.  Position-specific weights were causing
+    # 1B to be inflated (power=30% + discipline=30% hid their weak speed/
+    # fielding) while CF players were penalized for needing 5 tools.
+    #
+    # DH discount applied separately (no fielding contribution).
     positions = enriched.get("position", pd.Series("", index=enriched.index))
     is_two_way = enriched.get("is_two_way", pd.Series(False, index=enriched.index)).fillna(False)
 
-    # Compute diamond rating per player using their position's weights
-    dr = pd.Series(5.0, index=result.index)
-    for pos, weights in _POS_DIAMOND_WEIGHTS.items():
-        mask = positions == pos
-        if mask.any():
-            dr.loc[mask] = _diamond_rating(result.loc[mask], weights)
+    # Uniform weights for all fielding positions
+    _UNIFORM_WEIGHTS = {"hit": 0.25, "power": 0.20, "speed": 0.10, "fielding": 0.20, "discipline": 0.25}
+    # DH: no fielding, redistribute to bat tools
+    _DH_WEIGHTS = {"hit": 0.30, "power": 0.25, "speed": 0.05, "fielding": 0.00, "discipline": 0.40}
 
-    # Fallback for unknown positions
-    unknown = ~positions.isin(_POS_DIAMOND_WEIGHTS.keys())
-    if unknown.any():
-        dr.loc[unknown] = _diamond_rating(result.loc[unknown], _HITTER_DIAMOND_WEIGHTS)
+    dr = pd.Series(5.0, index=result.index)
+    is_dh = positions == "DH"
+    if (~is_dh).any():
+        dr.loc[~is_dh] = _tools_rating(result.loc[~is_dh], _UNIFORM_WEIGHTS)
+    if is_dh.any():
+        dr.loc[is_dh] = _tools_rating(result.loc[is_dh], _DH_WEIGHTS)
 
     # Blend tools (85%) with projected wRC+ (15%) as a production guardrail.
     # Prevents speed-only players with terrible bats from ranking top-10.
@@ -636,16 +639,26 @@ def grade_hitter_tools(
         two_way_boost = enriched["two_way_bonus"].fillna(0).clip(0, 0.05) * 20
         raw_dr = raw_dr + np.where(is_two_way, two_way_boost, 0)
 
+    # DH discount: DHs don't provide fielding value, so their overall
+    # contribution is lower than a fielding player with equal bat tools.
+    # Exempt two-way players (e.g. Ohtani) who DH only because they pitch.
+    dh_discount = is_dh & ~is_two_way
+    if dh_discount.any():
+        raw_dr = raw_dr.copy()
+        raw_dr.loc[dh_discount] *= 0.92  # 8% discount for pure DHs
+        logger.info("DH discount applied to %d pure DHs (exempting %d two-way)",
+                    dh_discount.sum(), (is_dh & is_two_way).sum())
+
     # Rescale so worst hitter = 1.0, best = 10.0 (league-relative)
     dr_min, dr_max = raw_dr.min(), raw_dr.max()
     if dr_max - dr_min > 1e-9:
-        result["diamond_rating"] = (1.0 + (raw_dr - dr_min) / (dr_max - dr_min) * 9.0).round(1)
+        result["tools_rating"] = (1.0 + (raw_dr - dr_min) / (dr_max - dr_min) * 9.0).round(1)
     else:
-        result["diamond_rating"] = 5.5
+        result["tools_rating"] = 5.5
 
     logger.info(
         "Hitter scouting grades: %d players, avg diamond=%.1f",
-        len(result), result["diamond_rating"].mean(),
+        len(result), result["tools_rating"].mean(),
     )
     return result
 
@@ -810,7 +823,7 @@ def grade_pitcher_tools(
     -------
     pd.DataFrame
         Columns: pitcher_id, grade_stuff, grade_command, grade_durability,
-        diamond_rating.
+        tools_rating.
     """
     # Grade SP and RP against their OWN populations.
     # A 60 Stuff SP = top-16% among starters (harder to achieve).
@@ -839,8 +852,8 @@ def grade_pitcher_tools(
         result.loc[rp_idx, "grade_command"] = _grade_command(base.loc[rp_idx], rp_pop).values
 
     # Diamond rating: role-specific weights
-    sp_dr = _diamond_rating(result, _SP_DIAMOND_WEIGHTS)
-    rp_dr = _diamond_rating(result, _RP_DIAMOND_WEIGHTS)
+    sp_dr = _tools_rating(result, _SP_DIAMOND_WEIGHTS)
+    rp_dr = _tools_rating(result, _RP_DIAMOND_WEIGHTS)
     tools_dr = np.where(is_sp, sp_dr, rp_dr)
 
     # Blend tools (85%) with projected FIP (15%) as production guardrail.
@@ -856,20 +869,20 @@ def grade_pitcher_tools(
     # Rescale SP and RP SEPARATELY so both use the full 1-10 range.
     # "9.0 SP" = elite starter, "9.0 RP" = elite reliever — comparable
     # because both represent the same within-role percentile.
-    result["diamond_rating"] = 5.5
+    result["tools_rating"] = 5.5
     for mask, label in [(is_sp, "SP"), (~is_sp, "RP")]:
         role_dr = raw_dr[mask]
         if len(role_dr) < 2:
             continue
         dr_min, dr_max = role_dr.min(), role_dr.max()
         if dr_max - dr_min > 1e-9:
-            result.loc[mask, "diamond_rating"] = (
+            result.loc[mask, "tools_rating"] = (
                 1.0 + (role_dr - dr_min) / (dr_max - dr_min) * 9.0
             ).round(1)
 
     logger.info(
         "Pitcher scouting grades: %d players, avg diamond=%.1f",
-        len(result), result["diamond_rating"].mean(),
+        len(result), result["tools_rating"].mean(),
     )
     return result
 
@@ -954,7 +967,7 @@ def grade_prospect_hitter(
     Returns
     -------
     pd.DataFrame
-        Present + future tool grades and diamond_rating.
+        Present + future tool grades and tools_rating.
     """
     if mlb_pop is None:
         mlb_pop = _compute_hitter_pop_stats(season)
@@ -1006,7 +1019,7 @@ def grade_prospect_hitter(
         result["grade_discipline"] = 50
 
     # Present diamond rating
-    result["diamond_rating"] = _diamond_rating(result, _HITTER_DIAMOND_WEIGHTS)
+    result["tools_rating"] = _tools_rating(result, _HITTER_DIAMOND_WEIGHTS)
 
     # Future grades: adjust present by trajectory + age
     for tool in ["hit", "power", "speed", "fielding", "discipline"]:
@@ -1052,7 +1065,7 @@ def grade_prospect_pitcher(
     else:
         result["grade_durability"] = 45
 
-    result["diamond_rating"] = _diamond_rating(result, _SP_DIAMOND_WEIGHTS)
+    result["tools_rating"] = _tools_rating(result, _SP_DIAMOND_WEIGHTS)
 
     # Future grades
     for tool in ["stuff", "command", "durability"]:

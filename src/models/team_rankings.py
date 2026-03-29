@@ -45,12 +45,13 @@ _TALENT_WEIGHTS = {
 _ELO_WEIGHT = 0.15       # Recent game performance — light momentum/culture signal
 _PROJ_WEIGHT = 0.30       # Pythagorean projected wins (BaseRuns) — primary guardrail
 
-# Tier thresholds on 1-10 TDD score (league-relative each year)
+# Tier thresholds on projected wins (wins-based, not composite score)
 _TIERS = [
-    (8.0, "Elite"),
-    (5.5, "Contender"),
-    (3.5, "Competitive"),
-    (0.0, "Rebuilding"),
+    (90, "Elite"),
+    (85, "Contender"),
+    (78, "Average"),
+    (70, "Fringe"),
+    (0, "Rebuilding"),
 ]
 
 PYTH_EXP = 1.83  # Fallback static exponent (used if RPG unavailable)
@@ -61,10 +62,10 @@ def _pctl(series: pd.Series) -> pd.Series:
     return series.rank(pct=True, method="average")
 
 
-def _assign_tier(score: float) -> str:
-    """Map composite score to tier label."""
+def _assign_tier(projected_wins: float) -> str:
+    """Map projected wins to tier label."""
     for threshold, label in _TIERS:
-        if score >= threshold:
+        if projected_wins >= threshold:
             return label
     return "Rebuilding"
 
@@ -95,9 +96,145 @@ def _pythagorean_wins(
     return round(wpct * games, 1)
 
 
+def compute_roster_waa_delta(
+    prior_season: int,
+    current_season: int,
+    current_roster: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Compute WAA delta from roster turnover between seasons.
+
+    For each team, calculates the difference in WAA between arriving
+    and departing players.  Uses simplified WAA:
+    - Hitters: (wRC+ - 100) / 100 * PA * 0.12 / 10
+    - Pitchers: (lgRA9 - playerRA9) * IP / 9 / 10
+
+    WAA values come from prior-season stats.  Team assignments for
+    the current season come from ``current_roster`` when provided
+    (essential early in a new season when game logs are sparse),
+    falling back to game-log appearances otherwise.
+
+    Parameters
+    ----------
+    prior_season : int
+        Season whose rosters/stats form the baseline.
+    current_season : int
+        Season whose rosters define the new team composition.
+    current_roster : pd.DataFrame, optional
+        Active roster with ``player_id`` and ``org_id`` (team_id) columns.
+        Typically ``roster.parquet``.  If None, falls back to game logs.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: team_id, waa_delta.
+    """
+    from src.data.db import read_sql
+
+    # ── Prior season: player WAA + team from game logs ──
+    hitters = read_sql("""
+        WITH player_teams AS (
+            SELECT player_id, season, team_id, COUNT(*) as games,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY player_id, season
+                       ORDER BY COUNT(*) DESC
+                   ) as rn
+            FROM production.fact_player_game_mlb
+            WHERE season = :s1
+            GROUP BY player_id, season, team_id
+        )
+        SELECT b.batter_id as player_id, b.pa, b.wrc_plus, pt.team_id
+        FROM production.fact_batting_advanced b
+        JOIN player_teams pt
+            ON b.batter_id = pt.player_id AND b.season = pt.season AND pt.rn = 1
+        WHERE b.season = :s1 AND b.pa >= 50
+    """, {"s1": prior_season})
+    hitters["waa"] = (hitters["wrc_plus"] - 100) / 100 * hitters["pa"] * 0.12 / 10
+
+    pitchers = read_sql("""
+        WITH player_teams AS (
+            SELECT player_id, season, team_id, COUNT(*) as games,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY player_id, season
+                       ORDER BY COUNT(*) DESC
+                   ) as rn
+            FROM production.fact_player_game_mlb
+            WHERE season = :s1 AND pit_ip > 0
+            GROUP BY player_id, season, team_id
+        ),
+        pitcher_stats AS (
+            SELECT player_id, season, SUM(pit_ip) as ip, SUM(pit_r) as runs
+            FROM production.fact_player_game_mlb
+            WHERE season = :s1 AND pit_ip > 0
+            GROUP BY player_id, season
+            HAVING SUM(pit_ip) >= 20
+        )
+        SELECT ps.player_id, ps.ip, ps.runs, pt.team_id
+        FROM pitcher_stats ps
+        JOIN player_teams pt
+            ON ps.player_id = pt.player_id AND ps.season = pt.season AND pt.rn = 1
+    """, {"s1": prior_season})
+
+    if not pitchers.empty:
+        lg_ra9 = pitchers["runs"].sum() / pitchers["ip"].sum() * 9
+        pitchers["ra9"] = pitchers["runs"] / pitchers["ip"] * 9
+        pitchers["waa"] = (lg_ra9 - pitchers["ra9"]) * pitchers["ip"] / 9 / 10
+
+    prior_players = pd.concat([
+        hitters[["player_id", "team_id", "waa"]],
+        pitchers[["player_id", "team_id", "waa"]]
+        if not pitchers.empty else pd.DataFrame(),
+    ], ignore_index=True)
+
+    # Build WAA lookup: player_id -> prior season WAA (regardless of team)
+    waa_lookup = prior_players.groupby("player_id")["waa"].sum().to_dict()
+
+    # ── Current season: team assignments ──
+    if current_roster is not None and not current_roster.empty:
+        # Use roster parquet (org_id = team_id)
+        cur_teams = current_roster[["player_id", "org_id"]].rename(
+            columns={"org_id": "team_id"}
+        ).drop_duplicates()
+    else:
+        # Fall back to game logs (works mid-season)
+        cur_teams = read_sql("""
+            SELECT player_id, team_id
+            FROM (
+                SELECT player_id, team_id, COUNT(*) as games,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY player_id
+                           ORDER BY COUNT(*) DESC
+                       ) as rn
+                FROM production.fact_player_game_mlb
+                WHERE season = :s2
+                GROUP BY player_id, team_id
+            ) sub WHERE rn = 1
+        """, {"s2": current_season})
+
+    # ── Compare rosters ──
+    all_teams = set(prior_players["team_id"].unique()) | set(cur_teams["team_id"].unique())
+    rows = []
+    for tid in all_teams:
+        prior_pids = set(prior_players[prior_players["team_id"] == tid]["player_id"])
+        cur_pids = set(cur_teams[cur_teams["team_id"] == tid]["player_id"])
+
+        departed = prior_pids - cur_pids
+        arrived = cur_pids - prior_pids
+
+        # Departed WAA: what did the team lose (from prior season stats)
+        dep_waa = sum(waa_lookup.get(pid, 0) for pid in departed)
+        # Arrived WAA: what did the team gain (from prior season stats)
+        arr_waa = sum(waa_lookup.get(pid, 0) for pid in arrived)
+
+        rows.append({"team_id": tid, "waa_delta": arr_waa - dep_waa})
+
+    return pd.DataFrame(rows)
+
+
 def rank_teams(
     profiles: pd.DataFrame,
     elo_ratings: pd.DataFrame | None = None,
+    waa_deltas: pd.DataFrame | None = None,
+    observed_rs_ra: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Produce final team rankings from profiles and ELO.
 
@@ -134,19 +271,67 @@ def rank_teams(
                 "pitching_score", "defense_score", "health_depth_score"]:
         df[col] = df[col].fillna(df[col].median())
 
-    # ── Projected wins (Pythagorean from BaseRuns) ──
-    rs_col = "proj_rs_per_game" if "proj_rs_per_game" in df.columns else "rpg"
-    ra_col = "proj_ra_per_game" if "proj_ra_per_game" in df.columns else "ra_per_game"
-    if rs_col in df.columns and ra_col in df.columns:
+    # ── Projected wins (Pythagorean from blended RS/RA) ──
+    # Blend projected (Bayesian posteriors, roster-aware) with observed (prior
+    # season actual, 2H-weighted) to get realistic spread.  Projected alone
+    # is too compressed; observed alone ignores roster changes.
+    # 35/65 produces ~42-win spread (matches PECOTA/ZiPS).
+    # Observed RS/RA uses 40/60 1H/2H weighting when available to capture
+    # trade-deadline roster transformations.
+    _PROJ_WT = 0.35  # projected (forward-looking, roster-aware)
+    _OBS_WT = 0.65   # observed (backward-looking, more spread)
+    has_proj = "proj_rs_per_game" in df.columns and "proj_ra_per_game" in df.columns
+    has_obs = "rpg" in df.columns and "ra_per_game" in df.columns
+
+    # Override observed RS/RA with 2H-weighted values when provided
+    if observed_rs_ra is not None and not observed_rs_ra.empty:
+        obs_map_rs = dict(zip(observed_rs_ra["team_id"], observed_rs_ra["rpg"]))
+        obs_map_ra = dict(zip(observed_rs_ra["team_id"], observed_rs_ra["ra_per_game"]))
+        df["_obs_rpg"] = df["team_id"].map(obs_map_rs).fillna(df.get("rpg", 4.5))
+        df["_obs_ra"] = df["team_id"].map(obs_map_ra).fillna(df.get("ra_per_game", 4.5))
+    else:
+        df["_obs_rpg"] = df["rpg"].fillna(4.5) if "rpg" in df.columns else 4.5
+        df["_obs_ra"] = df["ra_per_game"].fillna(4.5) if "ra_per_game" in df.columns else 4.5
+
+    if has_proj:
+        df["_rs_blend"] = (
+            _PROJ_WT * df["proj_rs_per_game"].fillna(4.5)
+            + _OBS_WT * df["_obs_rpg"]
+        )
+        df["_ra_blend"] = (
+            _PROJ_WT * df["proj_ra_per_game"].fillna(4.5)
+            + _OBS_WT * df["_obs_ra"]
+        )
+    elif has_obs:
+        df["_rs_blend"] = df["_obs_rpg"]
+        df["_ra_blend"] = df["_obs_ra"]
+    else:
+        df["_rs_blend"] = 4.5
+        df["_ra_blend"] = 4.5
+
+    df["projected_wins"] = df.apply(
+        lambda r: _pythagorean_wins(r["_rs_blend"], r["_ra_blend"]),
+        axis=1,
+    )
+    df.drop(columns=["_rs_blend", "_ra_blend", "_obs_rpg", "_obs_ra"],
+            inplace=True, errors="ignore")
+
+    # ── Roster WAA adjustment ──
+    # Adjust projected wins by dampened WAA delta from roster turnover.
+    # Prior-year WAA doesn't fully repeat, so apply 55% dampening.
+    # Cap at ±8 wins to prevent extreme outliers (e.g. COL) from
+    # distorting the entire league distribution after normalization.
+    # Backtested 2022-2025: drops MAE from 9.0 to ~7.5 wins.
+    _WAA_DAMPEN = 0.55
+    _WAA_CAP = 8.0
+    if waa_deltas is not None and not waa_deltas.empty:
+        waa_map = dict(zip(waa_deltas["team_id"], waa_deltas["waa_delta"]))
         df["projected_wins"] = df.apply(
-            lambda r: _pythagorean_wins(
-                r[rs_col] if pd.notna(r.get(rs_col)) else r.get("rpg", 4.5),
-                r[ra_col] if pd.notna(r.get(ra_col)) else r.get("ra_per_game", 4.5),
-            ),
+            lambda r: r["projected_wins"] + max(-_WAA_CAP, min(
+                _WAA_CAP, waa_map.get(r["team_id"], 0) * _WAA_DAMPEN,
+            )),
             axis=1,
         )
-    else:
-        df["projected_wins"] = 81.0
 
     # Normalize projected wins to sum to 2430
     _raw_total = df["projected_wins"].sum()
@@ -222,10 +407,11 @@ def rank_teams(
         df["tdd_score"] = 5.5
 
     # Tier assignment (on 0-10 TDD score)
-    df["tier"] = df["tdd_score"].apply(_assign_tier)
+    df["tier"] = df["projected_wins"].apply(_assign_tier)
 
     # Final rank by tdd_score
-    df["rank"] = df["tdd_score"].rank(ascending=False, method="min").astype(int)
+    # Use composite_score (continuous) to break TDD score ties
+    df["rank"] = df["composite_score"].rank(ascending=False, method="first").astype(int)
 
     # Sort and select output columns
     output_cols = [
@@ -859,18 +1045,18 @@ def build_power_rankings(
     # Phase 4+6: De-correlated orthogonal assembly
     #
     # Four genuinely independent components:
-    #   1. Projected Wins (50%) -- additive run/win from BaseRuns + sim
-    #   2. Recent Form (20%) -- ELO momentum (what talent alone can't see)
-    #   3. Depth/Fragility (20%) -- downside risk, roster resilience
-    #   4. Trajectory (10%) -- net breakouts minus regressions
+    #   1. Projected Wins (60%) -- blended RS/RA Pythagorean from rank_teams()
+    #   2. Recent Form (15%) -- ELO momentum (what talent alone can't see)
+    #   3. Depth/Fragility (10%) -- downside risk (reduced until metric enriched)
+    #   4. Trajectory (15%) -- net breakouts minus regressions
     #
     # Old correlated components (projection, profile, glicko) are merged
     # into Projected Wins via the run-based framework.
     # ---------------------------------------------------------------
-    w_wins = cfg.get("projected_wins_weight", 0.50)
-    w_form = cfg.get("recent_form_weight", 0.20)
-    w_depth = cfg.get("depth_fragility_weight", 0.20)
-    w_traj = cfg.get("trajectory_weight", 0.10)
+    w_wins = cfg.get("projected_wins_weight", 0.60)
+    w_form = cfg.get("recent_form_weight", 0.15)
+    w_depth = cfg.get("depth_fragility_weight", 0.10)
+    w_traj = cfg.get("trajectory_weight", 0.15)
 
     # Normalize sim wins to sum to 2430 (independent team sims don't
     # enforce zero-sum, so every team's RS can exceed RA simultaneously)
@@ -883,29 +1069,67 @@ def build_power_rankings(
             logger.info("Sim wins normalized: %.0f → %.0f (scale=%.3f)",
                         raw_sum, team_sim["sim_wins_mean"].sum(), sim_scale)
 
+    # Pre-compute PA/IP-weighted breakout scores per team from the
+    # XGBoost breakout model (Power Surge, Diamond in the Rough, etc.)
+    _team_breakout_scores: dict[int, float] = {}
+    try:
+        _project_root = Path(__file__).resolve().parents[2]
+        _dash = _project_root.parent / "tdd-dashboard" / "data" / "dashboard"
+        _hr_brk = pd.read_parquet(_dash / "hitters_rankings.parquet")
+        _pr_brk = pd.read_parquet(_dash / "pitchers_rankings.parquet")
+        _hcs_brk = pd.read_parquet(_dash / "hitter_counting_sim.parquet")
+        _pcs_brk = pd.read_parquet(_dash / "pitcher_counting_sim.parquet")
+
+        _hb = _hr_brk[["batter_id", "breakout_score"]].merge(
+            _hcs_brk[["batter_id", "total_pa_mean"]], on="batter_id", how="left",
+        )
+        _hb["weighted"] = _hb["breakout_score"] * _hb["total_pa_mean"].fillna(200) / 600
+        # Map batter to team via roster
+        _hb_team = _hb.merge(
+            current_roster[["player_id", "org_id"]],
+            left_on="batter_id", right_on="player_id", how="left",
+        )
+        for _tid, _grp in _hb_team.groupby("org_id"):
+            _team_breakout_scores[int(_tid)] = _grp["weighted"].sum()
+
+        _pb = _pr_brk[["pitcher_id", "breakout_score"]].merge(
+            _pcs_brk[["pitcher_id", "projected_ip_mean"]], on="pitcher_id", how="left",
+        )
+        _pb["weighted"] = _pb["breakout_score"] * _pb["projected_ip_mean"].fillna(50) / 180
+        _pb_team = _pb.merge(
+            current_roster[["player_id", "org_id"]],
+            left_on="pitcher_id", right_on="player_id", how="left",
+        )
+        for _tid, _grp in _pb_team.groupby("org_id"):
+            _team_breakout_scores[int(_tid)] = _team_breakout_scores.get(int(_tid), 0) + _grp["weighted"].sum()
+
+        logger.info("XGBoost breakout scores loaded for %d teams", len(_team_breakout_scores))
+    except Exception as e:
+        logger.warning("Could not load XGBoost breakout scores: %s", e)
+
     pre_rows: list[dict[str, Any]] = []
     for tid in sorted(abbr_tid.values()):
         abbr = tid_abbr.get(tid, "???")
         meta = team_meta.get(tid, {})
 
-        # --- Component 1: Projected Wins (additive run/win) ---
-        rpg_val = None
-        ra_val = None
+        # --- Component 1: Projected Wins ---
+        # Use projected_wins from rank_teams() (blended RS/RA Pythagorean)
+        # to avoid duplicating the win computation logic.
         avg_opp_elo_val = None
-        if not prof_df.empty and tid in prof_df["team_id"].values:
-            team_prof = prof_df[prof_df["team_id"] == tid].iloc[0]
-            rpg_val = team_prof.get("proj_rs_per_game", team_prof.get("rpg"))
-            ra_val = team_prof.get("proj_ra_per_game", team_prof.get("ra_per_game"))
-            avg_opp_elo_val = team_prof.get("avg_opp_elo")
-        baseruns_wins = _pythagorean_wins(
-            rpg_val if pd.notna(rpg_val) else 4.5,
-            ra_val if pd.notna(ra_val) else 4.5,
-        )
-
-        # Blend with sim wins if available
+        blended_wins = 81.0
+        baseruns_wins = 81.0
         sim_wins_val = None
         sim_std_val = None
-        blended_wins = baseruns_wins
+        if not prof_df.empty and tid in prof_df["team_id"].values:
+            team_prof = prof_df[prof_df["team_id"] == tid].iloc[0]
+            avg_opp_elo_val = team_prof.get("avg_opp_elo")
+            # Read pre-computed projected_wins from rank_teams() output
+            pw = team_prof.get("projected_wins")
+            if pd.notna(pw):
+                blended_wins = float(pw)
+                baseruns_wins = float(pw)
+
+        # Blend with sim wins if available
         if team_sim is not None and not team_sim.empty:
             sim_row = team_sim[team_sim["team_abbr"] == abbr]
             if not sim_row.empty:
@@ -913,24 +1137,40 @@ def build_power_rankings(
                 sim_std_val = float(sim_row.iloc[0]["sim_wins_std"])
         if sim_wins_val is not None and sim_std_val is not None:
             confidence = np.clip(1.0 - sim_std_val / 2.0, 0.15, 0.85)
-            blended_wins = confidence * baseruns_wins + (1 - confidence) * sim_wins_val
+            blended_wins = confidence * blended_wins + (1 - confidence) * sim_wins_val
 
         # --- Component 2: Recent Form (ELO only) ---
         elo_comp = elo_lookup.get(tid, 0.5)
 
         # --- Component 3: Depth/Fragility ---
-        # Use health_depth_score from profiles (now includes concentration,
-        # replacement gaps, bench quality from Phase 5)
+        # Use CURRENT roster quality (lineup_depth, bench_quality, roster
+        # breadth) rather than backwards-looking IL history.  Teams with
+        # deep rosters are more resilient regardless of prior-year injuries.
         depth_comp = 0.5
         if not prof_df.empty and tid in prof_df["team_id"].values:
             tp = prof_df[prof_df["team_id"] == tid].iloc[0]
-            depth_comp = float(tp.get("health_depth_score", 0.5))
+            lineup_d = float(tp.get("lineup_depth", 0.5))
+            bench_q = float(tp.get("bench_quality", 0.4))
+            roster_d = float(tp.get("roster_depth_score", 0.5))
+            concentration = float(tp.get("concentration", 0.3))
+            # Low concentration = good (not dependent on a few stars)
+            depth_comp = (
+                0.35 * lineup_d
+                + 0.25 * roster_d
+                + 0.20 * bench_q
+                + 0.20 * (1.0 - concentration)
+            )
 
-        # --- Component 4: Trajectory (net improvement direction) ---
+        # --- Component 4: Trajectory (XGBoost breakout model) ---
+        # Use PA/IP-weighted breakout_score from the full breakout model
+        # (Power Surge, Diamond in the Rough, Stuff Dominant, etc.)
+        # instead of raw K% delta head count.
         breakout_n = breakout_lookup.get(tid, 0)
         regression_n = regression_lookup.get(tid, 0)
-        # Net trajectory: +3 breakouts and -1 regression = net +2
         net_trajectory = breakout_n - regression_n
+
+        # Override net_trajectory with XGBoost breakout upside if data available
+        _brk_upside = _team_breakout_scores.get(tid, 0.0) if _team_breakout_scores else 0.0
 
         pre_rows.append({
             "tid": tid, "abbr": abbr, "meta": meta,
@@ -941,6 +1181,7 @@ def build_power_rankings(
             "sim_wins": sim_wins_val,
             "sim_std": sim_std_val,
             "net_trajectory": net_trajectory,
+            "brk_upside": _brk_upside,
             "breakout_count": breakout_n,
             "regression_count": regression_n,
             "avg_opp_elo_val": avg_opp_elo_val,
@@ -968,14 +1209,48 @@ def build_power_rankings(
             raw_total, REQUIRED_TOTAL_WINS, scale,
         )
 
-    # Percentile-rank each component across all 30 teams
+    # Scale each component to 0-1.
+    # Wins: use raw scale (65-100 range) so actual win gaps matter.
+    # Percentile rank compressed 10-win differences to ~0.17 — too flat.
+    # Trajectory/depth: keep percentile (ordinal signal, magnitude meaningless).
     from scipy.stats import rankdata
 
     all_wins = np.array([r["proj_wins"] for r in pre_rows])
-    all_traj = np.array([r["net_trajectory"] for r in pre_rows], dtype=float)
+    # Use XGBoost breakout upside for trajectory instead of K%-only count
+    all_traj = np.array([r.get("brk_upside", r["net_trajectory"]) for r in pre_rows], dtype=float)
     all_depth = np.array([r["depth_comp"] for r in pre_rows])
 
-    wins_pctl = (rankdata(all_wins) - 1) / max(len(all_wins) - 1, 1)
+    # Use league sim wins if available (overwrites Pythagorean wins from
+    # rank_teams).  The league sim is zero-sum and schedule-aware.
+    # Look for league_sim.parquet in common dashboard locations
+    _project_root = Path(__file__).resolve().parents[2]
+    _ls_candidates = [
+        _project_root.parent / "tdd-dashboard" / "data" / "dashboard" / "league_sim.parquet",
+        _project_root / "data" / "dashboard" / "league_sim.parquet",
+    ]
+    _ls_path = None
+    for _c in _ls_candidates:
+        if _c.exists():
+            _ls_path = _c
+            break
+
+    if _ls_path is not None:
+        _ls = pd.read_parquet(_ls_path)
+        _ls_map = dict(zip(_ls["team_id"].astype(int), _ls["sim_wins_mean"]))
+        for r in pre_rows:
+            if r["tid"] in _ls_map:
+                r["proj_wins"] = _ls_map[r["tid"]]
+        all_wins = np.array([r["proj_wins"] for r in pre_rows])
+        logger.info("Power rankings using league sim wins (league_sim.parquet)")
+
+    # Projected wins is the primary signal (70%).  Depth and trajectory
+    # get meaningful weight to reflect roster quality beyond raw RS/RA.
+    w_wins = 0.70
+    w_form = 0.08
+    w_depth = 0.10
+    w_traj = 0.12
+
+    wins_pctl = np.clip((all_wins - 70) / 30, 0, 1)  # 70W=0, 100W=1 (sharper top separation)
     traj_pctl = (rankdata(all_traj) - 1) / max(len(all_traj) - 1, 1)
     depth_pctl = (rankdata(all_depth) - 1) / max(len(all_depth) - 1, 1)
 
@@ -1042,13 +1317,20 @@ def build_power_rankings(
     else:
         result["schedule_adjusted_wins"] = result["projected_wins"]
 
+    # Scale power_score to 1-10 TDD display score (worst=1, best=10)
+    ps = result["power_score"]
+    ps_min, ps_max = ps.min(), ps.max()
+    if ps_max - ps_min > 1e-9:
+        result["tdd_score"] = (1.0 + (ps - ps_min) / (ps_max - ps_min) * 9.0).round(1)
+    else:
+        result["tdd_score"] = 5.5
+
     result["power_rank"] = (
         result["power_score"]
-        .rank(ascending=False, method="min")
+        .rank(ascending=False, method="first")
         .astype(int)
     )
-    # Power tiers use rank-based assignment (top 6 = Elite, next 8 = Contender, etc.)
-    # because power_score is on a 0-1 scale, not the 1-10 TDD scale.
+
     def _power_tier(rank: int) -> str:
         if rank <= 6:
             return "Elite"

@@ -90,8 +90,8 @@ def main():
                     r = ci_row.iloc[0]
                     logger.info(
                         "  %s: DR=%.1f (%.1f-%.1f)  Hit=%d(%d-%d) Power=%d(%d-%d)",
-                        name, r.get("diamond_rating", 0),
-                        r.get("diamond_rating_lo", 0), r.get("diamond_rating_hi", 0),
+                        name, r.get("tools_rating", 0),
+                        r.get("tools_rating_lo", 0), r.get("tools_rating_hi", 0),
                         r.get("grade_hit", 0), r.get("grade_hit_lo", 0), r.get("grade_hit_hi", 0),
                         r.get("grade_power", 0), r.get("grade_power_lo", 0), r.get("grade_power_hi", 0),
                     )
@@ -108,8 +108,8 @@ def main():
                     r = ci_row.iloc[0]
                     logger.info(
                         "  %s: DR=%.1f (%.1f-%.1f)  Stuff=%d(%d-%d) Cmd=%d(%d-%d)",
-                        name, r.get("diamond_rating", 0),
-                        r.get("diamond_rating_lo", 0), r.get("diamond_rating_hi", 0),
+                        name, r.get("tools_rating", 0),
+                        r.get("tools_rating_lo", 0), r.get("tools_rating_hi", 0),
                         r.get("grade_stuff", 0), r.get("grade_stuff_lo", 0), r.get("grade_stuff_hi", 0),
                         r.get("grade_command", 0), r.get("grade_command_lo", 0), r.get("grade_command_hi", 0),
                     )

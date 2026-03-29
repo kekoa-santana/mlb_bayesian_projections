@@ -90,6 +90,24 @@ _PITCHER_POS_SCARCITY = {
 # Level numeric mapping (for trajectory calc)
 _LEVEL_NUM = {"ROK": 0, "A": 1, "A+": 2, "AA": 3, "AAA": 4, "MLB": 5}
 
+# ---------------------------------------------------------------------------
+# MLB prospect eligibility thresholds
+# ---------------------------------------------------------------------------
+# Prospects with brief MLB callups should remain in prospect rankings.
+# ~400 BF ≈ 100 IP (roughly one full season of pitching).
+# ~200 PA ≈ 130 AB (close to MLB prospect eligibility rules).
+_MAX_MLB_BF_PROSPECT = 400
+_MAX_MLB_PA_PROSPECT = 200
+
+# MLB debut data is more informative per unit than translated MiLB.
+# 1 MLB BF/PA counts as this many translated MiLB BF/PA for blending.
+_MLB_RELIABILITY_MULTIPLIER = 2.0
+
+# Recency decay half-life for MiLB aggregation (years).
+# A developing prospect's most recent data is more predictive than older data.
+# 2-year half-life: 1yr ago = 71% weight, 2yr ago = 50%, 3yr ago = 35%.
+_RECENCY_HALF_LIFE = 2.0
+
 
 def _percentile_rank(series: pd.Series) -> pd.Series:
     """Convert a series to 0-1 percentile ranks (higher = better)."""
@@ -487,6 +505,309 @@ def _compute_composite_scores(
 
 
 # ===================================================================
+# FV grade lookup — used for FV-conditioned translation adjustments
+# ===================================================================
+
+def _get_prospect_fv_map(player_ids: set[int]) -> dict[int, float]:
+    """Look up most recent FanGraphs Future Value grade for each player.
+
+    Returns ``{player_id: fv_grade}`` for players that have FG rankings.
+    Players without FG data are absent from the dict (will default to
+    population-level translation, i.e. no FV adjustment).
+    """
+    if not player_ids:
+        return {}
+    try:
+        from src.data.db import read_sql
+        df = read_sql("""
+            SELECT DISTINCT ON (player_id)
+                   player_id, future_value
+            FROM production.dim_prospect_ranking
+            WHERE future_value IS NOT NULL
+            ORDER BY player_id, season DESC, source
+        """, {})
+        df = df[df["player_id"].isin(player_ids)]
+        return dict(zip(df["player_id"].astype(int), df["future_value"]))
+    except Exception:
+        logger.warning("Could not fetch FV grades from dim_prospect_ranking")
+        return {}
+
+
+# ===================================================================
+# Fix 2: Position guard — exclude pitchers from batter prospect pipeline
+# ===================================================================
+
+def _get_pitcher_player_ids() -> set[int]:
+    """Get player IDs whose primary position is pitcher.
+
+    Used to exclude converted pitchers (e.g. Nolan McLean) from
+    batter prospect rankings when they still have MiLB batting data.
+    """
+    try:
+        from src.data.db import read_sql
+        df = read_sql(
+            "SELECT player_id FROM production.dim_player "
+            "WHERE primary_position = 'P'",
+            {},
+        )
+        return set(df["player_id"].astype(int))
+    except Exception:
+        logger.warning("Could not query pitcher IDs from dim_player")
+        return set()
+
+
+# ===================================================================
+# Fix 3: MLB debut blending for prospects with small MLB samples
+# ===================================================================
+
+def _get_mlb_debut_pitcher_rates(
+    prospect_ids: set[int],
+    max_bf: int = _MAX_MLB_BF_PROSPECT,
+    min_bf: int = 20,
+) -> pd.DataFrame:
+    """Fetch MLB rates for pitching prospects with small debut samples.
+
+    Parameters
+    ----------
+    prospect_ids : set[int]
+        Player IDs to look up.
+    max_bf : int
+        Upper bound on MLB BF (above this they're excluded from prospects).
+    min_bf : int
+        Minimum MLB BF to be worth blending (very small samples add noise).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: player_id, mlb_bf, mlb_k_pct, mlb_bb_pct, mlb_hr_bf.
+        Empty if no matching data found.
+    """
+    if not prospect_ids:
+        return pd.DataFrame()
+
+    try:
+        from src.data.db import read_sql
+        df = read_sql("""
+            SELECT
+                pb.pitcher_id  AS player_id,
+                SUM(pb.batters_faced) AS mlb_bf,
+                SUM(pb.strike_outs)   AS mlb_k,
+                SUM(pb.walks)         AS mlb_bb,
+                SUM(pb.home_runs)     AS mlb_hr
+            FROM staging.pitching_boxscores pb
+            JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+            WHERE dg.game_type = 'R'
+            GROUP BY pb.pitcher_id
+            HAVING SUM(pb.batters_faced) BETWEEN :min_bf AND :max_bf
+        """, {"min_bf": min_bf, "max_bf": max_bf})
+    except Exception:
+        logger.warning("Could not fetch MLB debut pitcher rates")
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    df = df[df["player_id"].isin(prospect_ids)].copy()
+    if df.empty:
+        return df
+
+    df["mlb_k_pct"] = df["mlb_k"] / df["mlb_bf"]
+    df["mlb_bb_pct"] = df["mlb_bb"] / df["mlb_bf"]
+    df["mlb_hr_bf"] = df["mlb_hr"] / df["mlb_bf"]
+    return df[["player_id", "mlb_bf", "mlb_k_pct", "mlb_bb_pct", "mlb_hr_bf"]]
+
+
+def _blend_mlb_debut_pitcher_rates(df: pd.DataFrame) -> pd.DataFrame:
+    """Blend actual MLB debut rates into translated MiLB rates for pitching prospects.
+
+    For prospects who have a small MLB sample (20–400 BF), their actual MLB
+    performance is blended with their translated MiLB rates using a
+    reliability-weighted average.  MLB data counts as 2x per BF since it's
+    real MLB performance, not translated.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Pitcher prospect features from ``_build_pitcher_prospect_features()``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Same DataFrame with wtd_k_pct, wtd_bb_pct, wtd_hr_bf, k_bb_diff
+        updated for prospects who have MLB debut data.
+    """
+    prospect_ids = set(df["player_id"].unique())
+    mlb_rates = _get_mlb_debut_pitcher_rates(prospect_ids)
+
+    if mlb_rates.empty:
+        return df
+
+    df = df.merge(mlb_rates, on="player_id", how="left")
+    has_mlb = df["mlb_bf"].notna()
+
+    if not has_mlb.any():
+        df.drop(columns=["mlb_bf", "mlb_k_pct", "mlb_bb_pct", "mlb_hr_bf"],
+                inplace=True)
+        return df
+
+    logger.info(
+        "Blending MLB debut data for %d pitching prospects (avg %.0f BF)",
+        has_mlb.sum(),
+        df.loc[has_mlb, "mlb_bf"].mean(),
+    )
+
+    mlb_weight = df["mlb_bf"] * _MLB_RELIABILITY_MULTIPLIER
+    milb_weight = df["career_milb_bf"] * 0.7  # avg translation confidence
+    total_weight = mlb_weight + milb_weight
+
+    for stat_milb, stat_mlb in [
+        ("wtd_k_pct", "mlb_k_pct"),
+        ("wtd_bb_pct", "mlb_bb_pct"),
+        ("wtd_hr_bf", "mlb_hr_bf"),
+    ]:
+        blended = (
+            mlb_weight * df[stat_mlb] + milb_weight * df[stat_milb]
+        ) / total_weight
+        df.loc[has_mlb, stat_milb] = blended[has_mlb]
+
+    df.loc[has_mlb, "k_bb_diff"] = (
+        df.loc[has_mlb, "wtd_k_pct"] - df.loc[has_mlb, "wtd_bb_pct"]
+    )
+
+    # Track that this prospect has MLB data (useful for downstream)
+    df["has_mlb_debut"] = has_mlb
+    df["mlb_debut_bf"] = df["mlb_bf"].fillna(0).astype(int)
+
+    df.drop(columns=["mlb_bf", "mlb_k_pct", "mlb_bb_pct", "mlb_hr_bf"],
+            inplace=True)
+    return df
+
+
+def _get_mlb_debut_batter_rates(
+    prospect_ids: set[int],
+    max_pa: int = _MAX_MLB_PA_PROSPECT,
+    min_pa: int = 20,
+) -> pd.DataFrame:
+    """Fetch MLB rates for batting prospects with small debut samples.
+
+    Parameters
+    ----------
+    prospect_ids : set[int]
+        Player IDs to look up.
+    max_pa, min_pa : int
+        PA bounds for inclusion.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: player_id, mlb_pa, mlb_k_pct, mlb_bb_pct, mlb_iso.
+        Empty if no matching data found.
+    """
+    if not prospect_ids:
+        return pd.DataFrame()
+
+    try:
+        from src.data.db import read_sql
+        df = read_sql("""
+            SELECT
+                bb.batter_id  AS player_id,
+                SUM(bb.plate_appearances) AS mlb_pa,
+                SUM(bb.strikeouts)        AS mlb_k,
+                SUM(bb.walks)             AS mlb_bb,
+                SUM(bb.home_runs)         AS mlb_hr,
+                SUM(bb.hits)              AS mlb_h,
+                SUM(bb.at_bats)           AS mlb_ab,
+                SUM(bb.total_bases)       AS mlb_tb
+            FROM staging.batting_boxscores bb
+            JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+            WHERE dg.game_type = 'R'
+            GROUP BY bb.batter_id
+            HAVING SUM(bb.plate_appearances) BETWEEN :min_pa AND :max_pa
+        """, {"min_pa": min_pa, "max_pa": max_pa})
+    except Exception:
+        logger.warning("Could not fetch MLB debut batter rates")
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    df = df[df["player_id"].isin(prospect_ids)].copy()
+    if df.empty:
+        return df
+
+    df["mlb_k_pct"] = df["mlb_k"] / df["mlb_pa"]
+    df["mlb_bb_pct"] = df["mlb_bb"] / df["mlb_pa"]
+    df["mlb_iso"] = (df["mlb_tb"] - df["mlb_h"]) / df["mlb_ab"].replace(0, np.nan)
+    df["mlb_hr_pa"] = df["mlb_hr"] / df["mlb_pa"]
+    return df[["player_id", "mlb_pa", "mlb_k_pct", "mlb_bb_pct",
+               "mlb_iso", "mlb_hr_pa"]]
+
+
+def _blend_mlb_debut_batter_rates(df: pd.DataFrame) -> pd.DataFrame:
+    """Blend actual MLB debut rates into translated MiLB rates for batting prospects.
+
+    Same approach as pitcher blending — MLB data counts as 2x per PA.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Batter prospect features with wtd_ columns and career_milb_pa.
+
+    Returns
+    -------
+    pd.DataFrame
+        Updated with blended rates where MLB debut data exists.
+    """
+    prospect_ids = set(df["player_id"].unique())
+    mlb_rates = _get_mlb_debut_batter_rates(prospect_ids)
+
+    if mlb_rates.empty:
+        return df
+
+    df = df.merge(mlb_rates, on="player_id", how="left")
+    has_mlb = df["mlb_pa"].notna()
+
+    if not has_mlb.any():
+        df.drop(columns=["mlb_pa", "mlb_k_pct", "mlb_bb_pct",
+                          "mlb_iso", "mlb_hr_pa"], inplace=True)
+        return df
+
+    logger.info(
+        "Blending MLB debut data for %d batting prospects (avg %.0f PA)",
+        has_mlb.sum(),
+        df.loc[has_mlb, "mlb_pa"].mean(),
+    )
+
+    mlb_weight = df["mlb_pa"] * _MLB_RELIABILITY_MULTIPLIER
+    milb_weight = df["career_milb_pa"] * 0.7
+    total_weight = mlb_weight + milb_weight
+
+    for stat_milb, stat_mlb in [
+        ("wtd_k_pct", "mlb_k_pct"),
+        ("wtd_bb_pct", "mlb_bb_pct"),
+        ("wtd_iso", "mlb_iso"),
+        ("wtd_hr_pa", "mlb_hr_pa"),
+    ]:
+        if stat_milb in df.columns:
+            blended = (
+                mlb_weight * df[stat_mlb] + milb_weight * df[stat_milb]
+            ) / total_weight
+            df.loc[has_mlb, stat_milb] = blended[has_mlb]
+
+    if "k_bb_diff" in df.columns:
+        df.loc[has_mlb, "k_bb_diff"] = (
+            df.loc[has_mlb, "wtd_k_pct"] - df.loc[has_mlb, "wtd_bb_pct"]
+        )
+
+    df["has_mlb_debut"] = has_mlb
+    df["mlb_debut_pa"] = df["mlb_pa"].fillna(0).astype(int)
+
+    df.drop(columns=["mlb_pa", "mlb_k_pct", "mlb_bb_pct",
+                      "mlb_iso", "mlb_hr_pa"], inplace=True)
+    return df
+
+
+# ===================================================================
 # Pitching prospect feature builder
 # ===================================================================
 
@@ -530,7 +851,16 @@ def _build_pitcher_prospect_features(
             continue
 
         conf = grp["translation_confidence"].fillna(0.5) if "translation_confidence" in grp.columns else pd.Series(0.5, index=grp.index)
-        conf_bf = conf * grp["bf"]
+
+        # Recency decay: recent seasons contribute more than stale data.
+        # A developing pitcher's 2025 AA dominance is more informative
+        # than their 2023 A-ball numbers.
+        max_season = grp["season"].max()
+        recency = np.exp(
+            -np.log(2) * (max_season - grp["season"]) / _RECENCY_HALF_LIFE
+        )
+
+        conf_bf = conf * grp["bf"] * recency
         conf_bf_sum = conf_bf.sum()
         if conf_bf_sum > 0:
             wtd_k = (grp["translated_k_pct"] * conf_bf).sum() / conf_bf_sum
@@ -630,6 +960,12 @@ def rank_prospects(
     if milb_df is None:
         milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_batters.parquet")
 
+    # Apply FV-conditioned translation adjustments before aggregation
+    fv_map = _get_prospect_fv_map(set(milb_df["player_id"].unique()))
+    if fv_map:
+        from src.data.milb_translation import apply_fv_adjustments
+        milb_df = apply_fv_adjustments(milb_df, fv_map, "batter")
+
     if readiness_df is None:
         from src.models.mlb_readiness import score_prospects
         readiness_df = score_prospects(
@@ -642,6 +978,27 @@ def rank_prospects(
 
     df = readiness_df.copy()
     df["prospect_type"] = "batter"
+
+    # -------------------------------------------------------------------
+    # Fix 2: Exclude pitchers from batter prospect rankings
+    # -------------------------------------------------------------------
+    # Converted players (e.g. McLean) may still have MiLB batting data
+    # but their primary position is now P.
+    pitcher_ids = _get_pitcher_player_ids()
+    n_before = len(df)
+    df = df[~df["player_id"].isin(pitcher_ids)].copy()
+    n_dropped = n_before - len(df)
+    if n_dropped > 0:
+        logger.info("Excluded %d pitchers from batter prospect rankings", n_dropped)
+
+    if df.empty:
+        logger.warning("No batter prospects remain after pitcher exclusion")
+        return pd.DataFrame()
+
+    # -------------------------------------------------------------------
+    # Fix 3: Blend MLB debut data for prospects with small MLB samples
+    # -------------------------------------------------------------------
+    df = _blend_mlb_debut_batter_rates(df)
 
     # -------------------------------------------------------------------
     # Component 1: Readiness (already 0-1 probability)
@@ -731,7 +1088,7 @@ def rank_prospects(
         if not prospect_grades.empty:
             df = df.merge(prospect_grades, on="player_id", how="left")
             logger.info("Scouting grades computed for %d batting prospects",
-                        prospect_grades["diamond_rating"].notna().sum())
+                        prospect_grades["tools_rating"].notna().sum())
     except Exception:
         logger.warning("Could not compute prospect scouting grades", exc_info=True)
 
@@ -747,10 +1104,12 @@ def rank_prospects(
         "impact_score", "floor_eta_score",
         "comp_readiness", "comp_rate_quality", "comp_age",
         "comp_trajectory", "comp_positional",
-        # Translated stats
+        # Translated stats (blended with MLB debut data when available)
         "wtd_k_pct", "wtd_bb_pct", "wtd_iso", "wtd_hr_pa", "wtd_gb_pct",
         "k_bb_diff", "sb_rate",
         "career_milb_pa", "youngest_age_rel",
+        # MLB debut blend metadata
+        "has_mlb_debut", "mlb_debut_pa",
         # Sub-trajectory components
         "promotion_resilience", "availability_score",
         # Readiness
@@ -762,7 +1121,7 @@ def rank_prospects(
         "fg_risk", "fg_eta",
         # Scouting grades (20-80) — present + future + diamond rating
         "grade_hit", "grade_power", "grade_speed", "grade_fielding",
-        "grade_discipline", "diamond_rating",
+        "grade_discipline", "tools_rating",
         "future_hit", "future_power", "future_speed", "future_fielding",
         "future_discipline",
     ]
@@ -814,23 +1173,40 @@ def rank_pitching_prospects(
     milb_recent = milb_df[milb_df["player_id"].isin(recent_ids)].copy()
 
     # Exclude players who already have significant MLB time
+    # Fix 1: Raised from 100 BF to _MAX_MLB_BF_PROSPECT (400 BF ≈ 100 IP).
+    # Prospects with brief callups (e.g. McLean's 8-start debut) should
+    # remain in prospect rankings.
     try:
         from src.data.db import read_sql
-        mlb_pitchers = read_sql("""
+        mlb_pitchers = read_sql(f"""
             SELECT DISTINCT pitcher_id FROM production.fact_pitching_advanced
-            WHERE batters_faced >= 100
+            WHERE batters_faced >= {_MAX_MLB_BF_PROSPECT}
         """, {})
         mlb_ids = set(mlb_pitchers["pitcher_id"].astype(int))
     except Exception:
         mlb_ids = set()
 
+    n_before = len(milb_recent["player_id"].unique())
     milb_recent = milb_recent[~milb_recent["player_id"].isin(mlb_ids)]
+    n_after = len(milb_recent["player_id"].unique())
+    if n_before > n_after:
+        logger.info("Excluded %d pitchers with >= %d MLB BF from prospect pool",
+                     n_before - n_after, _MAX_MLB_BF_PROSPECT)
+
+    # Apply FV-conditioned translation adjustments before aggregation
+    fv_map = _get_prospect_fv_map(set(milb_recent["player_id"].unique()))
+    if fv_map:
+        from src.data.milb_translation import apply_fv_adjustments
+        milb_recent = apply_fv_adjustments(milb_recent, fv_map, "pitcher")
 
     # Build features
     df = _build_pitcher_prospect_features(milb_recent)
     if df.empty:
         logger.warning("No pitching prospects found")
         return pd.DataFrame()
+
+    # Fix 3: Blend MLB debut data for prospects with small samples
+    df = _blend_mlb_debut_pitcher_rates(df)
 
     logger.info("Building pitcher prospect rankings for %d prospects", len(df))
 
@@ -929,7 +1305,7 @@ def rank_pitching_prospects(
         if not prospect_grades.empty:
             df = df.merge(prospect_grades, on="player_id", how="left")
             logger.info("Scouting grades computed for %d pitching prospects",
-                        prospect_grades["diamond_rating"].notna().sum())
+                        prospect_grades["tools_rating"].notna().sum())
     except Exception:
         logger.warning("Could not compute pitching prospect scouting grades", exc_info=True)
 
@@ -945,16 +1321,18 @@ def rank_pitching_prospects(
         "impact_score", "floor_eta_score",
         "comp_readiness", "comp_rate_quality", "comp_age",
         "comp_trajectory", "comp_positional",
-        # Translated stats
+        # Translated stats (blended with MLB debut data when available)
         "wtd_k_pct", "wtd_bb_pct", "wtd_hr_bf", "k_bb_diff",
         "career_milb_bf", "youngest_age_rel", "sp_pct",
+        # MLB debut blend metadata
+        "has_mlb_debut", "mlb_debut_bf",
         # Readiness
         "readiness_score", "readiness_tier",
         # FanGraphs (display only)
         "fg_future_value", "fg_overall_rank", "fg_org_rank",
         "fg_risk", "fg_eta",
         # Scouting grades (20-80) — present + future + diamond rating
-        "grade_stuff", "grade_command", "grade_durability", "diamond_rating",
+        "grade_stuff", "grade_command", "grade_durability", "tools_rating",
         "future_stuff", "future_command", "future_durability",
     ]
     available = [c for c in output_cols if c in df.columns]

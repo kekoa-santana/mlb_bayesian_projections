@@ -1188,3 +1188,78 @@ def score_matchup_with_uncertainty(
         lifts[i] = result.get(lift_key, 0.0)
 
     return lifts
+
+
+# ---------------------------------------------------------------------------
+# Bullpen matchup lifts
+# ---------------------------------------------------------------------------
+
+def compute_bullpen_matchup_lifts(
+    batter_id: int,
+    reliever_roster: pd.DataFrame,
+    pitcher_arsenal: pd.DataFrame,
+    hitter_vuln: pd.DataFrame,
+    baselines_pt: dict[str, dict[str, float]],
+    *,
+    _cache: dict[tuple[int, int, str], float] | None = None,
+) -> dict[str, float]:
+    """Compute BF-share-weighted bullpen matchup lifts for one batter.
+
+    Parameters
+    ----------
+    batter_id : int
+        Batter MLB ID.
+    reliever_roster : pd.DataFrame
+        Relievers for *one team-season*, with columns ``pitcher_id``
+        and ``bf_share``.
+    pitcher_arsenal, hitter_vuln, baselines_pt
+        Standard matchup data (same as ``score_matchup_for_stat``).
+    _cache : dict or None
+        Optional ``(pitcher_id, batter_id, stat) -> lift`` cache to
+        avoid redundant computation across batter-games.
+
+    Returns
+    -------
+    dict
+        Keys: ``bullpen_matchup_k_lift``, ``bullpen_matchup_bb_lift``,
+        ``bullpen_matchup_hr_lift``.
+    """
+    totals = {"k": 0.0, "bb": 0.0, "hr": 0.0}
+    weight_sum = 0.0
+
+    for _, rrow in reliever_roster.iterrows():
+        pid = int(rrow["pitcher_id"])
+        share = float(rrow["bf_share"])
+
+        for stat in ("k", "bb", "hr"):
+            cache_key = (pid, batter_id, stat)
+            if _cache is not None and cache_key in _cache:
+                lift = _cache[cache_key]
+            else:
+                try:
+                    res = score_matchup_for_stat(
+                        stat, pid, batter_id,
+                        pitcher_arsenal, hitter_vuln, baselines_pt,
+                    )
+                    lift_key = f"matchup_{stat}_logit_lift"
+                    val = res.get(lift_key, 0.0)
+                    lift = val if isinstance(val, float) and not np.isnan(val) else 0.0
+                except Exception:
+                    lift = 0.0
+                if _cache is not None:
+                    _cache[cache_key] = lift
+
+            totals[stat] += lift * share
+
+        weight_sum += share
+
+    # Normalise in case bf_shares don't sum to 1 after filtering
+    if weight_sum > 0 and abs(weight_sum - 1.0) > 0.01:
+        for stat in totals:
+            totals[stat] /= weight_sum
+
+    return {
+        "bullpen_matchup_k_lift": totals["k"],
+        "bullpen_matchup_bb_lift": totals["bb"],
+        "bullpen_matchup_hr_lift": totals["hr"],
+    }

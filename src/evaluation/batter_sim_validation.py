@@ -24,6 +24,7 @@ from src.data.feature_eng import (
 from src.data.queries import (
     get_batter_game_actuals,
     get_team_bullpen_rates,
+    get_team_reliever_roster,
     get_umpire_tendencies,
 )
 from src.models.bf_model import compute_pitcher_bf_priors
@@ -33,7 +34,7 @@ from src.models.hitter_model import (
     fit_hitter_model,
     prepare_hitter_data,
 )
-from src.models.matchup import score_matchup_for_stat
+from src.models.matchup import compute_bullpen_matchup_lifts, score_matchup_for_stat
 from src.models.pitcher_model import (
     extract_rate_samples as extract_pitcher_rate_samples,
     fit_pitcher_model,
@@ -66,6 +67,7 @@ def build_batter_sim_predictions(
     n_sims: int = 5000,
     min_pa_game: int = 1,
     random_seed: int = 42,
+    enable_bullpen_matchup: bool = False,
 ) -> pd.DataFrame:
     """Build batter game predictions for one fold.
 
@@ -231,6 +233,23 @@ def build_batter_sim_predictions(
         .reset_index()
     )
 
+    # --- 6b. Reliever rosters for bullpen matchup lifts ---
+    reliever_roster_df = pd.DataFrame()
+    matchup_cache: dict[tuple[int, int, str], float] = {}
+    if enable_bullpen_matchup:
+        reliever_roster_df = get_team_reliever_roster(train_seasons)
+        # Use most recent season per team-pitcher
+        reliever_roster_df = (
+            reliever_roster_df
+            .sort_values("season")
+            .groupby(["team_id", "pitcher_id"])
+            .last()
+            .reset_index()
+        )
+        logger.info("Loaded reliever rosters: %d relievers across %d teams",
+                     len(reliever_roster_df),
+                     reliever_roster_df["team_id"].nunique())
+
     # --- 7. Matchup data ---
     pitcher_arsenal = get_pitcher_arsenal(last_train)
     hitter_vuln = get_hitter_vulnerability(last_train)
@@ -317,14 +336,33 @@ def build_batter_sim_predictions(
             pass
 
         # Bullpen rates
+        bp_matchup_k = 0.0
+        bp_matchup_bb = 0.0
+        bp_matchup_hr = 0.0
         if pd.notna(opp_team_id):
-            bp_row = bullpen_latest[bullpen_latest["team_id"] == int(opp_team_id)]
+            opp_tid = int(opp_team_id)
+            bp_row = bullpen_latest[bullpen_latest["team_id"] == opp_tid]
             if len(bp_row) > 0:
                 bp_k = float(bp_row.iloc[0]["k_rate"])
                 bp_bb = float(bp_row.iloc[0]["bb_rate"])
                 bp_hr = float(bp_row.iloc[0]["hr_rate"])
             else:
                 bp_k, bp_bb, bp_hr = 0.253, 0.084, 0.024
+
+            # Per-batter bullpen matchup lifts
+            if enable_bullpen_matchup and not reliever_roster_df.empty:
+                team_relievers = reliever_roster_df[
+                    reliever_roster_df["team_id"] == opp_tid
+                ]
+                if len(team_relievers) > 0:
+                    bp_lifts = compute_bullpen_matchup_lifts(
+                        batter_id, team_relievers,
+                        pitcher_arsenal, hitter_vuln, baselines_pt,
+                        _cache=matchup_cache,
+                    )
+                    bp_matchup_k = bp_lifts["bullpen_matchup_k_lift"]
+                    bp_matchup_bb = bp_lifts["bullpen_matchup_bb_lift"]
+                    bp_matchup_hr = bp_lifts["bullpen_matchup_hr_lift"]
         else:
             bp_k, bp_bb, bp_hr = 0.253, 0.084, 0.024
 
@@ -346,6 +384,9 @@ def build_batter_sim_predictions(
                 bullpen_k_rate=bp_k,
                 bullpen_bb_rate=bp_bb,
                 bullpen_hr_rate=bp_hr,
+                bullpen_matchup_k_lift=bp_matchup_k,
+                bullpen_matchup_bb_lift=bp_matchup_bb,
+                bullpen_matchup_hr_lift=bp_matchup_hr,
                 n_sims=n_sims,
                 random_seed=random_seed + game_pk % 10000 + batter_id % 1000,
             )

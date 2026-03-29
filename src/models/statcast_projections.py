@@ -415,8 +415,8 @@ def compute_projected_grades_with_ci(
     percentiles for floor/ceiling.
 
     Returns (hitter_grade_ci, pitcher_grade_ci) DataFrames with columns:
-    player_id, grade_X, grade_X_lo, grade_X_hi, diamond_rating,
-    diamond_rating_lo, diamond_rating_hi.
+    player_id, grade_X, grade_X_lo, grade_X_hi, tools_rating,
+    tools_rating_lo, tools_rating_hi.
     """
     # For now, compute simple CIs from the projected mean +/- SD
     # Full MC sampling requires the tool grade functions to accept arrays,
@@ -426,7 +426,7 @@ def compute_projected_grades_with_ci(
     pitcher_ci = pd.DataFrame()
 
     if not hitter_statcast_proj.empty and not hitter_rankings.empty:
-        hitter_ci = hitter_rankings[["batter_id", "diamond_rating",
+        hitter_ci = hitter_rankings[["batter_id", "tools_rating",
                                       "grade_hit", "grade_power", "grade_speed",
                                       "grade_fielding", "grade_discipline"]].copy()
         hitter_ci = hitter_ci.rename(columns={"batter_id": "player_id"})
@@ -462,17 +462,17 @@ def compute_projected_grades_with_ci(
 
         # Diamond rating CI: propagate from tool CIs
         # Floor: all tools at their low end; Ceiling: all at their high end
-        dr = hitter_ci["diamond_rating"]
+        dr = hitter_ci["tools_rating"]
         tool_uncertainty = (
             hitter_ci[[f"grade_{t}_hi" for t in ["hit", "power", "speed", "fielding", "discipline"]]].mean(axis=1)
             - hitter_ci[[f"grade_{t}_lo" for t in ["hit", "power", "speed", "fielding", "discipline"]]].mean(axis=1)
         ) / 60 * 10  # convert grade spread to diamond spread
 
-        hitter_ci["diamond_rating_lo"] = (dr - tool_uncertainty / 2).clip(1, 10).round(1)
-        hitter_ci["diamond_rating_hi"] = (dr + tool_uncertainty / 2).clip(1, 10).round(1)
+        hitter_ci["tools_rating_lo"] = (dr - tool_uncertainty / 2).clip(1, 10).round(1)
+        hitter_ci["tools_rating_hi"] = (dr + tool_uncertainty / 2).clip(1, 10).round(1)
 
     if not pitcher_statcast_proj.empty and not pitcher_rankings.empty:
-        pitcher_ci = pitcher_rankings[["pitcher_id", "diamond_rating",
+        pitcher_ci = pitcher_rankings[["pitcher_id", "tools_rating",
                                         "grade_stuff", "grade_command",
                                         "grade_durability"]].copy()
         pitcher_ci = pitcher_ci.rename(columns={"pitcher_id": "player_id"})
@@ -495,13 +495,13 @@ def compute_projected_grades_with_ci(
         pitcher_ci["grade_durability_lo"] = (pitcher_ci["grade_durability"] - 7).clip(20, 80)
         pitcher_ci["grade_durability_hi"] = (pitcher_ci["grade_durability"] + 7).clip(20, 80)
 
-        dr = pitcher_ci["diamond_rating"]
+        dr = pitcher_ci["tools_rating"]
         tool_uncertainty = (
             pitcher_ci[[f"grade_{t}_hi" for t in ["stuff", "command", "durability"]]].mean(axis=1)
             - pitcher_ci[[f"grade_{t}_lo" for t in ["stuff", "command", "durability"]]].mean(axis=1)
         ) / 60 * 10
 
-        pitcher_ci["diamond_rating_lo"] = (dr - tool_uncertainty / 2).clip(1, 10).round(1)
-        pitcher_ci["diamond_rating_hi"] = (dr + tool_uncertainty / 2).clip(1, 10).round(1)
+        pitcher_ci["tools_rating_lo"] = (dr - tool_uncertainty / 2).clip(1, 10).round(1)
+        pitcher_ci["tools_rating_hi"] = (dr + tool_uncertainty / 2).clip(1, 10).round(1)
 
     return hitter_ci, pitcher_ci

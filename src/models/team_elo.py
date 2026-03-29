@@ -51,11 +51,11 @@ _DEFAULTS = {
     "k_factor_ds": 14,   # Division Series
     "k_factor_cs": 18,   # League Championship Series
     "k_factor_ws": 22,   # World Series
-    "season_regression": 0.40,
+    "season_regression": 0.15,
     "margin_log_base": 1.5,
     "sp_weight": 0.40,
     "sp_k_factor": 6,
-    "sp_regression": 0.50,
+    "sp_regression": 0.25,
 }
 
 
@@ -289,27 +289,44 @@ def _process_game(
     pit_actual_home = 1 - _runs_to_score(away_scored_adj)  # good if opponent scored little
     pit_actual_away = 1 - _runs_to_score(home_scored_adj)
 
+    # --- Component-specific expectations (cross-component) ---
+    # Offense expectation depends on the OPPONENT'S pitching, not their
+    # offense.  A good offense facing bad pitching should expect to score a
+    # lot — and only gets credit for exceeding that.  Pitching expectation
+    # depends on the OPPONENT'S offense for the same reason.
+    # Without cross-component expectations, good pitching teams have
+    # inflated composite expectations that suppress their offense ELO.
+    off_exp_home = _expected_score(home_off + ha, away_pit)
+    off_exp_away = _expected_score(away_off, home_pit + ha)
+    pit_exp_home = _expected_score(home_pit + ha, away_off)
+    pit_exp_away = _expected_score(away_pit, home_off + ha)
+
     # --- Update OFFENSE ratings ---
-    off_surprise_home = off_actual_home - exp_home
-    off_surprise_away = off_actual_away - exp_away
+    off_surprise_home = off_actual_home - off_exp_home
+    off_surprise_away = off_actual_away - off_exp_away
 
     ratings.offense[home_id] = home_off + k_home * mov * off_surprise_home
     ratings.offense[away_id] = away_off + k_away * mov * off_surprise_away
 
     # --- Update PITCHING ratings ---
-    pit_surprise_home = pit_actual_home - exp_home
-    pit_surprise_away = pit_actual_away - exp_away
+    pit_surprise_home = pit_actual_home - pit_exp_home
+    pit_surprise_away = pit_actual_away - pit_exp_away
 
     ratings.pitching[home_id] = home_pit + k_home * mov * pit_surprise_home
     ratings.pitching[away_id] = away_pit + k_away * mov * pit_surprise_away
 
-    # --- Update SP ratings (pitching performance) ---
+    # --- Update SP ratings ---
+    # SP uses the team pitching expectation (my pitching vs their offense)
+    # so SPs aren't penalised for facing a strong lineup — they're expected
+    # to allow more runs in that spot.
     if home_sp is not None:
         sp_elo_h = ratings.get_sp(home_sp, initial)
-        ratings.sp[home_sp] = sp_elo_h + k_sp * mov * (pit_actual_home - exp_home)
+        sp_exp_h = _expected_score(sp_elo_h + ha, away_off)
+        ratings.sp[home_sp] = sp_elo_h + k_sp * mov * (pit_actual_home - sp_exp_h)
     if away_sp is not None:
         sp_elo_a = ratings.get_sp(away_sp, initial)
-        ratings.sp[away_sp] = sp_elo_a + k_sp * mov * (pit_actual_away - exp_away)
+        sp_exp_a = _expected_score(sp_elo_a, home_off + ha)
+        ratings.sp[away_sp] = sp_elo_a + k_sp * mov * (pit_actual_away - sp_exp_a)
 
     # Track games — only regular season counts toward early-season threshold
     if game_type == "R":

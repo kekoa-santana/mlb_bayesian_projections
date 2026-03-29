@@ -166,7 +166,7 @@ def run_team_profiles(
 
     try:
         from src.models.team_profiles import build_all_team_profiles
-        from src.models.team_rankings import rank_teams
+        from src.models.team_rankings import compute_roster_waa_delta, rank_teams
 
         team_profiles = build_all_team_profiles(
             season=from_season,
@@ -176,9 +176,38 @@ def run_team_profiles(
         team_profiles.to_parquet(DASHBOARD_DIR / "team_profiles.parquet", index=False)
         logger.info("Saved team_profiles.parquet: %d teams", len(team_profiles))
 
+        # Roster WAA delta: compare prior season rosters to current
+        waa_deltas = None
+        try:
+            roster_path = DASHBOARD_DIR / "roster.parquet"
+            cur_roster = pd.read_parquet(roster_path) if roster_path.exists() else None
+            waa_deltas = compute_roster_waa_delta(
+                from_season, from_season + 1, current_roster=cur_roster,
+            )
+            logger.info(
+                "Roster WAA deltas: %d teams, range [%.1f, %.1f]",
+                len(waa_deltas),
+                waa_deltas["waa_delta"].min(),
+                waa_deltas["waa_delta"].max(),
+            )
+        except Exception:
+            logger.warning("Could not compute roster WAA deltas", exc_info=True)
+
+        # Compute 2H-weighted RS/RA for observed component
+        obs_2h = None
+        try:
+            from src.models.team_sim.league_season_sim import compute_2h_weighted_rs_ra
+            from src.data.team_queries import get_game_results as _get_gr_rt
+            obs_2h = compute_2h_weighted_rs_ra(_get_gr_rt(), from_season)
+            logger.info("Using 2H-weighted RS/RA for rank_teams")
+        except Exception:
+            logger.warning("Could not compute 2H RS/RA for rank_teams", exc_info=True)
+
         team_rankings_df = rank_teams(
             team_profiles,
             elo_ratings=elo_current,
+            waa_deltas=waa_deltas,
+            observed_rs_ra=obs_2h,
         )
         team_rankings_df.to_parquet(DASHBOARD_DIR / "team_rankings.parquet", index=False)
         logger.info("Saved team_rankings.parquet: %d teams", len(team_rankings_df))
@@ -274,21 +303,24 @@ def run_team_power() -> None:
                     "team_pitching_glicko",
                 ]
                 power_cols = [c for c in power_cols if c in power_rankings_df.columns]
+                # Drop existing power columns to prevent _pw duplicates on re-runs
+                drop_cols = [c for c in power_cols if c != "team_id" and c in tr.columns]
+                tr = tr.drop(columns=drop_cols, errors="ignore")
                 tr = tr.merge(
                     power_rankings_df[power_cols],
-                    on="team_id", how="left", suffixes=("", "_pw"),
+                    on="team_id", how="left",
                 )
-                # Use power ranking as THE rank
-                if "power_rank" in tr.columns:
-                    tr["rank"] = tr["power_rank"]
-                    tr["tier"] = tr["power_tier"]
-                    # Re-derive TDD score (1-10) from power_score
+                # Rank and display score both from power rankings composite
+                # so the dashboard order matches the displayed TDD score.
+                if "power_score" in tr.columns:
                     ps = tr["power_score"]
                     ps_min, ps_max = ps.min(), ps.max()
                     if ps_max - ps_min > 1e-9:
                         tr["tdd_score"] = (
                             1.0 + (ps - ps_min) / (ps_max - ps_min) * 9.0
                         ).round(1)
+                    tr["rank"] = tr["power_rank"]
+                    tr["tier"] = tr["power_tier"]
                     tr = tr.sort_values("rank").reset_index(drop=True)
 
                 tr.to_parquet(_tr_path, index=False)
@@ -320,6 +352,258 @@ def run_team_power() -> None:
 
     except Exception:
         logger.exception("Failed to build power rankings")
+
+
+def run_league_sim(
+    *,
+    n_sims: int = 1000,
+    random_seed: int = 42,
+    from_season: int = FROM_SEASON,
+) -> None:
+    """Run full-league Bernoulli season sim on actual schedule.
+
+    Feeds the same team strengths (Pythagorean + WAA) used by rank_teams
+    into a zero-sum league simulator.  The sim mean wins REPLACE
+    projected_wins in team_rankings.parquet so there is one source of
+    truth.  Also writes playoff probabilities and win distributions.
+    """
+    logger.info("=" * 60)
+    logger.info("Running league season simulator (%d sims)...", n_sims)
+
+    try:
+        from src.models.team_sim.league_season_sim import (
+            build_team_strength,
+            compute_2h_weighted_rs_ra,
+            compute_team_history,
+            simulate_league_season,
+        )
+        from src.models.team_rankings import compute_roster_waa_delta, _assign_tier
+
+        tr_path = DASHBOARD_DIR / "team_rankings.parquet"
+        tp_path = DASHBOARD_DIR / "team_profiles.parquet"
+        if not tr_path.exists() or not tp_path.exists():
+            logger.warning("Skipping league sim -- need team_rankings + team_profiles first")
+            return
+
+        tr = pd.read_parquet(tr_path)
+        tp = pd.read_parquet(tp_path)
+
+        # Build team strength from the same RS/RA data rank_teams uses
+        # Need rpg + ra_per_game from profiles, plus WAA
+        waa_deltas = None
+        roster_path = DASHBOARD_DIR / "roster.parquet"
+        if roster_path.exists():
+            try:
+                cur_roster = pd.read_parquet(roster_path)
+                waa_df = compute_roster_waa_delta(
+                    from_season, from_season + 1, current_roster=cur_roster,
+                )
+                waa_deltas = dict(zip(waa_df["team_id"], waa_df["waa_delta"]))
+            except Exception:
+                logger.warning("Could not compute WAA for league sim", exc_info=True)
+
+        # Use 2H-weighted RS/RA (40% 1H + 60% 2H) for team strength.
+        # Teams that improved at the deadline carry that signal forward.
+        from src.data.team_queries import get_game_results as _get_gr
+        _game_results = _get_gr()
+        _2h_stats = compute_2h_weighted_rs_ra(_game_results, from_season)
+
+        # Build talent composite per team: 45% offense + 35% pitching + 20% defense
+        _talent_scores: dict[int, float] = {}
+        for _, _t in tr.iterrows():
+            _talent_scores[int(_t["team_id"])] = (
+                0.45 * _t.get("offense_score", 0.5)
+                + 0.35 * _t.get("pitching_score", 0.5)
+                + 0.20 * _t.get("defense_score", 0.5)
+            )
+        logger.info(
+            "Talent composites: min=%.3f, max=%.3f",
+            min(_talent_scores.values()), max(_talent_scores.values()),
+        )
+
+        # Compute 3-year team RS/RA history for team-specific regression
+        _team_hist = compute_team_history(_game_results, from_season, n_years=3)
+        logger.info("Team history: %d teams with 3-year baselines", len(_team_hist))
+
+        if not _2h_stats.empty:
+            logger.info("Using 2H-weighted RS/RA + talent blend + team-specific regression")
+            team_strength = build_team_strength(
+                _2h_stats, waa_deltas=waa_deltas, talent_scores=_talent_scores,
+                team_history=_team_hist,
+            )
+        else:
+            logger.info("Falling back to full-season RS/RA from profiles")
+            team_strength = build_team_strength(
+                tp, waa_deltas=waa_deltas, talent_scores=_talent_scores,
+                team_history=_team_hist,
+            )
+        # ── Breakout model trajectory adjustment ──
+        # Uses the full XGBoost breakout model scores (Power Surge, Diamond
+        # in the Rough, Stuff Dominant, ERA Correction, Command Leap)
+        # weighted by projected PA/IP.  Each team gets a net breakout upside
+        # adjustment relative to league average.
+        _TRAJ_SCALE = 1.5   # wins per unit of above-average breakout score
+        _TRAJ_CAP = 3.0     # max ±wins adjustment
+        try:
+            _hr = pd.read_parquet(DASHBOARD_DIR / "hitters_rankings.parquet")
+            _pr = pd.read_parquet(DASHBOARD_DIR / "pitchers_rankings.parquet")
+            _hcs = pd.read_parquet(DASHBOARD_DIR / "hitter_counting_sim.parquet")
+            _pcs = pd.read_parquet(DASHBOARD_DIR / "pitcher_counting_sim.parquet")
+            _rost = pd.read_parquet(DASHBOARD_DIR / "roster.parquet")
+
+            # Hitter: PA-weighted breakout score
+            _hb = _hr[["batter_id", "breakout_score"]].merge(
+                _hcs[["batter_id", "total_pa_mean"]], on="batter_id", how="left",
+            ).merge(
+                _rost[["player_id", "org_id"]], left_on="batter_id",
+                right_on="player_id", how="left",
+            )
+            _hb["weighted_brk"] = (
+                _hb["breakout_score"] * _hb["total_pa_mean"].fillna(200) / 600
+            )
+
+            # Pitcher: IP-weighted breakout score
+            _pb = _pr[["pitcher_id", "breakout_score"]].merge(
+                _pcs[["pitcher_id", "projected_ip_mean"]], on="pitcher_id", how="left",
+            ).merge(
+                _rost[["player_id", "org_id"]], left_on="pitcher_id",
+                right_on="player_id", how="left",
+            )
+            _pb["weighted_brk"] = (
+                _pb["breakout_score"] * _pb["projected_ip_mean"].fillna(50) / 180
+            )
+
+            # Sum per team
+            team_brk: dict[int, float] = {}
+            for tid, grp in _hb.groupby("org_id"):
+                team_brk[int(tid)] = grp["weighted_brk"].sum()
+            for tid, grp in _pb.groupby("org_id"):
+                team_brk[int(tid)] = team_brk.get(int(tid), 0) + grp["weighted_brk"].sum()
+
+            # Convert to win adjustment relative to league average
+            lg_avg_brk = np.mean(list(team_brk.values())) if team_brk else 0
+            for tid in team_strength:
+                raw = (team_brk.get(tid, lg_avg_brk) - lg_avg_brk) * _TRAJ_SCALE
+                capped = max(-_TRAJ_CAP, min(_TRAJ_CAP, raw))
+                team_strength[tid] += capped / 162.0
+                team_strength[tid] = max(0.250, min(0.750, team_strength[tid]))
+            logger.info(
+                "Breakout trajectory applied: lg_avg=%.2f, range [%.2f, %.2f], "
+                "win adj range [%+.1f, %+.1f]",
+                lg_avg_brk, min(team_brk.values()), max(team_brk.values()),
+                (min(team_brk.values()) - lg_avg_brk) * _TRAJ_SCALE,
+                (max(team_brk.values()) - lg_avg_brk) * _TRAJ_SCALE,
+            )
+        except Exception:
+            logger.warning("Could not compute breakout trajectory", exc_info=True)
+
+        logger.info(
+            "Team strengths: min=%.3f, max=%.3f, spread=%.3f",
+            min(team_strength.values()), max(team_strength.values()),
+            max(team_strength.values()) - min(team_strength.values()),
+        )
+
+        # Fetch schedule for projection season
+        target_season = from_season + 1
+        schedule = None
+
+        # Try dim_game first (for backtesting / if season has started)
+        from src.data.db import read_sql
+        sched = read_sql(
+            "SELECT home_team_id, away_team_id, venue_id "
+            "FROM production.dim_game "
+            "WHERE season = :s AND game_type = 'R' "
+            "ORDER BY game_date, game_pk",
+            {"s": target_season},
+        )
+        if len(sched) >= 2400:
+            schedule = sched
+            logger.info("Using dim_game schedule: %d games", len(schedule))
+
+        # Fall back to MLB API
+        if schedule is None or len(schedule) < 2400:
+            logger.info("Fetching %d schedule from MLB API...", target_season)
+            import json
+            import urllib.request
+
+            url = (
+                f"https://statsapi.mlb.com/api/v1/schedule"
+                f"?sportId=1&season={target_season}&gameType=R"
+                f"&hydrate=team&fields=dates,date,games,gamePk,"
+                f"teams,away,home,team,id"
+            )
+            try:
+                with urllib.request.urlopen(url, timeout=30) as resp:
+                    data = json.loads(resp.read().decode())
+                rows = []
+                for date_entry in data.get("dates", []):
+                    for game in date_entry.get("games", []):
+                        rows.append({
+                            "home_team_id": game["teams"]["home"]["team"]["id"],
+                            "away_team_id": game["teams"]["away"]["team"]["id"],
+                            "venue_id": 0,  # no venue in this endpoint
+                        })
+                schedule = pd.DataFrame(rows)
+                logger.info("Fetched %d games from MLB API", len(schedule))
+            except Exception:
+                logger.exception("Failed to fetch schedule from MLB API")
+                return
+
+        if schedule is None or schedule.empty:
+            logger.warning("No schedule available for %d", target_season)
+            return
+
+        # Run sim
+        result = simulate_league_season(
+            schedule, team_strength=team_strength,
+            n_sims=n_sims, random_seed=random_seed,
+        )
+
+        # Save standalone league sim results
+        # Map team_id to abbreviation
+        tid_abbr = dict(zip(tr["team_id"], tr["abbreviation"]))
+        result["team_abbr"] = result["team_id"].map(tid_abbr)
+        result.to_parquet(DASHBOARD_DIR / "league_sim.parquet", index=False)
+        logger.info("Saved league_sim.parquet: %d teams", len(result))
+
+        # Merge sim wins into team_rankings as the canonical projected_wins
+        sim_wins_map = dict(zip(result["team_id"], result["sim_wins_mean"]))
+        sim_p10_map = dict(zip(result["team_id"], result["sim_wins_p10"]))
+        sim_p90_map = dict(zip(result["team_id"], result["sim_wins_p90"]))
+        sim_std_map = dict(zip(result["team_id"], result["sim_wins_std"]))
+        playoff_map = dict(zip(result["team_id"], result["playoff_pct"]))
+
+        tr["projected_wins"] = tr["team_id"].map(sim_wins_map).round(1)
+        tr["wins_p10"] = tr["team_id"].map(sim_p10_map)
+        tr["wins_p90"] = tr["team_id"].map(sim_p90_map)
+        tr["wins_std"] = tr["team_id"].map(sim_std_map)
+        tr["playoff_pct"] = tr["team_id"].map(playoff_map)
+
+        # Re-derive tiers from new projected wins
+        tr["tier"] = tr["projected_wins"].apply(_assign_tier)
+
+        # Re-normalize (sim should already be ~2430 but round to be safe)
+        raw_total = tr["projected_wins"].sum()
+        if abs(raw_total - 2430) > 5:
+            tr["projected_wins"] = (tr["projected_wins"] * 2430 / raw_total).round(1)
+            tr["tier"] = tr["projected_wins"].apply(_assign_tier)
+
+        tr.to_parquet(tr_path, index=False)
+        logger.info("Updated team_rankings.parquet with league sim wins")
+
+        # Log top 10
+        for _, row in tr.sort_values("projected_wins", ascending=False).head(10).iterrows():
+            logger.info(
+                "  %-4s  %5.1fW (p10=%2.0f p90=%2.0f) %s  PO=%.0f%%",
+                row.get("abbreviation", "???"),
+                row["projected_wins"],
+                row.get("wins_p10", 0), row.get("wins_p90", 0),
+                row["tier"],
+                row.get("playoff_pct", 0) * 100,
+            )
+
+    except Exception:
+        logger.exception("Failed to run league season simulator")
 
 
 def run_team_sim(
@@ -872,8 +1156,21 @@ def run_depth_chart(
         logger.exception("Failed to compute probable starters")
 
 
-def run_roster() -> None:
-    """Export full MLB roster from dim_roster."""
+def run_roster(*, from_season: int = FROM_SEASON) -> None:
+    """Export full MLB roster enriched with actual lineup positions.
+
+    Reads dim_roster for the full roster (team, career positions, status)
+    then overlays current-season fact_lineup data to add:
+
+    - ``lineup_position``: position the player has actually started most
+      often this season (None for bench / pitchers without starts).
+    - ``is_depth_starter``: True for the primary everyday starter at each
+      position per team (9 per team).
+
+    Career ``secondary_positions`` from dim_roster are preserved — lineup
+    data only informs where the player is playing NOW, not what they can
+    play.
+    """
     logger.info("=" * 60)
     logger.info("Exporting MLB roster from dim_roster...")
     try:
@@ -899,13 +1196,80 @@ def run_roster() -> None:
             roster_full["secondary_positions"] = roster_full["secondary_positions"].apply(
                 lambda x: list(x) if x is not None else []
             )
+
+        # ── Overlay actual lineup positions from current season ──────
+        current_season = from_season + 1
+        lineup_pos = _read_sql_roster("""
+            SELECT fl.player_id, dt.abbreviation AS team_abbr,
+                   fl.position, COUNT(*) AS games_started
+            FROM production.fact_lineup fl
+            JOIN production.dim_team dt ON fl.team_id = dt.team_id
+            WHERE fl.season = :season
+              AND fl.is_starter = true
+              AND fl.position NOT IN ('P')
+            GROUP BY fl.player_id, dt.abbreviation, fl.position
+        """, {"season": current_season})
+
+        if lineup_pos.empty:
+            logger.info(
+                "No %d lineup data — falling back to %d",
+                current_season, from_season,
+            )
+            current_season = from_season
+            lineup_pos = _read_sql_roster("""
+                SELECT fl.player_id, dt.abbreviation AS team_abbr,
+                       fl.position, COUNT(*) AS games_started
+                FROM production.fact_lineup fl
+                JOIN production.dim_team dt ON fl.team_id = dt.team_id
+                WHERE fl.season = :season
+                  AND fl.is_starter = true
+                  AND fl.position NOT IN ('P')
+                GROUP BY fl.player_id, dt.abbreviation, fl.position
+            """, {"season": current_season})
+
+        roster_full["lineup_position"] = None
+        roster_full["is_depth_starter"] = False
+
+        if not lineup_pos.empty:
+            # Each player's most-started position this season
+            idx = lineup_pos.groupby("player_id")["games_started"].idxmax()
+            player_best = lineup_pos.loc[idx].set_index("player_id")
+
+            # Determine the primary starter at each (team, position):
+            # the player with the most games started there.
+            ALL_POSITIONS = ["C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"]
+            starter_pids: set[int] = set()
+            for (team, pos), grp in lineup_pos.groupby(["team_abbr", "position"]):
+                if pos not in ALL_POSITIONS:
+                    continue
+                top = grp.sort_values("games_started", ascending=False).iloc[0]
+                pid = int(top["player_id"])
+                # Only mark as starter if this is also the player's
+                # most-started position (avoid double-counting)
+                if pid in player_best.index:
+                    if player_best.loc[pid, "position"] == pos:
+                        starter_pids.add(pid)
+
+            for i, row in roster_full.iterrows():
+                pid = int(row["player_id"])
+                if pid in player_best.index:
+                    roster_full.at[i, "lineup_position"] = player_best.loc[
+                        pid, "position"
+                    ]
+                if pid in starter_pids:
+                    roster_full.at[i, "is_depth_starter"] = True
+
         if not roster_full.empty:
             roster_full.to_parquet(
                 DASHBOARD_DIR / "roster.parquet", index=False,
             )
+            n_starters = roster_full["is_depth_starter"].sum()
+            n_with_pos = roster_full["lineup_position"].notna().sum()
             logger.info(
-                "Saved roster.parquet: %d players across %d teams",
-                len(roster_full), roster_full["team_abbr"].nunique(),
+                "Saved roster.parquet: %d players (%d starters, %d with "
+                "lineup positions) across %d teams",
+                len(roster_full), n_starters, n_with_pos,
+                roster_full["team_abbr"].nunique(),
             )
         else:
             logger.warning("dim_roster query returned no rows")

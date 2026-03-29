@@ -210,7 +210,7 @@ def _build_offense_profile(
 
             # Scouting grade columns to aggregate at team level
             _GRADE_COLS = ["grade_hit", "grade_power", "grade_speed",
-                           "grade_fielding", "grade_discipline", "diamond_rating"]
+                           "grade_fielding", "grade_discipline", "tools_rating"]
 
             def _pa_weighted_score(g: pd.DataFrame) -> pd.Series:
                 top9 = g.nlargest(9, score_col)
@@ -236,10 +236,10 @@ def _build_offense_profile(
                     if gc in top9.columns and top9[gc].notna().any():
                         vals = top9[gc].dropna()
                         w = pa_w[:len(vals)] if len(vals) == len(pa_w) else None
-                        key = f"lineup_{gc}" if gc != "diamond_rating" else "lineup_diamond"
+                        key = f"lineup_{gc}" if gc != "tools_rating" else "lineup_diamond"
                         result[key] = float(np.average(vals, weights=w)) if w is not None and len(w) > 0 else vals.mean()
                     else:
-                        key = f"lineup_{gc}" if gc != "diamond_rating" else "lineup_diamond"
+                        key = f"lineup_{gc}" if gc != "tools_rating" else "lineup_diamond"
                         result[key] = np.nan
                 return pd.Series(result)
 
@@ -360,6 +360,7 @@ def _build_pitching_profile(
     team_pitching: pd.DataFrame | None,
     park_factors: pd.DataFrame | None = None,
     pitcher_counting: pd.DataFrame | None = None,
+    pitcher_fip: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Pitching sub-scores per team (rotation + bullpen split)."""
     pt_pid = "player_id" if "player_id" in player_teams.columns else "batter_id"
@@ -414,9 +415,10 @@ def _build_pitching_profile(
             sp_mask = pr_merged[role_col].isin(["SP"]) if role_col in pr_merged.columns else pd.Series(True, index=pr_merged.index)
             sp_data = pr_merged[sp_mask]
 
-            _P_GRADE_COLS = ["grade_stuff", "grade_command", "grade_durability", "diamond_rating"]
+            _P_GRADE_COLS = ["grade_stuff", "grade_command", "grade_durability", "tools_rating"]
             _REPLACEMENT_GRADE = 4.0  # replacement-level diamond rating
             _MIN_SP = 5  # every team needs at least 5 SP
+            _REPLACEMENT_SP = 0.40  # replacement-level tdd_value
 
             def _ip_weighted_rot(g: pd.DataFrame) -> pd.Series:
                 top5 = g.nlargest(5, score_col)
@@ -425,15 +427,35 @@ def _build_pitching_profile(
 
                 # If fewer than 5 SP, fill with replacement-level grades.
                 # A team with only 2 elite SP still needs 3 more arms.
-                n_actual = len(top5)
+                n_actual = len(g)
                 if n_actual < _MIN_SP:
                     n_fill = _MIN_SP - n_actual
-                    s = np.append(s, [0.40] * n_fill)  # 0.40 = replacement tdd_value
+                    s = np.append(s, [_REPLACEMENT_SP] * n_fill)
                     w = np.append(w, [100.0] * n_fill)  # neutral IP weight
 
+                base_strength = float(np.average(s, weights=w)) if w.sum() > 0 else s.mean()
+
+                # Rotation depth bonus: SPs beyond the top 5 provide insurance
+                # against injuries and mid-season fatigue. Steep diminishing
+                # returns: SP6 at 50% credit, SP7 at 25%, SP8 at 12.5%.
+                # Uses full-health scores (_raw_score) since depth = who can
+                # step in when healthy, not current IL-discounted value.
+                depth_bonus = 0.0
+                depth_col = "_raw_score" if "_raw_score" in g.columns else score_col
+                if n_actual > _MIN_SP:
+                    extras = g.nlargest(n_actual, depth_col).iloc[_MIN_SP:]
+                    for i, (_, sp_row) in enumerate(extras.iterrows()):
+                        discount = 0.5 ** (i + 1)  # 0.50, 0.25, 0.125, ...
+                        # Credit = how much better than replacement × discount
+                        above_repl = max(0, sp_row[depth_col] - _REPLACEMENT_SP)
+                        depth_bonus += discount * above_repl
+                    # Scale so max realistic bonus ≈ 0.03-0.05
+                    depth_bonus *= 0.15
+
                 result = {
-                    "rotation_strength": float(np.average(s, weights=w)) if w.sum() > 0 else s.mean(),
+                    "rotation_strength": base_strength + depth_bonus,
                     "rotation_sp_count": n_actual,
+                    "rotation_depth_bonus": round(depth_bonus, 4),
                 }
 
                 # Ceiling: full-health rotation
@@ -454,12 +476,12 @@ def _build_pitching_profile(
                         vals = list(top5[gc].dropna())
                         # Fill to 5 with replacement grade
                         while len(vals) < _MIN_SP:
-                            vals.append(_REPLACEMENT_GRADE if gc == "diamond_rating" else 40)
+                            vals.append(_REPLACEMENT_GRADE if gc == "tools_rating" else 40)
                         wv = w[:len(vals)]
-                        key = f"rotation_{gc}" if gc != "diamond_rating" else "rotation_diamond"
+                        key = f"rotation_{gc}" if gc != "tools_rating" else "rotation_diamond"
                         result[key] = float(np.average(vals, weights=wv))
                     else:
-                        key = f"rotation_{gc}" if gc != "diamond_rating" else "rotation_diamond"
+                        key = f"rotation_{gc}" if gc != "tools_rating" else "rotation_diamond"
                         result[key] = np.nan
                 return pd.Series(result)
 
@@ -506,7 +528,7 @@ def _build_pitching_profile(
                 roles_merged["weighted_score"] = roles_merged[score_col_r].fillna(0) * roles_merged["role_weight"]
 
                 # Also merge scouting grades for bullpen aggregation
-                _BP_GRADE_COLS = ["grade_stuff", "grade_command", "diamond_rating"]
+                _BP_GRADE_COLS = ["grade_stuff", "grade_command", "tools_rating"]
                 bp_grade_available = [gc for gc in _BP_GRADE_COLS if gc in pitcher_rankings.columns]
                 if bp_grade_available:
                     roles_merged = roles_merged.merge(
@@ -536,12 +558,12 @@ def _build_pitching_profile(
                                 vals = [p[0] for p in paired[:_STANDARD_RP]]
                                 w = [p[1] for p in paired[:_STANDARD_RP]]
                             while len(vals) < _STANDARD_RP:
-                                vals.append(4.0 if gc == "diamond_rating" else 40)
+                                vals.append(4.0 if gc == "tools_rating" else 40)
                                 w.append(0.5)  # MR weight
-                            key = f"bullpen_{gc}" if gc != "diamond_rating" else "bullpen_diamond"
+                            key = f"bullpen_{gc}" if gc != "tools_rating" else "bullpen_diamond"
                             result[key] = float(np.average(vals, weights=w))
                         else:
-                            key = f"bullpen_{gc}" if gc != "diamond_rating" else "bullpen_diamond"
+                            key = f"bullpen_{gc}" if gc != "tools_rating" else "bullpen_diamond"
                             result[key] = np.nan
                     return pd.Series(result)
 
@@ -550,67 +572,60 @@ def _build_pitching_profile(
                 ).reset_index()
                 teams = teams.merge(bp_depth, on="team_id", how="left")
 
-    # --- Glicko ratings per role (SP / RP) ---
-    pitcher_glicko = _safe_load("pitcher_glicko.parquet")
-    if pitcher_glicko is not None and pitcher_rankings is not None:
-        pid_col_g = "pitcher_id"
-        role_col_g = "role" if "role" in pitcher_rankings.columns else "position"
-        # Map pitcher_id -> team_id via player_teams
-        glicko_team = pitcher_glicko[[pid_col_g, "mu"]].merge(
-            player_teams[["team_id", pt_pid]].rename(columns={pt_pid: pid_col_g}),
-            on=pid_col_g,
-            how="inner",
-        )
-        # Map pitcher_id -> role via pitcher_rankings
+    # --- FIP per role (SP / RP) ---
+    # FIP measures pitcher talent independent of defense/luck.
+    # Replaces Glicko + ERA + BP K-rate as the backward-looking signal.
+    if pitcher_fip is not None and pitcher_rankings is not None:
+        pid_col_f = "pitcher_id"
+        role_col_f = "role" if "role" in pitcher_rankings.columns else "position"
         pid_col_pr2 = "player_id" if "player_id" in pitcher_rankings.columns else "pitcher_id"
-        glicko_team = glicko_team.merge(
-            pitcher_rankings[[pid_col_pr2, role_col_g]].rename(columns={pid_col_pr2: pid_col_g}),
-            on=pid_col_g,
+
+        # Use most recent season FIP
+        recent_fip = pitcher_fip.sort_values("season", ascending=False).drop_duplicates("pitcher_id")
+
+        # Map pitcher -> team + role
+        fip_team = recent_fip[["pitcher_id", "fip", "ip"]].merge(
+            player_teams[["team_id", pt_pid]].rename(columns={pt_pid: pid_col_f}),
+            on=pid_col_f,
+            how="inner",
+        )
+        fip_team = fip_team.merge(
+            pitcher_rankings[[pid_col_pr2, role_col_f]].rename(columns={pid_col_pr2: pid_col_f}),
+            on=pid_col_f,
             how="inner",
         )
 
-        # SP aggregate Glicko per team
-        sp_glicko = glicko_team[glicko_team[role_col_g] == "SP"]
-        if not sp_glicko.empty:
-            sp_glicko_agg = sp_glicko.groupby("team_id")["mu"].mean().reset_index(name="sp_glicko_mu")
-            sp_glicko_agg["sp_glicko_pctl"] = _pctl(sp_glicko_agg["sp_glicko_mu"])
-            teams = teams.merge(sp_glicko_agg[["team_id", "sp_glicko_pctl"]], on="team_id", how="left")
-            logger.info("SP Glicko aggregated for %d teams", sp_glicko_agg.shape[0])
+        # SP FIP: IP-weighted avg of top 5 SP (lower = better)
+        sp_fip = fip_team[fip_team[role_col_f] == "SP"]
+        if not sp_fip.empty:
+            def _sp_fip_agg(g: pd.DataFrame) -> float:
+                top5 = g.nlargest(5, "ip")
+                return float(np.average(top5["fip"], weights=top5["ip"]))
 
-        # RP aggregate Glicko per team
-        rp_glicko = glicko_team[glicko_team[role_col_g] == "RP"]
-        if not rp_glicko.empty:
-            rp_glicko_agg = rp_glicko.groupby("team_id")["mu"].mean().reset_index(name="rp_glicko_mu")
-            rp_glicko_agg["rp_glicko_pctl"] = _pctl(rp_glicko_agg["rp_glicko_mu"])
-            teams = teams.merge(rp_glicko_agg[["team_id", "rp_glicko_pctl"]], on="team_id", how="left")
-            logger.info("RP Glicko aggregated for %d teams", rp_glicko_agg.shape[0])
+            sp_fip_agg = sp_fip.groupby("team_id").apply(
+                _sp_fip_agg, include_groups=False,
+            ).reset_index(name="sp_fip_avg")
+            # Lower FIP = better, so invert the percentile
+            sp_fip_agg["sp_fip_pctl"] = 1 - _pctl(sp_fip_agg["sp_fip_avg"])
+            teams = teams.merge(sp_fip_agg[["team_id", "sp_fip_pctl"]], on="team_id", how="left")
+            logger.info("SP FIP aggregated for %d teams (range %.2f–%.2f)",
+                        len(sp_fip_agg), sp_fip_agg["sp_fip_avg"].min(), sp_fip_agg["sp_fip_avg"].max())
 
-    # --- SP park-adjusted ERA (top 5 SP per team) ---
-    if pr_merged is not None and "observed_era" in pr_merged.columns:
-        role_col_era = "role" if "role" in pr_merged.columns else "position"
-        sp_era_data = pr_merged[pr_merged[role_col_era] == "SP"].copy()
-        if not sp_era_data.empty:
-            sp_era_agg = sp_era_data.groupby("team_id").apply(
-                lambda g: g.nsmallest(5, "observed_era")["observed_era"].mean(),
-                include_groups=False,
-            ).reset_index(name="sp_era_avg")
-            # Lower ERA = better, so invert the percentile
-            sp_era_agg["sp_era_pctl"] = 1 - _pctl(sp_era_agg["sp_era_avg"])
-            teams = teams.merge(sp_era_agg[["team_id", "sp_era_pctl"]], on="team_id", how="left")
-            logger.info("SP ERA aggregated for %d teams", sp_era_agg.shape[0])
+        # RP FIP: IP-weighted avg of all RP (lower = better)
+        rp_fip = fip_team[fip_team[role_col_f] == "RP"]
+        if not rp_fip.empty:
+            def _rp_fip_agg(g: pd.DataFrame) -> float:
+                return float(np.average(g["fip"], weights=g["ip"]))
 
-    # --- Bullpen K rate from team_bullpen_rates ---
-    bp_rates = _safe_load("team_bullpen_rates.parquet")
-    if bp_rates is not None and not bp_rates.empty:
-        # Use most recent season
-        recent_bp = bp_rates.sort_values("season", ascending=False).drop_duplicates("team_id")
-        recent_bp["bp_k_rate_pctl"] = _pctl(recent_bp["k_rate"])
-        teams = teams.merge(
-            recent_bp[["team_id", "bp_k_rate_pctl"]],
-            on="team_id",
-            how="left",
-        )
-        logger.info("Bullpen K rate loaded for %d teams", recent_bp.shape[0])
+            rp_fip_agg = rp_fip.groupby("team_id").apply(
+                _rp_fip_agg, include_groups=False,
+            ).reset_index(name="rp_fip_avg")
+            rp_fip_agg["bp_fip_pctl"] = 1 - _pctl(rp_fip_agg["rp_fip_avg"])
+            teams = teams.merge(rp_fip_agg[["team_id", "bp_fip_pctl"]], on="team_id", how="left")
+            logger.info("RP FIP aggregated for %d teams (range %.2f–%.2f)",
+                        len(rp_fip_agg), rp_fip_agg["rp_fip_avg"].min(), rp_fip_agg["rp_fip_avg"].max())
+    else:
+        logger.warning("Pitcher FIP data not available — rotation/bullpen scores will be projection-only")
 
     # --- Staff style classification ---
     if team_pitching is not None:
@@ -647,16 +662,14 @@ def _build_pitching_profile(
         )
 
     # --- Rotation score ---
+    # rotation_strength (projected talent, 60%) + sp_fip_pctl (backward talent, 40%)
     rot_parts: list[tuple[str, float]] = []
     if "rotation_strength" in teams.columns:
         teams["rotation_strength_pctl"] = _pctl(teams["rotation_strength"].fillna(teams["rotation_strength"].median()))
-        rot_parts.append(("rotation_strength_pctl", 0.40))
-    if "sp_glicko_pctl" in teams.columns:
-        teams["sp_glicko_pctl"] = teams["sp_glicko_pctl"].fillna(0.5)
-        rot_parts.append(("sp_glicko_pctl", 0.30))
-    if "sp_era_pctl" in teams.columns:
-        teams["sp_era_pctl"] = teams["sp_era_pctl"].fillna(0.5)
-        rot_parts.append(("sp_era_pctl", 0.30))
+        rot_parts.append(("rotation_strength_pctl", 0.60))
+    if "sp_fip_pctl" in teams.columns:
+        teams["sp_fip_pctl"] = teams["sp_fip_pctl"].fillna(0.5)
+        rot_parts.append(("sp_fip_pctl", 0.40))
 
     if rot_parts:
         total_w = sum(w for _, w in rot_parts)
@@ -667,16 +680,14 @@ def _build_pitching_profile(
         teams["rotation_score"] = 0.5
 
     # --- Bullpen score ---
+    # bullpen_depth (projected talent, 50%) + bp_fip_pctl (backward talent, 50%)
     bp_parts: list[tuple[str, float]] = []
     if "bullpen_depth" in teams.columns:
         teams["bullpen_depth_pctl"] = _pctl(teams["bullpen_depth"].fillna(teams["bullpen_depth"].median()))
-        bp_parts.append(("bullpen_depth_pctl", 0.40))
-    if "rp_glicko_pctl" in teams.columns:
-        teams["rp_glicko_pctl"] = teams["rp_glicko_pctl"].fillna(0.5)
-        bp_parts.append(("rp_glicko_pctl", 0.30))
-    if "bp_k_rate_pctl" in teams.columns:
-        teams["bp_k_rate_pctl"] = teams["bp_k_rate_pctl"].fillna(0.5)
-        bp_parts.append(("bp_k_rate_pctl", 0.30))
+        bp_parts.append(("bullpen_depth_pctl", 0.50))
+    if "bp_fip_pctl" in teams.columns:
+        teams["bp_fip_pctl"] = teams["bp_fip_pctl"].fillna(0.5)
+        bp_parts.append(("bp_fip_pctl", 0.50))
 
     if bp_parts:
         total_w = sum(w for _, w in bp_parts)
@@ -1470,6 +1481,7 @@ def build_all_team_profiles(
         One row per team with all sub-scores.
     """
     from src.data.team_queries import (
+        get_pitcher_season_fip,
         get_team_age_profile,
         get_team_il_history,
         get_team_info,
@@ -1505,12 +1517,27 @@ def build_all_team_profiles(
     roster = _safe_load("roster.parquet")
     if roster is not None and "roster_status" in roster.columns:
         active_mask = roster["roster_status"].isin(_IL_AVAILABILITY.keys())
-        roster_filtered = roster.loc[active_mask, ["player_id", "roster_status"]].copy()
+        roster_cols = ["player_id", "roster_status"]
+        if "team_abbr" in roster.columns:
+            roster_cols.append("team_abbr")
+        roster_filtered = roster.loc[active_mask, roster_cols].copy()
         roster_filtered["availability"] = roster_filtered["roster_status"].map(_IL_AVAILABILITY)
 
         active_ids = set(roster_filtered["player_id"])
         before_n = len(player_teams)
         player_teams = player_teams[player_teams["player_id"].isin(active_ids)].copy()
+
+        # Override team assignment with roster's current team.
+        # player_teams reflects 2025 boxscores; roster reflects 2026 roster.
+        # Offseason acquisitions (e.g. Valdez HOU→DET) need the roster team.
+        if "team_abbr" in roster_filtered.columns:
+            roster_teams = roster_filtered[["player_id", "team_abbr"]].drop_duplicates("player_id")
+            player_teams = player_teams.drop(columns=["team_abbr"], errors="ignore")
+            player_teams = player_teams.merge(
+                roster_teams, on="player_id", how="left",
+            )
+            n_reassigned = (player_teams["team_abbr"].notna()).sum()
+            logger.info("Team assignments updated from roster for %d players", n_reassigned)
 
         # Merge availability weight into player_teams
         player_teams = player_teams.merge(
@@ -1580,10 +1607,16 @@ def build_all_team_profiles(
 
     logger.info("Building pitching profile...")
     pitcher_counting = _safe_load("pitcher_counting_sim.parquet")
+    try:
+        pitcher_fip = get_pitcher_season_fip(seasons=[season], min_ip=10)
+    except Exception as e:
+        logger.warning("Pitcher FIP query failed: %s", e)
+        pitcher_fip = None
     pitching = _build_pitching_profile(
         player_teams, pitcher_rankings, pitcher_roles, team_pitching,
         park_factors=park_factors,
         pitcher_counting=pitcher_counting,
+        pitcher_fip=pitcher_fip,
     )
 
     logger.info("Building defense profile...")
@@ -1735,7 +1768,9 @@ def build_all_team_profiles(
         (pitching, ["pitching_score", "pitching_ceiling",
                      "rotation_score", "bullpen_score",
                      "rotation_strength", "rotation_strength_ceiling",
+                     "rotation_depth_bonus",
                      "bullpen_depth",
+                     "sp_fip_pctl", "bp_fip_pctl",
                      "pitching_style", "ra_per_game", "k_per_game",
                      "proj_ra_per_game",
                      # Rotation + bullpen scouting grades

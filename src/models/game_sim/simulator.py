@@ -48,6 +48,41 @@ MAX_PA_PER_GAME = 45
 # This offset reduces exit probability to match observed BF distribution.
 _DEFAULT_EXIT_CALIBRATION_OFFSET = -0.35
 
+# Stamina offset parameters.
+# Workhorses (high avg IP) get more negative offset → stay longer.
+# Short-leash pitchers get less negative / positive offset → exit sooner.
+# Scale chosen so output IP spread matches observed 2025 distribution
+# (real std ≈ 0.49 IP across starters, 3.7–6.4 range).
+_STAMINA_POP_MEAN_IP = 5.28  # 2025 population mean IP for starters (10+ starts)
+_STAMINA_POP_STD_IP = 0.47   # 2025 population std
+_STAMINA_LOGIT_SCALE = 0.20  # logit shift per z-score of avg IP
+
+
+def compute_stamina_offset(
+    pitcher_avg_ip: float,
+    base_offset: float = _DEFAULT_EXIT_CALIBRATION_OFFSET,
+) -> float:
+    """Compute per-pitcher exit calibration offset based on stamina.
+
+    Workhorses (high avg IP) get a more negative offset (lower exit prob),
+    short-leash pitchers get a less negative offset (higher exit prob).
+
+    Parameters
+    ----------
+    pitcher_avg_ip : float
+        Pitcher's historical average innings pitched per start.
+    base_offset : float
+        Population-level calibration offset (logit scale).
+
+    Returns
+    -------
+    float
+        Per-pitcher exit calibration offset (logit scale).
+    """
+    z = (pitcher_avg_ip - _STAMINA_POP_MEAN_IP) / _STAMINA_POP_STD_IP
+    # Negative direction: higher avg IP → more negative offset → stays longer
+    return base_offset - _STAMINA_LOGIT_SCALE * z
+
 
 @dataclass
 class SimulationResult:

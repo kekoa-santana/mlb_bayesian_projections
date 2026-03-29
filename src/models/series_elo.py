@@ -44,7 +44,7 @@ _DEFAULTS: dict[str, Any] = {
     "k_factor_ds": 16,       # Division Series (best of 5)
     "k_factor_cs": 20,       # LCS (best of 7)
     "k_factor_ws": 24,       # World Series (best of 7)
-    "season_regression": 0.35,
+    "season_regression": 0.15,
     "margin_bonus": 0.15,    # extra K multiplier for sweeps
     "game_elo_blend": 0.60,
     "series_elo_blend": 0.40,

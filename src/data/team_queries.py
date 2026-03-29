@@ -545,3 +545,110 @@ def get_series_results(include_postseason: bool = True) -> pd.DataFrame:
         Same schema as ``get_game_results()``.
     """
     return get_game_results(include_postseason=include_postseason)
+
+
+# ---------------------------------------------------------------------------
+# 11. Pitcher season FIP
+# ---------------------------------------------------------------------------
+def get_pitcher_season_fip(
+    seasons: list[int] | None = None,
+    min_ip: float = 10.0,
+) -> pd.DataFrame:
+    """Compute season-level FIP per pitcher.
+
+    FIP = (13*HR + 3*(BB+HBP) - 2*K) / IP + FIP_constant,
+    where FIP_constant is calibrated so league-avg FIP = league-avg ERA
+    each season.
+
+    Parameters
+    ----------
+    seasons : list[int], optional
+        Seasons to include.  ``None`` returns 2018-2025.
+    min_ip : float
+        Minimum innings pitched to include a pitcher-season.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, season, ip, k, bb, hbp, hr, era, fip.
+    """
+    season_filter = ""
+    params: dict = {}
+    if seasons:
+        season_filter = "AND g.season = ANY(:seasons)"
+        params["seasons"] = seasons
+    else:
+        season_filter = "AND g.season BETWEEN 2018 AND 2025"
+
+    query = f"""
+    WITH pitcher_totals AS (
+        SELECT
+            g.player_id AS pitcher_id,
+            g.season,
+            SUM(g.pit_ip)  AS ip,
+            SUM(g.pit_k)   AS k,
+            SUM(g.pit_bb)  AS bb,
+            SUM(g.pit_hr)  AS hr,
+            SUM(g.pit_er)  AS er
+        FROM production.fact_player_game_mlb g
+        WHERE g.pit_ip > 0
+          {season_filter}
+        GROUP BY g.player_id, g.season
+        HAVING SUM(g.pit_ip) >= :min_ip
+    ),
+    hbp_totals AS (
+        SELECT
+            pa.pitcher_id,
+            dg.season,
+            COUNT(*) FILTER (WHERE pa.events = 'hit_by_pitch') AS hbp
+        FROM production.fact_pa pa
+        JOIN production.dim_game dg ON pa.game_pk = dg.game_pk
+        WHERE dg.game_type = 'R'
+          {"AND dg.season = ANY(:seasons)" if seasons else "AND dg.season BETWEEN 2018 AND 2025"}
+        GROUP BY pa.pitcher_id, dg.season
+    ),
+    combined AS (
+        SELECT
+            pt.pitcher_id,
+            pt.season,
+            pt.ip,
+            pt.k,
+            pt.bb,
+            COALESCE(h.hbp, 0) AS hbp,
+            pt.hr,
+            pt.er,
+            CASE WHEN pt.ip > 0 THEN pt.er / pt.ip * 9.0 ELSE NULL END AS era
+        FROM pitcher_totals pt
+        LEFT JOIN hbp_totals h
+            ON pt.pitcher_id = h.pitcher_id AND pt.season = h.season
+    ),
+    league_avg AS (
+        SELECT
+            season,
+            SUM(er) / NULLIF(SUM(ip), 0) * 9.0 AS lg_era,
+            SUM(13.0 * hr + 3.0 * (bb + hbp) - 2.0 * k)
+                / NULLIF(SUM(ip), 0)            AS lg_fip_raw
+        FROM combined
+        GROUP BY season
+    )
+    SELECT
+        c.pitcher_id,
+        c.season,
+        c.ip,
+        c.k,
+        c.bb,
+        c.hbp,
+        c.hr,
+        c.era,
+        (13.0 * c.hr + 3.0 * (c.bb + c.hbp) - 2.0 * c.k)
+            / NULLIF(c.ip, 0)
+            + (la.lg_era - la.lg_fip_raw) AS fip
+    FROM combined c
+    JOIN league_avg la ON c.season = la.season
+    ORDER BY c.season, c.pitcher_id
+    """
+
+    params["min_ip"] = min_ip
+    df = read_sql(query, params=params)
+    logger.info("Pitcher FIP: %d pitcher-seasons loaded", len(df))
+    return df

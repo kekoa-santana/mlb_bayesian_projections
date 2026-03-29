@@ -142,6 +142,9 @@ def simulate_batter_game(
     bullpen_k_rate: float = 0.253,
     bullpen_bb_rate: float = 0.084,
     bullpen_hr_rate: float = 0.024,
+    bullpen_matchup_k_lift: float = 0.0,
+    bullpen_matchup_bb_lift: float = 0.0,
+    bullpen_matchup_hr_lift: float = 0.0,
     batter_babip_adj: float = 0.0,
     umpire_k_lift: float = 0.0,
     umpire_bb_lift: float = 0.0,
@@ -275,17 +278,17 @@ def simulate_batter_game(
         k_pitcher_lift = np.where(
             vs_starter_active,
             starter_k_lift + matchup_k_lift,
-            bullpen_k_lift,
+            bullpen_k_lift + bullpen_matchup_k_lift,
         )
         bb_pitcher_lift = np.where(
             vs_starter_active,
             starter_bb_lift + matchup_bb_lift,
-            bullpen_bb_lift,
+            bullpen_bb_lift,  # BB matchup lift skipped — adds noise for relievers
         )
         hr_pitcher_lift = np.where(
             vs_starter_active,
             starter_hr_lift + matchup_hr_lift,
-            bullpen_hr_lift,
+            bullpen_hr_lift + bullpen_matchup_hr_lift,
         )
 
         # Final adjusted rates

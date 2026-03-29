@@ -124,18 +124,18 @@ _OBS_WEIGHT_BASE = 0.60
 # Pitcher sub-component weights by role (sum to 1.0)
 # ---------------------------------------------------------------------------
 _SP_WEIGHTS = {
-    # Walk-forward validated 2022-2025 (ranking_validation.py).
-    # Workload dropped from 0.22 → 0.05 (doesn't predict next-year quality).
-    # Trajectory raised from 0.10 → 0.25 (strongest forward signal).
-    # Command raised from 0.18 → 0.22.  Health raised from 0.07 → 0.11.
-    # Glicko kept at 0.10 (not in validation sub-scores, orthogonal signal).
+    # Walk-forward validated 2022-2025, then calibrated 2026-03-28.
+    # Workload raised from 0.05 → 0.12: for SPs, innings availability IS value.
+    # A 3.00 ERA over 160 IP is worth more than 2.50 ERA over 100 IP.
+    # Trajectory 0.25 → 0.20, glicko 0.10 → 0.08 to fund the increase.
+    # Workload + health = 23% (availability is ~quarter of SP value).
     "stuff": 0.27,
     "command": 0.22,
-    "workload": 0.05,
+    "workload": 0.12,
     "health": 0.11,
     "role": 0.00,
-    "trajectory": 0.25,
-    "glicko": 0.10,
+    "trajectory": 0.20,
+    "glicko": 0.08,
 }
 _RP_WEIGHTS = {
     # RP: stuff stays dominant; trajectory/command boosted same direction
@@ -284,40 +284,53 @@ def _hitter_age_factor(age: pd.Series) -> pd.Series:
     """Research-aligned hitter aging curve (piecewise linear).
 
     Based on industry consensus (FanGraphs, ZiPS, Marcel, OOPSY):
-    - Peak at 27 (wRC+ peaks 26-27, ISO holds to ~30)
-    - Gradual decline 27-33 (~0.5 WAR/year)
-    - Steep decline 33-40 (accelerating)
+    - Plateau 26-29: wRC+ peaks 26-27, ISO holds to ~28-29, BB%
+      improves through 29.  No penalty during prime window.
+    - Gradual decline 30-34: ~3-4% of peak per year (~0.5 WAR/yr)
+    - Steep decline 35-40: accelerating loss
 
     Uses explicit biology-based curve, not population-relative _inv_pctl,
     because aging is biological — a 33-year-old declines regardless of
     how young or old the league population is.
     """
-    # Phase 1: Development climb (20 → 27)
-    climb = 0.60 + 0.40 * ((age - 20) / 7.0).clip(0, 1)
-    # Phase 2: Gradual post-peak decline (27 → 33)
-    slow_decline = 1.0 - 0.50 * ((age - 27) / 6.0).clip(0, 1)
-    # Phase 3: Steep late-career decline (33 → 40)
-    steep_decline = 0.50 - 0.50 * ((age - 33) / 7.0).clip(0, 1)
+    # Phase 1: Development climb (20 → 26)
+    climb = 0.60 + 0.40 * ((age - 20) / 6.0).clip(0, 1)
+    # Phase 2: Prime plateau (26 → 29) — no decline
+    plateau = 1.0
+    # Phase 3: Gradual post-prime decline (30 → 34, ~4%/yr → 0.80 at 34)
+    slow_decline = 1.0 - 0.20 * ((age - 29) / 5.0).clip(0, 1)
+    # Phase 4: Steep late-career decline (35 → 40)
+    steep_decline = 0.80 - 0.60 * ((age - 34) / 6.0).clip(0, 1)
 
-    raw = np.where(age <= 27, climb, np.where(age <= 33, slow_decline, steep_decline))
+    raw = np.where(
+        age < 26, climb,
+        np.where(age <= 29, plateau,
+                 np.where(age <= 34, slow_decline, steep_decline))
+    )
     return pd.Series(raw, index=age.index).clip(0, 1)
 
 
 def _pitcher_age_factor(age: pd.Series) -> pd.Series:
     """Research-aligned pitcher aging curve (piecewise linear).
 
-    Peak at 28 (pitchers peak 27-29). Decline onset at 28, slightly
-    later and gentler than hitters. Velocity trend handled separately
-    in trajectory scoring (20% weight).
+    Pitchers peak slightly later than hitters (27-30).  K% and SwStr%
+    hold through ~30; decline driven by velocity loss which is captured
+    separately in the velo_trend component of trajectory scoring.
     """
-    # Phase 1: Development climb (20 → 28)
-    climb = 0.55 + 0.45 * ((age - 20) / 8.0).clip(0, 1)
-    # Phase 2: Gradual post-peak decline (28 → 34)
-    slow_decline = 1.0 - 0.50 * ((age - 28) / 6.0).clip(0, 1)
-    # Phase 3: Steep late-career decline (34 → 41)
-    steep_decline = 0.50 - 0.50 * ((age - 34) / 7.0).clip(0, 1)
+    # Phase 1: Development climb (20 → 27)
+    climb = 0.55 + 0.45 * ((age - 20) / 7.0).clip(0, 1)
+    # Phase 2: Prime plateau (27 → 30) — no decline
+    plateau = 1.0
+    # Phase 3: Gradual post-prime decline (31 → 35, ~4%/yr → 0.80 at 35)
+    slow_decline = 1.0 - 0.20 * ((age - 30) / 5.0).clip(0, 1)
+    # Phase 4: Steep late-career decline (36 → 41)
+    steep_decline = 0.80 - 0.60 * ((age - 35) / 6.0).clip(0, 1)
 
-    raw = np.where(age <= 28, climb, np.where(age <= 34, slow_decline, steep_decline))
+    raw = np.where(
+        age < 27, climb,
+        np.where(age <= 30, plateau,
+                 np.where(age <= 35, slow_decline, steep_decline))
+    )
     return pd.Series(raw, index=age.index).clip(0, 1)
 
 
@@ -496,6 +509,7 @@ def _get_career_weighted_positions(season: int = 2025) -> pd.DataFrame:
 def _verify_positions_mlb_api(
     positions: pd.DataFrame,
     season: int = 2026,
+    lineup_override_ids: set[int] | None = None,
 ) -> pd.DataFrame:
     """Cross-check position assignments against the MLB Stats API.
 
@@ -503,12 +517,19 @@ def _verify_positions_mlb_api(
     ``primaryPosition`` as a final sanity check.  Only overrides when
     the API position is a fielding position and our assignment differs.
 
+    Players in ``lineup_override_ids`` are SKIPPED — their position was
+    already set from actual game lineup data (more current than the
+    API's static ``primaryPosition`` field which MLB updates slowly).
+
     Parameters
     ----------
     positions : pd.DataFrame
         Must have ``player_id`` and ``position`` (primary only).
     season : int
         Season for roster lookup.
+    lineup_override_ids : set[int] or None
+        Player IDs whose position was set by lineup override.
+        API will not override these.
 
     Returns
     -------
@@ -567,9 +588,14 @@ def _verify_positions_mlb_api(
 
     # Compare and override where API disagrees
     positions = positions.copy()
+    skip_ids = lineup_override_ids or set()
     n_fixed = 0
+    n_skipped = 0
     for idx, row in positions.iterrows():
         pid = row["player_id"]
+        if pid in skip_ids:
+            n_skipped += 1
+            continue
         if pid in api_positions:
             api_pos = api_positions[pid]
             if api_pos != row["position"] and api_pos in FIELDING_POSITIONS:
@@ -582,8 +608,8 @@ def _verify_positions_mlb_api(
                 n_fixed += 1
 
     logger.info(
-        "MLB API verification: %d players checked, %d positions corrected",
-        len(api_positions), n_fixed,
+        "MLB API verification: %d players checked, %d corrected, %d skipped (lineup override)",
+        len(api_positions), n_fixed, n_skipped,
     )
     return positions
 
@@ -643,9 +669,34 @@ def _assign_hitter_positions(season: int = 2025, min_starts: int = 20) -> pd.Dat
     else:
         assigned = fallback[["player_id", "position"]].copy()
 
-    # MLB API verification (final pass)
+    # Collect IDs that were overridden by lineup data (current season
+    # or last-50 games).  These should NOT be re-overridden by the API's
+    # static primaryPosition field which MLB updates slowly.
+    lineup_override_ids: set[int] = set()
+    if not career.empty:
+        # Players whose is_primary position differs from their highest
+        # career weighted_games position before override
+        raw_primary = (
+            career.sort_values("weighted_games", ascending=False)
+            .drop_duplicates("player_id", keep="first")
+        )
+        for _, row in primary.iterrows():
+            pid = row["player_id"]
+            raw_row = raw_primary[raw_primary["player_id"] == pid]
+            if not raw_row.empty and raw_row.iloc[0]["position"] != row["position"]:
+                lineup_override_ids.add(int(pid))
+        if lineup_override_ids:
+            logger.info(
+                "Lineup-overridden positions (protected from API): %d players",
+                len(lineup_override_ids),
+            )
+
+    # MLB API verification (final pass — skips lineup-overridden players)
     try:
-        assigned = _verify_positions_mlb_api(assigned, season=season + 1)
+        assigned = _verify_positions_mlb_api(
+            assigned, season=season + 1,
+            lineup_override_ids=lineup_override_ids,
+        )
     except Exception:
         logger.warning("MLB API verification failed — using lineup-based positions",
                        exc_info=True)
@@ -789,7 +840,10 @@ def _build_hitter_offense_score(
     """
     # Merge projection + observed on batter_id
     obs_cols = ["batter_id", "pa", "k_pct", "bb_pct", "woba", "wrc_plus",
-                "barrel_pct", "hard_hit_pct", "xwoba", "sweet_spot_pct"]
+                "barrel_pct", "hard_hit_pct", "xwoba", "sweet_spot_pct",
+                # Multi-year recency-weighted columns (when available)
+                "wrc_plus_multiyear", "xwoba_multiyear",
+                "barrel_pct_multiyear", "hard_hit_pct_multiyear"]
     obs_cols = [c for c in obs_cols if c in observed.columns]
     proj_cols = ["batter_id", "projected_k_rate", "projected_bb_rate",
                   "projected_hr_per_fb", "composite_score"]
@@ -880,16 +934,23 @@ def _build_hitter_offense_score(
     else:
         proj_damage = _zscore_pctl(merged["projected_hr_per_fb"])
 
+    # Use multi-year recency-weighted Statcast when available (smooths
+    # outlier single seasons like Springer's 2025 career-best at 35).
+    # Falls back to single-season when multi-year data is absent.
+    _xwoba_col = "xwoba_multiyear" if "xwoba_multiyear" in merged.columns else "xwoba"
+    _barrel_col = "barrel_pct_multiyear" if "barrel_pct_multiyear" in merged.columns else "barrel_pct"
+    _hardhit_col = "hard_hit_pct_multiyear" if "hard_hit_pct_multiyear" in merged.columns else "hard_hit_pct"
+
     obs_damage_parts = []
     obs_damage_weights = []
-    if "xwoba" in merged.columns:
-        obs_damage_parts.append(_zscore_pctl(merged["xwoba"].fillna(merged["xwoba"].median())))
+    if _xwoba_col in merged.columns:
+        obs_damage_parts.append(_zscore_pctl(merged[_xwoba_col].fillna(merged[_xwoba_col].median())))
         obs_damage_weights.append(0.35)
-    if "barrel_pct" in merged.columns:
-        obs_damage_parts.append(_zscore_pctl(merged["barrel_pct"].fillna(0)))
+    if _barrel_col in merged.columns:
+        obs_damage_parts.append(_zscore_pctl(merged[_barrel_col].fillna(0)))
         obs_damage_weights.append(0.30)
-    if "hard_hit_pct" in merged.columns:
-        obs_damage_parts.append(_zscore_pctl(merged["hard_hit_pct"].fillna(0)))
+    if _hardhit_col in merged.columns:
+        obs_damage_parts.append(_zscore_pctl(merged[_hardhit_col].fillna(0)))
         obs_damage_weights.append(0.20)
     if "sweet_spot_pct" in merged.columns:
         obs_damage_parts.append(_zscore_pctl(merged["sweet_spot_pct"].fillna(0)))
@@ -910,8 +971,13 @@ def _build_hitter_offense_score(
     # Applies to damage + production (the two observation-heavy buckets).
     # Contact + decisions are already projection-anchored via K%/BB%.
     age = merged["age"].fillna(28)
-    age_trust = (1.0 - ((age - 30).clip(0) * 0.04)).clip(0.50, 1.0)
-    # age 30: 1.00, age 33: 0.88, age 35: 0.80, age 38: 0.68 (floor 0.50)
+    # Two-phase age trust: gentle 30-33, steeper 33+ (biological decline
+    # accelerates, and career-best seasons at 33+ are far more likely to
+    # regress than at 28).
+    phase1 = (1.0 - ((age - 30).clip(0) * 0.03)).clip(0.91, 1.0)  # 30-33: gentle
+    phase2 = (0.91 - ((age - 33).clip(0) * 0.06)).clip(0.50, 0.91)  # 33+: steeper
+    age_trust = np.where(age <= 33, phase1, phase2)
+    # age 30: 1.00, age 32: 0.94, age 33: 0.91, age 35: 0.79, age 37: 0.67, age 39: 0.55
 
     # Projection-deviation dampening: when observed stats diverge sharply
     # from the Bayesian projection, reduce trust in observed.  The model
@@ -926,7 +992,25 @@ def _build_hitter_offense_score(
     damage_deviation = (obs_damage - proj_damage).abs()
     damage_dev_trust = (1.0 - damage_deviation).clip(0.50, 1.0)
 
-    damage_trust = _stat_family_trust(pa, min_pa=200, full_pa=550) * age_trust * damage_dev_trust
+    # Aging spike penalty: if a 35+ year-old's most recent season sharply
+    # outperforms their multi-year baseline, it's almost certainly an
+    # outlier that will regress.  A 26-year-old breakout is believable;
+    # a 36-year-old career-best after two bad years is not.
+    # Detect via gap between single-season and multi-year observed damage.
+    aging_spike_penalty = pd.Series(1.0, index=merged.index)
+    if "xwoba" in merged.columns and "xwoba_multiyear" in merged.columns:
+        single = merged["xwoba"].fillna(0)
+        multi = merged["xwoba_multiyear"].fillna(single)
+        spike = (single - multi).clip(0)  # only penalize positive spikes
+        # 35+: for each 0.030 xwOBA spike above multi-year, cut trust by 15%
+        is_aging_spike = (age >= 35) & (spike > 0.015)
+        spike_factor = (1.0 - (spike - 0.015) / 0.030 * 0.15).clip(0.60, 1.0)
+        aging_spike_penalty = np.where(is_aging_spike, spike_factor, 1.0)
+
+    damage_trust = (
+        _stat_family_trust(pa, min_pa=200, full_pa=550)
+        * age_trust * damage_dev_trust * aging_spike_penalty
+    )
     merged["damage_skill"] = (1 - damage_trust) * proj_damage + damage_trust * obs_damage
 
     # =================================================================
@@ -941,16 +1025,19 @@ def _build_hitter_offense_score(
     else:
         proj_production = pd.Series(0.5, index=merged.index)
 
-    if "wrc_plus" in merged.columns:
-        obs_production = _zscore_pctl(merged["wrc_plus"].fillna(100))
+    # Use multi-year recency-weighted wRC+ when available (same smoothing
+    # as damage bucket — prevents single-season outliers from dominating).
+    _wrc_col = "wrc_plus_multiyear" if "wrc_plus_multiyear" in merged.columns else "wrc_plus"
+    if _wrc_col in merged.columns:
+        obs_production = _zscore_pctl(merged[_wrc_col].fillna(100))
     else:
         obs_production = proj_production
 
     # Production deviation: use raw wRC+ gap normalized by population SD.
     # Percentile deviation compresses the tails (165 vs 121 wRC+ both map
     # to >93rd pctl, hiding the 44-point gap).  Raw z-score preserves it.
-    if has_sim and "wrc_plus" in merged.columns:
-        raw_wrc_gap = (merged["wrc_plus"].fillna(100) - merged["projected_wrc_plus_mean"].fillna(100)).abs()
+    if has_sim and _wrc_col in merged.columns:
+        raw_wrc_gap = (merged[_wrc_col].fillna(100) - merged["projected_wrc_plus_mean"].fillna(100)).abs()
         wrc_std = merged["wrc_plus"].std()
         if wrc_std > 0:
             production_deviation_z = raw_wrc_gap / wrc_std
@@ -961,7 +1048,21 @@ def _build_hitter_offense_score(
     else:
         production_dev_trust = pd.Series(1.0, index=merged.index)
 
-    production_trust = _stat_family_trust(pa, min_pa=150, full_pa=500) * age_trust * production_dev_trust
+    # Aging spike penalty for production (same logic as damage bucket)
+    aging_spike_prod = pd.Series(1.0, index=merged.index)
+    if "wrc_plus" in merged.columns and "wrc_plus_multiyear" in merged.columns:
+        wrc_single = merged["wrc_plus"].fillna(100)
+        wrc_multi = merged["wrc_plus_multiyear"].fillna(wrc_single)
+        wrc_spike = (wrc_single - wrc_multi).clip(0)
+        # 35+: for each 15 wRC+ spike above multi-year, cut trust by 15%
+        is_wrc_spike = (age >= 35) & (wrc_spike > 10)
+        spike_factor_wrc = (1.0 - (wrc_spike - 10) / 15 * 0.15).clip(0.60, 1.0)
+        aging_spike_prod = np.where(is_wrc_spike, spike_factor_wrc, 1.0)
+
+    production_trust = (
+        _stat_family_trust(pa, min_pa=150, full_pa=500)
+        * age_trust * production_dev_trust * aging_spike_prod
+    )
 
     merged["production_skill"] = (
         (1 - production_trust) * proj_production
@@ -990,19 +1091,49 @@ def _build_hitter_offense_score(
                     "decision_skill", "damage_skill", "production_skill"]]
 
 
-def _build_hitter_baserunning_score() -> pd.DataFrame:
-    """Score baserunning value from sprint speed and projected SB.
+def _build_hitter_baserunning_score(season: int = 2025) -> pd.DataFrame:
+    """Score baserunning from speed, hustle, SB volume, efficiency, and utilization.
 
-    Prefers sim-based SB projections when available.
+    Components
+    ----------
+    - **Sprint speed** (25%): raw foot speed from Statcast
+    - **HP to 1B hustle** (15%): home-to-first time (faster = better).
+      Captures effort on routine plays beyond raw speed.
+    - **SB volume** (25%): projected SB per PA — aggressive baserunning.
+    - **SB efficiency** (15%): success rate regressed toward league avg (~78%).
+      Smart baserunning — not just fast, but picks good spots.
+    - **Speed utilization** (20%): SB rate relative to sprint-speed expectation.
+      A player who steals more than their speed predicts gets credit for
+      baserunning IQ and aggressiveness beyond raw ability.
 
     Returns
     -------
     pd.DataFrame
         Columns: batter_id, baserunning_score.
     """
+    from src.data.db import read_sql
+
     proj = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet")
 
-    # Prefer sim parquet for SB
+    # Sprint speed + HP-to-1B from Statcast
+    speed_df = read_sql(f"""
+        SELECT player_id AS batter_id, sprint_speed, hp_to_1b
+        FROM staging.statcast_sprint_speed
+        WHERE season = {season}
+    """, {})
+
+    # Observed SB/CS (2-year window for stability)
+    sb_obs = read_sql(f"""
+        SELECT pg.player_id AS batter_id,
+               SUM(pg.bat_sb) AS obs_sb, SUM(pg.bat_cs) AS obs_cs
+        FROM production.fact_player_game_mlb pg
+        JOIN production.dim_game dg ON pg.game_pk = dg.game_pk
+        WHERE dg.season BETWEEN {season - 1} AND {season}
+          AND dg.game_type = 'R'
+        GROUP BY pg.player_id
+    """, {})
+
+    # Projected SB from sim
     sim_path = DASHBOARD_DIR / "hitter_counting_sim.parquet"
     old_path = DASHBOARD_DIR / "hitter_counting.parquet"
     if sim_path.exists():
@@ -1014,21 +1145,78 @@ def _build_hitter_baserunning_score() -> pd.DataFrame:
         sb_col = "total_sb_mean"
         pa_col = "projected_pa_mean"
     else:
-        return pd.DataFrame(columns=["batter_id", "baserunning_score"])
+        counting = pd.DataFrame()
 
-    merged = proj[["batter_id", "sprint_speed"]].merge(
-        counting[["batter_id", sb_col, pa_col]],
-        on="batter_id", how="inner",
-    )
+    # Assemble
+    merged = proj[["batter_id", "sprint_speed"]].copy()
+    merged = merged.merge(speed_df, on="batter_id", how="left", suffixes=("_proj", ""))
+    # Prefer Statcast sprint_speed over projection parquet
+    if "sprint_speed_proj" in merged.columns:
+        merged["sprint_speed"] = merged["sprint_speed"].fillna(merged["sprint_speed_proj"])
+        merged.drop(columns=["sprint_speed_proj"], inplace=True)
+    merged = merged.merge(sb_obs, on="batter_id", how="left")
+    if not counting.empty:
+        merged = merged.merge(
+            counting[["batter_id", sb_col, pa_col]], on="batter_id", how="left",
+        )
 
     if merged.empty:
         return pd.DataFrame(columns=["batter_id", "baserunning_score"])
 
-    speed_score = _pctl(merged["sprint_speed"].fillna(merged["sprint_speed"].median()))
-    sb_rate = merged[sb_col] / merged[pa_col].clip(lower=1)
-    sb_score = _pctl(sb_rate)
+    # --- Component 1: Sprint speed (25%) ---
+    speed_med = merged["sprint_speed"].median()
+    speed_score = _pctl(merged["sprint_speed"].fillna(speed_med))
 
-    merged["baserunning_score"] = 0.60 * speed_score + 0.40 * sb_score
+    # --- Component 2: HP-to-1B hustle (15%) ---
+    # Lower = faster = better.  Captures effort beyond raw speed.
+    hp1b_med = merged["hp_to_1b"].median() if "hp_to_1b" in merged.columns else 4.45
+    hp1b_score = _inv_pctl(merged["hp_to_1b"].fillna(hp1b_med))
+
+    # --- Component 3: SB volume rate (25%) ---
+    if sb_col in merged.columns and pa_col in merged.columns:
+        sb_rate = merged[sb_col] / merged[pa_col].clip(lower=1)
+    else:
+        sb_rate = merged["obs_sb"].fillna(0) / 500  # rough fallback
+    sb_volume_score = _pctl(sb_rate)
+
+    # --- Component 4: SB efficiency (15%) ---
+    # Regress toward league average (~78%) using Bayesian shrinkage
+    _LEAGUE_SB_SUCCESS = 0.78
+    _SB_REGRESS_N = 10  # regress with 10 pseudo-attempts at league avg
+    obs_sb = merged["obs_sb"].fillna(0)
+    obs_cs = merged["obs_cs"].fillna(0)
+    obs_att = obs_sb + obs_cs
+    regressed_success = (
+        (obs_sb + _SB_REGRESS_N * _LEAGUE_SB_SUCCESS)
+        / (obs_att + _SB_REGRESS_N)
+    )
+    # Only score efficiency for players with enough attempts
+    has_attempts = obs_att >= 3
+    sb_eff_score = _pctl(regressed_success)
+    # Neutral (0.50) for players with < 3 attempts
+    sb_eff_score = np.where(has_attempts, sb_eff_score, 0.50)
+
+    # --- Component 5: Speed utilization (20%) ---
+    # How much does this player steal relative to their sprint speed?
+    # Fit linear model: expected SB rate = f(sprint_speed)
+    valid = merged[merged["sprint_speed"].notna() & (sb_rate > 0)].copy()
+    if len(valid) >= 20:
+        from numpy.polynomial import polynomial as P
+        coef = P.polyfit(valid["sprint_speed"].values, sb_rate[valid.index].values, 1)
+        expected_sb_rate = P.polyval(merged["sprint_speed"].fillna(speed_med).values, coef)
+        sb_over_expected = sb_rate - pd.Series(expected_sb_rate, index=merged.index)
+        utilization_score = _pctl(sb_over_expected)
+    else:
+        utilization_score = pd.Series(0.50, index=merged.index)
+
+    merged["baserunning_score"] = (
+        0.25 * speed_score
+        + 0.15 * hp1b_score
+        + 0.25 * sb_volume_score
+        + 0.15 * pd.Series(sb_eff_score, index=merged.index)
+        + 0.20 * utilization_score
+    )
+
     return merged[["batter_id", "baserunning_score"]]
 
 
@@ -1207,11 +1395,24 @@ def _build_hitter_fielding_score(season: int = 2025) -> pd.DataFrame:
         lambda p: 2 if p in _OF_POSITIONS else 3
     )
 
+    # Position-specific OAA priors (empirical means, 2023-2025).
+    # Unknown fielders regress toward their POSITION average, not 0.
+    # This prevents unproven 1B from getting neutral (50th pctl) scores
+    # when the typical 1B is below average defensively.
+    _POSITION_OAA_PRIOR = {
+        "CF": 2.8, "SS": 1.1, "2B": 0.2, "3B": -0.5,
+        "1B": -0.9, "RF": -1.1, "LF": -1.4,
+    }
+    result["pos_prior"] = result["position_group"].map(_POSITION_OAA_PRIOR).fillna(0.0)
+
     # Reliability: n_seasons / (n_seasons + k)
     # 1 year IF: 1/4=0.25, 3 years IF: 3/6=0.50
     # 1 year OF: 1/3=0.33, 3 years OF: 3/5=0.60
     result["reliability"] = result["n_seasons"] / (result["n_seasons"] + result["k"])
-    result["regressed_oaa"] = result["weighted_oaa"] * result["reliability"]
+    result["regressed_oaa"] = (
+        result["reliability"] * result["weighted_oaa"]
+        + (1 - result["reliability"]) * result["pos_prior"]
+    )
 
     # Percentile rank the regressed OAA, with floor so worst defenders
     # aren't zeroed out (even -15 OAA provides some value vs empty position)
@@ -1221,12 +1422,16 @@ def _build_hitter_fielding_score(season: int = 2025) -> pd.DataFrame:
 
 
 def _build_catcher_framing_score(season: int = 2025) -> pd.DataFrame:
-    """Build catcher framing score from framing data.
+    """Build catcher framing score from multi-year framing data.
+
+    Uses 3-year rolling with recency weights (3/2/1) and regression
+    toward league average, matching the pattern in fielding.  Single-season
+    framing is noisy (Will Smith: +9.1 in 2021, -7.6 in 2025).
 
     Parameters
     ----------
     season : int
-        Season for framing data.
+        Most recent season for framing data.
 
     Returns
     -------
@@ -1236,18 +1441,36 @@ def _build_catcher_framing_score(season: int = 2025) -> pd.DataFrame:
     from src.data.db import read_sql
 
     framing = read_sql(f"""
-        SELECT player_id, runs_extra_strikes, strike_rate_diff,
-               shadow_zone_strike_rate
+        SELECT player_id, season, runs_extra_strikes
         FROM production.fact_catcher_framing
-        WHERE season = {season}
+        WHERE season BETWEEN {season - 2} AND {season}
     """, {})
 
     if framing.empty:
         return pd.DataFrame(columns=["player_id", "framing_score"])
 
-    # Percentile rank runs_extra_strikes (higher = better)
-    framing["framing_score"] = _pctl(framing["runs_extra_strikes"])
-    return framing[["player_id", "framing_score"]]
+    # Recency weights
+    framing["weight"] = framing["season"].map(
+        {season: 3, season - 1: 2, season - 2: 1}
+    ).fillna(1)
+
+    # Weighted average per catcher
+    weighted = framing.groupby("player_id").apply(
+        lambda g: np.average(g["runs_extra_strikes"], weights=g["weight"]),
+        include_groups=False,
+    ).rename("weighted_framing")
+
+    n_seasons = framing.groupby("player_id")["season"].nunique().rename("n_seasons")
+    result = pd.DataFrame({"weighted_framing": weighted, "n_seasons": n_seasons})
+
+    # Regress toward 0 (league-average framing) based on sample size
+    # k=2: 1 year → 33% trust, 2 years → 50%, 3 years → 60%
+    k = 2
+    result["reliability"] = result["n_seasons"] / (result["n_seasons"] + k)
+    result["regressed_framing"] = result["weighted_framing"] * result["reliability"]
+
+    result["framing_score"] = _pctl(result["regressed_framing"])
+    return result.reset_index()[["player_id", "framing_score"]]
 
 
 def _build_hitter_playing_time_score() -> pd.DataFrame:
@@ -1514,6 +1737,56 @@ def rank_hitters(
     except Exception:
         logger.warning("Could not load park factors — using raw wOBA", exc_info=True)
 
+    # Multi-year observed stats (recency-weighted) for production and damage
+    # buckets.  Single-season observed overweights outlier years (Springer's
+    # career-best at 35, Grisham's breakout at 28).  Multi-year smoothing
+    # uses the same 3/2/1 pattern as fielding.
+    try:
+        obs_multi = read_sql(f"""
+            SELECT batter_id, season, pa, wrc_plus,
+                   xwoba, barrel_pct, hard_hit_pct
+            FROM production.fact_batting_advanced
+            WHERE season BETWEEN {season - 2} AND {season} AND pa >= 50
+        """, {})
+        if not obs_multi.empty:
+            # Flatten recency weights for age 33+: a 35-year-old's
+            # career-best most-recent season should not dominate the
+            # blend the way a 26-year-old's breakout should.
+            # Standard: 3/2/1.  Age 33+: 2/2/1 (recent year loses edge).
+            obs_multi = obs_multi.merge(
+                proj[["batter_id", "age"]].drop_duplicates("batter_id"),
+                on="batter_id", how="left",
+            )
+            is_aging = obs_multi["age"].fillna(28) >= 33
+            base_wt = obs_multi["season"].map(
+                {season: 3, season - 1: 2, season - 2: 1}
+            ).fillna(1)
+            aging_wt = obs_multi["season"].map(
+                {season: 2, season - 1: 2, season - 2: 1}
+            ).fillna(1)
+            obs_multi["recency_wt"] = np.where(is_aging, aging_wt, base_wt)
+            obs_multi.drop(columns=["age"], inplace=True)
+            obs_multi["total_wt"] = obs_multi["recency_wt"] * obs_multi["pa"]
+
+            def _wtd_avg(g, col):
+                valid = g[g[col].notna()]
+                if valid.empty or valid["total_wt"].sum() == 0:
+                    return np.nan
+                return np.average(valid[col], weights=valid["total_wt"])
+
+            multiyear = obs_multi.groupby("batter_id").agg(
+                wrc_plus_multiyear=("wrc_plus", lambda g: _wtd_avg(obs_multi.loc[g.index], "wrc_plus")),
+                xwoba_multiyear=("xwoba", lambda g: _wtd_avg(obs_multi.loc[g.index], "xwoba")),
+                barrel_pct_multiyear=("barrel_pct", lambda g: _wtd_avg(obs_multi.loc[g.index], "barrel_pct")),
+                hard_hit_pct_multiyear=("hard_hit_pct", lambda g: _wtd_avg(obs_multi.loc[g.index], "hard_hit_pct")),
+                obs_years=("season", "nunique"),
+            ).reset_index()
+            observed = observed.merge(multiyear, on="batter_id", how="left")
+            logger.info("Multi-year observed stats: %d hitters with 2+ years",
+                        (observed["obs_years"].fillna(1) >= 2).sum())
+    except Exception:
+        logger.warning("Could not load multi-year observed stats", exc_info=True)
+
     # Position assignments
     positions = _assign_hitter_positions(season=season)
 
@@ -1523,7 +1796,7 @@ def rank_hitters(
 
     # Build sub-scores
     offense = _build_hitter_offense_score(proj, observed, aggressiveness=aggressiveness)
-    baserunning = _build_hitter_baserunning_score()
+    baserunning = _build_hitter_baserunning_score(season=season)
     platoon = _build_hitter_platoon_modifier(season=season)
     fielding = _build_hitter_fielding_score(season=season)
     framing = _build_catcher_framing_score(season=season)
@@ -1680,6 +1953,14 @@ def rank_hitters(
         + 0.50 * base.loc[is_catcher, "framing_score"]
     )
 
+    # Percentile-rank fielding and baserunning so their effective spread
+    # matches offense.  Raw fielding has IQR ~0.66 vs offense ~0.20 — at
+    # 16% weight the raw scale gives fielding equal influence to 52% offense.
+    # Percentile-ranking compresses both to a uniform 0-1 distribution so
+    # the weights mean what they say.
+    base["fielding_combined"] = _pctl(base["fielding_combined"])
+    base["baserunning_score"] = _pctl(base["baserunning_score"])
+
     # For DH: redistribute fielding weight to offense + baserunning.
     # DHs are evaluated purely on production — no artificial cap.
     is_dh = base["position"] == "DH"
@@ -1809,10 +2090,10 @@ def rank_hitters(
         scouting = grade_hitter_tools(base, season=season)
         if not scouting.empty:
             base = base.merge(scouting, on="batter_id", how="left")
-            logger.info("Scouting grades computed for %d hitters", scouting["diamond_rating"].notna().sum())
+            logger.info("Scouting grades computed for %d hitters", scouting["tools_rating"].notna().sum())
 
             # Regress diamond rating by PA reliability (same for both scores)
-            dr_norm = (base["diamond_rating"] / 10.0).clip(0, 1)
+            dr_norm = (base["tools_rating"] / 10.0).clip(0, 1)
 
             pa_col = base["pa"] if "pa" in base.columns else base.get("total_pa", 400)
             cfg = _RANK_CFG["hitter"]
@@ -1821,17 +2102,22 @@ def rank_hitters(
             # Low-PA players: regress diamond rating toward 0.50 (league avg)
             dr_regressed = reliability * dr_norm + (1 - reliability) * 0.50
 
-            # Health penalty: injury-prone players get DR dampened
+            # Health penalty on DR: injury-prone players get dampened for
+            # current_value (availability matters for near-term), but NOT
+            # for talent_upside (tools and health are separate — an injured
+            # player's tools don't change, only their playing time does).
             health = base["health_adj"] if "health_adj" in base.columns else 0.50
             health_penalty = np.where(health < 0.40, 0.70 + 0.75 * health, 1.0)
-            dr_regressed = dr_regressed * health_penalty
+            dr_talent = dr_regressed.copy()       # no health penalty for talent
+            dr_regressed = dr_regressed * health_penalty  # health penalty for current value
 
             # ----- talent_upside_score: scouting-dominant -----
-            # This is the dynasty/prospect-oriented score where tool grades
-            # carry heavy weight.  Identical to the old tdd_value_score blend.
+            # Tool grades carry heavy weight for forward-looking assessment.
+            # Uses dr_talent (no health penalty — tools and health are separate).
+            # No positional multiplier — raw talent regardless of position.
             upside_w = cfg["upside_scout_weight"]
             base["talent_upside_score"] = (
-                upside_w * dr_regressed + (1 - upside_w) * production_composite
+                upside_w * dr_talent + (1 - upside_w) * production_composite
             )
 
             # ----- current_value_score: production-dominant -----
@@ -1850,7 +2136,7 @@ def rank_hitters(
                 scout_w * dr_regressed + (1 - scout_w) * production_composite
             )
 
-            n_scouted = scouting["diamond_rating"].notna().sum()
+            n_scouted = scouting["tools_rating"].notna().sum()
             logger.info(
                 "Two-score split: %d hitters — scout weight range [%.0f%%, %.0f%%]",
                 n_scouted, cfg["scout_weight_floor"] * 100, cfg["scout_weight_ceil"] * 100,
@@ -1876,14 +2162,14 @@ def rank_hitters(
     # tdd_value_score = current_value_score (backward compat for team consumption)
     base["tdd_value_score"] = base["current_value_score"]
 
-    # --- Rank within each position (no positional adjustment) ---
+    # --- Rank within each position ---
     base = base.sort_values("current_value_score", ascending=False)
     base["pos_rank"] = base.groupby("position").cumcount() + 1
 
-    # --- Overall rank uses positional adjustment (10%) ---
-    base["pos_adjustment"] = base["position"].map(_POS_ADJUSTMENT).fillna(0.50)
-    base["overall_score"] = 0.90 * base["current_value_score"] + 0.10 * base["pos_adjustment"]
-    base["overall_rank"] = base["overall_score"].rank(ascending=False, method="min").astype(int)
+    # --- Overall rank: directly from current_value_score ---
+    # No positional adjustment — the displayed score IS the ranking order.
+    # Positional value is captured by pos_rank within each position.
+    base["overall_rank"] = base["current_value_score"].rank(ascending=False, method="min").astype(int)
 
     # --- Talent-based ranking (scouting-dominant, no positional adj) ---
     base["talent_rank"] = base["talent_upside_score"].rank(ascending=False, method="min").astype(int)
@@ -1895,7 +2181,7 @@ def rank_hitters(
         "age", "batter_stand", "is_two_way",
         # Two-score architecture
         "current_value_score", "talent_upside_score",
-        "tdd_value_score", "overall_score", "pos_adjustment",
+        "tdd_value_score",
         # Sub-scores
         "offense_score", "contact_skill", "decision_skill", "damage_skill", "production_skill",
         "baserunning_score", "platoon_score",
@@ -1925,7 +2211,7 @@ def rank_hitters(
         "glicko_score", "glicko_mu", "glicko_phi",
         # Scouting grades (20-80) + diamond rating (0-10)
         "grade_hit", "grade_power", "grade_speed", "grade_fielding",
-        "grade_discipline", "diamond_rating",
+        "grade_discipline", "tools_rating",
     ]
     available = [c for c in output_cols if c in base.columns]
     result = base[available].sort_values(["position", "pos_rank"])
@@ -2319,6 +2605,13 @@ def _build_pitcher_trajectory_score(season: int = 2025) -> pd.DataFrame:
     bb_certainty = _inv_pctl(bb_cv)
     certainty_score = 0.50 * k_certainty + 0.50 * bb_certainty
 
+    # Projected rate quality: elite rates signal upside regardless of track
+    # record length.  Without this, short-track-record aces (Crochet, Yamamoto)
+    # get penalized purely for having wide posteriors.
+    k_quality = _pctl(proj["projected_k_rate"])
+    bb_quality = _inv_pctl(proj["projected_bb_rate"])
+    rate_quality = 0.60 * k_quality + 0.40 * bb_quality
+
     # Age factor: research-aligned curve (peak 27-29, decline from 30, accel 35+)
     age = proj["age"].fillna(28)
     age_factor = _pitcher_age_factor(age)
@@ -2332,7 +2625,8 @@ def _build_pitcher_trajectory_score(season: int = 2025) -> pd.DataFrame:
     velo_score = ((proj["velo_delta"] + 2.0) / 4.0).clip(0, 1)
 
     proj["trajectory_score"] = (
-        0.40 * certainty_score
+        0.35 * certainty_score
+        + 0.25 * rate_quality
         + 0.20 * age_factor
         + 0.20 * velo_score
     )
@@ -2517,11 +2811,17 @@ def rank_pitchers(
     else:
         base["role_score"] = 0.5
 
-    # Blend pitcher breakout potential into trajectory (same pattern as hitters)
+    # Sustain/upside blend into trajectory (mirrors hitter pattern).
+    # Without this, elite established pitchers (Crochet, Yamamoto) get
+    # penalized for having "no room to break out" — same problem hitters
+    # had with Soto/Judge before the sustain fix.
+    #   - Elite pitchers: stuff_score provides a high trajectory floor
+    #   - Developing pitchers: breakout_pctl drives the score
     base["breakout_score"] = base["breakout_score"].fillna(0.0)
     p_breakout_pctl = _pctl(base["breakout_score"].clip(lower=0))
+    sustain_upside = np.maximum(p_breakout_pctl, base["stuff_score"])
     base["trajectory_score"] = (
-        0.65 * base["trajectory_score"] + 0.35 * p_breakout_pctl
+        0.65 * base["trajectory_score"] + 0.35 * sustain_upside
     )
 
     # Blend innings durability into SP workload (30% durability, 70% base workload)
@@ -2587,10 +2887,10 @@ def rank_pitchers(
         scouting = grade_pitcher_tools(base, season=season)
         if not scouting.empty:
             base = base.merge(scouting, on="pitcher_id", how="left")
-            logger.info("Scouting grades computed for %d pitchers", scouting["diamond_rating"].notna().sum())
+            logger.info("Scouting grades computed for %d pitchers", scouting["tools_rating"].notna().sum())
 
             # Regress diamond rating by BF reliability (same for both scores)
-            dr_norm = (base["diamond_rating"] / 10.0).clip(0, 1)
+            dr_norm = (base["tools_rating"] / 10.0).clip(0, 1)
 
             cfg = _RANK_CFG["pitcher"]
             bf_col = base["batters_faced"] if "batters_faced" in base.columns else 400
@@ -2622,7 +2922,7 @@ def rank_pitchers(
                 scout_w * dr_regressed + (1 - scout_w) * production_composite
             )
 
-            n_scouted = scouting["diamond_rating"].notna().sum()
+            n_scouted = scouting["tools_rating"].notna().sum()
             logger.info(
                 "Two-score split: %d pitchers — scout weight range [%.0f%%, %.0f%%]",
                 n_scouted, cfg["scout_weight_floor"] * 100, cfg["scout_weight_ceil"] * 100,
@@ -2681,7 +2981,7 @@ def rank_pitchers(
         # Glicko-2 opponent-adjusted rating
         "glicko_score", "glicko_mu", "glicko_phi",
         # Scouting grades (20-80) + diamond rating (0-10)
-        "grade_stuff", "grade_command", "grade_durability", "diamond_rating",
+        "grade_stuff", "grade_command", "grade_durability", "tools_rating",
     ]
     available = [c for c in output_cols if c in base.columns]
     result = base[available].sort_values(["role", "role_rank"])

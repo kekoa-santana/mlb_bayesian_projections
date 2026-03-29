@@ -3557,7 +3557,9 @@ def get_pitcher_exit_tendencies(seasons: list[int]) -> pd.DataFrame:
             season,
             team_id,
             pit_pitches,
-            pit_bf
+            pit_bf,
+            -- Convert baseball IP notation (.1=1/3, .2=2/3) to true outs
+            FLOOR(pit_ip) * 3 + ROUND((pit_ip - FLOOR(pit_ip)) * 10) AS outs
         FROM production.fact_player_game_mlb
         WHERE pit_is_starter = TRUE
           AND season IN ({season_list})
@@ -3571,7 +3573,8 @@ def get_pitcher_exit_tendencies(seasons: list[int]) -> pd.DataFrame:
             COUNT(*)            AS n_starts,
             AVG(pit_pitches)    AS avg_pitches,
             STDDEV(pit_pitches) AS std_pitches,
-            AVG(pit_bf)         AS avg_bf
+            AVG(pit_bf)         AS avg_bf,
+            AVG(outs) / 3.0     AS avg_ip
         FROM pitcher_starts
         GROUP BY pitcher_id, season
     ),
@@ -3591,6 +3594,7 @@ def get_pitcher_exit_tendencies(seasons: list[int]) -> pd.DataFrame:
         ROUND(pa.avg_pitches::numeric, 1)  AS avg_pitches,
         ROUND(pa.std_pitches::numeric, 1)  AS std_pitches,
         ROUND(pa.avg_bf::numeric, 1)       AS avg_bf,
+        ROUND(pa.avg_ip::numeric, 2)      AS avg_ip,
         ROUND(ta.team_avg_pitches::numeric, 1) AS team_avg_pitches
     FROM pitcher_agg pa
     LEFT JOIN team_agg ta
@@ -3744,6 +3748,46 @@ def get_team_bullpen_rates(seasons: list[int]) -> pd.DataFrame:
     ORDER BY team_id, season
     """
     logger.info("Fetching team bullpen rates for seasons %s", seasons)
+    return read_sql(query)
+
+
+def get_team_reliever_roster(
+    seasons: list[int],
+    min_bf: int = 10,
+) -> pd.DataFrame:
+    """Per-team reliever roster with BF shares for bullpen matchup weighting.
+
+    Parameters
+    ----------
+    seasons : list[int]
+        Seasons to include.
+    min_bf : int
+        Minimum total BF to include a reliever (filters mop-up / position players).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: team_id, season, pitcher_id, bf, bf_share.
+    """
+    season_list = ", ".join(str(s) for s in seasons)
+    query = f"""
+    SELECT
+        team_id,
+        season,
+        player_id AS pitcher_id,
+        SUM(pit_bf) AS bf,
+        SUM(pit_bf)::float / SUM(SUM(pit_bf)) OVER (
+            PARTITION BY team_id, season
+        ) AS bf_share
+    FROM production.fact_player_game_mlb
+    WHERE pit_is_starter = FALSE
+      AND pit_bf >= 1
+      AND season IN ({season_list})
+    GROUP BY team_id, season, player_id
+    HAVING SUM(pit_bf) >= {min_bf}
+    ORDER BY team_id, season, bf DESC
+    """
+    logger.info("Fetching team reliever rosters for seasons %s", seasons)
     return read_sql(query)
 
 
