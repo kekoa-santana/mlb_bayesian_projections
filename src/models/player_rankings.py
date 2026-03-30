@@ -992,19 +992,20 @@ def _build_hitter_offense_score(
     damage_deviation = (obs_damage - proj_damage).abs()
     damage_dev_trust = (1.0 - damage_deviation).clip(0.50, 1.0)
 
-    # Aging spike penalty: if a 35+ year-old's most recent season sharply
+    # Aging spike penalty: if a 33+ year-old's most recent season sharply
     # outperforms their multi-year baseline, it's almost certainly an
     # outlier that will regress.  A 26-year-old breakout is believable;
     # a 36-year-old career-best after two bad years is not.
-    # Detect via gap between single-season and multi-year observed damage.
+    # The penalty scales with age: harsher at 35+ than at 33.
     aging_spike_penalty = pd.Series(1.0, index=merged.index)
     if "xwoba" in merged.columns and "xwoba_multiyear" in merged.columns:
         single = merged["xwoba"].fillna(0)
         multi = merged["xwoba_multiyear"].fillna(single)
         spike = (single - multi).clip(0)  # only penalize positive spikes
-        # 35+: for each 0.030 xwOBA spike above multi-year, cut trust by 15%
-        is_aging_spike = (age >= 35) & (spike > 0.015)
-        spike_factor = (1.0 - (spike - 0.015) / 0.030 * 0.15).clip(0.60, 1.0)
+        # Age-scaled severity: 33 = 15% per unit, 35 = 25%, 37 = 35%
+        age_severity = (0.15 + ((age - 33).clip(0) * 0.05)).clip(0.15, 0.40)
+        is_aging_spike = (age >= 33) & (spike > 0.015)
+        spike_factor = (1.0 - (spike - 0.015) / 0.030 * age_severity).clip(0.35, 1.0)
         aging_spike_penalty = np.where(is_aging_spike, spike_factor, 1.0)
 
     damage_trust = (
@@ -1054,9 +1055,10 @@ def _build_hitter_offense_score(
         wrc_single = merged["wrc_plus"].fillna(100)
         wrc_multi = merged["wrc_plus_multiyear"].fillna(wrc_single)
         wrc_spike = (wrc_single - wrc_multi).clip(0)
-        # 35+: for each 15 wRC+ spike above multi-year, cut trust by 15%
-        is_wrc_spike = (age >= 35) & (wrc_spike > 10)
-        spike_factor_wrc = (1.0 - (wrc_spike - 10) / 15 * 0.15).clip(0.60, 1.0)
+        # Age-scaled wRC+ spike penalty (same pattern as damage)
+        age_severity_wrc = (0.15 + ((age - 33).clip(0) * 0.05)).clip(0.15, 0.40)
+        is_wrc_spike = (age >= 33) & (wrc_spike > 10)
+        spike_factor_wrc = (1.0 - (wrc_spike - 10) / 15 * age_severity_wrc).clip(0.35, 1.0)
         aging_spike_prod = np.where(is_wrc_spike, spike_factor_wrc, 1.0)
 
     production_trust = (
@@ -2158,6 +2160,16 @@ def rank_hitters(
     upside_age_mult = (1.0 + (26 - age) * 0.02).clip(0.76, 1.10)
     # age 21: 1.10, age 24: 1.04, age 26: 1.00, age 30: 0.92, age 33: 0.86, age 38: 0.76
     base["talent_upside_score"] = base["talent_upside_score"] * upside_age_mult
+
+    # DH penalty: DHs don't field, which is a real value gap (~1.75 WAR/season).
+    # Applied after all other scoring so it's the final adjustment, not a
+    # compounding factor.  Two-way players (Ohtani) exempt — they DH because
+    # they pitch, not because they can't field.
+    is_pure_dh = (base["position"] == "DH") & (~base["is_two_way"])
+    if is_pure_dh.any():
+        base.loc[is_pure_dh, "current_value_score"] *= 0.90
+        logger.info("DH penalty (10%%): %d pure DHs, %d two-way exempt",
+                     is_pure_dh.sum(), (base["is_two_way"] & (base["position"] == "DH")).sum())
 
     # tdd_value_score = current_value_score (backward compat for team consumption)
     base["tdd_value_score"] = base["current_value_score"]

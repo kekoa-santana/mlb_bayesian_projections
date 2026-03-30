@@ -26,7 +26,7 @@ from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS
 logger = logging.getLogger("precompute.confident_picks")
 
 # Batter stats to project (HR excluded — too noisy at game level)
-BATTER_STATS = ("h", "tb", "k")
+BATTER_STATS = ("h", "tb", "k", "hrr")
 
 
 def run(
@@ -77,6 +77,26 @@ def run(
         len(schedule_today), len(schedule_tomorrow), len(schedule),
     )
 
+    # --- Fetch confirmed lineups from MLB API ---
+    confirmed_lineups: dict[tuple[int, int], list[int]] = {}
+    try:
+        from src.data.schedule import fetch_game_lineups
+        for gpk in schedule["game_pk"].unique():
+            lu = fetch_game_lineups(int(gpk))
+            if not lu.empty and "batting_order" in lu.columns:
+                for tid, grp in lu.groupby("team_id"):
+                    ordered = grp.sort_values("batting_order")
+                    bids = ordered["batter_id"].astype(int).tolist()[:9]
+                    if bids:
+                        confirmed_lineups[(int(gpk), int(tid))] = bids
+        if confirmed_lineups:
+            n_teams = len(confirmed_lineups)
+            logger.info("Fetched confirmed lineups for %d team-games", n_teams)
+        else:
+            logger.info("No confirmed lineups available yet")
+    except Exception:
+        logger.warning("Failed to fetch confirmed lineups", exc_info=True)
+
     # --- Load pre-computed data ---
     logger.info("Loading pre-computed sim inputs...")
 
@@ -116,15 +136,7 @@ def run(
     # BF priors
     bf_priors = pd.read_parquet(DASHBOARD_DIR / "bf_priors.parquet")
 
-    # Player names for display
-    try:
-        player_teams = pd.read_parquet(
-            DASHBOARD_DIR / "player_teams.parquet"
-        )
-    except FileNotFoundError:
-        player_teams = pd.DataFrame()
-
-    # Roster + lineup priors for projected lineups
+    # Roster + lineup priors for projected lineups (roster also used for name lookups)
     try:
         roster = pd.read_parquet(DASHBOARD_DIR / "roster.parquet")
     except FileNotFoundError:
@@ -226,11 +238,12 @@ def run(
             if bb_samples is None or hr_samples is None:
                 continue
 
-            # Get opposing lineup (top 9 by batting order)
+            # Get opposing lineup: prefer confirmed, fall back to priors
             opp_team_id = game.get(opp_team_col)
-            lineup_ids = _get_lineup(
-                roster, lineup_priors,
-                int(opp_team_id) if pd.notna(opp_team_id) else 0,
+            opp_tid = int(opp_team_id) if pd.notna(opp_team_id) else 0
+            lineup_ids = confirmed_lineups.get(
+                (game_pk, opp_tid),
+                _get_lineup(roster, lineup_priors, opp_tid),
             )
             if len(lineup_ids) < 9:
                 # Pad with zeros for missing lineup slots
@@ -347,6 +360,13 @@ def run(
                 over_df = sim.over_probs(stat_key, all_lines)
                 p_over_map = dict(zip(over_df["line"], over_df["p_over"]))
 
+                # Store P(over) at standard lines 0.5-10.5
+                p_over_cols = {}
+                for lv in [x + 0.5 for x in range(11)]:
+                    p_over_cols[f"p_over_{lv:.1f}"] = round(
+                        p_over_map.get(lv, 0), 3
+                    )
+
                 pitcher_picks.append({
                     **_meta,
                     "stat": stat_label,
@@ -354,7 +374,7 @@ def run(
                     "std": round(std, 2),
                     "line": default_line,
                     "p_over": round(p_over_map.get(default_line, 0), 3),
-                    "_p_over_map": p_over_map,
+                    **p_over_cols,
                 })
 
         # --- BATTER SIMS (both teams' lineups) ---
@@ -398,8 +418,11 @@ def run(
             else:
                 bp_k, bp_bb, bp_hr = 0.253, 0.084, 0.024
 
-            # Get lineup
-            lineup_ids = _get_lineup(roster, lineup_priors, team_id)
+            # Get lineup: prefer confirmed, fall back to priors
+            lineup_ids = confirmed_lineups.get(
+                (game_pk, team_id),
+                _get_lineup(roster, lineup_priors, team_id),
+            )
             team_abbr = game.get(team_abbr_col, "")
             opp_abbr = game.get(opp_abbr_col, "")
 
@@ -460,17 +483,29 @@ def run(
                     continue
 
                 bsummary = bsim.summary()
-                batter_name = _lookup_name(player_teams, batter_id)
+                batter_name = _lookup_name(roster, batter_id)
                 game_dt = game.get("game_date", game_date)
 
                 # Build props for each batter stat
                 for stat_key in BATTER_STATS:
                     expected = bsummary[stat_key]["mean"]
                     std = bsummary[stat_key]["std"]
-                    default_line = max(np.floor(expected) + 0.5, 0.5)
+                    # HRR (combined stat): default to O 0.5 since
+                    # "1+ H+R+RBI" is the standard prop market line
+                    if stat_key == "hrr":
+                        default_line = 0.5
+                    else:
+                        default_line = max(np.floor(expected) + 0.5, 0.5)
                     all_lines = [x + 0.5 for x in range(16)]
                     over_df = bsim.over_probs(stat_key, all_lines)
                     p_over_map = dict(zip(over_df["line"], over_df["p_over"]))
+
+                    # Store P(over) at standard lines 0.5-10.5
+                    p_over_cols = {}
+                    for lv in [x + 0.5 for x in range(11)]:
+                        p_over_cols[f"p_over_{lv:.1f}"] = round(
+                            p_over_map.get(lv, 0), 3
+                        )
 
                     batter_picks.append({
                         "game_date": game_dt,
@@ -486,7 +521,7 @@ def run(
                         "std": round(std, 2),
                         "line": default_line,
                         "p_over": round(p_over_map.get(default_line, 0), 3),
-                        "_p_over_map": p_over_map,
+                        **p_over_cols,
                     })
 
     # --- Combine new predictions ---
@@ -497,79 +532,13 @@ def run(
             ascending=[True, True, False],
         )
 
-    # --- Attach DraftKings odds as Vegas baseline ---
-    all_props["vegas_line"] = None
-    all_props["vegas_odds"] = None
-    all_props["vegas_implied"] = None
-    try:
-        _dk_path = DASHBOARD_DIR.parent.parent / "lib" / "draftkings.py"
-        if _dk_path.exists():
-            import importlib.util
-            _spec = importlib.util.spec_from_file_location("draftkings", _dk_path)
-            _dk_mod = importlib.util.module_from_spec(_spec)
-            _spec.loader.exec_module(_dk_mod)
-            dk_df = _dk_mod.fetch_dk_player_props()
-        else:
-            from lib.draftkings import fetch_dk_player_props
-            dk_df = fetch_dk_player_props()
+    # Fall back to mid line for legacy rows
+    if "line_mid" in all_props.columns:
+        all_props["line"] = all_props["line"].fillna(all_props["line_mid"])
+        all_props["p_over"] = all_props["p_over"].fillna(all_props["p_over_mid"])
 
-        if not dk_df.empty and len(all_props) > 0:
-            # Build name lookup from projections
-            _name_lookup: dict[int, str] = {}
-            try:
-                _pp = pd.read_parquet(DASHBOARD_DIR / "pitcher_projections.parquet")
-                if "pitcher_name" in _pp.columns:
-                    for _, r in _pp.iterrows():
-                        _name_lookup[int(r["pitcher_id"])] = r["pitcher_name"]
-            except FileNotFoundError:
-                pass
-            try:
-                _hp = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet")
-                if "batter_name" in _hp.columns:
-                    for _, r in _hp.iterrows():
-                        _name_lookup[int(r["batter_id"])] = r["batter_name"]
-            except FileNotFoundError:
-                pass
-
-            # Index DK props by (last_name, stat) for matching
-            dk_by_stat: dict[str, list] = {}
-            for _, dr in dk_df.iterrows():
-                key = dr["stat"]
-                if key not in dk_by_stat:
-                    dk_by_stat[key] = []
-                dk_by_stat[key].append(dr)
-
-            for idx, row in all_props.iterrows():
-                pid = int(row["player_id"])
-                name = _name_lookup.get(pid, "")
-                if not name:
-                    continue
-                last = name.split()[-1].lower()
-                stat = row["stat"]
-                for dr in dk_by_stat.get(stat, []):
-                    dk_last = dr["player_name"].split()[-1].lower()
-                    if last == dk_last:
-                        all_props.at[idx, "vegas_line"] = dr["line"]
-                        all_props.at[idx, "vegas_odds"] = dr["over_odds"]
-                        all_props.at[idx, "vegas_implied"] = dr["over_implied"]
-                        # Resolve line + p_over to the DK line
-                        dk_line = float(dr["line"])
-                        p_map = row.get("_p_over_map")
-                        if isinstance(p_map, dict) and dk_line in p_map:
-                            all_props.at[idx, "line"] = dk_line
-                            all_props.at[idx, "p_over"] = round(
-                                p_map[dk_line], 3)
-                        break
-
-            n_matched = all_props["vegas_line"].notna().sum()
-            logger.info("Matched %d/%d props to DraftKings odds",
-                        n_matched, len(all_props))
-    except Exception:
-        logger.debug("DraftKings odds fetch failed", exc_info=True)
-
-    # Drop the temporary p_over map column
-    if "_p_over_map" in all_props.columns:
-        all_props.drop(columns=["_p_over_map"], inplace=True)
+    # --- Fetch and save book props (DK + Prize Picks) ---
+    _fetch_book_props(all_props)
 
     # --- Merge with history: freeze started/finished, update pre-game ---
     # Props for games that have started or finished are never overwritten.
@@ -655,6 +624,100 @@ def run(
                 )
 
 
+def _fetch_book_props(all_props: pd.DataFrame) -> None:
+    """Fetch DraftKings and Prize Picks lines and save as separate parquets.
+
+    Resolves book player names to MLB player IDs so downstream joins
+    are by (player_id, stat) instead of fuzzy name matching.
+    """
+    # Build name lookup: MLB player_id -> name
+    _name_lookup: dict[int, str] = {}
+    try:
+        _pp = pd.read_parquet(DASHBOARD_DIR / "pitcher_projections.parquet")
+        if "pitcher_name" in _pp.columns:
+            for _, r in _pp.iterrows():
+                _name_lookup[int(r["pitcher_id"])] = r["pitcher_name"]
+    except FileNotFoundError:
+        pass
+    try:
+        _hp = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet")
+        if "batter_name" in _hp.columns:
+            for _, r in _hp.iterrows():
+                _name_lookup[int(r["batter_id"])] = r["batter_name"]
+    except FileNotFoundError:
+        pass
+
+    # Build reverse lookup: match_name -> player_id
+    _SUFFIXES = {"jr.", "sr.", "ii", "iii", "iv", "v"}
+
+    def _match_name(full_name: str) -> str:
+        parts = full_name.strip().split()
+        parts = [p for p in parts if p.lower().rstrip(".") not in _SUFFIXES]
+        if len(parts) >= 2:
+            return f"{parts[0]} {parts[-1]}".lower()
+        return full_name.lower()
+
+    name_to_id: dict[str, int] = {}
+    for pid, name in _name_lookup.items():
+        key = _match_name(name)
+        name_to_id[key] = pid
+
+    def _resolve_id(book_name: str) -> int | None:
+        return name_to_id.get(_match_name(book_name))
+
+    # --- DraftKings ---
+    try:
+        _dk_path = DASHBOARD_DIR.parent.parent / "lib" / "draftkings.py"
+        if _dk_path.exists():
+            import importlib.util
+            _spec = importlib.util.spec_from_file_location("draftkings", _dk_path)
+            _dk_mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_dk_mod)
+            dk_df = _dk_mod.fetch_dk_player_props()
+        else:
+            dk_df = pd.DataFrame()
+
+        if not dk_df.empty:
+            dk_df["player_id"] = dk_df["player_name"].apply(_resolve_id)
+            dk_df = dk_df[dk_df["player_id"].notna()].copy()
+            dk_df["player_id"] = dk_df["player_id"].astype(int)
+            dk_df.to_parquet(DASHBOARD_DIR / "dk_props.parquet", index=False)
+            logger.info(
+                "Saved %d DK props (%d resolved to MLB IDs)",
+                len(dk_df), dk_df["player_id"].notna().sum(),
+            )
+        else:
+            logger.info("No DK props available")
+    except Exception:
+        logger.warning("DK props fetch failed", exc_info=True)
+
+    # --- Prize Picks ---
+    try:
+        _pp_path = DASHBOARD_DIR.parent.parent / "lib" / "prizepicks.py"
+        if _pp_path.exists():
+            import importlib.util
+            _spec = importlib.util.spec_from_file_location("prizepicks", _pp_path)
+            _pp_mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_pp_mod)
+            pp_df = _pp_mod.fetch_pp_player_props()
+        else:
+            pp_df = pd.DataFrame()
+
+        if not pp_df.empty:
+            pp_df["player_id"] = pp_df["player_name"].apply(_resolve_id)
+            pp_df = pp_df[pp_df["player_id"].notna()].copy()
+            pp_df["player_id"] = pp_df["player_id"].astype(int)
+            pp_df.to_parquet(DASHBOARD_DIR / "pp_props.parquet", index=False)
+            logger.info(
+                "Saved %d PP props (%d resolved to MLB IDs)",
+                len(pp_df), pp_df["player_id"].notna().sum(),
+            )
+        else:
+            logger.info("No Prize Picks props available")
+    except Exception:
+        logger.warning("Prize Picks props fetch failed", exc_info=True)
+
+
 def _backfill_results(props_df: pd.DataFrame) -> None:
     """Fill in actual stats and over/under results from MLB boxscores.
 
@@ -670,6 +733,7 @@ def _backfill_results(props_df: pd.DataFrame) -> None:
     _STAT_TO_BOX = {
         "K": "strikeOuts", "H": "hits", "HR": "homeRuns",
         "BB": "baseOnBalls", "TB": "totalBases", "Outs": None,
+        "R": "runs", "RBI": "rbi",
     }
 
     # Find games that need results: scheduled (no results yet)
@@ -747,8 +811,18 @@ def _backfill_results(props_df: pd.DataFrame) -> None:
 
             props_df.at[idx, "game_status"] = game_status
 
-            if pid in player_stats and stat in player_stats[pid]:
-                actual = player_stats[pid][stat]
+            if pid not in player_stats:
+                continue
+
+            ps = player_stats[pid]
+            if stat == "HRR":
+                # Combined: Hits + Runs + RBIs
+                if "H" in ps and "R" in ps and "RBI" in ps:
+                    actual = ps["H"] + ps["R"] + ps["RBI"]
+                    props_df.at[idx, "actual"] = actual
+                    props_df.at[idx, "over_hit"] = actual > line
+            elif stat in ps:
+                actual = ps[stat]
                 props_df.at[idx, "actual"] = actual
                 props_df.at[idx, "over_hit"] = actual > line
 
@@ -779,7 +853,8 @@ def _save_empty(game_date: str) -> None:
         "espn_mean", "espn_median",
         "expected_ip", "expected_pitches", "expected_bf",
         "actual", "over_hit", "game_status",
-    ]).to_parquet(history_path, index=False)
+    ] + [f"p_over_{x + 0.5:.1f}" for x in range(11)]
+    ).to_parquet(history_path, index=False)
 
 
 def _build_baselines_pt(

@@ -20,4 +20,5 @@ __pycache__/
 .codex/
 
 *.ipynb
+output.md
 TODO.md

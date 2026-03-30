@@ -610,27 +610,32 @@ def grade_hitter_tools(
     positions = enriched.get("position", pd.Series("", index=enriched.index))
     is_two_way = enriched.get("is_two_way", pd.Series(False, index=enriched.index)).fillna(False)
 
-    # Uniform weights for all fielding positions
+    # Same weights for ALL positions including DH.  DHs get graded on
+    # fielding like everyone else — they'll score low there naturally,
+    # which correctly reflects they provide less total value.
     _UNIFORM_WEIGHTS = {"hit": 0.25, "power": 0.20, "speed": 0.10, "fielding": 0.20, "discipline": 0.25}
-    # DH: no fielding, redistribute to bat tools
-    _DH_WEIGHTS = {"hit": 0.30, "power": 0.25, "speed": 0.05, "fielding": 0.00, "discipline": 0.40}
 
-    dr = pd.Series(5.0, index=result.index)
-    is_dh = positions == "DH"
-    if (~is_dh).any():
-        dr.loc[~is_dh] = _tools_rating(result.loc[~is_dh], _UNIFORM_WEIGHTS)
-    if is_dh.any():
-        dr.loc[is_dh] = _tools_rating(result.loc[is_dh], _DH_WEIGHTS)
+    dr = _tools_rating(result, _UNIFORM_WEIGHTS)
 
-    # Blend tools (85%) with projected wRC+ (15%) as a production guardrail.
-    # Prevents speed-only players with terrible bats from ranking top-10.
-    # Projected wRC+ comes from the Bayesian sim and already regresses
-    # small samples toward population priors.
+    # Blend tools (85%) with multi-year observed wRC+ (15%) as a production
+    # guardrail.  Prevents speed-only players with terrible bats from ranking
+    # top-10.  Uses multi-year recency-weighted wRC+ (backward-looking fact)
+    # rather than projected wRC+ (model output that can be circular — a good
+    # recent season inflates the projection which then boosts the guardrail).
     wrc_grade = pd.Series(5.0, index=result.index)  # default: average
-    wrc_col = "projected_wrc_plus_mean"
-    if wrc_col in enriched.columns and enriched[wrc_col].notna().any():
+    # Prefer multi-year observed, fall back to single-season, then projected
+    wrc_col = next(
+        (c for c in ("wrc_plus_multiyear", "wrc_plus", "projected_wrc_plus_mean")
+         if c in enriched.columns and enriched[c].notna().any()),
+        None,
+    )
+    if wrc_col is not None:
         wrc_grade = ((enriched[wrc_col].fillna(100) - 60) / 80 * 10).clip(0, 10)
-        raw_dr = 0.85 * dr + 0.15 * wrc_grade
+        # Asymmetric guardrail: only LOWER tools_rating when production
+        # doesn't back up the tools.  Never BOOST — that creates circular
+        # reinforcement (good season → high wRC+ → higher tools_rating).
+        blended = 0.85 * dr + 0.15 * wrc_grade
+        raw_dr = np.minimum(dr, blended)
     else:
         raw_dr = dr
 
@@ -639,15 +644,9 @@ def grade_hitter_tools(
         two_way_boost = enriched["two_way_bonus"].fillna(0).clip(0, 0.05) * 20
         raw_dr = raw_dr + np.where(is_two_way, two_way_boost, 0)
 
-    # DH discount: DHs don't provide fielding value, so their overall
-    # contribution is lower than a fielding player with equal bat tools.
-    # Exempt two-way players (e.g. Ohtani) who DH only because they pitch.
-    dh_discount = is_dh & ~is_two_way
-    if dh_discount.any():
-        raw_dr = raw_dr.copy()
-        raw_dr.loc[dh_discount] *= 0.92  # 8% discount for pure DHs
-        logger.info("DH discount applied to %d pure DHs (exempting %d two-way)",
-                    dh_discount.sum(), (is_dh & is_two_way).sum())
+    # No explicit DH discount — uniform weights with 20% fielding already
+    # penalizes DHs naturally (they score low on fielding like everyone else
+    # who doesn't field).
 
     # Rescale so worst hitter = 1.0, best = 10.0 (league-relative)
     dr_min, dr_max = raw_dr.min(), raw_dr.max()

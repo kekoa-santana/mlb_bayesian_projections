@@ -82,12 +82,17 @@ class BatterSimulationResult:
     pa_vs_reliever_samples: np.ndarray
     n_sims: int = 0
 
+    @property
+    def hrr_samples(self) -> np.ndarray:
+        """Hits + Runs + RBIs combined samples."""
+        return self.h_samples + self.r_samples + self.rbi_samples
+
     def summary(self) -> dict[str, dict[str, float]]:
         """Compute summary statistics for all stats."""
         stats = {}
         for name in [
             "k", "bb", "h", "hr", "single", "double", "triple",
-            "tb", "r", "rbi", "hbp", "pa",
+            "tb", "r", "rbi", "hbp", "pa", "hrr",
         ]:
             samples = getattr(self, f"{name}_samples")
             stats[name] = {
@@ -278,7 +283,7 @@ def simulate_batter_game(
         k_pitcher_lift = np.where(
             vs_starter_active,
             starter_k_lift + matchup_k_lift,
-            bullpen_k_lift + bullpen_matchup_k_lift,
+            bullpen_k_lift,  # K matchup lift skipped — adds noise for relievers
         )
         bb_pitcher_lift = np.where(
             vs_starter_active,
