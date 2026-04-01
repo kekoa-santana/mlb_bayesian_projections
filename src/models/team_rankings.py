@@ -665,6 +665,7 @@ def build_power_rankings(
     pitcher_glicko_path: Path | None = None,
     team_sim: pd.DataFrame | None = None,
     config: dict[str, Any] | None = None,
+    league_sim_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build projection-integrated power rankings for all 30 teams.
 
@@ -708,6 +709,10 @@ def build_power_rankings(
         Path to ``pitcher_glicko.parquet``.
     config : dict, optional
         Override weight / threshold configuration.
+    league_sim_df : pd.DataFrame, optional
+        League season sim results (from ``run_league_sim``).  When provided,
+        sim wins are taken from this DataFrame instead of reading
+        ``league_sim.parquet`` from disk.
 
     Returns
     -------
@@ -1222,26 +1227,26 @@ def build_power_rankings(
 
     # Use league sim wins if available (overwrites Pythagorean wins from
     # rank_teams).  The league sim is zero-sum and schedule-aware.
-    # Look for league_sim.parquet in common dashboard locations
-    _project_root = Path(__file__).resolve().parents[2]
-    _ls_candidates = [
-        _project_root.parent / "tdd-dashboard" / "data" / "dashboard" / "league_sim.parquet",
-        _project_root / "data" / "dashboard" / "league_sim.parquet",
-    ]
-    _ls_path = None
-    for _c in _ls_candidates:
-        if _c.exists():
-            _ls_path = _c
-            break
+    # Prefer in-memory DataFrame; fall back to parquet on disk.
+    _ls: pd.DataFrame | None = league_sim_df
+    if _ls is None:
+        _project_root = Path(__file__).resolve().parents[2]
+        _ls_candidates = [
+            _project_root.parent / "tdd-dashboard" / "data" / "dashboard" / "league_sim.parquet",
+            _project_root / "data" / "dashboard" / "league_sim.parquet",
+        ]
+        for _c in _ls_candidates:
+            if _c.exists():
+                _ls = pd.read_parquet(_c)
+                break
 
-    if _ls_path is not None:
-        _ls = pd.read_parquet(_ls_path)
+    if _ls is not None:
         _ls_map = dict(zip(_ls["team_id"].astype(int), _ls["sim_wins_mean"]))
         for r in pre_rows:
             if r["tid"] in _ls_map:
                 r["proj_wins"] = _ls_map[r["tid"]]
         all_wins = np.array([r["proj_wins"] for r in pre_rows])
-        logger.info("Power rankings using league sim wins (league_sim.parquet)")
+        logger.info("Power rankings using league sim wins")
 
     # Projected wins is the primary signal (70%).  Depth and trajectory
     # get meaningful weight to reflect roster quality beyond raw RS/RA.

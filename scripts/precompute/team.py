@@ -127,11 +127,6 @@ def run_series_elo(*, from_season: int = FROM_SEASON) -> None:
         # Compute series ELO
         ratings, history = compute_series_elo(series_data)
 
-        # Current (end-of-2025) ratings
-        current = get_current_ratings(ratings, team_info)
-        current.to_parquet(DASHBOARD_DIR / "team_series_elo.parquet", index=False)
-        logger.info("Saved team_series_elo.parquet: %d teams", len(current))
-
         # Pre-season 2026 projection (regressed)
         preseason_ratings = project_preseason_elo(ratings)
         preseason = get_current_ratings(preseason_ratings, team_info)
@@ -158,6 +153,7 @@ def run_team_profiles(
     *,
     elo_history: pd.DataFrame | None = None,
     elo_current: pd.DataFrame | None = None,
+    pitcher_roles_df: pd.DataFrame | None = None,
     from_season: int = FROM_SEASON,
 ) -> None:
     """Build team profiles and rankings."""
@@ -172,6 +168,7 @@ def run_team_profiles(
             season=from_season,
             projection_season=from_season + 1,
             elo_history=elo_history,
+            pitcher_roles_df=pitcher_roles_df,
         )
         team_profiles.to_parquet(DASHBOARD_DIR / "team_profiles.parquet", index=False)
         logger.info("Saved team_profiles.parquet: %d teams", len(team_profiles))
@@ -225,8 +222,23 @@ def run_team_profiles(
         logger.exception("Failed to build team profiles/rankings")
 
 
-def run_team_power() -> None:
-    """Build projection-integrated power rankings."""
+def run_team_power(
+    *,
+    team_sim_df: pd.DataFrame | None = None,
+    league_sim_df: pd.DataFrame | None = None,
+) -> None:
+    """Build projection-integrated power rankings.
+
+    Parameters
+    ----------
+    team_sim_df : pd.DataFrame or None
+        Team season sim results (from ``run_team_sim``).  If None, falls
+        back to reading ``team_sim_wins.parquet`` from disk.
+    league_sim_df : pd.DataFrame or None
+        League season sim results (from ``run_league_sim``).  Passed through
+        to ``build_power_rankings`` so it can use sim wins without reading
+        ``league_sim.parquet`` from disk.
+    """
     logger.info("=" * 60)
     logger.info("Building projection-integrated power rankings...")
 
@@ -259,11 +271,12 @@ def run_team_power() -> None:
             _h_rank_pw, _p_rank_pw, _h_proj_pw, _p_proj_pw,
         ]):
             from src.models.team_rankings import build_power_rankings
-            # Load team sim if available (for confidence-weighted win blend)
-            _team_sim = None
-            _sim_path = DASHBOARD_DIR / "team_sim_wins.parquet"
-            if _sim_path.exists():
-                _team_sim = pd.read_parquet(_sim_path)
+            # Use in-memory team sim if provided, else load from disk
+            _team_sim = team_sim_df
+            if _team_sim is None:
+                _sim_path = DASHBOARD_DIR / "team_sim_wins.parquet"
+                if _sim_path.exists():
+                    _team_sim = pd.read_parquet(_sim_path)
 
             power_rankings_df = build_power_rankings(
                 elo_ratings=_elo_pre,
@@ -276,6 +289,7 @@ def run_team_power() -> None:
                 batter_glicko_path=_bg_path if _bg_path.exists() else None,
                 pitcher_glicko_path=_pg_path if _pg_path.exists() else None,
                 team_sim=_team_sim,
+                league_sim_df=league_sim_df,
             )
             # Save power rankings standalone (backward compat)
             power_rankings_df.to_parquet(
@@ -359,13 +373,18 @@ def run_league_sim(
     n_sims: int = 1000,
     random_seed: int = 42,
     from_season: int = FROM_SEASON,
-) -> None:
+) -> pd.DataFrame | None:
     """Run full-league Bernoulli season sim on actual schedule.
 
     Feeds the same team strengths (Pythagorean + WAA) used by rank_teams
     into a zero-sum league simulator.  The sim mean wins REPLACE
     projected_wins in team_rankings.parquet so there is one source of
     truth.  Also writes playoff probabilities and win distributions.
+
+    Returns
+    -------
+    result : pd.DataFrame or None
+        League sim results (one row per team), or None on failure.
     """
     logger.info("=" * 60)
     logger.info("Running league season simulator (%d sims)...", n_sims)
@@ -377,13 +396,14 @@ def run_league_sim(
             compute_team_history,
             simulate_league_season,
         )
+        from src.models.team_sim.injury_model import build_team_injury_params
         from src.models.team_rankings import compute_roster_waa_delta, _assign_tier
 
         tr_path = DASHBOARD_DIR / "team_rankings.parquet"
         tp_path = DASHBOARD_DIR / "team_profiles.parquet"
         if not tr_path.exists() or not tp_path.exists():
             logger.warning("Skipping league sim -- need team_rankings + team_profiles first")
-            return
+            return None
 
         tr = pd.read_parquet(tr_path)
         tp = pd.read_parquet(tp_path)
@@ -547,17 +567,137 @@ def run_league_sim(
                 logger.info("Fetched %d games from MLB API", len(schedule))
             except Exception:
                 logger.exception("Failed to fetch schedule from MLB API")
-                return
+                return None
 
         if schedule is None or schedule.empty:
             logger.warning("No schedule available for %d", target_season)
-            return
+            return None
 
-        # Run sim
-        result = simulate_league_season(
-            schedule, team_strength=team_strength,
-            n_sims=n_sims, random_seed=random_seed,
-        )
+        # ── Build team_rosters for injury cascading (Poisson mode) ──
+        # Reuses the same data that run_team_sim() loads, keyed by team_id
+        # instead of team_abbr.
+        league_rosters: dict[int, dict] | None = None
+        league_profiles: dict[int, dict] | None = None
+        try:
+            _hcs_path = DASHBOARD_DIR / "hitter_counting_sim.parquet"
+            _pcs_path = DASHBOARD_DIR / "pitcher_counting_sim.parquet"
+            _pt_path = DASHBOARD_DIR / "player_teams.parquet"
+            _pe_path = DASHBOARD_DIR / "hitter_position_eligibility.parquet"
+            _hs_path = DASHBOARD_DIR / "health_scores.parquet"
+
+            _hr_path = DASHBOARD_DIR / "hitters_rankings.parquet"
+            _pr_path = DASHBOARD_DIR / "pitchers_rankings.parquet"
+            _needed = [_hcs_path, _pcs_path, _pt_path, _hr_path, _pr_path]
+            if all(p.exists() for p in _needed):
+                _lr_hr_src = pd.read_parquet(_hr_path)
+                _lr_pr = pd.read_parquet(_pr_path)
+                _lr_hcs = pd.read_parquet(_hcs_path)
+                _lr_pcs = pd.read_parquet(_pcs_path)
+                _lr_teams = pd.read_parquet(_pt_path)
+                _lr_health = (
+                    pd.read_parquet(_hs_path) if _hs_path.exists()
+                    else None
+                )
+
+                # Build team_id <-> team_abbr mapping from team_rankings
+                _abbr_to_tid: dict[str, int] = dict(
+                    zip(tr["abbreviation"], tr["team_id"].astype(int))
+                )
+
+                league_rosters = {}
+                league_profiles = {}
+                for abbr in _lr_teams["team_abbr"].unique():
+                    tid = _abbr_to_tid.get(abbr)
+                    if tid is None:
+                        continue
+                    t_ids = set(_lr_teams[_lr_teams["team_abbr"] == abbr]["player_id"])
+
+                    # Hitters
+                    t_hr = _lr_hr_src[_lr_hr_src["batter_id"].isin(t_ids)]
+                    t_hcs = _lr_hcs[_lr_hcs["batter_id"].isin(t_ids)]
+                    h_m = t_hr[["batter_id", "position", "tdd_value_score", "pa", "age"]].merge(
+                        t_hcs[["batter_id", "total_h_mean", "total_hr_mean",
+                                "total_bb_mean", "total_hbp_mean", "total_tb_mean",
+                                "total_pa_mean"]],
+                        on="batter_id", how="inner",
+                    ).rename(columns={
+                        "batter_id": "player_id",
+                        "tdd_value_score": "value_score",
+                    })
+                    h_m["projected_pa"] = h_m["total_pa_mean"]
+                    h_m = h_m.sort_values("value_score", ascending=False).reset_index(drop=True)
+                    h_m["is_starter"] = h_m.index < 9
+                    h_m["games"] = (h_m["pa"] / 3.85).clip(20, 162).astype(int)
+
+                    # Pitchers
+                    t_pr = _lr_pr[_lr_pr["pitcher_id"].isin(t_ids)]
+                    t_pcs = _lr_pcs[_lr_pcs["pitcher_id"].isin(t_ids)]
+                    bf_col = "batters_faced" if "batters_faced" in t_pr.columns else None
+                    p_cols = ["pitcher_id", "role", "tdd_value_score", "age"]
+                    if bf_col:
+                        p_cols.append(bf_col)
+                    p_m = t_pr[p_cols].merge(
+                        t_pcs[["pitcher_id", "total_runs_mean", "projected_ip_mean"]],
+                        on="pitcher_id", how="inner",
+                    ).rename(columns={
+                        "pitcher_id": "player_id",
+                        "tdd_value_score": "value_score",
+                    })
+                    p_m["projected_ip"] = p_m["projected_ip_mean"]
+                    if bf_col and bf_col in p_m.columns:
+                        p_m["games"] = (p_m[bf_col] / 25).clip(10, 35).astype(int)
+                    else:
+                        p_m["games"] = 30
+
+                    if h_m.empty and p_m.empty:
+                        continue
+
+                    # Injury params
+                    all_players = pd.concat([
+                        h_m[["player_id", "age", "position", "games"]].rename(
+                            columns={"position": "primary_position"}),
+                        p_m[["player_id", "age", "role", "games"]].rename(
+                            columns={"role": "primary_position"}),
+                    ], ignore_index=True)
+                    injury_params = build_team_injury_params(
+                        all_players, health_scores=_lr_health,
+                    )
+
+                    league_rosters[tid] = {
+                        "hitters": h_m,
+                        "pitchers": p_m,
+                        "injury_params": injury_params,
+                    }
+
+                logger.info(
+                    "Built league rosters for %d teams (injury cascade mode)",
+                    len(league_rosters),
+                )
+            else:
+                missing = [p.name for p in _needed if not p.exists()]
+                logger.info(
+                    "Skipping injury cascade (missing: %s) -- using Bernoulli",
+                    ", ".join(missing),
+                )
+        except Exception:
+            logger.warning(
+                "Could not build team rosters for injury cascade",
+                exc_info=True,
+            )
+
+        # Run sim: prefer Poisson+injury, fall back to Bernoulli
+        if league_rosters and len(league_rosters) >= 25:
+            result = simulate_league_season(
+                schedule,
+                team_profiles=league_profiles or None,
+                team_rosters=league_rosters,
+                n_sims=n_sims, random_seed=random_seed,
+            )
+        else:
+            result = simulate_league_season(
+                schedule, team_strength=team_strength,
+                n_sims=n_sims, random_seed=random_seed,
+            )
 
         # Save standalone league sim results
         # Map team_id to abbreviation
@@ -602,16 +742,37 @@ def run_league_sim(
                 row.get("playoff_pct", 0) * 100,
             )
 
+        return result
+
     except Exception:
         logger.exception("Failed to run league season simulator")
+        return None
 
 
 def run_team_sim(
     *,
+    health_df: pd.DataFrame | None = None,
     n_sims: int = 1000,
     random_seed: int = 42,
-) -> None:
-    """Run Monte Carlo team season sim with injury cascading."""
+) -> pd.DataFrame | None:
+    """Run Monte Carlo team season sim with injury cascading.
+
+    Parameters
+    ----------
+    health_df : pd.DataFrame or None
+        Pre-loaded health scores (columns: player_id, health_score,
+        health_label).  When provided the disk read of
+        ``health_scores.parquet`` is skipped.
+    n_sims : int
+        Number of Monte Carlo simulations per team.
+    random_seed : int
+        RNG seed for reproducibility.
+
+    Returns
+    -------
+    results : pd.DataFrame or None
+        Team sim results (one row per team), or None on failure.
+    """
     logger.info("=" * 60)
     logger.info("Running team season simulator (%d sims)...", n_sims)
 
@@ -627,10 +788,11 @@ def run_team_sim(
         teams_df = pd.read_parquet(DASHBOARD_DIR / "player_teams.parquet")
         pe = pd.read_parquet(DASHBOARD_DIR / "hitter_position_eligibility.parquet")
 
-        health = None
-        health_path = DASHBOARD_DIR / "health_scores.parquet"
-        if health_path.exists():
-            health = pd.read_parquet(health_path)
+        health = health_df
+        if health is None:
+            health_path = DASHBOARD_DIR / "health_scores.parquet"
+            if health_path.exists():
+                health = pd.read_parquet(health_path)
 
         # Build per-team data
         team_rosters: dict[str, dict] = {}
@@ -696,8 +858,11 @@ def run_team_sim(
                 row["sim_wins_p10"], row["sim_wins_p90"], row["sim_wins_std"],
             )
 
+        return results
+
     except Exception:
         logger.exception("Failed to run team season simulator")
+        return None
 
 
 def _load_oaa_by_position(from_season: int) -> dict[tuple[int, str], float]:

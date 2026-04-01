@@ -44,19 +44,6 @@ from src.models.pitcher_model import (
 logger = logging.getLogger(__name__)
 
 
-def _build_baselines_pt(pitcher_arsenal: pd.DataFrame) -> dict:
-    """Build league baselines per pitch type."""
-    agg = pitcher_arsenal.groupby("pitch_type").agg(
-        total_whiffs=("whiffs", "sum"),
-        total_swings=("swings", "sum"),
-    ).reset_index()
-    agg["whiff_rate"] = agg["total_whiffs"] / agg["total_swings"].replace(0, np.nan)
-    return {
-        row["pitch_type"]: {"whiff_rate": float(row["whiff_rate"])}
-        for _, row in agg.iterrows()
-        if pd.notna(row["whiff_rate"])
-    }
-
 
 def build_batter_sim_predictions(
     train_seasons: list[int],
@@ -253,7 +240,8 @@ def build_batter_sim_predictions(
     # --- 7. Matchup data ---
     pitcher_arsenal = get_pitcher_arsenal(last_train)
     hitter_vuln = get_hitter_vulnerability(last_train)
-    baselines_pt = _build_baselines_pt(pitcher_arsenal)
+    from src.data.league_baselines import get_baselines_dict
+    baselines_pt = get_baselines_dict(seasons=train_seasons, recency_weights="equal")
 
     # --- 8. Load test season actuals ---
     logger.info("Loading test season %d batter actuals...", test_season)

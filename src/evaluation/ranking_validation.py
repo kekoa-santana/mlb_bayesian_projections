@@ -599,63 +599,6 @@ def learn_blend_weights(
     }
 
 
-def pa_conditioned_blend_curve(
-    sub_scores: pd.DataFrame,
-    outcomes: pd.Series,
-    pa_col: str = "pa",
-    score_cols: list[str] | None = None,
-    pa_bins: list[int] | None = None,
-) -> pd.DataFrame:
-    """Learn optimal projection weight at each PA level.
-
-    For each PA bin, re-optimizes weights and reports the fraction
-    that goes to "projection-like" sub-scores (trajectory, health)
-    versus "observed-like" sub-scores (offense, fielding).
-
-    Parameters
-    ----------
-    sub_scores : pd.DataFrame
-        Must contain ``pa_col`` and score columns.
-    outcomes : pd.Series
-        Actual next-season values.
-    pa_col : str
-        Column name for plate appearances.
-    score_cols : list[str], optional
-        Sub-score columns. Defaults to hitter score columns.
-    pa_bins : list[int], optional
-        PA bin edges. Defaults to [150, 300, 450, 600, 800].
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: pa_bin, n_players, optimal_weights, rmse, spearman_rho.
-    """
-    if score_cols is None:
-        score_cols = _HITTER_SCORE_COLS
-    if pa_bins is None:
-        pa_bins = [150, 300, 450, 600, 800]
-
-    results = []
-    for i in range(len(pa_bins) - 1):
-        lo, hi = pa_bins[i], pa_bins[i + 1]
-        mask = (sub_scores[pa_col] >= lo) & (sub_scores[pa_col] < hi)
-        bin_scores = sub_scores[mask]
-        bin_outcomes = outcomes.loc[bin_scores.index]
-
-        if len(bin_scores) < 20:
-            continue
-
-        opt = learn_blend_weights(bin_scores, bin_outcomes, score_cols)
-        opt["pa_bin"] = f"{lo}-{hi}"
-        opt["n_players"] = len(bin_scores)
-        results.append(opt)
-
-    if not results:
-        return pd.DataFrame()
-
-    return pd.DataFrame(results)
-
-
 # ===================================================================
 # Walk-forward validation: hitters
 # ===================================================================

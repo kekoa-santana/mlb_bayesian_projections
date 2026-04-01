@@ -34,11 +34,9 @@ from src.models.game_sim.pa_outcome_model import (
 )
 from src.models.game_sim.pitch_count_model import PitchCountModel
 from src.models.game_sim.tto_model import BF_PER_TTO, get_tto_for_bf
+from src.utils.constants import CLIP_LO, CLIP_HI
 
 logger = logging.getLogger(__name__)
-
-_CLIP_LO = 1e-6
-_CLIP_HI = 1 - 1e-6
 
 # Maximum PA per game (safety valve)
 MAX_PA_PER_GAME = 45
@@ -183,6 +181,8 @@ def simulate_game(
     babip_adj: float = 0.0,
     umpire_k_lift: float = 0.0,
     umpire_bb_lift: float = 0.0,
+    park_k_lift: float = 0.0,
+    park_bb_lift: float = 0.0,
     park_hr_lift: float = 0.0,
     weather_k_lift: float = 0.0,
     exit_calibration_offset: float = _DEFAULT_EXIT_CALIBRATION_OFFSET,
@@ -222,6 +222,8 @@ def simulate_game(
         Umpire K-rate logit lift.
     umpire_bb_lift : float
         Umpire BB-rate logit lift.
+    park_k_lift, park_bb_lift : float
+        Park factor logit lifts for K and BB.
     park_hr_lift : float
         Park HR logit lift.
     weather_k_lift : float
@@ -338,6 +340,8 @@ def simulate_game(
             fatigue_hr_lift=fatigue["hr"],
             umpire_k_lift=umpire_k_lift,
             umpire_bb_lift=umpire_bb_lift,
+            park_k_lift=park_k_lift,
+            park_bb_lift=park_bb_lift,
             park_hr_lift=park_hr_lift,
             weather_k_lift=weather_k_lift,
         )
@@ -446,7 +450,7 @@ def simulate_game(
 
         # Apply calibration offset (logit scale)
         if exit_calibration_offset != 0.0:
-            exit_prob = np.clip(exit_prob, _CLIP_LO, _CLIP_HI)
+            exit_prob = np.clip(exit_prob, CLIP_LO, CLIP_HI)
             exit_logit = logit(exit_prob) + exit_calibration_offset
             exit_prob = expit(exit_logit)
 

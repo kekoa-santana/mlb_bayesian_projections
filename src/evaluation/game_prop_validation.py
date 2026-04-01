@@ -343,69 +343,12 @@ def _get_batter_rate_samples(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_baselines_pt(
-    pitcher_arsenal: pd.DataFrame,
+def _get_baselines_pt(
+    train_seasons: list[int],
 ) -> dict[str, dict[str, float]]:
-    """Build league-average baselines per pitch type from arsenal data.
-
-    Computes whiff_rate, chase_rate, and barrel_rate per pitch type.
-
-    Parameters
-    ----------
-    pitcher_arsenal : pd.DataFrame
-        Full pitcher arsenal profiles for a season.
-
-    Returns
-    -------
-    dict[str, dict[str, float]]
-        {pitch_type: {"whiff_rate": float, "chase_rate": float, ...}}.
-    """
-    baselines: dict[str, dict[str, float]] = {}
-
-    # Whiff rate
-    agg = pitcher_arsenal.groupby("pitch_type").agg(
-        total_whiffs=("whiffs", "sum"),
-        total_swings=("swings", "sum"),
-    ).reset_index()
-    agg["whiff_rate"] = agg["total_whiffs"] / agg["total_swings"].replace(0, np.nan)
-
-    for _, row in agg.iterrows():
-        pt = row["pitch_type"]
-        wr = row["whiff_rate"]
-        if pd.notna(wr):
-            baselines.setdefault(pt, {})["whiff_rate"] = float(wr)
-
-    # Chase rate (if columns exist)
-    if "chase_swings" in pitcher_arsenal.columns and "pitches_out_zone" in pitcher_arsenal.columns:
-        agg_chase = pitcher_arsenal.groupby("pitch_type").agg(
-            total_chase=("chase_swings", "sum"),
-            total_out_zone=("pitches_out_zone", "sum"),
-        ).reset_index()
-        agg_chase["chase_rate"] = (
-            agg_chase["total_chase"] / agg_chase["total_out_zone"].replace(0, np.nan)
-        )
-        for _, row in agg_chase.iterrows():
-            pt = row["pitch_type"]
-            cr = row["chase_rate"]
-            if pd.notna(cr):
-                baselines.setdefault(pt, {})["chase_rate"] = float(cr)
-
-    # Barrel rate (if columns exist)
-    if "barrels" in pitcher_arsenal.columns and "bip" in pitcher_arsenal.columns:
-        agg_barrel = pitcher_arsenal.groupby("pitch_type").agg(
-            total_barrels=("barrels", "sum"),
-            total_bip=("bip", "sum"),
-        ).reset_index()
-        agg_barrel["barrel_rate"] = (
-            agg_barrel["total_barrels"] / agg_barrel["total_bip"].replace(0, np.nan)
-        )
-        for _, row in agg_barrel.iterrows():
-            pt = row["pitch_type"]
-            br = row["barrel_rate"]
-            if pd.notna(br):
-                baselines.setdefault(pt, {})["barrel_rate"] = float(br)
-
-    return baselines
+    """Get league-average baselines per pitch type from league_baselines module."""
+    from src.data.league_baselines import get_baselines_dict
+    return get_baselines_dict(seasons=train_seasons, recency_weights="equal")
 
 
 def _extract_all_pitcher_posteriors(
@@ -1004,7 +947,7 @@ def _build_pitcher_prop_predictions(
     # 4. Load matchup data from last training season
     pitcher_arsenal = get_pitcher_arsenal(last_train)
     hitter_vuln = get_hitter_vulnerability(last_train)
-    baselines_pt = _build_baselines_pt(pitcher_arsenal)
+    baselines_pt = _get_baselines_pt(train_seasons)
 
     # Lineup data from test season (public pre-game)
     game_lineups = get_cached_game_lineups(test_season)
@@ -1133,6 +1076,11 @@ def _build_pitcher_prop_predictions(
         actual_col=config.actual_col,
         n_draws=n_mc_draws,
     )
+
+    # Add separate umpire/weather lift columns for stratified evaluation
+    if len(predictions) > 0:
+        predictions["umpire_lift"] = predictions["game_pk"].map(umpire_stat_lifts).fillna(0.0)
+        predictions["weather_lift"] = predictions["game_pk"].map(weather_stat_lifts).fillna(0.0)
 
     sn = config.stat_name.lower()
     logger.info(
@@ -1334,7 +1282,7 @@ def _build_batter_prop_predictions(
     # 4. Load matchup data from last training season
     pitcher_arsenal = get_pitcher_arsenal(last_train)
     hitter_vuln = get_hitter_vulnerability(last_train)
-    baselines_pt = _build_baselines_pt(pitcher_arsenal)
+    baselines_pt = _get_baselines_pt(train_seasons)
 
     # 5. Load game lineups for pitcher identification
     game_lineups = get_cached_game_lineups(test_season)
@@ -1522,6 +1470,10 @@ def _build_batter_prop_predictions(
             "pa_sigma": pred["pa_sigma"],
             "matchup_logit_lift": pred["matchup_logit_lift"],
             "opposing_pitcher_lift": pred.get("opposing_pitcher_lift", 0.0),
+            "umpire_lift": umpire_stat_lifts.get(game_pk, 0.0),
+            "weather_lift": weather_stat_lifts.get(game_pk, 0.0),
+            "park_factor": pf,
+            "catcher_framing_lift": framing_lift,
             f"batter_{config.rate_col}_mean": float(np.mean(rate_samples)),
         }
 
@@ -1906,46 +1858,122 @@ def fit_isotonic_recalibration(
     return calibrators
 
 
-def apply_isotonic_recalibration(
-    predictions: pd.DataFrame,
-    calibrators: dict[float, IsotonicRegression],
-    lines: list[float],
-) -> pd.DataFrame:
-    """Apply isotonic recalibration to predictions.
+# ---------------------------------------------------------------------------
+# 9. Stratified evaluation
+# ---------------------------------------------------------------------------
 
-    Creates new columns ``p_over_X_5_cal`` with recalibrated probabilities.
-    Original columns are preserved.
+# Stratum columns used when available in predictions.
+_DEFAULT_STRATA: list[str] = [
+    "umpire_lift",
+    "weather_lift",
+    "park_factor",
+    "bf_mu",
+    "pa_mu",
+    "pitcher_rate_mean",
+    "matchup_logit_lift",
+    "rest_bucket",
+]
+
+_TERCILE_LABELS: list[str] = ["low", "mid", "high"]
+
+
+def compute_stratified_metrics(
+    config: GamePropConfig,
+    predictions: pd.DataFrame,
+    strata: list[str] | None = None,
+    n_bins: int = 3,
+    min_group: int = 50,
+) -> pd.DataFrame:
+    """Compute Brier / ECE / RMSE stratified by context columns.
+
+    Continuous columns are binned into *n_bins* quantile buckets.
+    Categorical or low-cardinality columns are used as-is.
 
     Parameters
     ----------
+    config : GamePropConfig
+        Prop configuration (needed for line list and stat name).
     predictions : pd.DataFrame
-        Predictions with p_over columns.
-    calibrators : dict[float, IsotonicRegression]
-        Mapping of line -> fitted IsotonicRegression (from
-        ``fit_isotonic_recalibration``).
-    lines : list[float]
-        Lines to recalibrate.
+        Output of ``build_game_prop_predictions`` (single fold or
+        concatenated across folds).  Must already contain the stratum
+        columns to slice on.
+    strata : list[str] or None
+        Columns to stratify by.  Defaults to ``_DEFAULT_STRATA``,
+        filtered to those present in *predictions*.
+    n_bins : int
+        Number of quantile bins for continuous columns (default 3 =
+        terciles labelled low / mid / high).
+    min_group : int
+        Minimum rows in a bin to compute metrics (default 50).
 
     Returns
     -------
     pd.DataFrame
-        Copy of predictions with added ``*_cal`` columns.
+        One row per (stratum_col, bin_label) with columns:
+        stratum, bin, bin_n, bin_min, bin_max, stat_name, side,
+        rmse, mae, avg_brier, ece, temperature, coverage_80, n_games.
     """
-    result = predictions.copy()
+    if strata is None:
+        strata = _DEFAULT_STRATA
+    available = [s for s in strata if s in predictions.columns]
 
-    for line in lines:
-        col = f"p_over_{line:.1f}".replace(".", "_")
-        cal_col = f"{col}_cal"
+    if not available:
+        logger.info("No stratum columns found in predictions")
+        return pd.DataFrame()
 
-        if col not in result.columns:
+    labels = _TERCILE_LABELS[:n_bins] if n_bins <= len(_TERCILE_LABELS) else None
+
+    rows: list[dict[str, Any]] = []
+
+    for col in available:
+        series = predictions[col]
+
+        # Skip columns that are all null
+        if series.isna().all():
             continue
-        if line not in calibrators:
-            # No calibrator — copy raw
-            result[cal_col] = result[col]
-            continue
 
-        ir = calibrators[line]
-        raw_probs = result[col].values
-        result[cal_col] = ir.predict(raw_probs)
+        # Decide binning strategy
+        if series.dtype == object or series.nunique() <= n_bins:
+            # Categorical / low-cardinality: use values directly
+            bin_col = series.copy()
+        else:
+            # Continuous: quantile-bin
+            valid = series.dropna()
+            if len(valid) < n_bins * min_group:
+                continue
+            try:
+                bin_col = pd.qcut(
+                    series, q=n_bins, labels=labels, duplicates="drop",
+                )
+            except ValueError:
+                continue
 
-    return result
+        for bin_label, idx in predictions.groupby(bin_col).groups.items():
+            group = predictions.loc[idx]
+            if len(group) < min_group:
+                continue
+
+            metrics = compute_game_prop_metrics(config, group)
+            raw_vals = series.loc[idx].dropna()
+
+            rows.append({
+                "stratum": col,
+                "bin": str(bin_label),
+                "bin_n": len(group),
+                "bin_min": float(raw_vals.min()) if len(raw_vals) else np.nan,
+                "bin_max": float(raw_vals.max()) if len(raw_vals) else np.nan,
+                "stat_name": metrics["stat_name"],
+                "side": metrics["side"],
+                "rmse": metrics["rmse"],
+                "mae": metrics["mae"],
+                "avg_brier": metrics["avg_brier"],
+                "ece": metrics["ece"],
+                "temperature": metrics["temperature"],
+                "coverage_80": metrics["coverage_80"],
+                "n_games": metrics["n_games"],
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)

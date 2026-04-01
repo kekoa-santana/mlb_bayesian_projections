@@ -8,6 +8,12 @@ v2: Poisson game-score simulation with SP rotation and park factors.
 Each game simulates actual runs scored via Poisson draws adjusted for
 the matchup (offense vs that day's opposing SP), park factor, and
 home advantage.
+
+v3: Injury cascading.  When ``team_rosters`` are provided, each sim
+iteration draws injuries for all 30 teams, cascades PA/IP to backups,
+and recomputes RS/RA via BaseRuns before running that season's games.
+Injury-prone / thin-depth teams get wider win distributions while
+maintaining zero-sum.
 """
 from __future__ import annotations
 
@@ -16,6 +22,13 @@ import time
 
 import numpy as np
 import pandas as pd
+
+from src.models.team_sim.depth_cascade import (
+    cascade_hitter_pa,
+    cascade_pitcher_ip,
+)
+from src.models.team_sim.injury_model import draw_games_missed
+from src.models.team_sim.team_season_sim import _baseruns_from_counting
 
 logger = logging.getLogger(__name__)
 
@@ -232,99 +245,259 @@ def compute_team_history(
     return result
 
 
-# ── Team offense/pitching profiles for Poisson sim ──────────────────
+# ── Injury cascade helpers ─────────────────────────────────────────
 
-def build_team_profiles(
-    team_stats: pd.DataFrame,
-    waa_deltas: dict[int, float] | None = None,
-    blend_proj_wt: float = 0.35,
-    regress_pct: float = 0.40,
-    waa_dampen: float = 0.55,
-    waa_cap: float = 8.0,
+# Standard full-season targets for normalization (same as team_season_sim)
+_TARGET_TEAM_PA = 6100.0
+_TARGET_TEAM_IP = 1458.0
+_LG_RA_PER_9 = 4.50
+
+
+def _precompute_roster_data(
+    team_rosters: dict[int, dict],
 ) -> dict[int, dict]:
-    """Build per-team offense RS/G and pitching RA/G profiles.
+    """Pre-extract rate stats and roster splits for all teams.
 
-    Returns dict[team_id, {"rs_per_game": float, "ra_per_game": float}].
-    """
-    lg_rpg = team_stats["rpg"].mean()
-    lg_ra = team_stats["ra_per_game"].mean()
-    obs_wt = 1.0 - blend_proj_wt
-
-    profiles = {}
-    for _, row in team_stats.iterrows():
-        tid = int(row["team_id"])
-        rpg = row["rpg"]
-        ra = row["ra_per_game"]
-
-        proj_rpg = rpg * (1 - regress_pct) + lg_rpg * regress_pct
-        proj_ra = ra * (1 - regress_pct) + lg_ra * regress_pct
-
-        blend_rpg = blend_proj_wt * proj_rpg + obs_wt * rpg
-        blend_ra = blend_proj_wt * proj_ra + obs_wt * ra
-
-        # Apply WAA as RS/RA shift (~10 runs per win, ~162 games)
-        if waa_deltas and tid in waa_deltas:
-            waa_wins = max(-waa_cap, min(waa_cap, waa_deltas[tid] * waa_dampen))
-            # Split WAA evenly between offense boost and pitching boost
-            run_adj = waa_wins * 10.0 / 162.0  # runs per game
-            blend_rpg += run_adj / 2
-            blend_ra -= run_adj / 2
-
-        profiles[tid] = {
-            "rs_per_game": max(2.5, blend_rpg),
-            "ra_per_game": max(2.5, blend_ra),
-        }
-
-    return profiles
-
-
-# ── SP rotation builder ─────────────────────────────────────────────
-
-def build_rotations(
-    sp_data: pd.DataFrame,
-    roster: pd.DataFrame,
-    lg_ra9: float = LG_AVG_RPG,
-) -> dict[int, list[float]]:
-    """Build 5-man rotation RA/9 arrays per team.
+    Runs once before the sim loop so per-iteration work is minimal.
 
     Parameters
     ----------
-    sp_data : pd.DataFrame
-        SP counting sim projections.  Needs pitcher_id, role,
-        projected_ip_mean, total_runs_mean.
-    roster : pd.DataFrame
-        Active roster with player_id, org_id (team_id).
-    lg_ra9 : float
-        League average RA/9 for replacement-level fill.
+    team_rosters : dict[int, dict]
+        team_id -> {"hitters": DataFrame, "pitchers": DataFrame,
+                     "injury_params": DataFrame}
 
     Returns
     -------
-    dict[int, list[float]]
-        team_id -> list of 5 RA/9 values (best to worst).
+    dict[int, dict]
+        team_id -> pre-extracted roster data (starters, bench, rates, etc.)
     """
-    sp = sp_data[sp_data["role"] == "SP"].copy()
-    sp["ra9"] = sp["total_runs_mean"] / sp["projected_ip_mean"].clip(1) * 9
+    precomp: dict[int, dict] = {}
+    for tid, data in team_rosters.items():
+        hitters = data["hitters"]
+        pitchers = data["pitchers"]
 
-    # Map pitcher to team via roster
-    sp = sp.merge(
-        roster[["player_id", "org_id"]].rename(columns={"org_id": "team_id"}),
-        left_on="pitcher_id", right_on="player_id", how="inner",
-    )
+        # --- Hitter starter/bench split ---
+        if "is_starter" in hitters.columns:
+            h_starters = hitters[hitters["is_starter"] == True].copy()
+            h_bench = hitters[hitters["is_starter"] != True].copy()
+        else:
+            h_starters = hitters.nlargest(9, "value_score").copy()
+            h_bench = hitters[~hitters.index.isin(h_starters.index)].copy()
+        if h_starters.empty:
+            h_starters = hitters.nlargest(9, "value_score").copy()
+            h_bench = hitters[~hitters.index.isin(h_starters.index)].copy()
 
-    # Sort by projected IP desc (best starters pitch most)
-    sp = sp.sort_values(["team_id", "projected_ip_mean"], ascending=[True, False])
+        # --- Pitcher SP/RP split ---
+        if "role" in pitchers.columns:
+            p_starters = pitchers[pitchers["role"] == "SP"].nlargest(
+                5, "value_score"
+            ).copy()
+            p_relievers = pitchers[
+                ~pitchers.index.isin(p_starters.index)
+            ].copy()
+        else:
+            p_starters = pitchers.nlargest(5, "value_score").copy()
+            p_relievers = pitchers[
+                ~pitchers.index.isin(p_starters.index)
+            ].copy()
 
-    repl_ra9 = lg_ra9 * 1.15  # replacement SP ~ 15% worse than average
+        # --- Hitter counting stat lookup ---
+        h_stats: dict[int, dict] = {}
+        for _, row in hitters.iterrows():
+            pid = int(row["player_id"])
+            pa = float(row.get("projected_pa", row.get("total_pa_mean", 400)))
+            h_stats[pid] = {
+                "pa": pa,
+                "h": float(row.get("total_h_mean", pa * 0.250)),
+                "hr": float(row.get("total_hr_mean", pa * 0.030)),
+                "bb": float(row.get("total_bb_mean", pa * 0.082)),
+                "hbp": float(row.get("total_hbp_mean", pa * 0.008)),
+                "tb": float(row.get("total_tb_mean", pa * 0.400)),
+            }
 
-    rotations: dict[int, list[float]] = {}
-    for tid, grp in sp.groupby("team_id"):
-        ra9_list = grp["ra9"].head(5).tolist()
-        # Pad to 5 with replacement level
-        while len(ra9_list) < 5:
-            ra9_list.append(repl_ra9)
-        rotations[int(tid)] = ra9_list
+        # --- Pitcher counting stat lookup ---
+        p_stats: dict[int, dict] = {}
+        for _, row in pitchers.iterrows():
+            pid = int(row["player_id"])
+            ip = float(
+                row.get("projected_ip", row.get("projected_ip_mean", 50))
+            )
+            p_stats[pid] = {
+                "ip": ip,
+                "runs": float(
+                    row.get("total_runs_mean", ip * _LG_RA_PER_9 / 9)
+                ),
+            }
 
-    return rotations
+        # --- Replacement-level rates (from bench quality) ---
+        bench_h = hitters.sort_values("value_score").head(
+            max(len(hitters) - 9, 3)
+        )
+        if len(bench_h) > 0 and "total_h_mean" in bench_h.columns:
+            bh_pa = bench_h["projected_pa"].clip(1)
+            repl_h_rate = float((bench_h["total_h_mean"] / bh_pa).mean())
+            repl_hr_rate = float((bench_h["total_hr_mean"] / bh_pa).mean())
+            repl_tb_rate = float((bench_h["total_tb_mean"] / bh_pa).mean())
+        else:
+            repl_h_rate, repl_hr_rate, repl_tb_rate = 0.200, 0.020, 0.290
+
+        bench_p = pitchers.sort_values("value_score").head(
+            max(len(pitchers) - 5, 3)
+        )
+        if len(bench_p) > 0 and "total_runs_mean" in bench_p.columns:
+            bp_ip = bench_p["projected_ip"].clip(1)
+            repl_ra_per_9 = float(
+                (bench_p["total_runs_mean"] / bp_ip * 9).mean()
+            )
+        else:
+            repl_ra_per_9 = 5.20
+
+        # --- IL prob lookup ---
+        injury_params = data["injury_params"]
+        il_probs: dict[int, float] = dict(
+            zip(
+                injury_params["player_id"].astype(int),
+                injury_params["il_prob"],
+            )
+        )
+        all_pids = sorted(
+            set(hitters["player_id"].astype(int))
+            | set(pitchers["player_id"].astype(int))
+        )
+
+        precomp[tid] = {
+            "h_starters": h_starters,
+            "h_bench": h_bench,
+            "p_starters": p_starters,
+            "p_relievers": p_relievers,
+            "h_stats": h_stats,
+            "p_stats": p_stats,
+            "repl_h_rate": repl_h_rate,
+            "repl_hr_rate": repl_hr_rate,
+            "repl_tb_rate": repl_tb_rate,
+            "repl_ra_per_9": repl_ra_per_9,
+            "il_probs": il_probs,
+            "all_pids": all_pids,
+        }
+
+    return precomp
+
+
+def _draw_team_profiles_for_sim(
+    all_teams: list[int],
+    precomp: dict[int, dict],
+    rng: np.random.Generator,
+) -> dict[int, dict]:
+    """Draw one sim's injuries for all teams and return adjusted profiles.
+
+    For each team: draw injuries -> cascade PA/IP -> BaseRuns RS ->
+    pitcher RA -> RS/G, RA/G.
+
+    Parameters
+    ----------
+    all_teams : list[int]
+        Team IDs participating in the sim.
+    precomp : dict
+        Output of ``_precompute_roster_data()``.
+    rng : np.random.Generator
+
+    Returns
+    -------
+    dict[int, {"rs_per_game": float, "ra_per_game": float}]
+    """
+    profiles: dict[int, dict] = {}
+
+    for tid in all_teams:
+        if tid not in precomp:
+            profiles[tid] = {"rs_per_game": 4.5, "ra_per_game": 4.5}
+            continue
+
+        pc = precomp[tid]
+
+        # Draw injuries for every player on this team
+        sim_injuries: dict[int, int] = {}
+        for pid in pc["all_pids"]:
+            prob = pc["il_probs"].get(pid, 0.50)
+            # Single draw (n_sims=1), take scalar
+            sim_injuries[pid] = int(draw_games_missed(prob, 1, rng)[0])
+
+        # --- Offense: cascade PA, compute BaseRuns ---
+        adj_h = cascade_hitter_pa(
+            pc["h_starters"], pc["h_bench"], sim_injuries,
+        )
+
+        tot_h, tot_hr, tot_bb, tot_hbp, tot_tb, tot_pa = (
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        )
+        h_stats = pc["h_stats"]
+        for _, row in adj_h.iterrows():
+            pid = int(row["player_id"])
+            adj_pa = float(row["adjusted_pa"])
+            if adj_pa <= 0:
+                continue
+            if row.get("is_replacement", False):
+                tot_pa += adj_pa
+                tot_h += adj_pa * pc["repl_h_rate"]
+                tot_hr += adj_pa * pc["repl_hr_rate"]
+                tot_bb += adj_pa * 0.075
+                tot_hbp += adj_pa * 0.008
+                tot_tb += adj_pa * pc["repl_tb_rate"]
+            elif pid in h_stats:
+                s = h_stats[pid]
+                frac = adj_pa / max(s["pa"], 1)
+                tot_pa += adj_pa
+                tot_h += s["h"] * frac
+                tot_hr += s["hr"] * frac
+                tot_bb += s["bb"] * frac
+                tot_hbp += s["hbp"] * frac
+                tot_tb += s["tb"] * frac
+
+        if tot_pa > 0:
+            pa_scale = _TARGET_TEAM_PA / tot_pa
+            tot_h *= pa_scale
+            tot_hr *= pa_scale
+            tot_bb *= pa_scale
+            tot_hbp *= pa_scale
+            tot_tb *= pa_scale
+            tot_pa = _TARGET_TEAM_PA
+
+        rs_season = _baseruns_from_counting(
+            tot_h, tot_bb, tot_hbp, tot_hr, tot_tb, tot_pa,
+        )
+
+        # --- Pitching: cascade IP, compute RA ---
+        adj_p = cascade_pitcher_ip(
+            pc["p_starters"], pc["p_relievers"], sim_injuries,
+        )
+
+        tot_runs_allowed, tot_ip = 0.0, 0.0
+        p_stats = pc["p_stats"]
+        for _, row in adj_p.iterrows():
+            pid = int(row["player_id"])
+            adj_ip = float(row["adjusted_ip"])
+            if adj_ip <= 0:
+                continue
+            if row.get("is_replacement", False):
+                tot_runs_allowed += adj_ip * pc["repl_ra_per_9"] / 9
+                tot_ip += adj_ip
+            elif pid in p_stats:
+                s = p_stats[pid]
+                frac = adj_ip / max(s["ip"], 1)
+                tot_runs_allowed += s["runs"] * frac
+                tot_ip += adj_ip
+
+        if tot_ip > 0:
+            ip_scale = _TARGET_TEAM_IP / tot_ip
+            ra_season = tot_runs_allowed * ip_scale
+        else:
+            ra_season = _LG_RA_PER_9 * 162
+
+        profiles[tid] = {
+            "rs_per_game": rs_season / 162,
+            "ra_per_game": ra_season / 162,
+        }
+
+    return profiles
 
 
 # ── Poisson league simulator ────────────────────────────────────────
@@ -333,6 +506,7 @@ def simulate_league_season(
     schedule: pd.DataFrame,
     team_strength: dict[int, float] | None = None,
     team_profiles: dict[int, dict] | None = None,
+    team_rosters: dict[int, dict] | None = None,
     rotations: dict[int, list[float]] | None = None,
     venue_factors: dict[int, float] | None = None,
     n_sims: int = 1_000,
@@ -343,6 +517,12 @@ def simulate_league_season(
     Uses Poisson game-score simulation when team_profiles are provided
     (v2), otherwise falls back to Bernoulli Log5 (v1).
 
+    When ``team_rosters`` is provided alongside ``team_profiles`` (v3),
+    each sim iteration draws injuries for all 30 teams, cascades PA/IP
+    to backups, and recomputes team RS/RA via BaseRuns before simulating
+    that season's games.  This gives injury-prone / thin-depth teams
+    wider win distributions while maintaining zero-sum.
+
     Parameters
     ----------
     schedule : pd.DataFrame
@@ -351,6 +531,12 @@ def simulate_league_season(
         team_id -> win% (v1 Bernoulli mode).
     team_profiles : dict, optional
         team_id -> {"rs_per_game", "ra_per_game"} (v2 Poisson mode).
+        Used as static fallback when ``team_rosters`` is None, or as
+        the default for teams missing from ``team_rosters``.
+    team_rosters : dict, optional
+        team_id -> {"hitters": DataFrame, "pitchers": DataFrame,
+        "injury_params": DataFrame}.  When provided, enables per-sim
+        injury cascading in Poisson mode.
     rotations : dict, optional
         team_id -> [ra9_sp1, ra9_sp2, ..., ra9_sp5].
     venue_factors : dict, optional
@@ -363,13 +549,27 @@ def simulate_league_season(
     pd.DataFrame
         One row per team with win distribution + run totals.
     """
-    use_poisson = team_profiles is not None
+    use_poisson = team_profiles is not None or team_rosters is not None
+    use_injury_cascade = team_rosters is not None and use_poisson
 
     if not use_poisson and team_strength is None:
         raise ValueError("Provide either team_strength or team_profiles")
 
+    # Ensure we have base team_profiles even in injury mode (fallback)
+    if team_profiles is None and team_rosters is not None:
+        team_profiles = {}  # will be overridden per-sim by injury draws
+
     t0 = time.time()
     rng = np.random.default_rng(random_seed)
+
+    # Pre-extract roster data for injury cascade (runs once)
+    roster_precomp: dict[int, dict] | None = None
+    if use_injury_cascade:
+        roster_precomp = _precompute_roster_data(team_rosters)
+        logger.info(
+            "Injury cascade enabled: %d teams with roster data",
+            len(roster_precomp),
+        )
 
     home_ids = schedule["home_team_id"].values.astype(int)
     away_ids = schedule["away_team_id"].values.astype(int)
@@ -390,7 +590,7 @@ def simulate_league_season(
     ra_total = np.zeros((n_sims, n_teams), dtype=np.float64)
 
     if use_poisson:
-        # ── Poisson mode (v2) ──
+        # ── Poisson mode (v2/v3) ──
         # Track rotation position per team: resets each sim
         lg_ra9 = LG_AVG_RPG
 
@@ -398,12 +598,20 @@ def simulate_league_season(
             # Reset rotation counters each season
             rotation_idx: dict[int, int] = {tid: 0 for tid in all_teams}
 
+            # v3: Draw injuries and recompute team RS/RA for this sim
+            if use_injury_cascade:
+                sim_profiles = _draw_team_profiles_for_sim(
+                    all_teams, roster_precomp, rng,
+                )
+            else:
+                sim_profiles = team_profiles
+
             for g in range(n_games):
                 h_tid = home_ids[g]
                 a_tid = away_ids[g]
 
-                h_prof = team_profiles.get(h_tid, {"rs_per_game": 4.5, "ra_per_game": 4.5})
-                a_prof = team_profiles.get(a_tid, {"rs_per_game": 4.5, "ra_per_game": 4.5})
+                h_prof = sim_profiles.get(h_tid, {"rs_per_game": 4.5, "ra_per_game": 4.5})
+                a_prof = sim_profiles.get(a_tid, {"rs_per_game": 4.5, "ra_per_game": 4.5})
 
                 # Park factor
                 pf = 1.0
@@ -500,9 +708,12 @@ def simulate_league_season(
             wins[~mask, away_idx[g]] += 1
 
     elapsed = time.time() - t0
+    mode = "Poisson+injury" if use_injury_cascade else (
+        "Poisson" if use_poisson else "Bernoulli"
+    )
     logger.info(
-        "League sim: %d sims x %d games in %.1fs",
-        n_sims, n_games, elapsed,
+        "League sim (%s): %d sims x %d games in %.1fs",
+        mode, n_sims, n_games, elapsed,
     )
 
     # Summarize

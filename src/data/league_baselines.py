@@ -187,12 +187,10 @@ def get_pooled_baselines(
     seasons: list[int] | None = None,
     grouping: str = "archetype_stand",
     n_clusters: int = 8,
+    recency_weights: str = "marcel",
     force_rebuild: bool = False,
 ) -> pd.DataFrame:
     """Pool raw counts across seasons THEN divide to compute rates.
-
-    This correctly weights short seasons (e.g. 2020) by volume rather
-    than giving each season equal weight.
 
     Parameters
     ----------
@@ -203,6 +201,12 @@ def get_pooled_baselines(
         "archetype", "overall".
     n_clusters : int
         Number of archetype clusters (only used for archetype groupings).
+    recency_weights : str
+        Weighting scheme for seasons.  ``"equal"`` preserves the original
+        behaviour (each pitch counts once).  ``"marcel"`` weights the 3
+        most recent seasons 5/4/3 and drops older ones — the standard
+        Marcel method, appropriate for daily predictions where recent
+        rule-era data matters most.  Default ``"marcel"``.
     force_rebuild : bool
         If True, rebuild from scratch.
     """
@@ -216,17 +220,40 @@ def get_pooled_baselines(
     if grouping not in valid_groupings:
         raise ValueError(f"grouping must be one of {valid_groupings}, got '{grouping}'")
 
+    valid_schemes = {"equal", "marcel"}
+    if recency_weights not in valid_schemes:
+        raise ValueError(f"recency_weights must be one of {valid_schemes}, got '{recency_weights}'")
+
     if seasons is None:
         seasons = _get_train_seasons()
 
     season_min, season_max = min(seasons), max(seasons)
-    cache_path = CACHE_DIR / f"league_baselines_pooled_{grouping}_{season_min}_{season_max}.parquet"
+    cache_path = CACHE_DIR / f"league_baselines_pooled_{grouping}_{recency_weights}_{season_min}_{season_max}.parquet"
 
     def _build() -> pd.DataFrame:
+        # Build per-season weight map
+        sorted_desc = sorted(seasons, reverse=True)
+        if recency_weights == "marcel":
+            marcel = [5, 4, 3]
+            weight_map = {
+                s: marcel[i] if i < len(marcel) else 0
+                for i, s in enumerate(sorted_desc)
+            }
+        else:  # "equal"
+            weight_map = {s: 1 for s in sorted_desc}
+
         frames = []
         for s in seasons:
+            w = weight_map.get(s, 0)
+            if w == 0:
+                continue
             df = _build_outcomes_with_archetypes(s, n_clusters, force_rebuild=False)
+            if w != 1:
+                df[list(COUNT_COLS)] = df[list(COUNT_COLS)] * w
             frames.append(df)
+
+        if not frames:
+            return pd.DataFrame()
         pooled = pd.concat(frames, ignore_index=True)
 
         group_map = {
@@ -256,6 +283,7 @@ def get_pooled_baselines(
 
         agg["season_min"] = season_min
         agg["season_max"] = season_max
+        agg["recency_weights"] = recency_weights
         return agg
 
     return _load_or_build(cache_path, _build, force_rebuild)
@@ -311,3 +339,60 @@ def get_prior_baselines(
     # Fallback: overall
     df = get_pooled_baselines(seasons, "overall", n_clusters)
     return _row_to_dict(df.iloc[0])
+
+
+# ---------------------------------------------------------------------------
+# Dict converter for matchup.py interface
+# ---------------------------------------------------------------------------
+def get_baselines_dict(
+    seasons: list[int] | None = None,
+    grouping: str = "pitch_type",
+    recency_weights: str = "marcel",
+    n_clusters: int = 8,
+) -> dict[str, dict[str, float]]:
+    """Return pooled baselines as a nested dict for ``matchup.py``.
+
+    Parameters
+    ----------
+    seasons : list[int] | None
+        Seasons to pool.  Defaults to ``model.yaml`` ``seasons.train``.
+    grouping : str
+        ``"pitch_type"`` (default) or ``"pitch_type_stand"``.
+        For ``"pitch_type"`` the outer key is the pitch-type string
+        (e.g. ``"FF"``).  For ``"pitch_type_stand"`` the outer key is
+        a ``(pitch_type, batter_stand)`` tuple.
+    recency_weights : str
+        ``"marcel"`` (default, for production) or ``"equal"`` (for
+        backtests that already subset seasons).
+    n_clusters : int
+        Archetype cluster count (only relevant for archetype groupings).
+
+    Returns
+    -------
+    dict[str, dict[str, float]]
+        ``{key: {whiff_rate, chase_rate, csw_pct, barrel_rate, ...}}``.
+    """
+    df = get_pooled_baselines(
+        seasons=seasons,
+        grouping=grouping,
+        n_clusters=n_clusters,
+        recency_weights=recency_weights,
+    )
+    if df.empty:
+        return {}
+
+    result: dict[str, dict[str, float]] = {}
+    for _, row in df.iterrows():
+        if grouping == "pitch_type":
+            key = row["pitch_type"]
+        elif grouping == "pitch_type_stand":
+            key = (row["pitch_type"], row["batter_stand"])
+        else:
+            raise ValueError(f"get_baselines_dict only supports pitch_type or pitch_type_stand, got '{grouping}'")
+
+        result[key] = {
+            col: float(row[col])
+            for col in RATE_COLS
+            if pd.notna(row.get(col))
+        }
+    return result

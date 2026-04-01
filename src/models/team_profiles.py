@@ -1463,6 +1463,7 @@ def build_all_team_profiles(
     season: int,
     projection_season: int,
     elo_history: pd.DataFrame | None = None,
+    pitcher_roles_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build comprehensive team profiles (one row per team, all sub-scores).
 
@@ -1474,6 +1475,9 @@ def build_all_team_profiles(
         Season being projected (typically season + 1).
     elo_history : pd.DataFrame, optional
         ELO history from ``compute_elo_history()``.
+    pitcher_roles_df : pd.DataFrame or None
+        Pre-loaded reliever roles (columns: pitcher_id, role, ...).
+        When provided the disk read of ``pitcher_roles.parquet`` is skipped.
 
     Returns
     -------
@@ -1566,7 +1570,7 @@ def build_all_team_profiles(
     hitter_rankings = _safe_load("hitters_rankings.parquet")
     pitcher_rankings = _safe_load("pitchers_rankings.parquet")
     hitter_counting = _safe_load("hitter_counting_sim.parquet")
-    pitcher_roles = _safe_load("pitcher_roles.parquet")
+    pitcher_roles = pitcher_roles_df if pitcher_roles_df is not None else _safe_load("pitcher_roles.parquet")
 
     # Merge GB%/FB% from pitcher_projections into pitcher_rankings for synergy
     pitcher_proj = _safe_load("pitcher_projections.parquet")

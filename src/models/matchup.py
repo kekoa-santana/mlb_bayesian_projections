@@ -16,13 +16,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.utils.constants import LEAGUE_AVG_BY_PITCH_TYPE, LEAGUE_AVG_OVERALL, PITCH_TO_FAMILY
+from src.utils.constants import CLIP_LO, CLIP_HI, LEAGUE_AVG_BY_PITCH_TYPE, LEAGUE_AVG_OVERALL, PITCH_TO_FAMILY
 
 logger = logging.getLogger(__name__)
-
-# Clipping bounds for logit to avoid infinities
-_CLIP_LO = 1e-4
-_CLIP_HI = 1.0 - 1e-4
 
 # Minimum pitches for a pitch type to be included in a pitcher's arsenal
 _MIN_PITCHES = 20
@@ -47,7 +43,7 @@ def _logit(p: float | np.ndarray) -> float | np.ndarray:
     float or ndarray
         logit(p) = log(p / (1 - p)).
     """
-    p = np.clip(p, _CLIP_LO, _CLIP_HI)
+    p = np.clip(p, CLIP_LO, CLIP_HI)
     return np.log(p / (1.0 - p))
 
 
@@ -604,37 +600,6 @@ def score_matchups_batch_by_archetype(
     return df
 
 
-def compute_game_matchup_k_rate_by_archetype(
-    pitcher_baseline_k_rate: float,
-    game_batter_pa: pd.DataFrame,
-    matchup_scores: pd.DataFrame,
-) -> dict[str, Any]:
-    """Compute matchup-adjusted K prediction using archetype-based scores.
-
-    Same interface as ``compute_game_matchup_k_rate`` — the only
-    difference is how ``matchup_scores`` was produced (by archetype
-    scoring instead of pitch_type scoring).
-
-    Parameters
-    ----------
-    pitcher_baseline_k_rate : float
-        Pitcher's season-level K rate (K / BF).
-    game_batter_pa : pd.DataFrame
-        Per-batter PA counts for this game. Columns: batter_id, pa.
-    matchup_scores : pd.DataFrame
-        Archetype matchup scores with columns: batter_id,
-        matchup_k_logit_lift.
-
-    Returns
-    -------
-    dict
-        Same schema as ``compute_game_matchup_k_rate``.
-    """
-    return compute_game_matchup_k_rate(
-        pitcher_baseline_k_rate, game_batter_pa, matchup_scores
-    )
-
-
 # ===================================================================
 # BB and HR matchup scoring
 # ===================================================================
@@ -790,7 +755,9 @@ def score_matchup_bb(
         pitcher_chase = row.get("chase_rate", np.nan)
 
         # League baseline for this pitch type
-        league_chase = baselines_pt.get(pt, {}).get("chase_rate", 0.30)
+        league_chase = baselines_pt.get(pt, {}).get(
+            "chase_rate", LEAGUE_AVG_BY_PITCH_TYPE.get(pt, {}).get("chase_rate", 0.30)
+        )
 
         if pd.isna(pitcher_chase):
             pitcher_chase = league_chase
@@ -978,7 +945,9 @@ def score_matchup_hr(
             pitcher_barrel = np.nan
 
         # League baseline for this pitch type
-        league_barrel = baselines_pt.get(pt, {}).get("barrel_rate", 0.06)
+        league_barrel = baselines_pt.get(pt, {}).get(
+            "barrel_rate", LEAGUE_AVG_BY_PITCH_TYPE.get(pt, {}).get("barrel_rate", 0.06)
+        )
 
         if pd.isna(pitcher_barrel):
             pitcher_barrel = league_barrel
@@ -1023,6 +992,7 @@ def score_matchup_for_stat(
     pitcher_arsenal: pd.DataFrame,
     hitter_vuln: pd.DataFrame,
     baselines_pt: dict[str, dict[str, float]],
+    shrinkage: float = 0.0,
 ) -> dict[str, Any]:
     """Dispatch matchup scoring based on stat type.
 
@@ -1041,6 +1011,11 @@ def score_matchup_for_stat(
         Hitter vulnerability profiles.
     baselines_pt : dict[str, dict[str, float]]
         League-average baselines keyed by pitch_type.
+    shrinkage : float
+        Reliability exponent for lift shrinkage.  ``0.0`` = no shrinkage
+        (backward compatible).  ``0.5`` = moderate: a matchup with
+        reliability 0.25 has its lift halved.  The lift is multiplied by
+        ``reliability ** shrinkage``.
 
     Returns
     -------
@@ -1051,16 +1026,18 @@ def score_matchup_for_stat(
     """
     stat = stat_name.lower().strip()
 
+    _LIFT_KEYS = {"k": "matchup_k_logit_lift", "bb": "matchup_bb_logit_lift", "hr": "matchup_hr_logit_lift"}
+
     if stat == "k":
-        return score_matchup(
+        result = score_matchup(
             pitcher_id, batter_id, pitcher_arsenal, hitter_vuln, baselines_pt
         )
     elif stat == "bb":
-        return score_matchup_bb(
+        result = score_matchup_bb(
             pitcher_id, batter_id, pitcher_arsenal, hitter_vuln, baselines_pt
         )
     elif stat == "hr":
-        return score_matchup_hr(
+        result = score_matchup_hr(
             pitcher_id, batter_id, pitcher_arsenal, hitter_vuln, baselines_pt
         )
     else:
@@ -1073,121 +1050,15 @@ def score_matchup_for_stat(
             "avg_reliability": 0.0,
         }
 
+    # Apply reliability-weighted shrinkage
+    if shrinkage > 0.0:
+        lift_key = _LIFT_KEYS.get(stat)
+        reliability = result.get("avg_reliability", 0.0)
+        if lift_key and reliability < 1.0:
+            scale = max(reliability, 0.01) ** shrinkage
+            result[lift_key] = result.get(lift_key, 0.0) * scale
 
-# ---------------------------------------------------------------------------
-# Bootstrap uncertainty wrapper
-# ---------------------------------------------------------------------------
-def score_matchup_with_uncertainty(
-    stat_name: str,
-    pitcher_id: int,
-    batter_id: int,
-    pitcher_arsenal: pd.DataFrame,
-    hitter_vuln: pd.DataFrame,
-    baselines_pt: dict[str, dict[str, float]],
-    n_draws: int = 200,
-    rng: np.random.Generator | None = None,
-) -> np.ndarray:
-    """Bootstrap matchup uncertainty by resampling rates from Beta posterior.
-
-    For each draw, resample the hitter's per-pitch-type rates from
-    Beta(successes + 0.5, trials - successes + 0.5) (Jeffreys prior).
-    Small samples naturally produce wide distributions — replaces
-    reliability weighting with proper uncertainty propagation.
-
-    Parameters
-    ----------
-    stat_name : str
-        One of 'k', 'bb', 'hr'.
-    pitcher_id : int
-        Pitcher MLB ID.
-    batter_id : int
-        Batter MLB ID.
-    pitcher_arsenal : pd.DataFrame
-        Pitcher arsenal profiles.
-    hitter_vuln : pd.DataFrame
-        Hitter vulnerability profiles.
-    baselines_pt : dict[str, dict[str, float]]
-        League-average baselines keyed by pitch_type.
-    n_draws : int
-        Number of Monte Carlo draws (default 200).
-    rng : np.random.Generator or None
-        Random number generator for reproducibility.
-
-    Returns
-    -------
-    np.ndarray
-        Array of logit lifts, shape (n_draws,).
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-
-    stat = stat_name.lower().strip()
-
-    # Determine which rate columns to resample based on stat type
-    if stat == "k":
-        success_col = "whiffs"
-        trials_col = "swings"
-        rate_col = "whiff_rate"
-        lift_key = "matchup_k_logit_lift"
-        scorer = score_matchup
-    elif stat == "bb":
-        success_col = "chase_swings"
-        trials_col = "out_of_zone_pitches"
-        rate_col = "chase_rate"
-        lift_key = "matchup_bb_logit_lift"
-        scorer = score_matchup_bb
-    elif stat == "hr":
-        success_col = "barrels_proxy"
-        trials_col = "bip"
-        rate_col = None  # barrel_rate computed on the fly
-        lift_key = "matchup_hr_logit_lift"
-        scorer = score_matchup_hr
-    else:
-        return np.zeros(n_draws)
-
-    # Get batter rows to resample
-    batter_rows = hitter_vuln[hitter_vuln["batter_id"] == batter_id].copy()
-    if len(batter_rows) == 0:
-        # No hitter data — all draws get the same zero-information lift
-        result = scorer(
-            pitcher_id, batter_id, pitcher_arsenal, hitter_vuln, baselines_pt
-        )
-        return np.full(n_draws, result.get(lift_key, 0.0))
-
-    lifts = np.empty(n_draws)
-
-    for i in range(n_draws):
-        # Resample hitter rates from Beta posterior (Jeffreys prior)
-        resampled = batter_rows.copy()
-
-        successes = resampled[success_col].fillna(0).values.astype(float)
-        trials = resampled[trials_col].fillna(0).values.astype(float)
-
-        # Beta(successes + 0.5, trials - successes + 0.5) — Jeffreys prior
-        alpha = successes + 0.5
-        beta_param = np.maximum(trials - successes + 0.5, 0.5)
-        sampled_rates = rng.beta(alpha, beta_param)
-
-        if stat == "hr":
-            # For HR, barrel_rate is barrels_proxy / bip — we store the
-            # resampled rate in barrels_proxy and set bip = 1 so the
-            # scorer computes barrel_rate = barrels_proxy / bip correctly.
-            resampled = resampled.copy()
-            resampled["barrels_proxy"] = sampled_rates
-            resampled["bip"] = 1.0
-        else:
-            resampled[rate_col] = sampled_rates
-
-        # Build a modified hitter_vuln with only this batter resampled
-        other_batters = hitter_vuln[hitter_vuln["batter_id"] != batter_id]
-        vuln_draw = pd.concat([other_batters, resampled], ignore_index=True)
-
-        result = scorer(
-            pitcher_id, batter_id, pitcher_arsenal, vuln_draw, baselines_pt
-        )
-        lifts[i] = result.get(lift_key, 0.0)
-
-    return lifts
+    return result
 
 
 # ---------------------------------------------------------------------------

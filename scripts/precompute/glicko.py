@@ -88,13 +88,5 @@ def run_glicko(*, from_season: int = FROM_SEASON) -> None:
                     label, len(df), names,
                 )
 
-        # 6. Save history (recent seasons for dashboard charts)
-        if not history.empty:
-            recent = history[history["season"] >= from_season - 1]
-            recent.to_parquet(
-                DASHBOARD_DIR / "glicko_history.parquet", index=False,
-            )
-            logger.info("Saved glicko_history.parquet: %d rows", len(recent))
-
     except Exception:
         logger.exception("Failed to compute Glicko-2 ratings")

@@ -16,12 +16,12 @@ logger = logging.getLogger("precompute.projections")
 def run_health_parks(
     *,
     from_season: int = FROM_SEASON,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Compute health/durability scores and park factors.
 
     Returns
     -------
-    health_df : pd.DataFrame
+    (health_df, park_factors, hitter_venues)
     """
     from src.models.health_score import compute_health_scores
     from src.data.queries import get_park_factors, get_hitter_team_venue
@@ -37,10 +37,8 @@ def run_health_parks(
     hitter_venues = get_hitter_team_venue(from_season)
     logger.info("Park factors: %d venue-hand combos, %d hitter-venue mappings",
                 len(park_factors), len(hitter_venues))
-    hitter_venues.to_parquet(DASHBOARD_DIR / "hitter_venues.parquet", index=False)
-    park_factors.to_parquet(DASHBOARD_DIR / "park_factors.parquet", index=False)
 
-    return health_df
+    return health_df, park_factors, hitter_venues
 
 
 def _load_health_df(from_season: int) -> pd.DataFrame:
@@ -70,6 +68,8 @@ def run_counting(
     hitter_results: dict,
     pitcher_results: dict,
     health_df: pd.DataFrame | None = None,
+    park_factors: pd.DataFrame | None = None,
+    hitter_venues: pd.DataFrame | None = None,
     seasons: list[int] = SEASONS,
     from_season: int = FROM_SEASON,
 ) -> None:
@@ -90,7 +90,8 @@ def run_counting(
     if health_df is None or health_df.empty:
         health_df = _load_health_df(from_season)
 
-    park_factors, hitter_venues = _load_park_factors()
+    if park_factors is None or hitter_venues is None:
+        park_factors, hitter_venues = _load_park_factors()
 
     # Hitter counting stats (with park factor adjustment for HR)
     hitter_ext = build_multi_season_hitter_extended(seasons, min_pa=1)
@@ -134,8 +135,16 @@ def run_sim_pitcher(
     health_df: pd.DataFrame | None = None,
     seasons: list[int] = SEASONS,
     from_season: int = FROM_SEASON,
-) -> None:
-    """Run sim-based pitcher season projections + reliever roles & rankings."""
+) -> pd.DataFrame | None:
+    """Run sim-based pitcher season projections + reliever roles & rankings.
+
+    Returns
+    -------
+    pd.DataFrame or None
+        The reliever roles DataFrame (pitcher_id, role, ...) so the
+        pipeline can pass it downstream without re-reading from disk.
+        Returns None if pitcher_results are unavailable or on failure.
+    """
     from src.data.feature_eng import build_multi_season_pitcher_extended
     from src.data.queries import get_exit_model_training_data, get_pitcher_exit_tendencies
     from src.models.counting_projections import (
@@ -149,7 +158,7 @@ def run_sim_pitcher(
 
     if not pitcher_results:
         logger.warning("pitcher_results not available (pitcher_models skipped) -- skipping sim_pitcher")
-        return
+        return None
 
     if health_df is None or health_df.empty:
         health_df = _load_health_df(from_season)
@@ -369,8 +378,11 @@ def run_sim_pitcher(
         )
         logger.info("Saved reliever rankings: %d relievers", len(rp_rankings))
 
+        return reliever_roles
+
     except Exception:
         logger.exception("Failed to run sim-based pitcher projections")
+        return None
 
 
 def run_sim_hitter(

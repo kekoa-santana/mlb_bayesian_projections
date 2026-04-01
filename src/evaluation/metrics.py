@@ -16,45 +16,6 @@ from scipy.stats import kstest
 logger = logging.getLogger(__name__)
 
 
-def compute_crps(observed: np.ndarray, posterior_samples: np.ndarray) -> float:
-    """Continuous Ranked Probability Score for count data.
-
-    CRPS measures the full-distribution forecast quality, not just
-    a binary threshold like Brier. Lower is better.
-
-    Parameters
-    ----------
-    observed : np.ndarray
-        Actual outcomes, shape (n_games,).
-    posterior_samples : np.ndarray
-        MC samples, shape (n_games, n_draws).
-
-    Returns
-    -------
-    float
-        Mean CRPS across all games.
-    """
-    n_games = len(observed)
-    if n_games == 0:
-        return np.nan
-
-    crps_values = np.empty(n_games)
-    for i in range(n_games):
-        samples = posterior_samples[i]
-        y = observed[i]
-        # CRPS = E|X - y| - 0.5 * E|X - X'|
-        abs_diff = np.mean(np.abs(samples - y))
-        # For the E|X-X'| term, use sorted samples for efficiency
-        sorted_s = np.sort(samples)
-        n = len(sorted_s)
-        # E|X-X'| = (2/n^2) * sum_{i=1}^{n} (2i - n - 1) * x_{(i)}
-        weights = 2 * np.arange(1, n + 1) - n - 1
-        mean_abs_diff = np.sum(weights * sorted_s) / (n * n)
-        crps_values[i] = abs_diff - 0.5 * mean_abs_diff
-
-    return float(np.mean(crps_values))
-
-
 def compute_crps_single(observed: float, samples: np.ndarray) -> float:
     """CRPS for a single observation against MC samples.
 

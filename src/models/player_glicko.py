@@ -79,14 +79,6 @@ class GlickoRatings:
         """Return current rating for *pid*, initializing if absent."""
         return self.mu.setdefault(pid, initial)
 
-    def get_phi(self, pid: int, initial: float = 350.0) -> float:
-        """Return current RD for *pid*, initializing if absent."""
-        return self.phi.setdefault(pid, initial)
-
-    def get_sigma(self, pid: int, initial: float = 0.06) -> float:
-        """Return current volatility for *pid*, initializing if absent."""
-        return self.sigma.setdefault(pid, initial)
-
 
 # ---------------------------------------------------------------------------
 # PA outcome scoring

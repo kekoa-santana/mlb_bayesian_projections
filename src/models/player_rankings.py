@@ -1475,11 +1475,20 @@ def _build_catcher_framing_score(season: int = 2025) -> pd.DataFrame:
     return result.reset_index()[["player_id", "framing_score"]]
 
 
-def _build_hitter_playing_time_score() -> pd.DataFrame:
+def _build_hitter_playing_time_score(
+    health_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Score projected playing time from counting projections + health.
 
     Prefers sim-based ``hitter_counting_sim.parquet`` (PA + games from
     game sim). Falls back to old ``hitter_counting.parquet``.
+
+    Parameters
+    ----------
+    health_df : pd.DataFrame or None
+        Pre-loaded health scores (columns: player_id, health_score,
+        health_label).  When provided the disk read of
+        ``health_scores.parquet`` is skipped.
 
     Returns
     -------
@@ -1511,12 +1520,14 @@ def _build_hitter_playing_time_score() -> pd.DataFrame:
         counting["projected_pa_mean"] = counting["total_pa_mean"]
 
     # Health scores: prefer columns already on counting parquet,
-    # fall back to standalone health_scores.parquet
+    # then in-memory health_df, then disk fallback
     has_health = "health_score" in counting.columns and counting["health_score"].notna().any()
     if not has_health:
-        health_path = DASHBOARD_DIR / "health_scores.parquet"
-        if health_path.exists():
-            health_df = pd.read_parquet(health_path)
+        if health_df is None:
+            health_path = DASHBOARD_DIR / "health_scores.parquet"
+            if health_path.exists():
+                health_df = pd.read_parquet(health_path)
+        if health_df is not None and not health_df.empty:
             counting = counting.merge(
                 health_df[["player_id", "health_score", "health_label"]].rename(
                     columns={"player_id": "batter_id"}
@@ -1683,6 +1694,7 @@ def rank_hitters(
     season: int = 2025,
     projection_season: int = 2026,
     min_pa: int = 100,
+    health_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Rank all hitters by position for 2026 value.
 
@@ -1694,6 +1706,10 @@ def rank_hitters(
         Target projection season.
     min_pa : int
         Minimum PA in observed season to qualify.
+    health_df : pd.DataFrame or None
+        Pre-loaded health scores (columns: player_id, health_score,
+        health_label).  Passed through to ``_build_hitter_playing_time_score``
+        to avoid a disk read when the pipeline already has it in memory.
 
     Returns
     -------
@@ -1802,7 +1818,7 @@ def rank_hitters(
     platoon = _build_hitter_platoon_modifier(season=season)
     fielding = _build_hitter_fielding_score(season=season)
     framing = _build_catcher_framing_score(season=season)
-    playing_time = _build_hitter_playing_time_score()
+    playing_time = _build_hitter_playing_time_score(health_df=health_df)
     trajectory = _build_hitter_trajectory_score()
 
     # Start from projections as base (has batter_id, name, age, etc.)
@@ -2431,12 +2447,21 @@ def _build_pitcher_command_score(
     return merged[["pitcher_id", "command_score"]]
 
 
-def _build_pitcher_workload_score() -> pd.DataFrame:
+def _build_pitcher_workload_score(
+    health_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Score projected workload from sim-based counting projections + health.
 
     Prefers ``pitcher_counting_sim.parquet`` (sim-based IP/games) over
     the old ``pitcher_counting.parquet`` (rate x BF). Falls back to old
     file if sim parquet doesn't exist.
+
+    Parameters
+    ----------
+    health_df : pd.DataFrame or None
+        Pre-loaded health scores (columns: player_id, health_score,
+        health_label).  When provided the disk read of
+        ``health_scores.parquet`` is skipped.
 
     Returns
     -------
@@ -2463,12 +2488,14 @@ def _build_pitcher_workload_score() -> pd.DataFrame:
         logger.warning("No counting parquet found for workload score")
         return pd.DataFrame(columns=["pitcher_id", "workload_score"])
 
-    # Health scores
+    # Health scores: prefer columns on counting, then in-memory, then disk
     has_health = "health_score" in counting.columns and counting["health_score"].notna().any()
     if not has_health:
-        health_path = DASHBOARD_DIR / "health_scores.parquet"
-        if health_path.exists():
-            health_df = pd.read_parquet(health_path)
+        if health_df is None:
+            health_path = DASHBOARD_DIR / "health_scores.parquet"
+            if health_path.exists():
+                health_df = pd.read_parquet(health_path)
+        if health_df is not None and not health_df.empty:
             counting = counting.merge(
                 health_df[["player_id", "health_score", "health_label"]].rename(
                     columns={"player_id": "pitcher_id"}
@@ -2649,6 +2676,8 @@ def rank_pitchers(
     season: int = 2025,
     projection_season: int = 2026,
     min_bf: int = 50,
+    health_df: pd.DataFrame | None = None,
+    pitcher_roles_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Rank all pitchers by role (SP/RP) for 2026 value.
 
@@ -2660,6 +2689,13 @@ def rank_pitchers(
         Target projection season.
     min_bf : int
         Minimum batters faced to qualify.
+    health_df : pd.DataFrame or None
+        Pre-loaded health scores (columns: player_id, health_score,
+        health_label).  Passed through to ``_build_pitcher_workload_score``
+        to avoid a disk read when the pipeline already has it in memory.
+    pitcher_roles_df : pd.DataFrame or None
+        Pre-loaded reliever roles (columns: pitcher_id, role, ...).
+        When provided the disk read of ``pitcher_roles.parquet`` is skipped.
 
     Returns
     -------
@@ -2681,10 +2717,13 @@ def rank_pitchers(
         WHERE season = {season} AND batters_faced >= {min_bf}
     """, {})
 
-    # Role assignment — prefer sim-derived CL/SU/MR roles, fall back to SP/RP
-    roles_path = DASHBOARD_DIR / "pitcher_roles.parquet"
-    if roles_path.exists():
-        rp_roles = pd.read_parquet(roles_path)
+    # Role assignment — prefer in-memory roles, then disk, then heuristic
+    rp_roles = pitcher_roles_df
+    if rp_roles is None:
+        roles_path = DASHBOARD_DIR / "pitcher_roles.parquet"
+        if roles_path.exists():
+            rp_roles = pd.read_parquet(roles_path)
+    if rp_roles is not None and not rp_roles.empty:
         # Map CL/SU/MR -> RP for composite weights, keep detail for display
         roles = rp_roles[["pitcher_id", "role"]].copy()
         roles["role_detail"] = roles["role"]
@@ -2712,7 +2751,7 @@ def rank_pitchers(
     # Build sub-scores
     stuff = _build_pitcher_stuff_score(proj, observed, run_values=run_values)
     command = _build_pitcher_command_score(proj, observed, efficiency=efficiency)
-    workload = _build_pitcher_workload_score()
+    workload = _build_pitcher_workload_score(health_df=health_df)
     durability = _build_pitcher_innings_durability()
     trajectory = _build_pitcher_trajectory_score(season=season)
 
@@ -3018,6 +3057,8 @@ def rank_pitchers(
 def rank_all(
     season: int = 2025,
     projection_season: int = 2026,
+    health_df: pd.DataFrame | None = None,
+    pitcher_roles_df: pd.DataFrame | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Run all positional rankings.
 
@@ -3027,6 +3068,11 @@ def rank_all(
         Most recent completed season for observed data.
     projection_season : int
         Target projection season.
+    health_df : pd.DataFrame or None
+        Pre-loaded health scores.  Passed through to both hitter and
+        pitcher ranking functions to avoid disk reads.
+    pitcher_roles_df : pd.DataFrame or None
+        Pre-loaded reliever roles.  Passed through to pitcher ranking.
 
     Returns
     -------
@@ -3034,8 +3080,14 @@ def rank_all(
         Keys: 'hitters', 'pitchers'. Each sorted by position/role then rank.
     """
     logger.info("Building 2026 positional rankings...")
-    hitters = rank_hitters(season=season, projection_season=projection_season)
-    pitchers = rank_pitchers(season=season, projection_season=projection_season)
+    hitters = rank_hitters(
+        season=season, projection_season=projection_season,
+        health_df=health_df,
+    )
+    pitchers = rank_pitchers(
+        season=season, projection_season=projection_season,
+        health_df=health_df, pitcher_roles_df=pitcher_roles_df,
+    )
     logger.info(
         "Rankings complete: %d hitters, %d pitchers",
         len(hitters), len(pitchers),

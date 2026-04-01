@@ -19,6 +19,15 @@ from scipy import stats
 logger = logging.getLogger(__name__)
 
 
+def _safe_int(val: object) -> int:
+    """Convert a value to int, handling NaN, None, and duplicate-column Series."""
+    if isinstance(val, pd.Series):
+        val = val.iloc[0]
+    if val is None or pd.isna(val):
+        return 0
+    return int(val)
+
+
 def moment_match_to_beta(
     samples: np.ndarray,
     floor_total: float = 5.0,
@@ -89,17 +98,6 @@ def conjugate_update(
     }
 
 
-def draw_updated_samples(
-    alpha: float,
-    beta: float,
-    n_samples: int = 8000,
-    random_seed: int = 42,
-) -> np.ndarray:
-    """Draw posterior samples from an updated Beta distribution."""
-    rng = np.random.default_rng(random_seed)
-    return rng.beta(alpha, beta, size=n_samples)
-
-
 def update_projections(
     preseason_proj: pd.DataFrame,
     observed_2026: pd.DataFrame,
@@ -149,8 +147,8 @@ def update_projections(
         delta_col = f"delta_{stat}"
 
         for idx, row in proj.iterrows():
-            n_obs = int(row.get(trials_col, 0) or 0)
-            k_obs = int(row.get(success_col, 0) or 0)
+            n_obs = _safe_int(row.get(trials_col, 0))
+            k_obs = _safe_int(row.get(success_col, 0))
 
             if n_obs < min_trials:
                 continue
@@ -204,23 +202,38 @@ def update_projections(
     return proj
 
 
-def update_pitcher_k_samples(
+def update_rate_samples(
     preseason_samples: dict[str, np.ndarray],
-    observed_2026: pd.DataFrame,
-    min_bf: int = 10,
+    observed_df: pd.DataFrame,
+    player_id_col: str,
+    trials_col: str,
+    successes_col: str,
+    league_avg: float = 0.22,
+    min_trials: int = 10,
     n_samples: int = 8000,
     random_seed: int = 42,
 ) -> dict[str, np.ndarray]:
-    """Regenerate pitcher K% posterior samples with conjugate updating.
+    """Regenerate rate posterior samples with Beta-Binomial conjugate updating.
+
+    Generic version that works for any rate stat (K%, BB%, HR/BF, etc.)
+    by parameterizing the column names.
 
     Parameters
     ----------
     preseason_samples : dict[str, np.ndarray]
-        Preseason K% samples keyed by str(pitcher_id).
-    observed_2026 : pd.DataFrame
-        Columns: pitcher_id, batters_faced, strike_outs.
-    min_bf : int
-        Minimum BF before updating.
+        Preseason rate samples keyed by str(player_id).
+    observed_df : pd.DataFrame
+        Observed season totals with player ID, trials, and successes columns.
+    player_id_col : str
+        Column name for the player ID (e.g., 'pitcher_id', 'batter_id').
+    trials_col : str
+        Column name for trials (e.g., 'batters_faced', 'pa').
+    successes_col : str
+        Column name for successes (e.g., 'strike_outs', 'walks', 'hr').
+    league_avg : float
+        League average rate, used as prior for new players.
+    min_trials : int
+        Minimum trials before updating (below this, keep preseason).
     n_samples : int
         Number of posterior samples to draw.
     random_seed : int
@@ -229,23 +242,23 @@ def update_pitcher_k_samples(
     Returns
     -------
     dict[str, np.ndarray]
-        Updated K% samples per pitcher.
+        Updated rate samples per player.
     """
     updated = {}
     obs_lookup = {}
-    for _, row in observed_2026.iterrows():
-        pid = str(int(row["pitcher_id"]))
+    for _, row in observed_df.iterrows():
+        pid = str(int(row[player_id_col]))
         obs_lookup[pid] = {
-            "bf": int(row.get("batters_faced", 0) or 0),
-            "k": int(row.get("strike_outs", 0) or 0),
+            "trials": _safe_int(row.get(trials_col, 0)),
+            "successes": _safe_int(row.get(successes_col, 0)),
         }
 
     rng = np.random.default_rng(random_seed)
 
     for pid_str, samples in preseason_samples.items():
-        obs = obs_lookup.get(pid_str, {"bf": 0, "k": 0})
+        obs = obs_lookup.get(pid_str, {"trials": 0, "successes": 0})
 
-        if obs["bf"] < min_bf:
+        if obs["trials"] < min_trials:
             updated[pid_str] = samples
             continue
 
@@ -253,24 +266,68 @@ def update_pitcher_k_samples(
         alpha_0, beta_0 = moment_match_to_beta(samples)
 
         # Conjugate update
-        alpha_post = alpha_0 + obs["k"]
-        beta_post = beta_0 + (obs["bf"] - obs["k"])
+        alpha_post = alpha_0 + obs["successes"]
+        beta_post = beta_0 + (obs["trials"] - obs["successes"])
 
         updated[pid_str] = rng.beta(alpha_post, beta_post, size=n_samples)
 
-    # Handle new pitchers (in observed but not in preseason)
-    league_k_rate = 0.22  # ~league average
+    # Handle new players (in observed but not in preseason)
     new_prior_strength = 50
 
     for pid_str, obs in obs_lookup.items():
-        if pid_str not in updated and obs["bf"] >= min_bf:
-            alpha_0 = league_k_rate * new_prior_strength
-            beta_0 = (1 - league_k_rate) * new_prior_strength
-            alpha_post = alpha_0 + obs["k"]
-            beta_post = beta_0 + (obs["bf"] - obs["k"])
+        if pid_str not in updated and obs["trials"] >= min_trials:
+            alpha_0 = league_avg * new_prior_strength
+            beta_0 = (1 - league_avg) * new_prior_strength
+            alpha_post = alpha_0 + obs["successes"]
+            beta_post = beta_0 + (obs["trials"] - obs["successes"])
             updated[pid_str] = rng.beta(alpha_post, beta_post, size=n_samples)
-            logger.info("New pitcher %s: %d BF, %d K → K%% = %.1f%%",
-                        pid_str, obs["bf"], obs["k"],
+            logger.info("New player %s: %d trials, %d successes → rate = %.1f%%",
+                        pid_str, obs["trials"], obs["successes"],
                         alpha_post / (alpha_post + beta_post) * 100)
 
     return updated
+
+
+def update_pitcher_k_samples(
+    preseason_samples: dict[str, np.ndarray],
+    observed_2026: pd.DataFrame,
+    min_bf: int = 10,
+    n_samples: int = 8000,
+    random_seed: int = 42,
+    league_avg: float = 0.22,
+) -> dict[str, np.ndarray]:
+    """Regenerate pitcher K% posterior samples with conjugate updating.
+
+    Convenience wrapper around :func:`update_rate_samples` for pitcher K%.
+
+    Parameters
+    ----------
+    preseason_samples : dict[str, np.ndarray]
+        Preseason rate samples keyed by str(player_id).
+    observed_2026 : pd.DataFrame
+        Columns: pitcher_id, batters_faced, strike_outs.
+    min_bf : int
+        Minimum BF before updating.
+    n_samples : int
+        Number of posterior samples to draw.
+    random_seed : int
+        For reproducibility.
+    league_avg : float
+        League average K rate for new-player prior.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        Updated K% samples per pitcher.
+    """
+    return update_rate_samples(
+        preseason_samples=preseason_samples,
+        observed_df=observed_2026,
+        player_id_col="pitcher_id",
+        trials_col="batters_faced",
+        successes_col="strike_outs",
+        league_avg=league_avg,
+        min_trials=min_bf,
+        n_samples=n_samples,
+        random_seed=random_seed,
+    )

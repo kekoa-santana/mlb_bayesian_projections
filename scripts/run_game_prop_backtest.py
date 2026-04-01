@@ -7,6 +7,7 @@ python scripts/run_game_prop_backtest.py                    # all props
 python scripts/run_game_prop_backtest.py --side pitcher      # pitcher only
 python scripts/run_game_prop_backtest.py --stat k bb         # K and BB only
 python scripts/run_game_prop_backtest.py --side batter --stat k  # batter K only
+python scripts/run_game_prop_backtest.py --stratify           # include stratified metrics
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.evaluation.game_prop_validation import (
     BATTER_PROP_CONFIGS,
     PITCHER_PROP_CONFIGS,
+    compute_stratified_metrics,
     run_full_game_prop_backtest,
 )
 
@@ -45,6 +47,8 @@ def main() -> None:
     parser.add_argument("--chains", type=int, default=2)
     parser.add_argument("--mc-draws", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--stratify", action="store_true",
+                        help="Compute stratified metrics by context columns")
     args = parser.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -62,6 +66,7 @@ def main() -> None:
                 configs_to_run.append((f"batter_{name}", config))
 
     all_summaries = []
+    all_stratified = []
 
     for label, config in configs_to_run:
         logger.info("=" * 60)
@@ -89,6 +94,13 @@ def main() -> None:
             summary_df["stat"] = config.stat_name
             all_summaries.append(summary_df)
 
+            # Stratified metrics
+            if args.stratify and len(predictions_df) > 0:
+                strat_df = compute_stratified_metrics(config, predictions_df)
+                if len(strat_df) > 0:
+                    strat_df["prop"] = label
+                    all_stratified.append(strat_df)
+
         except Exception:
             logger.exception("Failed backtest for %s", label)
             continue
@@ -109,6 +121,20 @@ def main() -> None:
         print(combined[available].to_string(index=False))
     else:
         logger.warning("No backtests completed successfully")
+
+    if all_stratified:
+        strat_combined = pd.concat(all_stratified, ignore_index=True)
+        strat_path = OUTPUT_DIR / "game_prop_stratified_summary.parquet"
+        strat_combined.to_parquet(strat_path, index=False)
+        logger.info("Saved stratified summary to %s", strat_path)
+
+        print("\n" + "=" * 80)
+        print("STRATIFIED METRICS")
+        print("=" * 80)
+        strat_cols = ["prop", "stratum", "bin", "bin_n",
+                      "rmse", "avg_brier", "ece", "temperature"]
+        avail = [c for c in strat_cols if c in strat_combined.columns]
+        print(strat_combined[avail].to_string(index=False))
 
 
 if __name__ == "__main__":

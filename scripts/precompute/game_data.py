@@ -160,12 +160,12 @@ def run_umpire(
     *,
     from_season: int = FROM_SEASON,
 ) -> None:
-    """Compute umpire K-rate tendencies."""
-    from src.data.queries import get_umpire_k_tendencies
+    """Compute umpire K, BB, and HR rate tendencies with shrinkage."""
+    from src.data.queries import get_umpire_tendencies
 
     logger.info("=" * 60)
-    logger.info("Computing umpire K-rate tendencies...")
-    umpire_tendencies = get_umpire_k_tendencies(
+    logger.info("Computing umpire tendencies (K + BB + HR)...")
+    umpire_tendencies = get_umpire_tendencies(
         seasons=list(range(2021, from_season + 1)), min_games=30,
     )
     umpire_tendencies.to_parquet(DASHBOARD_DIR / "umpire_tendencies.parquet", index=False)
@@ -184,3 +184,28 @@ def run_weather(
     weather_effects = get_weather_effects(seasons=seasons)
     weather_effects.to_parquet(DASHBOARD_DIR / "weather_effects.parquet", index=False)
     logger.info("Saved weather effects: %d combinations", len(weather_effects))
+
+
+def run_catcher_framing(
+    *,
+    seasons: list[int] = SEASONS,
+) -> None:
+    """Compute catcher framing effects (called-strike logit lifts)."""
+    from src.data.queries import get_catcher_framing_effects
+
+    logger.info("=" * 60)
+    logger.info("Computing catcher framing effects...")
+    frames = []
+    for s in seasons:
+        try:
+            df = get_catcher_framing_effects(s)
+            if not df.empty:
+                frames.append(df)
+        except Exception as e:
+            logger.warning("Catcher framing failed for season %d: %s", s, e)
+    if frames:
+        framing = pd.concat(frames, ignore_index=True)
+        framing.to_parquet(DASHBOARD_DIR / "catcher_framing.parquet", index=False)
+        logger.info("Saved catcher framing: %d catcher-seasons", len(framing))
+    else:
+        logger.warning("No catcher framing data produced")

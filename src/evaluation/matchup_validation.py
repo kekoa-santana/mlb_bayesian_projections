@@ -23,45 +23,8 @@ from src.models.matchup import (
     compute_game_matchup_k_rate,
     score_matchup,
 )
-from src.utils.constants import LEAGUE_AVG_BY_PITCH_TYPE
-
 logger = logging.getLogger(__name__)
 
-
-def _build_baselines_pt(
-    pitcher_arsenal: pd.DataFrame,
-) -> dict[str, dict[str, float]]:
-    """Build league-average baselines per pitch type from the full arsenal data.
-
-    Computes volume-weighted league whiff rate per pitch type from all
-    pitchers in the arsenal DataFrame.
-
-    Parameters
-    ----------
-    pitcher_arsenal : pd.DataFrame
-        Full pitcher arsenal profiles for a season.
-
-    Returns
-    -------
-    dict[str, dict[str, float]]
-        {pitch_type: {"whiff_rate": float}}.
-    """
-    agg = pitcher_arsenal.groupby("pitch_type").agg(
-        total_whiffs=("whiffs", "sum"),
-        total_swings=("swings", "sum"),
-    ).reset_index()
-    agg["whiff_rate"] = agg["total_whiffs"] / agg["total_swings"].replace(0, np.nan)
-
-    baselines: dict[str, dict[str, float]] = {}
-    for _, row in agg.iterrows():
-        pt = row["pitch_type"]
-        wr = row["whiff_rate"]
-        if pd.notna(wr):
-            baselines[pt] = {"whiff_rate": float(wr)}
-        else:
-            fallback = LEAGUE_AVG_BY_PITCH_TYPE.get(pt, {}).get("whiff_rate", 0.25)
-            baselines[pt] = {"whiff_rate": fallback}
-    return baselines
 
 
 def build_game_predictions(
@@ -91,8 +54,9 @@ def build_game_predictions(
     pitcher_arsenal = get_pitcher_arsenal(season)
     hitter_vuln = get_hitter_vulnerability(season)
 
-    # Build league baselines from this season's arsenal data
-    baselines_pt = _build_baselines_pt(pitcher_arsenal)
+    # Build league baselines from this season's data
+    from src.data.league_baselines import get_baselines_dict
+    baselines_pt = get_baselines_dict(seasons=[season], recency_weights="equal")
 
     # Filter to starters if requested
     if starters_only:
@@ -235,6 +199,9 @@ def compute_validation_metrics(predictions: pd.DataFrame) -> dict[str, float]:
     }
 
 
+# NOTE: Not currently wired into any pipeline or backtest runner.
+# Kept for future use — standalone walk-forward matchup model validation.
+# Run manually when revisiting the matchup scoring system.
 def run_matchup_validation(
     seasons: list[int] | None = None,
 ) -> pd.DataFrame:

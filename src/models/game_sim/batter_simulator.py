@@ -40,23 +40,25 @@ from src.models.game_sim.batter_pa_model import (
     split_pa_starter_reliever,
 )
 from src.models.bf_model import draw_bf_samples
+from src.utils.constants import (
+    CLIP_LO,
+    CLIP_HI,
+    SIM_LEAGUE_K_RATE,
+    SIM_LEAGUE_BB_RATE,
+    SIM_LEAGUE_HR_RATE,
+    BULLPEN_K_RATE,
+    BULLPEN_BB_RATE,
+    BULLPEN_HR_RATE,
+)
 
 logger = logging.getLogger(__name__)
-
-_CLIP_LO = 1e-6
-_CLIP_HI = 1 - 1e-6
 
 # Max PAs a batter can get in a game
 MAX_BATTER_PA = 7
 
-# League average rates (2022-2025) for logit centering
-LEAGUE_K_RATE = 0.226
-LEAGUE_BB_RATE = 0.082
-LEAGUE_HR_RATE = 0.031
-
 
 def _safe_logit(p: float | np.ndarray) -> float | np.ndarray:
-    return logit(np.clip(p, _CLIP_LO, _CLIP_HI))
+    return logit(np.clip(p, CLIP_LO, CLIP_HI))
 
 
 @dataclass
@@ -144,16 +146,19 @@ def simulate_batter_game(
     matchup_k_lift: float = 0.0,
     matchup_bb_lift: float = 0.0,
     matchup_hr_lift: float = 0.0,
-    bullpen_k_rate: float = 0.253,
-    bullpen_bb_rate: float = 0.084,
-    bullpen_hr_rate: float = 0.024,
+    bullpen_k_rate: float = BULLPEN_K_RATE,
+    bullpen_bb_rate: float = BULLPEN_BB_RATE,
+    bullpen_hr_rate: float = BULLPEN_HR_RATE,
     bullpen_matchup_k_lift: float = 0.0,
     bullpen_matchup_bb_lift: float = 0.0,
     bullpen_matchup_hr_lift: float = 0.0,
     batter_babip_adj: float = 0.0,
     umpire_k_lift: float = 0.0,
     umpire_bb_lift: float = 0.0,
+    park_k_lift: float = 0.0,
+    park_bb_lift: float = 0.0,
     park_hr_lift: float = 0.0,
+    park_h_babip_adj: float = 0.0,
     weather_k_lift: float = 0.0,
     n_sims: int = 50_000,
     random_seed: int = 42,
@@ -194,8 +199,14 @@ def simulate_batter_game(
         Opposing team bullpen aggregate HR rate.
     batter_babip_adj : float
         Batter BABIP adjustment for BIP outcomes.
-    umpire_k_lift, umpire_bb_lift, park_hr_lift, weather_k_lift : float
-        Context adjustments.
+    umpire_k_lift, umpire_bb_lift : float
+        Umpire tendency adjustments on logit scale.
+    park_k_lift, park_bb_lift, park_hr_lift : float
+        Park factor adjustments on logit scale.
+    park_h_babip_adj : float
+        Park factor BABIP adjustment for hits.
+    weather_k_lift : float
+        Weather K adjustment on logit scale.
     n_sims : int
         Number of simulations.
     random_seed : int
@@ -239,13 +250,13 @@ def simulate_batter_game(
 
     # --- 2. Compute per-PA rates ---
     # Pitcher quality lift: how far is the starter/reliever from league avg?
-    starter_k_lift = _safe_logit(starter_k_rate) - _safe_logit(LEAGUE_K_RATE)
-    starter_bb_lift = _safe_logit(starter_bb_rate) - _safe_logit(LEAGUE_BB_RATE)
-    starter_hr_lift = _safe_logit(starter_hr_rate) - _safe_logit(LEAGUE_HR_RATE)
+    starter_k_lift = _safe_logit(starter_k_rate) - _safe_logit(SIM_LEAGUE_K_RATE)
+    starter_bb_lift = _safe_logit(starter_bb_rate) - _safe_logit(SIM_LEAGUE_BB_RATE)
+    starter_hr_lift = _safe_logit(starter_hr_rate) - _safe_logit(SIM_LEAGUE_HR_RATE)
 
-    bullpen_k_lift = _safe_logit(bullpen_k_rate) - _safe_logit(LEAGUE_K_RATE)
-    bullpen_bb_lift = _safe_logit(bullpen_bb_rate) - _safe_logit(LEAGUE_BB_RATE)
-    bullpen_hr_lift = _safe_logit(bullpen_hr_rate) - _safe_logit(LEAGUE_HR_RATE)
+    bullpen_k_lift = _safe_logit(bullpen_k_rate) - _safe_logit(SIM_LEAGUE_K_RATE)
+    bullpen_bb_lift = _safe_logit(bullpen_bb_rate) - _safe_logit(SIM_LEAGUE_BB_RATE)
+    bullpen_hr_lift = _safe_logit(bullpen_hr_rate) - _safe_logit(SIM_LEAGUE_HR_RATE)
 
     # --- 3. Accumulators ---
     k_total = np.zeros(n_sims, dtype=np.int32)
@@ -298,10 +309,11 @@ def simulate_batter_game(
 
         # Final adjusted rates
         k_rate_adj = expit(
-            k_logit_base + k_pitcher_lift + umpire_k_lift + weather_k_lift
+            k_logit_base + k_pitcher_lift
+            + umpire_k_lift + park_k_lift + weather_k_lift
         )
         bb_rate_adj = expit(
-            bb_logit_base + bb_pitcher_lift + umpire_bb_lift
+            bb_logit_base + bb_pitcher_lift + umpire_bb_lift + park_bb_lift
         )
         hr_rate_adj = expit(
             hr_logit_base + hr_pitcher_lift + park_hr_lift
@@ -315,7 +327,7 @@ def simulate_batter_game(
         )
         outcomes = pa_model.draw_outcomes(
             probs=probs, rng=rng, n_draws=n_active,
-            babip_adj=batter_babip_adj,
+            babip_adj=batter_babip_adj + park_h_babip_adj,
         )
 
         # Accumulate

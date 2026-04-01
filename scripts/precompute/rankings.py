@@ -10,9 +10,21 @@ logger = logging.getLogger("precompute.rankings")
 
 def run_player_rankings(
     *,
+    health_df: "pd.DataFrame | None" = None,
+    pitcher_roles_df: "pd.DataFrame | None" = None,
     from_season: int = FROM_SEASON,
 ) -> None:
-    """Build MLB positional rankings and position eligibility."""
+    """Build MLB positional rankings and position eligibility.
+
+    Parameters
+    ----------
+    health_df : pd.DataFrame or None
+        Pre-loaded health scores.  Passed through to ranking functions
+        to avoid a disk read when the pipeline already has it in memory.
+    pitcher_roles_df : pd.DataFrame or None
+        Pre-loaded reliever roles.  Passed through to pitcher rankings
+        to avoid a disk read.
+    """
     logger.info("=" * 60)
     logger.info("Building MLB positional rankings...")
 
@@ -21,6 +33,7 @@ def run_player_rankings(
 
         rankings = rank_all(
             season=from_season, projection_season=from_season + 1,
+            health_df=health_df, pitcher_roles_df=pitcher_roles_df,
         )
         for key, rdf in rankings.items():
             if not rdf.empty:

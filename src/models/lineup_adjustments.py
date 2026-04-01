@@ -3,8 +3,9 @@ Lineup-aware adjustments for game-level prop predictions.
 
 Phase 1G: Aggregate lineup K/BB/HR-proneness for pitcher props.
 Phase 1J: Opposing pitcher quality lift for batter props.
+Platoon: Multiplicative adjustment using observed vs-hand splits.
 
-Both adjustments operate on the logit scale, consistent with the
+All adjustments operate on the logit scale, consistent with the
 existing umpire/weather/matchup lift pattern in game_k_model.py.
 """
 from __future__ import annotations
@@ -13,13 +14,12 @@ import logging
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from scipy.special import expit, logit
 
-logger = logging.getLogger(__name__)
+from src.utils.constants import CLIP_LO, CLIP_HI
 
-# Clip bounds for logit transform (avoid infinities)
-_CLIP_LO = 1e-6
-_CLIP_HI = 1 - 1e-6
+logger = logging.getLogger(__name__)
 
 # Expected PA per batting order slot in a 9-inning game.
 # Slot 1 (leadoff) gets ~4.5 PA, slot 9 gets ~3.5 PA.
@@ -39,7 +39,7 @@ PA_WEIGHTS_BY_SLOT: np.ndarray = np.array([
 
 def _safe_logit(p: float | np.ndarray) -> float | np.ndarray:
     """Logit with clipping to avoid infinities."""
-    return logit(np.clip(p, _CLIP_LO, _CLIP_HI))
+    return logit(np.clip(p, CLIP_LO, CLIP_HI))
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +171,151 @@ def compute_lineup_proneness_batch(
         stat_name, len(result), len(game_lineups),
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Platoon-adjusted lineup proneness
+# ---------------------------------------------------------------------------
+
+# Mapping from stat name to the rate column in platoon splits DataFrame
+_PLATOON_RATE_COL: dict[str, str] = {
+    "k": "k_rate",
+    "bb": "bb_rate",
+}
+
+
+def compute_platoon_adjusted_proneness(
+    lineup_batter_ids: list[int],
+    batter_posteriors: dict[int, np.ndarray],
+    platoon_splits: pd.DataFrame,
+    pitcher_hand: str,
+    league_avg_rate: float,
+    stat_name: str = "k",
+    weight: float = 0.5,
+    platoon_cap: tuple[float, float] = (0.7, 1.4),
+    min_pa_for_platoon: int = 50,
+) -> float:
+    """Lineup proneness with platoon adjustment for pitcher handedness.
+
+    Uses observed vs-hand splits as a multiplicative ratio on each
+    batter's posterior mean, capped to avoid blowups on thin data.
+
+    Parameters
+    ----------
+    lineup_batter_ids : list[int]
+        Exactly 9 batter IDs in batting order.
+    batter_posteriors : dict[int, np.ndarray]
+        Mapping of batter_id -> rate posterior samples.
+    platoon_splits : pd.DataFrame
+        Output of ``get_season_totals_by_pitcher_hand()``.  Must contain
+        columns: batter_id, pitch_hand, pa, and the relevant rate column
+        (e.g. k_rate, bb_rate).
+    pitcher_hand : str
+        ``'R'`` or ``'L'`` — the starting pitcher's throwing hand.
+    league_avg_rate : float
+        League average rate for this stat.
+    stat_name : str
+        ``'k'`` or ``'bb'``.  ``'hr'`` and others fall back to
+        non-platoon ``compute_lineup_proneness`` (platoon HR splits
+        are too noisy to be useful).
+    weight : float
+        Scaling factor for the lift (0.0-1.0).
+    platoon_cap : tuple[float, float]
+        (min_ratio, max_ratio) to cap the platoon multiplier.
+    min_pa_for_platoon : int
+        Minimum PA vs. hand to apply platoon adjustment.
+
+    Returns
+    -------
+    float
+        Logit-scale lift. Falls back to non-platoon computation if
+        platoon data is unavailable.
+    """
+    if weight == 0.0:
+        return 0.0
+
+    if len(lineup_batter_ids) != 9:
+        return 0.0
+
+    rate_col = _PLATOON_RATE_COL.get(stat_name)
+    if rate_col is None or platoon_splits.empty:
+        # No platoon data for this stat — fall back to generic
+        return compute_lineup_proneness(
+            lineup_batter_ids, batter_posteriors,
+            league_avg_rate, stat_name, weight,
+        )
+
+    # Pre-index platoon splits for fast lookup
+    # Key: (batter_id, pitch_hand) -> (rate, pa)
+    plat_idx: dict[tuple[int, str], tuple[float, int]] = {}
+    for _, row in platoon_splits.iterrows():
+        bid = int(row["batter_id"])
+        ph = str(row["pitch_hand"])
+        pa = int(row.get("pa", 0))
+        rate = row.get(rate_col)
+        if pd.notna(rate) and pa > 0:
+            plat_idx[(bid, ph)] = (float(rate), pa)
+
+    # Compute per-batter overall rate from both sides
+    batter_overall: dict[int, float] = {}
+    for bid in set(r[0] for r in plat_idx.keys()):
+        rates_pa = []
+        for hand in ("R", "L"):
+            entry = plat_idx.get((bid, hand))
+            if entry:
+                rates_pa.append(entry)
+        if rates_pa:
+            total_pa = sum(e[1] for e in rates_pa)
+            if total_pa > 0:
+                batter_overall[bid] = sum(
+                    e[0] * e[1] for e in rates_pa
+                ) / total_pa
+
+    pa_weights = PA_WEIGHTS_BY_SLOT.copy()
+    batter_means = np.full(9, np.nan)
+    n_found = 0
+    n_platoon = 0
+
+    for i, bid in enumerate(lineup_batter_ids):
+        if bid not in batter_posteriors:
+            continue
+
+        posterior_mean = float(np.mean(batter_posteriors[bid]))
+        n_found += 1
+
+        # Try platoon adjustment
+        entry = plat_idx.get((bid, pitcher_hand))
+        overall = batter_overall.get(bid)
+        if (
+            entry is not None
+            and overall is not None
+            and entry[1] >= min_pa_for_platoon
+            and overall > 0
+        ):
+            ratio = entry[0] / overall
+            ratio = float(np.clip(ratio, platoon_cap[0], platoon_cap[1]))
+            batter_means[i] = posterior_mean * ratio
+            n_platoon += 1
+        else:
+            batter_means[i] = posterior_mean
+
+    if n_found == 0:
+        return 0.0
+
+    # Fill missing with league average
+    missing = np.isnan(batter_means)
+    batter_means[missing] = league_avg_rate
+
+    lineup_avg = float(np.average(batter_means, weights=pa_weights))
+    lift = weight * (_safe_logit(lineup_avg) - _safe_logit(league_avg_rate))
+
+    logger.debug(
+        "Platoon %s proneness (vs %sHP): %d/%d batters, %d platoon-adjusted, "
+        "lineup_avg=%.3f, lift=%.4f",
+        stat_name, pitcher_hand, n_found, 9, n_platoon, lineup_avg, lift,
+    )
+
+    return float(lift)
 
 
 # ---------------------------------------------------------------------------

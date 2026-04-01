@@ -35,7 +35,8 @@ def fetch_todays_schedule(
         away_team_id, away_team_name, away_abbr,
         home_team_id, home_team_name, home_abbr,
         away_pitcher_id, away_pitcher_name,
-        home_pitcher_id, home_pitcher_name.
+        home_pitcher_id, home_pitcher_name,
+        hp_umpire_name, venue_id.
     """
     import urllib.request
 
@@ -45,7 +46,7 @@ def fetch_todays_schedule(
     url = (
         f"{MLB_API_BASE}/schedule"
         f"?date={game_date}&sportId=1"
-        f"&hydrate=probablePitcher,team"
+        f"&hydrate=probablePitcher,team,officials"
     )
 
     try:
@@ -88,6 +89,13 @@ def fetch_todays_schedule(
             away_pp = away.get("probablePitcher", {})
             home_pp = home.get("probablePitcher", {})
 
+            # Home plate umpire (available once crew is assigned, usually day-of)
+            hp_umpire_name = ""
+            for official in game.get("officials", []):
+                if official.get("officialType") == "Home Plate":
+                    hp_umpire_name = official.get("official", {}).get("fullName", "")
+                    break
+
             rows.append({
                 "game_pk": gpk,
                 "game_date": game_date,
@@ -103,6 +111,8 @@ def fetch_todays_schedule(
                 "away_pitcher_name": away_pp.get("fullName", ""),
                 "home_pitcher_id": home_pp.get("id"),
                 "home_pitcher_name": home_pp.get("fullName", ""),
+                "hp_umpire_name": hp_umpire_name,
+                "venue_id": game.get("venue", {}).get("id"),
             })
 
     df = pd.DataFrame(rows)

@@ -79,8 +79,22 @@ def run_backtest_summaries() -> None:
         shutil.copy2(pred_file, dest)
         logger.info("Copied %s to dashboard", pred_file.name)
 
-    # Copy existing season backtest CSVs as standardized parquets
+    # Convert only the backtest CSVs that the dashboard actually loads
+    _BACKTEST_WHITELIST = {
+        "bip_backtest_results",
+        "hitter_multi_stat_backtest",
+        "pitcher_multi_stat_backtest",
+        "hitter_k_backtest",
+        "pitcher_k_backtest",
+        "hitter_counting_backtest",
+        "pitcher_counting_backtest",
+        "game_sim_backtest_summary",
+        "game_k_backtest",
+        "game_sim_backtest_predictions",
+    }
     for csv_file in outputs_dir.glob("*backtest*.csv"):
+        if csv_file.stem not in _BACKTEST_WHITELIST:
+            continue
         try:
             df = pd.read_csv(csv_file)
             dest = dashboard_dir / f"backtest_{csv_file.stem}.parquet"

@@ -98,65 +98,6 @@ class FantasyResult:
             "q90": float(np.percentile(self.espn_points, 90)),
         }
 
-    def dk_over_probs(
-        self, lines: list[float] | None = None,
-    ) -> pd.DataFrame:
-        """P(DK points over X) for given lines."""
-        if lines is None:
-            lines = [5, 10, 15, 20, 25, 30]
-        records = []
-        for line in lines:
-            records.append({
-                "line": line,
-                "p_over": float(np.mean(self.dk_points > line)),
-            })
-        return pd.DataFrame(records)
-
-
-def compute_batter_fantasy(
-    result: BatterSimulationResult,
-) -> FantasyResult:
-    """Compute fantasy point distributions for a batter game simulation.
-
-    Parameters
-    ----------
-    result : BatterSimulationResult
-        Output of simulate_batter_game().
-
-    Returns
-    -------
-    FantasyResult
-        DK and ESPN point distributions.
-    """
-    dk = (
-        DK_BAT_SINGLE * result.single_samples
-        + DK_BAT_DOUBLE * result.double_samples
-        + DK_BAT_TRIPLE * result.triple_samples
-        + DK_BAT_HR * result.hr_samples
-        + DK_BAT_RBI * result.rbi_samples
-        + DK_BAT_R * result.r_samples
-        + DK_BAT_BB * result.bb_samples
-        + DK_BAT_HBP * result.hbp_samples
-    ).astype(float)
-
-    espn = (
-        ESPN_BAT_SINGLE * result.single_samples
-        + ESPN_BAT_DOUBLE * result.double_samples
-        + ESPN_BAT_TRIPLE * result.triple_samples
-        + ESPN_BAT_HR * result.hr_samples
-        + ESPN_BAT_RBI * result.rbi_samples
-        + ESPN_BAT_R * result.r_samples
-        + ESPN_BAT_BB * result.bb_samples
-        + ESPN_BAT_HBP * result.hbp_samples
-        + ESPN_BAT_K * result.k_samples
-    ).astype(float)
-
-    return FantasyResult(
-        dk_points=dk,
-        espn_points=espn,
-        n_sims=result.n_sims,
-    )
-
 
 def compute_pitcher_fantasy(
     result: SimulationResult,

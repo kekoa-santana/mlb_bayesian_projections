@@ -165,6 +165,9 @@ def get_lineup_archetype_profile(
     return dict(lineup["archetype_name"].value_counts())
 
 
+# NOTE: Not currently wired into any pipeline or dashboard view.
+# Kept for future use — enables live "pitcher arsenal vs lineup weaknesses"
+# matchup narratives. Wire into game-day precompute when ready.
 def score_pitcher_vs_lineup_archetypes(
     pitcher_id: int,
     lineup_batter_ids: list[int],

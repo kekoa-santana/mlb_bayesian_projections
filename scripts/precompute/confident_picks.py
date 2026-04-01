@@ -26,7 +26,11 @@ from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS
 logger = logging.getLogger("precompute.confident_picks")
 
 # Batter stats to project (HR excluded — too noisy at game level)
-BATTER_STATS = ("h", "tb", "k", "hrr")
+# Lineup sim: stats that benefit from base-state tracking (R, RBI, HRR)
+# Per-batter sim: stats that only depend on batter hit types (TB)
+LINEUP_SIM_STATS = ("h", "k", "bb", "r", "rbi", "hrr")
+BATTER_SIM_STATS = ("tb",)
+BATTER_STATS = LINEUP_SIM_STATS + BATTER_SIM_STATS
 
 
 def run(
@@ -46,6 +50,7 @@ def run(
     from src.data.schedule import fetch_todays_schedule
     from src.models.game_sim.exit_model import ExitModel
     from src.models.game_sim.simulator import simulate_game, compute_stamina_offset
+    from src.models.game_sim.lineup_simulator import simulate_lineup_game
     from src.models.game_sim.batter_simulator import simulate_batter_game
     from src.models.game_sim.tto_model import build_all_tto_lifts
     from src.models.game_sim.pitch_count_model import build_pitch_count_features
@@ -146,17 +151,82 @@ def run(
     except FileNotFoundError:
         lineup_priors = pd.DataFrame()
 
-    # Umpire tendencies → per-umpire K logit lift lookup
-    ump_lookup: dict[str, float] = {}
+    # LD%-based BABIP adjustments for batter sim
+    ld_babip_lookup: dict[int, float] = {}
+    _LD_BABIP_COEFFICIENT = 0.25
+    _LEAGUE_LD_RATE = 0.22
+    try:
+        ld_df = pd.read_parquet(DASHBOARD_DIR / "batter_ld_rate.parquet")
+        if not ld_df.empty:
+            ld_latest = (
+                ld_df.sort_values("season")
+                .groupby("player_id").last().reset_index()
+            )
+            for _, lr in ld_latest.iterrows():
+                ld_dev = float(lr["ld_rate_regressed"]) - _LEAGUE_LD_RATE
+                ld_babip_lookup[int(lr["player_id"])] = ld_dev * _LD_BABIP_COEFFICIENT
+            logger.info(
+                "Loaded LD%% BABIP adjustments for %d batters",
+                len(ld_babip_lookup),
+            )
+    except FileNotFoundError:
+        logger.info("No batter_ld_rate.parquet found; LD BABIP adjustments disabled")
+
+    # Sprint speed BABIP adjustments (stacks with LD%)
+    speed_babip_lookup: dict[int, float] = {}
+    _LEAGUE_SPRINT_SPEED = 27.0
+    _SPEED_BABIP_COEFFICIENT = 0.010
+    try:
+        speed_df = pd.read_parquet(DASHBOARD_DIR / "batter_sprint_speed.parquet")
+        if not speed_df.empty:
+            speed_latest = (
+                speed_df.sort_values("season")
+                .groupby("player_id").last().reset_index()
+            )
+            for _, sr in speed_latest.iterrows():
+                speed_dev = float(sr["sprint_speed_regressed"]) - _LEAGUE_SPRINT_SPEED
+                speed_babip_lookup[int(sr["player_id"])] = (
+                    speed_dev * _SPEED_BABIP_COEFFICIENT
+                )
+            logger.info(
+                "Loaded sprint speed BABIP adjustments for %d batters",
+                len(speed_babip_lookup),
+            )
+    except FileNotFoundError:
+        logger.info(
+            "No batter_sprint_speed.parquet found; speed BABIP adjustments disabled"
+        )
+
+    # Park factor lifts (K and HR only; H/BB skipped due to model H bias)
+    park_lift_lookup: dict[int, dict[str, float]] = {}
+    try:
+        pf_lifts = pd.read_parquet(DASHBOARD_DIR / "park_factor_lifts.parquet")
+        for _, pr in pf_lifts.iterrows():
+            park_lift_lookup[int(pr["venue_id"])] = {
+                "k_lift": float(pr["k_lift"]),
+                "hr_lift": float(pr["hr_lift"]),
+            }
+        logger.info("Loaded park factor lifts for %d venues", len(park_lift_lookup))
+    except (FileNotFoundError, KeyError):
+        logger.info("No park_factor_lifts.parquet; park adjustments disabled")
+
+    # Umpire tendencies -> per-umpire K and BB logit lift lookups
+    ump_k_lookup: dict[str, float] = {}
+    ump_bb_lookup: dict[str, float] = {}
     try:
         umpire_tend = pd.read_parquet(
             DASHBOARD_DIR / "umpire_tendencies.parquet"
         )
         for _, ur in umpire_tend.iterrows():
-            ump_lookup[ur["hp_umpire_name"]] = float(ur["k_logit_lift"])
-        logger.info("Loaded %d umpire tendencies", len(ump_lookup))
+            ump_k_lookup[ur["hp_umpire_name"]] = float(ur["k_logit_lift"])
+            ump_bb_lookup[ur["hp_umpire_name"]] = float(
+                ur.get("bb_logit_lift", 0.0)
+            )
+        logger.info(
+            "Loaded %d umpire tendencies (K + BB lifts)", len(ump_k_lookup)
+        )
     except (FileNotFoundError, KeyError):
-        logger.info("No umpire tendencies — skipping umpire adjustments")
+        logger.info("No umpire tendencies -- skipping umpire adjustments")
 
     # Weather effects → (temp_bucket, wind_category) lookup
     wx_lookup: dict[tuple[str, str], dict] = {}
@@ -171,11 +241,33 @@ def run(
     except (FileNotFoundError, KeyError):
         logger.info("No weather effects — skipping weather adjustments")
 
+    # Catcher framing effects → catcher_id lookup
+    catcher_framing_lookup: dict[int, float] = {}
+    try:
+        framing_df = pd.read_parquet(
+            DASHBOARD_DIR / "catcher_framing.parquet"
+        )
+        # Use most recent season per catcher
+        framing_latest = (
+            framing_df.sort_values("season")
+            .groupby("catcher_id").last().reset_index()
+        )
+        for _, fr in framing_latest.iterrows():
+            catcher_framing_lookup[int(fr["catcher_id"])] = float(
+                fr.get("logit_lift", 0.0)
+            )
+        logger.info(
+            "Loaded catcher framing for %d catchers", len(catcher_framing_lookup)
+        )
+    except (FileNotFoundError, KeyError):
+        logger.info("No catcher framing data — skipping framing adjustments")
+
     # Fantasy scoring
     from src.models.game_sim.fantasy_scoring import compute_pitcher_fantasy
 
     # Build pitch type baselines for matchup scoring
-    baselines_pt = _build_baselines_pt(pitcher_arsenal)
+    from src.data.league_baselines import get_baselines_dict
+    baselines_pt = get_baselines_dict(grouping="pitch_type", recency_weights="marcel")
 
     # Latest bullpen rates per team
     bullpen_latest = (
@@ -191,6 +283,21 @@ def run(
 
     last_train = FROM_SEASON
 
+    # Platoon splits for platoon-aware lineup proneness
+    platoon_splits = pd.DataFrame()
+    pitcher_hand_lookup: dict[int, str] = {}
+    try:
+        from src.data.feature_eng import get_cached_season_totals_by_pitcher_hand
+        platoon_splits = get_cached_season_totals_by_pitcher_hand(last_train)
+        logger.info("Loaded platoon splits: %d batter-hand rows", len(platoon_splits))
+    except Exception as e:
+        logger.info("No platoon splits: %s", e)
+    if "pitch_hand" in pitcher_arsenal.columns:
+        hand_df = pitcher_arsenal[["pitcher_id", "pitch_hand"]].drop_duplicates()
+        for _, hr in hand_df.iterrows():
+            pitcher_hand_lookup[int(hr["pitcher_id"])] = str(hr["pitch_hand"])
+        logger.info("Built pitcher hand lookup: %d pitchers", len(pitcher_hand_lookup))
+
     # --- Run sims per game ---
     pitcher_picks = []
     batter_picks = []
@@ -200,7 +307,8 @@ def run(
 
         # --- Per-game context lifts ---
         hp_ump_name = game.get("hp_umpire_name", "")
-        ump_k_lift = ump_lookup.get(hp_ump_name, 0.0) if hp_ump_name else 0.0
+        ump_k_lift = ump_k_lookup.get(hp_ump_name, 0.0) if hp_ump_name else 0.0
+        ump_bb_lift = ump_bb_lookup.get(hp_ump_name, 0.0) if hp_ump_name else 0.0
 
         wx_k_lift = 0.0
         temp_bucket = _parse_temp_bucket(game.get("weather_temp"))
@@ -213,6 +321,12 @@ def run(
             wx_k_lift = float(
                 _logit(adj_k) - _logit(np.clip(overall_k, 1e-6, 1 - 1e-6))
             )
+
+        # Park factor lifts (K and HR only)
+        venue_id = game.get("venue_id")
+        park_lifts = park_lift_lookup.get(int(venue_id), {}) if pd.notna(venue_id) else {}
+        park_k_lift = park_lifts.get("k_lift", 0.0)
+        park_hr_lift = park_lifts.get("hr_lift", 0.0)
 
         # --- PITCHER SIMS (both starters) ---
         for side in ("home", "away"):
@@ -255,6 +369,30 @@ def run(
                 hitter_vuln, baselines_pt,
             )
 
+            # Platoon-adjusted lineup proneness (extra context lift)
+            platoon_k_lift = 0.0
+            platoon_bb_lift = 0.0
+            p_hand = pitcher_hand_lookup.get(pitcher_id)
+            if p_hand and not platoon_splits.empty:
+                from src.models.lineup_adjustments import compute_platoon_adjusted_proneness
+                # Build batter posteriors for this lineup
+                lu_k_post = {
+                    bid: hitter_k_npz[str(bid)]
+                    for bid in lineup_ids if str(bid) in hitter_k_npz
+                }
+                lu_bb_post = {
+                    bid: hitter_bb_npz[str(bid)]
+                    for bid in lineup_ids if str(bid) in hitter_bb_npz
+                }
+                platoon_k_lift = compute_platoon_adjusted_proneness(
+                    lineup_ids, lu_k_post, platoon_splits, p_hand,
+                    league_avg_rate=0.224, stat_name="k", weight=0.3,
+                )
+                platoon_bb_lift = compute_platoon_adjusted_proneness(
+                    lineup_ids, lu_bb_post, platoon_splits, p_hand,
+                    league_avg_rate=0.083, stat_name="bb", weight=0.3,
+                )
+
             # TTO lifts
             tto_lifts = build_all_tto_lifts(
                 tto_profiles, pitcher_id, last_train,
@@ -283,7 +421,21 @@ def run(
             )
             stamina_offset = compute_stamina_offset(avg_ip)
 
-            # Run pitcher sim (with umpire/weather context)
+            # Catcher framing lift (pitcher's own team's catcher)
+            catcher_k_lift = 0.0
+            pitcher_team_id = int(game.get(team_col, 0)) if pd.notna(game.get(team_col)) else 0
+            if catcher_framing_lookup and pitcher_team_id and not roster.empty:
+                id_col_r = "org_id" if "org_id" in roster.columns else "team_id"
+                _has_pos = "primary_position" in roster.columns
+                team_catchers = roster[
+                    (roster[id_col_r] == pitcher_team_id)
+                    & (roster["primary_position"] == "C" if _has_pos else False)
+                ]
+                if not team_catchers.empty:
+                    catcher_id = int(team_catchers.iloc[0].get("player_id", 0))
+                    catcher_k_lift = catcher_framing_lookup.get(catcher_id, 0.0)
+
+            # Run pitcher sim (with umpire/weather/catcher context)
             try:
                 sim = simulate_game(
                     pitcher_k_rate_samples=k_samples,
@@ -296,7 +448,8 @@ def run(
                     exit_model=exit_model,
                     pitcher_avg_pitches=avg_pitches,
                     exit_calibration_offset=stamina_offset,
-                    umpire_k_lift=ump_k_lift,
+                    umpire_k_lift=ump_k_lift + catcher_k_lift + platoon_k_lift,
+                    umpire_bb_lift=ump_bb_lift + platoon_bb_lift,
                     weather_k_lift=wx_k_lift,
                     n_sims=n_sims,
                     random_seed=42 + game_pk % 10000,
@@ -334,6 +487,7 @@ def run(
                 "opponent": opp_abbr,
                 "side": side,
                 "umpire_k_lift": round(ump_k_lift, 4),
+                "umpire_bb_lift": round(ump_bb_lift, 4),
                 "weather_k_lift": round(wx_k_lift, 4),
                 "dk_mean": round(dk["mean"], 1),
                 "dk_median": round(dk["median"], 1),
@@ -377,7 +531,7 @@ def run(
                     **p_over_cols,
                 })
 
-        # --- BATTER SIMS (both teams' lineups) ---
+        # --- BATTER SIMS (both teams' lineups via lineup simulator) ---
         for side in ("home", "away"):
             team_col = f"{side}_team_id"
             team_abbr_col = f"{side}_abbr"
@@ -426,79 +580,153 @@ def run(
             team_abbr = game.get(team_abbr_col, "")
             opp_abbr = game.get(opp_abbr_col, "")
 
-            for order_idx, batter_id in enumerate(lineup_ids):
+            # --- Gather posteriors for all 9 lineup slots ---
+            lineup_k_samples: list[np.ndarray] = []
+            lineup_bb_samples: list[np.ndarray] = []
+            lineup_hr_samples: list[np.ndarray] = []
+            valid_slots: dict[int, tuple[int, int]] = {}
+            _FALLBACK_N = 500
+
+            for order_idx, batter_id in enumerate(lineup_ids[:9]):
                 bid_str = str(batter_id)
-                if bid_str not in hitter_k_npz:
-                    continue
+                bk = hitter_k_npz.get(bid_str)
+                bbb = hitter_bb_npz.get(bid_str)
+                bhr = hitter_hr_npz.get(bid_str)
+                if bk is not None and bbb is not None and bhr is not None:
+                    lineup_k_samples.append(bk)
+                    lineup_bb_samples.append(bbb)
+                    lineup_hr_samples.append(bhr)
+                    valid_slots[order_idx] = (batter_id, order_idx + 1)
+                else:
+                    # League-average fallback for missing batters
+                    lineup_k_samples.append(np.full(_FALLBACK_N, 0.226))
+                    lineup_bb_samples.append(np.full(_FALLBACK_N, 0.082))
+                    lineup_hr_samples.append(np.full(_FALLBACK_N, 0.031))
 
-                batter_k = hitter_k_npz[bid_str]
-                batter_bb = hitter_bb_npz.get(bid_str)
-                batter_hr = hitter_hr_npz.get(bid_str)
-                if batter_bb is None or batter_hr is None:
-                    continue
+            # Pad to 9 if lineup is short
+            while len(lineup_k_samples) < 9:
+                lineup_k_samples.append(np.full(_FALLBACK_N, 0.226))
+                lineup_bb_samples.append(np.full(_FALLBACK_N, 0.082))
+                lineup_hr_samples.append(np.full(_FALLBACK_N, 0.031))
 
-                batting_order = order_idx + 1
+            if not valid_slots:
+                continue
 
-                # Matchup lifts vs starter
-                matchup_k, matchup_bb, matchup_hr = 0.0, 0.0, 0.0
+            # Matchup lifts for full lineup vs opposing starter
+            padded_ids = (lineup_ids[:9] + [0] * 9)[:9]
+            batter_matchup_lifts = _compute_lineup_matchup_lifts(
+                opp_pitcher_id, padded_ids,
+                pitcher_arsenal, hitter_vuln, baselines_pt,
+            )
+
+            # Build per-batter BABIP adjustments (LD% + sprint speed, additive)
+            padded_bids = (lineup_ids[:9] + [0] * 9)[:9]
+            lineup_babip_adjs = np.array([
+                ld_babip_lookup.get(bid, 0.0) + speed_babip_lookup.get(bid, 0.0)
+                for bid in padded_bids
+            ])
+
+            # Run lineup simulation (single call for all 9 batters)
+            try:
+                lineup_sim = simulate_lineup_game(
+                    batter_k_rate_samples=lineup_k_samples,
+                    batter_bb_rate_samples=lineup_bb_samples,
+                    batter_hr_rate_samples=lineup_hr_samples,
+                    starter_k_rate=starter_k,
+                    starter_bb_rate=starter_bb,
+                    starter_hr_rate=starter_hr,
+                    starter_bf_mu=bf_mu,
+                    starter_bf_sigma=bf_sigma,
+                    matchup_k_lifts=batter_matchup_lifts["k"],
+                    matchup_bb_lifts=batter_matchup_lifts["bb"],
+                    matchup_hr_lifts=batter_matchup_lifts["hr"],
+                    bullpen_k_rate=bp_k,
+                    bullpen_bb_rate=bp_bb,
+                    bullpen_hr_rate=bp_hr,
+                    batter_babip_adjs=lineup_babip_adjs,
+                    umpire_k_lift=ump_k_lift,
+                    umpire_bb_lift=ump_bb_lift,
+                    park_k_lift=park_k_lift,
+                    park_hr_lift=park_hr_lift,
+                    weather_k_lift=wx_k_lift,
+                    n_sims=n_sims,
+                    random_seed=42 + game_pk % 10000,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Lineup sim failed: game %d %s: %s",
+                    game_pk, side, e,
+                )
+                continue
+
+            # Extract per-batter results for valid slots
+            game_dt = game.get("game_date", game_date)
+            for slot_idx, (batter_id, batting_order) in valid_slots.items():
+                lineup_summary = lineup_sim.batter_summary(slot_idx)
+                batter_name = _lookup_name(roster, batter_id)
+
+                # Per-batter sim for TB (uses calibrated PA model,
+                # avoids the lineup sim's PA inflation that biases TB)
+                bid_str = str(batter_id)
                 try:
-                    for stat in ("k", "bb", "hr"):
-                        res = score_matchup_for_stat(
-                            stat, opp_pitcher_id, batter_id,
-                            pitcher_arsenal, hitter_vuln, baselines_pt,
-                        )
-                        val = res.get(f"matchup_{stat}_logit_lift", 0.0)
-                        if isinstance(val, float) and not np.isnan(val):
-                            if stat == "k":
-                                matchup_k = val
-                            elif stat == "bb":
-                                matchup_bb = val
-                            else:
-                                matchup_hr = val
-                except Exception:
-                    pass
-
-                # Run batter sim
-                try:
-                    bsim = simulate_batter_game(
-                        batter_k_rate_samples=batter_k,
-                        batter_bb_rate_samples=batter_bb,
-                        batter_hr_rate_samples=batter_hr,
+                    batter_sim = simulate_batter_game(
+                        batter_k_rate_samples=hitter_k_npz[bid_str],
+                        batter_bb_rate_samples=hitter_bb_npz[bid_str],
+                        batter_hr_rate_samples=hitter_hr_npz[bid_str],
                         batting_order=batting_order,
                         starter_k_rate=starter_k,
                         starter_bb_rate=starter_bb,
                         starter_hr_rate=starter_hr,
                         starter_bf_mu=bf_mu,
                         starter_bf_sigma=bf_sigma,
-                        matchup_k_lift=matchup_k,
-                        matchup_bb_lift=matchup_bb,
-                        matchup_hr_lift=matchup_hr,
+                        matchup_k_lift=float(
+                            batter_matchup_lifts["k"][slot_idx]
+                        ),
+                        matchup_bb_lift=float(
+                            batter_matchup_lifts["bb"][slot_idx]
+                        ),
+                        matchup_hr_lift=float(
+                            batter_matchup_lifts["hr"][slot_idx]
+                        ),
                         bullpen_k_rate=bp_k,
                         bullpen_bb_rate=bp_bb,
                         bullpen_hr_rate=bp_hr,
+                        batter_babip_adj=ld_babip_lookup.get(batter_id, 0.0),
+                        umpire_k_lift=ump_k_lift,
+                        umpire_bb_lift=ump_bb_lift,
+                        weather_k_lift=wx_k_lift,
                         n_sims=n_sims,
-                        random_seed=42 + game_pk % 10000 + batter_id % 1000,
+                        random_seed=(
+                            42 + game_pk % 10000 + batter_id % 1000
+                        ),
                     )
+                    batter_summary = batter_sim.summary()
                 except Exception:
-                    continue
+                    batter_summary = None
 
-                bsummary = bsim.summary()
-                batter_name = _lookup_name(roster, batter_id)
-                game_dt = game.get("game_date", game_date)
-
-                # Build props for each batter stat
                 for stat_key in BATTER_STATS:
-                    expected = bsummary[stat_key]["mean"]
-                    std = bsummary[stat_key]["std"]
-                    # HRR (combined stat): default to O 0.5 since
-                    # "1+ H+R+RBI" is the standard prop market line
-                    if stat_key == "hrr":
-                        default_line = 0.5
+                    # TB uses per-batter sim; all others use lineup sim
+                    if stat_key in BATTER_SIM_STATS:
+                        if batter_summary is None:
+                            continue
+                        expected = batter_summary[stat_key]["mean"]
+                        std = batter_summary[stat_key]["std"]
+                        all_lines = [x + 0.5 for x in range(16)]
+                        over_df = batter_sim.over_probs(
+                            stat_key, all_lines,
+                        )
                     else:
-                        default_line = max(np.floor(expected) + 0.5, 0.5)
-                    all_lines = [x + 0.5 for x in range(16)]
-                    over_df = bsim.over_probs(stat_key, all_lines)
-                    p_over_map = dict(zip(over_df["line"], over_df["p_over"]))
+                        expected = lineup_summary[stat_key]["mean"]
+                        std = lineup_summary[stat_key]["std"]
+                        all_lines = [x + 0.5 for x in range(16)]
+                        over_df = lineup_sim.batter_over_probs(
+                            slot_idx, stat_key, all_lines,
+                        )
+
+                    default_line = max(np.floor(expected) + 0.5, 0.5)
+                    p_over_map = dict(
+                        zip(over_df["line"], over_df["p_over"])
+                    )
 
                     # Store P(over) at standard lines 0.5-10.5
                     p_over_cols = {}
@@ -520,7 +748,9 @@ def run(
                         "expected": round(expected, 2),
                         "std": round(std, 2),
                         "line": default_line,
-                        "p_over": round(p_over_map.get(default_line, 0), 3),
+                        "p_over": round(
+                            p_over_map.get(default_line, 0), 3
+                        ),
                         **p_over_cols,
                     })
 
@@ -538,7 +768,98 @@ def run(
         all_props["p_over"] = all_props["p_over"].fillna(all_props["p_over_mid"])
 
     # --- Fetch and save book props (DK + Prize Picks) ---
-    _fetch_book_props(all_props)
+    dk_resolved, pp_resolved = _fetch_book_props(all_props, game_date=game_date)
+
+    # --- Merge vegas_line + odds into all_props ---
+    # DK is primary source; PP standard lines fill gaps (e.g. HRR).
+    if len(all_props) > 0:
+        # DK: one line per (player_id, stat) — line + odds + implied
+        if not dk_resolved.empty and "player_id" in dk_resolved.columns:
+            dk_cols = ["player_id", "stat", "line"]
+            if "over_odds" in dk_resolved.columns:
+                dk_cols.append("over_odds")
+            if "over_implied" in dk_resolved.columns:
+                dk_cols.append("over_implied")
+            dk_lines = (
+                dk_resolved[dk_cols]
+                .drop_duplicates(subset=["player_id", "stat"], keep="first")
+                .rename(columns={
+                    "line": "vegas_line",
+                    "over_odds": "vegas_odds",
+                    "over_implied": "vegas_implied",
+                })
+            )
+            all_props = all_props.merge(
+                dk_lines, on=["player_id", "stat"], how="left",
+                suffixes=("", "_dk"),
+            )
+            for col in ("vegas_line", "vegas_odds", "vegas_implied"):
+                dk_col = f"{col}_dk"
+                if dk_col in all_props.columns:
+                    all_props[col] = all_props[col].fillna(all_props[dk_col])
+                    all_props.drop(columns=[dk_col], inplace=True)
+
+        for col in ("vegas_line", "vegas_odds", "vegas_implied"):
+            if col not in all_props.columns:
+                all_props[col] = None
+
+        # PP standard lines fill remaining gaps (HRR, etc.)
+        if not pp_resolved.empty and "player_id" in pp_resolved.columns:
+            pp_std = pp_resolved[
+                pp_resolved["odds_type"] == "standard"
+            ] if "odds_type" in pp_resolved.columns else pp_resolved
+            if not pp_std.empty:
+                pp_lines = (
+                    pp_std[["player_id", "stat", "line"]]
+                    .drop_duplicates(subset=["player_id", "stat"], keep="first")
+                    .rename(columns={"line": "vegas_line_pp"})
+                )
+                all_props = all_props.merge(
+                    pp_lines, on=["player_id", "stat"], how="left",
+                )
+                all_props["vegas_line"] = all_props["vegas_line"].fillna(
+                    all_props["vegas_line_pp"]
+                )
+                all_props.drop(columns=["vegas_line_pp"], inplace=True)
+
+        # --- Compute model edge at book line ---
+        # model_edge = model P(over at vegas_line) - book implied P(over)
+        # Positive edge = model thinks over is more likely than the book does
+        all_props["model_p_over"] = np.nan
+        has_vl = all_props["vegas_line"].notna()
+        for idx in all_props.index[has_vl]:
+            vl = float(all_props.at[idx, "vegas_line"])
+            col = f"p_over_{round(vl * 2) / 2:.1f}"
+            if col in all_props.columns and pd.notna(all_props.at[idx, col]):
+                all_props.at[idx, "model_p_over"] = float(all_props.at[idx, col])
+            else:
+                # Fall back to legacy triplet
+                for lv_col, p_col in (
+                    ("line_low", "p_over_low"),
+                    ("line_mid", "p_over_mid"),
+                    ("line_high", "p_over_high"),
+                ):
+                    if (lv_col in all_props.columns and p_col in all_props.columns
+                            and pd.notna(all_props.at[idx, lv_col])
+                            and abs(float(all_props.at[idx, lv_col]) - vl) < 0.01
+                            and pd.notna(all_props.at[idx, p_col])):
+                        all_props.at[idx, "model_p_over"] = float(all_props.at[idx, p_col])
+                        break
+
+        # model_edge: positive = over is underpriced by book
+        all_props["model_edge"] = np.nan
+        has_both = all_props["model_p_over"].notna() & all_props["vegas_implied"].notna()
+        all_props.loc[has_both, "model_edge"] = (
+            all_props.loc[has_both, "model_p_over"].astype(float)
+            - all_props.loc[has_both, "vegas_implied"].astype(float)
+        )
+
+        n_with_line = all_props["vegas_line"].notna().sum()
+        n_with_edge = all_props["model_edge"].notna().sum()
+        logger.info(
+            "Vegas merge: %d / %d with lines, %d with edge",
+            n_with_line, len(all_props), n_with_edge,
+        )
 
     # --- Merge with history: freeze started/finished, update pre-game ---
     # Props for games that have started or finished are never overwritten.
@@ -624,12 +945,21 @@ def run(
                 )
 
 
-def _fetch_book_props(all_props: pd.DataFrame) -> None:
-    """Fetch DraftKings and Prize Picks lines and save as separate parquets.
+def _fetch_book_props(
+    all_props: pd.DataFrame,
+    game_date: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fetch DraftKings and Prize Picks lines, save snapshots + history.
 
     Resolves book player names to MLB player IDs so downstream joins
     are by (player_id, stat) instead of fuzzy name matching.
+
+    Returns resolved (dk_df, pp_df) so the caller can merge vegas_line
+    into the main props DataFrame.
     """
+    from datetime import date as _date
+    if game_date is None:
+        game_date = _date.today().isoformat()
     # Build name lookup: MLB player_id -> name
     _name_lookup: dict[int, str] = {}
     try:
@@ -666,6 +996,8 @@ def _fetch_book_props(all_props: pd.DataFrame) -> None:
         return name_to_id.get(_match_name(book_name))
 
     # --- DraftKings ---
+    dk_resolved = pd.DataFrame()
+    pp_resolved = pd.DataFrame()
     try:
         _dk_path = DASHBOARD_DIR.parent.parent / "lib" / "draftkings.py"
         if _dk_path.exists():
@@ -681,10 +1013,23 @@ def _fetch_book_props(all_props: pd.DataFrame) -> None:
             dk_df["player_id"] = dk_df["player_name"].apply(_resolve_id)
             dk_df = dk_df[dk_df["player_id"].notna()].copy()
             dk_df["player_id"] = dk_df["player_id"].astype(int)
+            dk_df["game_date"] = game_date
             dk_df.to_parquet(DASHBOARD_DIR / "dk_props.parquet", index=False)
+            # Append to history
+            _dk_hist_path = DASHBOARD_DIR / "dk_props_history.parquet"
+            if _dk_hist_path.exists():
+                _dk_hist = pd.read_parquet(_dk_hist_path)
+                # Drop any existing rows for this date to avoid duplicates
+                _dk_hist = _dk_hist[_dk_hist["game_date"] != game_date]
+                dk_df = pd.concat([_dk_hist, dk_df], ignore_index=True)
+            dk_df.to_parquet(_dk_hist_path, index=False)
+            # Re-filter to today only for return value
+            dk_resolved = dk_df[dk_df["game_date"] == game_date].copy()
             logger.info(
-                "Saved %d DK props (%d resolved to MLB IDs)",
-                len(dk_df), dk_df["player_id"].notna().sum(),
+                "Saved %d DK props (%d resolved to MLB IDs), "
+                "history now %d rows",
+                len(dk_resolved), dk_resolved["player_id"].notna().sum(),
+                len(dk_df),
             )
         else:
             logger.info("No DK props available")
@@ -707,15 +1052,29 @@ def _fetch_book_props(all_props: pd.DataFrame) -> None:
             pp_df["player_id"] = pp_df["player_name"].apply(_resolve_id)
             pp_df = pp_df[pp_df["player_id"].notna()].copy()
             pp_df["player_id"] = pp_df["player_id"].astype(int)
+            pp_df["game_date"] = game_date
             pp_df.to_parquet(DASHBOARD_DIR / "pp_props.parquet", index=False)
+            # Append to history
+            _pp_hist_path = DASHBOARD_DIR / "pp_props_history.parquet"
+            if _pp_hist_path.exists():
+                _pp_hist = pd.read_parquet(_pp_hist_path)
+                _pp_hist = _pp_hist[_pp_hist["game_date"] != game_date]
+                pp_df = pd.concat([_pp_hist, pp_df], ignore_index=True)
+            pp_df.to_parquet(_pp_hist_path, index=False)
+            pp_resolved = pp_df[pp_df["game_date"] == game_date].copy()
             logger.info(
-                "Saved %d PP props (%d resolved to MLB IDs)",
-                len(pp_df), pp_df["player_id"].notna().sum(),
+                "Saved %d PP props (%d resolved to MLB IDs), "
+                "history now %d rows",
+                len(pp_resolved), pp_resolved["player_id"].notna().sum(),
+                len(pp_df),
             )
         else:
             logger.info("No Prize Picks props available")
     except Exception:
         logger.warning("Prize Picks props fetch failed", exc_info=True)
+
+    return (dk_resolved, pp_resolved)
+
 
 
 def _backfill_results(props_df: pd.DataFrame) -> None:
@@ -848,7 +1207,7 @@ def _save_empty(game_date: str) -> None:
         "player_type", "team", "opponent", "side", "stat",
         "expected", "std",
         "line", "p_over",
-        "umpire_k_lift", "weather_k_lift",
+        "umpire_k_lift", "umpire_bb_lift", "weather_k_lift",
         "dk_mean", "dk_median", "dk_q10", "dk_q90",
         "espn_mean", "espn_median",
         "expected_ip", "expected_pitches", "expected_bf",
@@ -856,21 +1215,6 @@ def _save_empty(game_date: str) -> None:
     ] + [f"p_over_{x + 0.5:.1f}" for x in range(11)]
     ).to_parquet(history_path, index=False)
 
-
-def _build_baselines_pt(
-    pitcher_arsenal: pd.DataFrame,
-) -> dict[str, dict[str, float]]:
-    """Build league baselines per pitch type."""
-    agg = pitcher_arsenal.groupby("pitch_type").agg(
-        total_whiffs=("whiffs", "sum"),
-        total_swings=("swings", "sum"),
-    ).reset_index()
-    agg["whiff_rate"] = agg["total_whiffs"] / agg["total_swings"].replace(0, np.nan)
-    return {
-        row["pitch_type"]: {"whiff_rate": float(row["whiff_rate"])}
-        for _, row in agg.iterrows()
-        if pd.notna(row["whiff_rate"])
-    }
 
 
 def _get_lineup(
@@ -930,6 +1274,7 @@ def _compute_lineup_matchup_lifts(
     pitcher_arsenal: pd.DataFrame,
     hitter_vuln: pd.DataFrame,
     baselines_pt: dict[str, dict[str, float]],
+    shrinkage: float = 0.5,
 ) -> dict[str, np.ndarray]:
     """Score matchups for lineup across K, BB, HR."""
     from src.models.matchup import score_matchup_for_stat
@@ -943,6 +1288,7 @@ def _compute_lineup_matchup_lifts(
                 result = score_matchup_for_stat(
                     stat, pitcher_id, batter_id,
                     pitcher_arsenal, hitter_vuln, baselines_pt,
+                    shrinkage=shrinkage,
                 )
                 val = result.get(f"matchup_{stat}_logit_lift", 0.0)
                 if isinstance(val, float) and not np.isnan(val):

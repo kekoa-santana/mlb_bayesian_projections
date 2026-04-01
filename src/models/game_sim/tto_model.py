@@ -15,10 +15,9 @@ import numpy as np
 import pandas as pd
 from scipy.special import logit
 
-logger = logging.getLogger(__name__)
+from src.utils.constants import CLIP_LO, CLIP_HI
 
-_CLIP_LO = 1e-6
-_CLIP_HI = 1 - 1e-6
+logger = logging.getLogger(__name__)
 
 # League-average TTO rates (computed from 2018-2025 fact_pa)
 # Used to derive logit lifts relative to overall rates.
@@ -44,8 +43,8 @@ _LEAGUE_TTO_RATES: dict[str, dict[str, np.ndarray]] = {
 # Pre-computed league-average logit lifts
 LEAGUE_TTO_LOGIT_LIFTS: dict[str, np.ndarray] = {}
 for _stat, _rates in _LEAGUE_TTO_RATES.items():
-    _overall_logit = logit(np.clip(_rates["overall"], _CLIP_LO, _CLIP_HI))
-    _tto_logits = logit(np.clip(_rates["tto"], _CLIP_LO, _CLIP_HI))
+    _overall_logit = logit(np.clip(_rates["overall"], CLIP_LO, CLIP_HI))
+    _tto_logits = logit(np.clip(_rates["tto"], CLIP_LO, CLIP_HI))
     LEAGUE_TTO_LOGIT_LIFTS[_stat] = _tto_logits - _overall_logit
 
 # BF per TTO block
@@ -108,11 +107,11 @@ def build_tto_logit_lifts(
     tto_rates = pitcher_data[rate_col].values.astype(float)
     overall_rate = pitcher_data[overall_col].values[0].astype(float)
 
-    if overall_rate < _CLIP_LO or overall_rate > _CLIP_HI:
+    if overall_rate < CLIP_LO or overall_rate > CLIP_HI:
         return league_lifts.copy()
 
-    overall_logit = logit(np.clip(overall_rate, _CLIP_LO, _CLIP_HI))
-    tto_logits = logit(np.clip(tto_rates, _CLIP_LO, _CLIP_HI))
+    overall_logit = logit(np.clip(overall_rate, CLIP_LO, CLIP_HI))
+    tto_logits = logit(np.clip(tto_rates, CLIP_LO, CLIP_HI))
     pitcher_lifts = tto_logits - overall_logit
 
     # Reliability-weight toward league average

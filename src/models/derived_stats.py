@@ -22,19 +22,24 @@ import logging
 
 import numpy as np
 
+from src.utils.constants import (
+    LEAGUE_BABIP_PITCHER,
+    LEAGUE_BABIP_BATTER,
+    LEAGUE_HBP_RATE,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # League-average constants (2018-2025 pooled)
 # ---------------------------------------------------------------------------
-LEAGUE_BABIP: float = 0.292
-LEAGUE_HBP_RATE: float = 0.011
+LEAGUE_BABIP: float = LEAGUE_BABIP_PITCHER
 LEAGUE_H_PER_BF: float = 0.220
 LEAGUE_OUTS_PER_BF: float = 0.703
 
 # Batter-side league averages
-BATTER_LEAGUE_BABIP: float = 0.300  # slightly higher perspective (includes sac bunts etc.)
-BATTER_LEAGUE_HBP_RATE: float = 0.011
+BATTER_LEAGUE_BABIP: float = LEAGUE_BABIP_BATTER
+BATTER_LEAGUE_HBP_RATE: float = LEAGUE_HBP_RATE
 
 
 def _shrink_babip(

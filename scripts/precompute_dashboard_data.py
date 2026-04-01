@@ -52,7 +52,7 @@ _SECTION_GROUPS: dict[str, list[str]] = {
     "team":        ["team_elo", "series_elo", "team_profiles", "league_sim", "team_power", "team_sim", "depth_chart", "roster"],
     "profiles":    ["arsenal", "vuln", "archetypes", "zones"],
     "rankings":    ["player_rankings", "breakouts"],
-    "game_data":   ["player_teams", "game_logs", "bf_priors", "umpire", "weather"],
+    "game_data":   ["player_teams", "game_logs", "bf_priors", "umpire", "weather", "catcher_framing"],
     "traditional": ["trad_stats", "agg_eff"],
     "glicko":      ["player_glicko"],
     "historical":  ["historical_all"],
@@ -165,8 +165,12 @@ def main() -> None:
     # 2a. Health scores + park factors
     # =================================================================
     health_df = pd.DataFrame()
+    park_factors_df: pd.DataFrame | None = None
+    hitter_venues_df: pd.DataFrame | None = None
     if should_run("health_parks"):
-        health_df = projections.run_health_parks(from_season=FROM_SEASON)
+        health_df, park_factors_df, hitter_venues_df = projections.run_health_parks(
+            from_season=FROM_SEASON,
+        )
 
     # =================================================================
     # 2b. Counting stat projections
@@ -176,6 +180,8 @@ def main() -> None:
             hitter_results=hitter_results,
             pitcher_results=pitcher_results,
             health_df=health_df,
+            park_factors=park_factors_df,
+            hitter_venues=hitter_venues_df,
             seasons=SEASONS,
             from_season=FROM_SEASON,
         )
@@ -183,8 +189,9 @@ def main() -> None:
     # =================================================================
     # 2c. Sim-based pitcher counting stats + reliever roles & rankings
     # =================================================================
+    pitcher_roles_df: pd.DataFrame | None = None
     if should_run("sim_pitcher"):
-        projections.run_sim_pitcher(
+        pitcher_roles_df = projections.run_sim_pitcher(
             pitcher_results=pitcher_results,
             health_df=health_df,
             seasons=SEASONS,
@@ -230,6 +237,12 @@ def main() -> None:
     # =================================================================
     if should_run("weather"):
         game_data.run_weather(seasons=SEASONS)
+
+    # =================================================================
+    # 4c-ii. Catcher framing effects
+    # =================================================================
+    if should_run("catcher_framing"):
+        game_data.run_catcher_framing(seasons=SEASONS)
 
     # =================================================================
     # 4d. Player team mapping
@@ -295,7 +308,11 @@ def main() -> None:
     # 6g-6h. MLB positional rankings
     # =================================================================
     if should_run("player_rankings"):
-        rankings.run_player_rankings(from_season=FROM_SEASON)
+        rankings.run_player_rankings(
+            health_df=health_df,
+            pitcher_roles_df=pitcher_roles_df,
+            from_season=FROM_SEASON,
+        )
 
     # =================================================================
     # 6i-6j. Breakout candidates
@@ -324,27 +341,31 @@ def main() -> None:
         team.run_team_profiles(
             elo_history=elo_history,
             elo_current=elo_current,
+            pitcher_roles_df=pitcher_roles_df,
             from_season=FROM_SEASON,
         )
 
     # =================================================================
     # 6m. League season simulator (zero-sum Bernoulli on actual schedule)
-    #     Must run BEFORE power rankings so league_sim.parquet exists.
+    #     Must run BEFORE power rankings so league_sim results are available.
     # =================================================================
+    league_sim_df: pd.DataFrame | None = None
     if should_run("league_sim"):
-        team.run_league_sim(n_sims=1000)
+        league_sim_df = team.run_league_sim(n_sims=1000)
 
     # =================================================================
-    # 6n. Power rankings (uses league sim wins as primary input)
+    # 6n. Team season simulator (injury cascading, per-team MC)
+    #     Must run BEFORE power rankings so team_sim results are available.
+    # =================================================================
+    team_sim_df: pd.DataFrame | None = None
+    if should_run("team_sim"):
+        team_sim_df = team.run_team_sim(health_df=health_df, n_sims=1000)
+
+    # =================================================================
+    # 6o. Power rankings (uses league sim + team sim wins)
     # =================================================================
     if should_run("team_power"):
-        team.run_team_power()
-
-    # =================================================================
-    # 6o. Team season simulator (injury cascading, per-team MC)
-    # =================================================================
-    if should_run("team_sim"):
-        team.run_team_sim(n_sims=1000)
+        team.run_team_power(league_sim_df=league_sim_df, team_sim_df=team_sim_df)
 
     # =================================================================
     # 7. Preseason snapshot

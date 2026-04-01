@@ -86,6 +86,18 @@ def load_preseason_rate_samples(stat_name: str) -> dict[str, np.ndarray]:
     return {k: data[k] for k in data.files}
 
 
+def load_hitter_preseason_samples(stat_name: str) -> dict[str, np.ndarray]:
+    """Load frozen preseason hitter rate samples (k, bb, or hr)."""
+    npz_name = f"hitter_{stat_name}_samples"
+    path = SNAPSHOT_DIR / f"{npz_name}_preseason.npz"
+    if not path.exists():
+        path = DASHBOARD_DIR / f"{npz_name}.npz"
+    if not path.exists():
+        return {}
+    data = np.load(path)
+    return {k: data[k] for k in data.files}
+
+
 def get_observed_hitter_totals() -> pd.DataFrame:
     """Query 2026 hitter season totals from the database."""
     from src.data.db import read_sql
@@ -204,8 +216,8 @@ def update_rate_samples_step(
     successes_col: str,
     league_avg: float,
 ) -> dict[str, np.ndarray]:
-    """Conjugate-update BB% or HR/BF samples (same Beta-Binomial logic as K)."""
-    from src.models.in_season_updater import update_pitcher_k_samples
+    """Conjugate-update pitcher BB% or HR/BF samples."""
+    from src.models.in_season_updater import update_rate_samples
 
     preseason = load_preseason_rate_samples(stat_name)
     if not preseason:
@@ -217,17 +229,46 @@ def update_rate_samples_step(
         logger.info("No 2026 pitcher data — using preseason %s samples", stat_name)
         return preseason
 
-    # Remap columns to match update_pitcher_k_samples expectations
-    obs_remapped = p_obs.rename(columns={
-        trials_col: "batters_faced",
-        successes_col: "strike_outs",
-    })
-
-    updated = update_pitcher_k_samples(
-        preseason, obs_remapped,
-        min_bf=10, n_samples=8000,
+    updated = update_rate_samples(
+        preseason, p_obs,
+        player_id_col="pitcher_id",
+        trials_col=trials_col,
+        successes_col=successes_col,
+        league_avg=league_avg,
+        min_trials=10, n_samples=8000,
     )
     logger.info("Updated %s samples: %d pitchers", stat_name, len(updated))
+    return updated
+
+
+def update_hitter_rate_samples_step(
+    stat_name: str,
+    trials_col: str,
+    successes_col: str,
+    league_avg: float,
+) -> dict[str, np.ndarray]:
+    """Conjugate-update hitter K%, BB%, or HR rate samples."""
+    from src.models.in_season_updater import update_rate_samples
+
+    preseason = load_hitter_preseason_samples(stat_name)
+    if not preseason:
+        logger.warning("No preseason hitter %s samples — skipping", stat_name)
+        return {}
+
+    h_obs = get_observed_hitter_totals()
+    if h_obs.empty:
+        logger.info("No 2026 hitter data — using preseason %s samples", stat_name)
+        return preseason
+
+    updated = update_rate_samples(
+        preseason, h_obs,
+        player_id_col="batter_id",
+        trials_col=trials_col,
+        successes_col=successes_col,
+        league_avg=league_avg,
+        min_trials=10, n_samples=8000,
+    )
+    logger.info("Updated hitter %s samples: %d batters", stat_name, len(updated))
     return updated
 
 
@@ -260,7 +301,7 @@ def simulate_todays_games(
     from src.models.bf_model import get_bf_distribution
     from src.models.game_k_model import compute_k_over_probs, simulate_game_ks
     from src.models.matchup import score_matchup
-    from src.utils.constants import LEAGUE_AVG_BY_PITCH_TYPE
+    from src.data.league_baselines import get_baselines_dict
 
     # Load matchup data
     arsenal_path = DASHBOARD_DIR / "pitcher_arsenal.parquet"
@@ -268,10 +309,7 @@ def simulate_todays_games(
     arsenal_df = pd.read_parquet(arsenal_path) if arsenal_path.exists() else pd.DataFrame()
     vuln_df = pd.read_parquet(vuln_path) if vuln_path.exists() else pd.DataFrame()
 
-    baselines_pt = {
-        pt: {"whiff_rate": vals.get("whiff_rate", 0.25)}
-        for pt, vals in LEAGUE_AVG_BY_PITCH_TYPE.items()
-    }
+    baselines_pt = get_baselines_dict(grouping="pitch_type", recency_weights="marcel")
 
     results = []
     for _, game in schedule.iterrows():
@@ -422,6 +460,32 @@ def main() -> None:
         np.savez_compressed(DASHBOARD_DIR / "pitcher_hr_samples.npz", **hr_samples)
         logger.info("Saved updated HR/BF samples for %d pitchers", len(hr_samples))
 
+    # Step 2c: Update hitter K%, BB%, HR samples
+    logger.info("Step 2c: Updating hitter K%%, BB%%, HR samples...")
+    h_k_samples = update_hitter_rate_samples_step(
+        "k", trials_col="pa", successes_col="strikeouts",
+        league_avg=0.226,
+    )
+    if h_k_samples:
+        np.savez_compressed(DASHBOARD_DIR / "hitter_k_samples.npz", **h_k_samples)
+        logger.info("Saved updated hitter K%% samples for %d batters", len(h_k_samples))
+
+    h_bb_samples = update_hitter_rate_samples_step(
+        "bb", trials_col="pa", successes_col="walks",
+        league_avg=0.082,
+    )
+    if h_bb_samples:
+        np.savez_compressed(DASHBOARD_DIR / "hitter_bb_samples.npz", **h_bb_samples)
+        logger.info("Saved updated hitter BB%% samples for %d batters", len(h_bb_samples))
+
+    h_hr_samples = update_hitter_rate_samples_step(
+        "hr", trials_col="pa", successes_col="hr",
+        league_avg=0.031,
+    )
+    if h_hr_samples:
+        np.savez_compressed(DASHBOARD_DIR / "hitter_hr_samples.npz", **h_hr_samples)
+        logger.info("Saved updated hitter HR samples for %d batters", len(h_hr_samples))
+
     # Step 3: Update team assignments
     logger.info("Step 3: Updating team assignments...")
     try:
@@ -466,9 +530,12 @@ def main() -> None:
         "season": SEASON,
         "hitters_updated": len(h_updated) if not h_updated.empty else 0,
         "pitchers_updated": len(p_updated) if not p_updated.empty else 0,
-        "k_samples_count": len(k_samples),
-        "bb_samples_count": len(bb_samples),
-        "hr_samples_count": len(hr_samples),
+        "pitcher_k_samples_count": len(k_samples),
+        "pitcher_bb_samples_count": len(bb_samples),
+        "pitcher_hr_samples_count": len(hr_samples),
+        "hitter_k_samples_count": len(h_k_samples),
+        "hitter_bb_samples_count": len(h_bb_samples),
+        "hitter_hr_samples_count": len(h_hr_samples),
     }
     meta_path = DASHBOARD_DIR / "update_metadata.json"
     with open(meta_path, "w") as f:

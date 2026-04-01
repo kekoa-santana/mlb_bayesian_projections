@@ -703,29 +703,6 @@ def get_pitcher_archetypes(
         n_clusters=n_clusters, force_rebuild=force_rebuild,
     )
 
-
-def get_hitter_cluster_metadata(
-    n_clusters: int = 6,
-    force_rebuild: bool = False,
-) -> pd.DataFrame:
-    """Return hitter cluster center metadata."""
-    artifacts = fit_player_archetypes(
-        "hitter", n_clusters=n_clusters, force_rebuild=force_rebuild,
-    )
-    return artifacts["clusters"]
-
-
-def get_pitcher_cluster_metadata(
-    n_clusters: int = 6,
-    force_rebuild: bool = False,
-) -> pd.DataFrame:
-    """Return pitcher cluster center metadata."""
-    artifacts = fit_player_archetypes(
-        "pitcher", n_clusters=n_clusters, force_rebuild=force_rebuild,
-    )
-    return artifacts["clusters"]
-
-
 # ===========================================================================
 # Dashboard export — simplified parquets for tdd-dashboard consumption
 # ===========================================================================
@@ -831,45 +808,3 @@ def export_for_dashboard(
     logger.info("Wrote %s (%d rows)", path, len(p_meta))
 
     return written
-
-
-# ===========================================================================
-# Diagnostic — not called in pipeline
-# ===========================================================================
-
-def evaluate_cluster_counts(
-    player_type: str,
-    seasons: list[int] | None = None,
-    k_range: range = range(3, 10),
-    random_state: int = 42,
-) -> pd.DataFrame:
-    """Evaluate a range of k values for elbow/silhouette analysis.
-
-    Returns a DataFrame with ``k``, ``inertia``, ``silhouette_score``.
-    Does NOT modify cached models.
-    """
-    if seasons is None:
-        seasons = _get_clustering_seasons()
-
-    if player_type == "hitter":
-        features = list(HITTER_FEATURES)
-        data = _build_hitter_feature_matrix(seasons)
-        weight_col = "pa"
-    else:
-        features = list(PITCHER_FEATURES)
-        data = _build_pitcher_feature_matrix(seasons)
-        weight_col = "batters_faced"
-
-    scaler = StandardScaler()
-    X = scaler.fit_transform(data[features])
-    weights = data[weight_col].to_numpy(dtype=float)
-
-    results = []
-    for k in k_range:
-        km = KMeans(n_clusters=k, random_state=random_state, n_init="auto")
-        km.fit(X, sample_weight=weights)
-        sil = silhouette_score(X, km.labels_)
-        results.append({"k": k, "inertia": km.inertia_, "silhouette_score": sil})
-        logger.info("k=%d  inertia=%.1f  silhouette=%.4f", k, km.inertia_, sil)
-
-    return pd.DataFrame(results)

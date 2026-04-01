@@ -1346,22 +1346,3 @@ def rank_pitching_prospects(
         (result["tdd_tier"] == "Solid").sum(),
     )
     return result
-
-
-def rank_all_prospects(
-    projection_season: int = 2026,
-) -> dict[str, pd.DataFrame]:
-    """Run both batter and pitcher prospect rankings.
-
-    Returns
-    -------
-    dict[str, pd.DataFrame]
-        Keys: 'batters', 'pitchers'.
-    """
-    batters = rank_prospects(projection_season=projection_season)
-    pitchers = rank_pitching_prospects(projection_season=projection_season)
-    logger.info(
-        "All prospect rankings: %d batters, %d pitchers",
-        len(batters), len(pitchers),
-    )
-    return {"batters": batters, "pitchers": pitchers}

@@ -13,6 +13,8 @@ import logging
 import numpy as np
 import pandas as pd
 
+from src.utils.constants import LEAGUE_BABIP_BATTER
+
 logger = logging.getLogger(__name__)
 
 # League-average BIP outcome splits (2022-2025)
@@ -27,7 +29,7 @@ _DEFAULT_BIP_PROBS = {
 }
 
 # Population BABIP for shrinkage
-POP_BABIP = 0.300
+POP_BABIP = LEAGUE_BABIP_BATTER
 
 # Shrinkage constant
 _SHRINKAGE_K = 500  # BIP needed for full weight on pitcher-specific BABIP
@@ -177,16 +179,6 @@ class BIPOutcomeModel:
         self._base_prob_array = np.array(
             [self.base_probs[k] for k in self._outcome_names]
         )
-
-    def get_league_probs(self) -> np.ndarray:
-        """Get league-average BIP outcome probabilities.
-
-        Returns
-        -------
-        np.ndarray
-            Shape (4,) probabilities for [out, single, double, triple].
-        """
-        return self._base_prob_array.copy()
 
     def compute_pitcher_babip_adj(
         self,

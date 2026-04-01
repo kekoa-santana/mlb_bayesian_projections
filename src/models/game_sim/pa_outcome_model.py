@@ -26,11 +26,9 @@ from src.models.game_sim.bip_model import (
     BIP_TRIPLE,
     BIPOutcomeModel,
 )
+from src.utils.constants import CLIP_LO, CLIP_HI, LEAGUE_HBP_RATE
 
 logger = logging.getLogger(__name__)
-
-_CLIP_LO = 1e-6
-_CLIP_HI = 1 - 1e-6
 
 # PA outcome codes
 PA_STRIKEOUT = 0
@@ -41,9 +39,6 @@ PA_DOUBLE = 4
 PA_TRIPLE = 5
 PA_HOME_RUN = 6
 PA_OUT = 7
-
-# League average HBP rate (near-constant, not worth modeling individually)
-LEAGUE_HBP_RATE = 0.011
 
 # Sim calibration offsets (logit scale).
 # After exit model calibration fix (-0.35 logit offset), residual biases are:
@@ -105,7 +100,7 @@ class PAOutcomeModel:
     @staticmethod
     def _safe_logit(p: np.ndarray | float) -> np.ndarray | float:
         """Logit with clipping."""
-        return logit(np.clip(p, _CLIP_LO, _CLIP_HI))
+        return logit(np.clip(p, CLIP_LO, CLIP_HI))
 
     def compute_pa_probs(
         self,
@@ -123,6 +118,8 @@ class PAOutcomeModel:
         fatigue_hr_lift: float = 0.0,
         umpire_k_lift: float = 0.0,
         umpire_bb_lift: float = 0.0,
+        park_k_lift: float = 0.0,
+        park_bb_lift: float = 0.0,
         park_hr_lift: float = 0.0,
         weather_k_lift: float = 0.0,
     ) -> dict[str, float | np.ndarray]:
@@ -148,8 +145,8 @@ class PAOutcomeModel:
             Pitch count fatigue logit lifts.
         umpire_*_lift : float
             Umpire tendency logit lifts.
-        park_hr_lift : float
-            Park factor HR logit lift.
+        park_k_lift, park_bb_lift, park_hr_lift : float
+            Park factor logit lifts for K, BB, and HR.
         weather_k_lift : float
             Weather K logit lift.
 
@@ -162,7 +159,7 @@ class PAOutcomeModel:
         k_logit = (
             self._safe_logit(pitcher_k_rate)
             + matchup_k_lift + tto_k_lift + fatigue_k_lift
-            + umpire_k_lift + weather_k_lift
+            + umpire_k_lift + park_k_lift + weather_k_lift
             + _CALIBRATION_K_OFFSET
         )
         k_prob = expit(k_logit)
@@ -171,7 +168,7 @@ class PAOutcomeModel:
         bb_logit = (
             self._safe_logit(pitcher_bb_rate)
             + matchup_bb_lift + tto_bb_lift + fatigue_bb_lift
-            + umpire_bb_lift
+            + umpire_bb_lift + park_bb_lift
             + _CALIBRATION_BB_OFFSET
         )
         bb_prob = expit(bb_logit)
@@ -290,19 +287,3 @@ class PAOutcomeModel:
                 )
 
         return outcomes
-
-
-# Helper: classify outcome for game state updates
-def outcome_is_on_base(outcome: int) -> bool:
-    """Check if outcome puts the batter on base."""
-    return outcome in (PA_WALK, PA_HBP, PA_SINGLE, PA_DOUBLE, PA_TRIPLE)
-
-
-def outcome_is_hit(outcome: int) -> bool:
-    """Check if outcome is a hit (single, double, triple, or HR)."""
-    return outcome in (PA_SINGLE, PA_DOUBLE, PA_TRIPLE, PA_HOME_RUN)
-
-
-def outcome_is_out(outcome: int) -> bool:
-    """Check if outcome records an out."""
-    return outcome in (PA_STRIKEOUT, PA_OUT)

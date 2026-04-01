@@ -25,6 +25,7 @@ from src.data.feature_eng import (
     build_multi_season_pitcher_data,
     get_cached_pitcher_observed_profile,
 )
+from src.utils.constants import LEAGUE_BABIP_PITCHER
 from src.models.pitcher_model import (
     PITCHER_STAT_CONFIGS,
     check_convergence,
@@ -279,7 +280,7 @@ def _derive_fip_era(
         outs_s = derive_pitcher_outs_rate(
             k_s, bb_s, hr_s,
             observed_babip=None, bip=0,
-            league_babip=babip_prior if babip_prior is not None else 0.292,
+            league_babip=babip_prior if babip_prior is not None else LEAGUE_BABIP_PITCHER,
             rng=rng,
         )
 

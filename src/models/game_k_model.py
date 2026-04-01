@@ -24,12 +24,9 @@ from src.models.rest_adjustment import (
     compute_rest_for_game,
     get_rest_adjustment,
 )
+from src.utils.constants import CLIP_LO, CLIP_HI
 
 logger = logging.getLogger(__name__)
-
-# Clip bounds for logit transform (avoid infinities)
-_CLIP_LO = 1e-6
-_CLIP_HI = 1 - 1e-6
 
 # ---------------------------------------------------------------------------
 # League-average TTO logit lifts (relative to overall rate).
@@ -63,7 +60,7 @@ _BF_PER_TTO = 9
 
 def _safe_logit(p: np.ndarray) -> np.ndarray:
     """Logit with clipping."""
-    return logit(np.clip(p, _CLIP_LO, _CLIP_HI))
+    return logit(np.clip(p, CLIP_LO, CLIP_HI))
 
 
 def build_tto_logit_lifts(
@@ -120,11 +117,11 @@ def build_tto_logit_lifts(
     overall_rate = pitcher_data[overall_col].values[0].astype(float)
 
     # Avoid degenerate rates
-    if overall_rate < _CLIP_LO or overall_rate > _CLIP_HI:
+    if overall_rate < CLIP_LO or overall_rate > CLIP_HI:
         return league_lifts.copy()
 
-    overall_logit = logit(np.clip(overall_rate, _CLIP_LO, _CLIP_HI))
-    tto_logits = logit(np.clip(tto_rates, _CLIP_LO, _CLIP_HI))
+    overall_logit = logit(np.clip(overall_rate, CLIP_LO, CLIP_HI))
+    tto_logits = logit(np.clip(tto_rates, CLIP_LO, CLIP_HI))
     pitcher_lifts = tto_logits - overall_logit
 
     # Reliability-weight toward league average based on PA
@@ -133,26 +130,6 @@ def build_tto_logit_lifts(
     blended = reliability * pitcher_lifts + (1.0 - reliability) * league_lifts
 
     return blended
-
-
-def _assign_bf_to_tto(bf: int) -> np.ndarray:
-    """Assign each BF to a TTO block (0-indexed: 0=TTO1, 1=TTO2, 2=TTO3).
-
-    Parameters
-    ----------
-    bf : int
-        Total batters faced in the game.
-
-    Returns
-    -------
-    np.ndarray
-        Shape (bf,) with values 0, 1, or 2 indicating TTO block.
-    """
-    tto_assignments = np.zeros(bf, dtype=int)
-    for i in range(bf):
-        tto_assignments[i] = min(i // _BF_PER_TTO, 2)
-    return tto_assignments
-
 
 def simulate_game_ks(
     pitcher_k_rate_samples: np.ndarray,

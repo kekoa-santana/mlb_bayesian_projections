@@ -305,35 +305,6 @@ def _build_weather_lift_lookup_multi(
     return {"k": result_k, "hr": result_hr}
 
 
-def _build_baselines_pt(
-    pitcher_arsenal: pd.DataFrame,
-) -> dict[str, dict[str, float]]:
-    """Build league-average baselines per pitch type from arsenal data.
-
-    Parameters
-    ----------
-    pitcher_arsenal : pd.DataFrame
-        Full pitcher arsenal profiles for a season.
-
-    Returns
-    -------
-    dict[str, dict[str, float]]
-        {pitch_type: {"whiff_rate": float}}.
-    """
-    agg = pitcher_arsenal.groupby("pitch_type").agg(
-        total_whiffs=("whiffs", "sum"),
-        total_swings=("swings", "sum"),
-    ).reset_index()
-    agg["whiff_rate"] = agg["total_whiffs"] / agg["total_swings"].replace(0, np.nan)
-
-    baselines: dict[str, dict[str, float]] = {}
-    for _, row in agg.iterrows():
-        pt = row["pitch_type"]
-        wr = row["whiff_rate"]
-        if pd.notna(wr):
-            baselines[pt] = {"whiff_rate": float(wr)}
-    return baselines
-
 
 def build_game_k_predictions(
     train_seasons: list[int],
@@ -432,7 +403,8 @@ def build_game_k_predictions(
     # prediction time.
     pitcher_arsenal = get_pitcher_arsenal(last_train)
     hitter_vuln = get_hitter_vulnerability(last_train)
-    baselines_pt = _build_baselines_pt(pitcher_arsenal)
+    from src.data.league_baselines import get_baselines_dict
+    baselines_pt = get_baselines_dict(seasons=train_seasons, recency_weights="equal")
     # Lineup identity from test season is OK (lineups are public pre-game)
     game_batter_ks = get_cached_game_batter_ks(test_season)
 
@@ -1190,7 +1162,8 @@ def run_full_game_backtest(
 
         pitcher_arsenal = get_pitcher_arsenal(last_train)
         hitter_vuln = get_hitter_vulnerability(last_train)
-        baselines_pt = _build_baselines_pt(pitcher_arsenal)
+        from src.data.league_baselines import get_baselines_dict
+        baselines_pt = get_baselines_dict(seasons=train_seasons, recency_weights="equal")
         game_batter_ks = get_cached_game_batter_ks(test_season)
         game_lineups = get_cached_game_lineups(test_season)
         umpire_lifts = _build_umpire_lift_lookup(train_seasons, test_season)

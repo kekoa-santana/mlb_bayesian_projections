@@ -153,24 +153,6 @@ def _build_weather_lifts(
     return {"k": result_k, "hr": result_hr}
 
 
-def _build_baselines_pt(
-    pitcher_arsenal: pd.DataFrame,
-) -> dict[str, dict[str, float]]:
-    """Build league baselines per pitch type."""
-    agg = pitcher_arsenal.groupby("pitch_type").agg(
-        total_whiffs=("whiffs", "sum"),
-        total_swings=("swings", "sum"),
-    ).reset_index()
-    agg["whiff_rate"] = agg["total_whiffs"] / agg["total_swings"].replace(0, np.nan)
-
-    baselines: dict[str, dict[str, float]] = {}
-    for _, row in agg.iterrows():
-        pt = row["pitch_type"]
-        wr = row["whiff_rate"]
-        if pd.notna(wr):
-            baselines[pt] = {"whiff_rate": float(wr)}
-    return baselines
-
 
 def _compute_lineup_matchup_lifts(
     pitcher_id: int,
@@ -375,7 +357,8 @@ def build_game_sim_predictions(
 
     pitcher_arsenal = get_pitcher_arsenal(last_train)
     hitter_vuln = get_hitter_vulnerability(last_train)
-    baselines_pt = _build_baselines_pt(pitcher_arsenal)
+    from src.data.league_baselines import get_baselines_dict
+    baselines_pt = get_baselines_dict(seasons=train_seasons, recency_weights="equal")
 
     umpire_lifts = _build_umpire_lifts(train_seasons, test_season)
     weather_lifts = _build_weather_lifts(train_seasons, test_season)
