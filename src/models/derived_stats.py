@@ -204,6 +204,46 @@ def derive_pitcher_outs_rate(
     return np.clip(outs_rate, 0.0, 1.0)
 
 
+def derive_batter_hr_rate(
+    hr_per_fb_posterior: np.ndarray,
+    fb_rate_posterior: np.ndarray,
+    k_rate_posterior: np.ndarray,
+    bb_rate_posterior: np.ndarray,
+    hbp_rate: float = BATTER_LEAGUE_HBP_RATE,
+) -> np.ndarray:
+    """Derive batter HR/PA from HR/FB x FB% x BIP% component posteriors.
+
+    Identity: HR/PA = (HR/FB) x (FB/BIP) x (BIP/PA)
+    where BIP/PA = 1 - K% - BB% - HBP%.
+
+    Small approximation: FB/BIP_with_LA ≈ FB/BIP (>95% coverage
+    in Statcast era, dwarfed by posterior uncertainty).
+
+    Parameters
+    ----------
+    hr_per_fb_posterior : np.ndarray
+        Posterior samples of HR/FB rate.
+    fb_rate_posterior : np.ndarray
+        Posterior samples of FB% (FB / BIP_with_LA).
+    k_rate_posterior : np.ndarray
+        Posterior samples of batter K%.
+    bb_rate_posterior : np.ndarray
+        Posterior samples of batter BB%.
+    hbp_rate : float
+        HBP rate (constant).
+
+    Returns
+    -------
+    np.ndarray
+        Posterior samples of HR/PA rate.
+    """
+    bip_rate = np.clip(
+        1.0 - k_rate_posterior - bb_rate_posterior - hbp_rate, 0.0, 1.0,
+    )
+    hr_rate = hr_per_fb_posterior * fb_rate_posterior * bip_rate
+    return np.clip(hr_rate, 0.0, 1.0)
+
+
 def derive_batter_h_rate(
     k_rate_posterior: np.ndarray,
     bb_rate_posterior: np.ndarray,
@@ -436,6 +476,61 @@ def derive_batter_rates_batch(
 
     logger.info(
         "Derived batter H/PA posteriors for %d/%d batters",
+        len(results), len(common_ids),
+    )
+    return results
+
+
+def derive_batter_hr_rate_batch(
+    batter_posteriors: dict[str, dict[int, np.ndarray]],
+    hbp_rate: float = BATTER_LEAGUE_HBP_RATE,
+) -> dict[int, np.ndarray]:
+    """Derive HR/PA posteriors from HR/FB x FB% x BIP% for a batch of batters.
+
+    Requires ``hr_per_fb``, ``fb_rate``, ``k_rate``, and ``bb_rate``
+    posterior samples in *batter_posteriors*.
+
+    Parameters
+    ----------
+    batter_posteriors : dict
+        {rate_col: {batter_id: samples}}.
+    hbp_rate : float
+        League HBP rate.
+
+    Returns
+    -------
+    dict[int, np.ndarray]
+        {batter_id: hr_rate_samples}.
+    """
+    hr_fb = batter_posteriors.get("hr_per_fb", {})
+    fb = batter_posteriors.get("fb_rate", {})
+    k = batter_posteriors.get("k_rate", {})
+    bb = batter_posteriors.get("bb_rate", {})
+
+    if not hr_fb or not fb or not k or not bb:
+        logger.warning(
+            "Missing posteriors for composed batter HR rate — need "
+            "hr_per_fb, fb_rate, k_rate, bb_rate. Available: %s",
+            list(batter_posteriors.keys()),
+        )
+        return {}
+
+    common_ids = set(hr_fb) & set(fb) & set(k) & set(bb)
+
+    results: dict[int, np.ndarray] = {}
+    for bid in common_ids:
+        n = min(len(hr_fb[bid]), len(fb[bid]), len(k[bid]), len(bb[bid]))
+        results[bid] = derive_batter_hr_rate(
+            hr_per_fb_posterior=hr_fb[bid][:n],
+            fb_rate_posterior=fb[bid][:n],
+            k_rate_posterior=k[bid][:n],
+            bb_rate_posterior=bb[bid][:n],
+            hbp_rate=hbp_rate,
+        )
+
+    logger.info(
+        "Derived batter HR/PA posteriors for %d/%d batters "
+        "(HR/FB x FB%% x BIP%% composition)",
         len(results), len(common_ids),
     )
     return results

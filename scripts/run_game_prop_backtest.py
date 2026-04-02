@@ -116,7 +116,10 @@ def main() -> None:
         print("GAME PROP BACKTEST SUMMARY")
         print("=" * 80)
         display_cols = ["prop", "test_season", "n_games", "rmse", "mae",
-                        "avg_brier", "ece", "coverage_80", "coverage_90"]
+                        "avg_brier", "avg_log_loss", "ece",
+                        "coverage_80", "coverage_90",
+                        "sharpness_mean_confidence", "sharpness_pct_actionable_60",
+                        "sharpness_entropy"]
         available = [c for c in display_cols if c in combined.columns]
         print(combined[available].to_string(index=False))
     else:
@@ -132,7 +135,8 @@ def main() -> None:
         print("STRATIFIED METRICS")
         print("=" * 80)
         strat_cols = ["prop", "stratum", "bin", "bin_n",
-                      "rmse", "avg_brier", "ece", "temperature"]
+                      "rmse", "avg_brier", "avg_log_loss", "ece",
+                      "temperature"]
         avail = [c for c in strat_cols if c in strat_combined.columns]
         print(strat_combined[avail].to_string(index=False))
 

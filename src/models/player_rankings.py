@@ -1917,6 +1917,45 @@ def rank_hitters(
     # (widened from ±5% — industry research shows extreme splits = 1+ WAR penalty).
     platoon_modifier = 0.90 + 0.20 * base["platoon_score"]  # 0.90 to 1.10
     base["offense_score"] = (base["offense_score"] * platoon_modifier).clip(0, 1)
+
+    # --- Postseason performance boost (player-specific) ---
+    # Apply individual postseason performance as an additive adjustment
+    # to offense_score.  Elite October performers get up to +5%, poor
+    # performers get up to -5%.  Heavy sample-size dampening prevents
+    # small-sample noise (e.g. 2 IP in October barely moves the needle).
+    try:
+        from src.data.queries import get_postseason_batter_stats
+        from src.models.postseason_boost import compute_postseason_scores
+
+        ps_seasons = list(range(max(2018, projection_season - 3), projection_season))
+        ps_bat = get_postseason_batter_stats(ps_seasons)
+        if not ps_bat.empty:
+            ps_hitter_scores, _ = compute_postseason_scores(
+                ps_bat, pd.DataFrame(), season=projection_season - 1,
+            )
+            if not ps_hitter_scores.empty:
+                base = base.merge(
+                    ps_hitter_scores[["batter_id", "postseason_score",
+                                      "postseason_pa", "best_round"]].rename(
+                        columns={"best_round": "ps_best_round"}
+                    ),
+                    on="batter_id", how="left",
+                )
+                base["postseason_score"] = base["postseason_score"].fillna(0.50)
+                ps_adj = (base["postseason_score"] - 0.50) * 0.10  # +/-5% max
+                base["offense_score"] = np.clip(
+                    base["offense_score"] + ps_adj, 0, 1,
+                )
+                n_affected = (ps_adj.abs() > 0.001).sum()
+                logger.info(
+                    "Postseason offense adjustment: %d hitters affected "
+                    "(max +%.3f, min %.3f)",
+                    n_affected, ps_adj.max(), ps_adj.min(),
+                )
+    except Exception:
+        logger.warning("Could not compute hitter postseason boost", exc_info=True)
+        base["postseason_score"] = 0.50
+
     base["pt_score"] = base["pt_score"].fillna(0.50)
     base["trajectory_score"] = base["trajectory_score"].fillna(0.50)
 
@@ -2197,10 +2236,20 @@ def rank_hitters(
     # --- Overall rank: directly from current_value_score ---
     # No positional adjustment — the displayed score IS the ranking order.
     # Positional value is captured by pos_rank within each position.
-    base["overall_rank"] = base["current_value_score"].rank(ascending=False, method="min").astype(int)
+    base["overall_rank"] = (
+        base["current_value_score"]
+        .rank(ascending=False, method="min", na_option="bottom")
+        .fillna(len(base))
+        .astype(int)
+    )
 
     # --- Talent-based ranking (scouting-dominant, no positional adj) ---
-    base["talent_rank"] = base["talent_upside_score"].rank(ascending=False, method="min").astype(int)
+    base["talent_rank"] = (
+        base["talent_upside_score"]
+        .rank(ascending=False, method="min", na_option="bottom")
+        .fillna(len(base))
+        .astype(int)
+    )
 
     # Select output columns
     output_cols = [
@@ -2240,6 +2289,8 @@ def rank_hitters(
         # Scouting grades (20-80) + diamond rating (0-10)
         "grade_hit", "grade_power", "grade_speed", "grade_fielding",
         "grade_discipline", "tools_rating",
+        # Postseason performance
+        "postseason_score", "postseason_pa", "ps_best_round",
     ]
     available = [c for c in output_cols if c in base.columns]
     result = base[available].sort_values(["position", "pos_rank"])
@@ -2841,6 +2892,40 @@ def rank_pitchers(
         base["health_score"] = np.nan
         base["health_label"] = ""
 
+    # --- Postseason performance boost (player-specific) ---
+    try:
+        from src.data.queries import get_postseason_pitcher_stats
+        from src.models.postseason_boost import compute_postseason_scores
+
+        ps_seasons = list(range(max(2018, projection_season - 3), projection_season))
+        ps_pit = get_postseason_pitcher_stats(ps_seasons)
+        if not ps_pit.empty:
+            _, ps_pitcher_scores = compute_postseason_scores(
+                pd.DataFrame(), ps_pit, season=projection_season - 1,
+            )
+            if not ps_pitcher_scores.empty:
+                base = base.merge(
+                    ps_pitcher_scores[["pitcher_id", "postseason_score",
+                                       "postseason_bf", "best_round"]].rename(
+                        columns={"best_round": "ps_best_round"}
+                    ),
+                    on="pitcher_id", how="left",
+                )
+                base["postseason_score"] = base["postseason_score"].fillna(0.50)
+                ps_adj = (base["postseason_score"] - 0.50) * 0.10  # +/-5% max
+                base["stuff_score"] = np.clip(
+                    base["stuff_score"] + ps_adj, 0, 1,
+                )
+                n_affected = (ps_adj.abs() > 0.001).sum()
+                logger.info(
+                    "Postseason stuff adjustment: %d pitchers affected "
+                    "(max +%.3f, min %.3f)",
+                    n_affected, ps_adj.max(), ps_adj.min(),
+                )
+    except Exception:
+        logger.warning("Could not compute pitcher postseason boost", exc_info=True)
+        base["postseason_score"] = 0.50
+
     # --- Health & role scores ---
     base["health_adj"] = base["health_score"].fillna(0.50)
     # Role score: SP uses starts (min(starts/30, 1)), RP uses appearances (min(apps/60, 1))
@@ -2989,10 +3074,20 @@ def rank_pitchers(
     base["role_rank"] = base.groupby("role").cumcount() + 1
 
     # Overall pitcher rank
-    base["overall_rank"] = base["current_value_score"].rank(ascending=False, method="min").astype(int)
+    base["overall_rank"] = (
+        base["current_value_score"]
+        .rank(ascending=False, method="min", na_option="bottom")
+        .fillna(len(base))
+        .astype(int)
+    )
 
     # Talent-based ranking (scouting-dominant)
-    base["talent_rank"] = base["talent_upside_score"].rank(ascending=False, method="min").astype(int)
+    base["talent_rank"] = (
+        base["talent_upside_score"]
+        .rank(ascending=False, method="min", na_option="bottom")
+        .fillna(len(base))
+        .astype(int)
+    )
 
     # Select output
     output_cols = [
@@ -3033,6 +3128,8 @@ def rank_pitchers(
         "glicko_score", "glicko_mu", "glicko_phi",
         # Scouting grades (20-80) + diamond rating (0-10)
         "grade_stuff", "grade_command", "grade_durability", "tools_rating",
+        # Postseason performance
+        "postseason_score", "postseason_bf", "ps_best_round",
     ]
     available = [c for c in output_cols if c in base.columns]
     result = base[available].sort_values(["role", "role_rank"])
@@ -3059,13 +3156,17 @@ def rank_all(
     projection_season: int = 2026,
     health_df: pd.DataFrame | None = None,
     pitcher_roles_df: pd.DataFrame | None = None,
+    min_pa: int | None = None,
+    min_bf: int | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Run all positional rankings.
 
     Parameters
     ----------
     season : int
-        Most recent completed season for observed data.
+        Most recent completed season for observed data.  During the
+        in-season weekly refresh this equals ``projection_season``
+        (e.g. both 2026).
     projection_season : int
         Target projection season.
     health_df : pd.DataFrame or None
@@ -3073,19 +3174,35 @@ def rank_all(
         pitcher ranking functions to avoid disk reads.
     pitcher_roles_df : pd.DataFrame or None
         Pre-loaded reliever roles.  Passed through to pitcher ranking.
+    min_pa : int or None
+        Minimum PA for hitters.  Defaults to 100 (preseason) or 10
+        when ``season == projection_season`` (in-season).
+    min_bf : int or None
+        Minimum BF for pitchers.  Defaults to 50 (preseason) or 10
+        when ``season == projection_season`` (in-season).
 
     Returns
     -------
     dict[str, pd.DataFrame]
         Keys: 'hitters', 'pitchers'. Each sorted by position/role then rank.
     """
-    logger.info("Building 2026 positional rankings...")
+    in_season = season == projection_season
+    if min_pa is None:
+        min_pa = 10 if in_season else 100
+    if min_bf is None:
+        min_bf = 10 if in_season else 50
+
+    logger.info(
+        "Building %d positional rankings (min_pa=%d, min_bf=%d)...",
+        projection_season, min_pa, min_bf,
+    )
     hitters = rank_hitters(
         season=season, projection_season=projection_season,
-        health_df=health_df,
+        min_pa=min_pa, health_df=health_df,
     )
     pitchers = rank_pitchers(
         season=season, projection_season=projection_season,
+        min_bf=min_bf,
         health_df=health_df, pitcher_roles_df=pitcher_roles_df,
     )
     logger.info(

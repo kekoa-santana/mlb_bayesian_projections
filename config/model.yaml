@@ -162,6 +162,23 @@ rankings:
     bf_ramp_min: 100            # BF where scouting is at ceiling weight
     bf_ramp_max: 500            # BF where scouting is at floor weight
 
+matchup_advantage:
+  # Composite weights (all signals normalized to logit scale before weighting)
+  # Sign convention: positive weight means positive signal value → pitcher advantage
+  weights:
+    k_lift: 1.0            # whiff matchup lift (already logit-scale)
+    bb_lift: -0.4          # walk matchup lift (positive = more walks = hitter advantage)
+    hr_lift: -0.5          # barrel matchup lift (positive = more barrels = hitter advantage)
+    platoon_lift: 0.3      # platoon K/BB blend (positive = pitcher has platoon edge)
+    primary_pitch_edge: 0.2 # top-2 pitch reweighting delta
+    damage_score: -0.15    # contact quality delta (positive = hitter does damage)
+    trajectory_edge: -0.1  # GB/FB mismatch (positive = mismatch helps hitter)
+    glicko_edge: 0.1       # skill rating gap (positive = pitcher stronger)
+  tiers:
+    strong: 0.30
+    moderate: 0.12
+  platoon_reliability_pa: 200  # PA needed for full weight on individual split
+
 calibration:
   hitter:
     k_rate: 1.0

@@ -1,6 +1,7 @@
-"""Precompute: Arsenal, vulnerability, archetypes, zones."""
+"""Precompute: Arsenal, vulnerability, archetypes, zones, matchup baselines."""
 from __future__ import annotations
 
+import json
 import logging
 
 import numpy as np
@@ -271,3 +272,142 @@ def run_archetypes(
         logger.info("Exported archetype matchup matrix to %s", arch_path)
     except Exception as e:
         logger.warning("Archetype matchup matrix failed: %s", e)
+
+
+def run_matchup_advantage_data(
+    *,
+    from_season: int = FROM_SEASON,
+    seasons: list[int] = SEASONS,
+) -> None:
+    """Precompute platoon splits, league baselines, and signal scaling factors."""
+    from src.data.feature_eng import get_cached_season_totals_by_pitcher_hand
+    from src.data.queries import (
+        get_league_platoon_baselines,
+        get_season_totals_with_age,
+        get_pitcher_observed_profile,
+    )
+
+    logger.info("=" * 60)
+    logger.info("Building matchup advantage data...")
+
+    # ------------------------------------------------------------------
+    # 1. Batter platoon splits parquet
+    # ------------------------------------------------------------------
+    platoon_df = get_cached_season_totals_by_pitcher_hand(from_season)
+    if platoon_df.empty:
+        logger.warning("No platoon data for season %d", from_season)
+        return
+
+    # Also get overall rates per batter (for shrinkage baseline)
+    overall = (
+        platoon_df.groupby("batter_id")
+        .agg(overall_pa=("pa", "sum"), overall_k=("k", "sum"), overall_bb=("bb", "sum"))
+        .reset_index()
+    )
+    overall["overall_k_rate"] = overall["overall_k"] / overall["overall_pa"].clip(lower=1)
+    overall["overall_bb_rate"] = overall["overall_bb"] / overall["overall_pa"].clip(lower=1)
+
+    # Keep per (batter_id, pitch_hand) rows with overall rates merged
+    platoon_out = platoon_df[["batter_id", "pitch_hand", "k_rate", "bb_rate", "pa"]].copy()
+    platoon_out = platoon_out.merge(
+        overall[["batter_id", "overall_k_rate", "overall_bb_rate", "overall_pa"]],
+        on="batter_id",
+        how="left",
+    )
+
+    platoon_path = DASHBOARD_DIR / "batter_platoon_splits.parquet"
+    platoon_out.to_parquet(platoon_path, index=False)
+    logger.info("Saved batter platoon splits: %d rows → %s", len(platoon_out), platoon_path)
+
+    # ------------------------------------------------------------------
+    # 2. League platoon baselines + GB/FB rates
+    # ------------------------------------------------------------------
+    baseline_seasons = [s for s in seasons if s >= 2022]
+    baselines = get_league_platoon_baselines(baseline_seasons)
+    logger.info(
+        "League platoon baselines: K same=%.3f opp=%.3f, BB same=%.3f opp=%.3f",
+        baselines["platoon_k_logit"].get("same", 0),
+        baselines["platoon_k_logit"].get("opposite", 0),
+        baselines["platoon_bb_logit"].get("same", 0),
+        baselines["platoon_bb_logit"].get("opposite", 0),
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Signal scaling factors (trajectory + glicko)
+    # ------------------------------------------------------------------
+    # Load pitcher GB% and batter GB/FB rates for trajectory scaling
+    try:
+        pitcher_obs = get_pitcher_observed_profile(from_season)
+        batter_totals = get_season_totals_with_age(from_season)
+    except Exception as e:
+        logger.warning("Could not load pitcher/batter profiles for scaling: %s", e)
+        pitcher_obs = pd.DataFrame()
+        batter_totals = pd.DataFrame()
+
+    # Also save pitcher gb_pct for dashboard use
+    if not pitcher_obs.empty and "gb_pct" in pitcher_obs.columns:
+        pitcher_gb = pitcher_obs[["pitcher_id", "gb_pct"]].dropna(subset=["gb_pct"])
+        pitcher_gb_path = DASHBOARD_DIR / "pitcher_gb_pct.parquet"
+        pitcher_gb.to_parquet(pitcher_gb_path, index=False)
+        logger.info("Saved pitcher GB%%: %d rows", len(pitcher_gb))
+
+    # Compute trajectory scale from observed distributions
+    trajectory_scale = 5.0  # fallback
+    if (
+        not pitcher_obs.empty
+        and not batter_totals.empty
+        and "gb_pct" in pitcher_obs.columns
+        and "gb_rate" in batter_totals.columns
+        and "fb_rate" in batter_totals.columns
+    ):
+        lg_gb = baselines.get("lg_gb_rate", 0.446)
+        lg_fb = baselines.get("lg_fb_rate", 0.321)
+
+        p_gb_excess = pitcher_obs["gb_pct"].dropna() - lg_gb
+        b_fb_excess = batter_totals["fb_rate"].dropna() - lg_fb
+
+        # Cross-product std: sample ~500 random matchups
+        rng = np.random.default_rng(42)
+        n_sample = min(500, len(p_gb_excess) * len(b_fb_excess))
+        p_idx = rng.choice(len(p_gb_excess), size=n_sample, replace=True)
+        b_idx = rng.choice(len(b_fb_excess), size=n_sample, replace=True)
+        raw_traj = p_gb_excess.values[p_idx] * b_fb_excess.values[b_idx]
+        traj_std = float(np.std(raw_traj))
+        if traj_std > 1e-6:
+            # Target: K lift typically has std ~0.15-0.25 on logit scale
+            target_std = 0.15
+            trajectory_scale = target_std / traj_std
+        logger.info("Trajectory scale: %.2f (raw std=%.4f)", trajectory_scale, traj_std)
+
+    # Compute glicko scale from observed distributions
+    glicko_scale = 1.0 / 1000.0  # fallback
+    try:
+        pitcher_glicko_path = DASHBOARD_DIR / "pitcher_glicko.parquet"
+        batter_glicko_path = DASHBOARD_DIR / "batter_glicko.parquet"
+        if pitcher_glicko_path.exists() and batter_glicko_path.exists():
+            p_glicko = pd.read_parquet(pitcher_glicko_path)
+            b_glicko = pd.read_parquet(batter_glicko_path)
+            if "mu" in p_glicko.columns and "mu" in b_glicko.columns:
+                rng = np.random.default_rng(42)
+                n_sample = min(500, len(p_glicko) * len(b_glicko))
+                p_idx = rng.choice(len(p_glicko), size=n_sample, replace=True)
+                b_idx = rng.choice(len(b_glicko), size=n_sample, replace=True)
+                raw_gap = p_glicko["mu"].values[p_idx] - b_glicko["mu"].values[b_idx]
+                gap_std = float(np.std(raw_gap))
+                if gap_std > 1e-6:
+                    target_std = 0.15
+                    glicko_scale = target_std / gap_std
+                logger.info("Glicko scale: %.6f (raw std=%.1f)", glicko_scale, gap_std)
+    except Exception as e:
+        logger.warning("Could not compute Glicko scale: %s", e)
+
+    # ------------------------------------------------------------------
+    # Write baselines + scales JSON
+    # ------------------------------------------------------------------
+    baselines["trajectory_scale"] = trajectory_scale
+    baselines["glicko_scale"] = glicko_scale
+
+    baselines_path = DASHBOARD_DIR / "matchup_baselines.json"
+    with open(baselines_path, "w", encoding="utf-8") as f:
+        json.dump(baselines, f, indent=2)
+    logger.info("Saved matchup baselines → %s", baselines_path)

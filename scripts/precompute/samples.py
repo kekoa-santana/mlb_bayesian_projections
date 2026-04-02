@@ -11,6 +11,19 @@ from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS
 
 logger = logging.getLogger("precompute.samples")
 
+# Maximum posterior draws saved per player.  1,000 is sufficient for KDE
+# display and game-level Monte Carlo while keeping NPZ files small (~24 MB
+# total vs ~189 MB at 8,000 draws).
+_MAX_DASHBOARD_SAMPLES = 1_000
+
+
+def _downsample(arr: np.ndarray, max_n: int = _MAX_DASHBOARD_SAMPLES) -> np.ndarray:
+    """Thin a posterior sample array to *max_n* draws (evenly spaced)."""
+    if arr.shape[0] <= max_n:
+        return arr
+    idx = np.linspace(0, arr.shape[0] - 1, max_n, dtype=int)
+    return arr[idx]
+
 
 def run_pitcher_samples(
     *,
@@ -44,7 +57,7 @@ def run_pitcher_samples(
             logger.warning("No %s pre-extracted samples -- skipping %s", stat_name, npz_name)
             continue
 
-        samples_dict = {str(pid): arr for pid, arr in pre.items()}
+        samples_dict = {str(pid): _downsample(arr) for pid, arr in pre.items()}
         np.savez_compressed(DASHBOARD_DIR / f"{npz_name}.npz", **samples_dict)
         logger.info("Saved %s posterior samples for %d pitchers", stat_name, len(samples_dict))
 
@@ -84,7 +97,7 @@ def run_pitcher_samples(
                 season=from_season,
                 project_forward=True,
             )
-            k_samples_dict[str(int(pid))] = samples
+            k_samples_dict[str(int(pid))] = _downsample(samples)
         except ValueError:
             continue
 
@@ -124,7 +137,7 @@ def run_hitter_samples(
             logger.warning("No %s pre-extracted samples -- skipping %s", stat_name, npz_name)
             continue
 
-        h_samples_dict = {str(pid): arr for pid, arr in pre.items()}
+        h_samples_dict = {str(pid): _downsample(arr) for pid, arr in pre.items()}
         np.savez_compressed(DASHBOARD_DIR / f"{npz_name}.npz", **h_samples_dict)
         logger.info("Saved hitter %s posterior samples for %d batters", stat_name, len(h_samples_dict))
 

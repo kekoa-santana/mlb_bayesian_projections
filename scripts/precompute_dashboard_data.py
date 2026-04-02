@@ -50,7 +50,7 @@ _SECTION_GROUPS: dict[str, list[str]] = {
     "projections": ["hitter_proj", "pitcher_proj", "counting", "sim_pitcher", "sim_hitter"],
     "samples":     ["pitcher_samples", "hitter_samples"],
     "team":        ["team_elo", "series_elo", "team_profiles", "league_sim", "team_power", "team_sim", "depth_chart", "roster"],
-    "profiles":    ["arsenal", "vuln", "archetypes", "zones"],
+    "profiles":    ["arsenal", "vuln", "archetypes", "zones", "matchup_advantage"],
     "rankings":    ["player_rankings", "breakouts"],
     "game_data":   ["player_teams", "game_logs", "bf_priors", "umpire", "weather", "catcher_framing"],
     "traditional": ["trad_stats", "agg_eff"],
@@ -273,6 +273,12 @@ def main() -> None:
     # =================================================================
     if should_run("archetypes"):
         profiles.run_archetypes(from_season=FROM_SEASON, seasons=SEASONS)
+
+    # =================================================================
+    # 5d. Matchup advantage data (platoon splits, baselines, scales)
+    # =================================================================
+    if should_run("matchup_advantage"):
+        profiles.run_matchup_advantage_data(from_season=FROM_SEASON, seasons=SEASONS)
 
     # =================================================================
     # 6. Traditional / actual stats

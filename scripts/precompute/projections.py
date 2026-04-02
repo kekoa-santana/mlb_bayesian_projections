@@ -38,6 +38,10 @@ def run_health_parks(
     logger.info("Park factors: %d venue-hand combos, %d hitter-venue mappings",
                 len(park_factors), len(hitter_venues))
 
+    # Save so _load_park_factors() can find them when health_parks is skipped
+    park_factors.to_parquet(DASHBOARD_DIR / "hr_park_factors.parquet", index=False)
+    hitter_venues.to_parquet(DASHBOARD_DIR / "hitter_venues.parquet", index=False)
+
     return health_df, park_factors, hitter_venues
 
 
@@ -51,9 +55,9 @@ def _load_health_df(from_season: int) -> pd.DataFrame:
 
 
 def _load_park_factors() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load park factors and hitter venues from parquet or compute fresh."""
+    """Load HR park factors and hitter venues from parquet or compute fresh."""
     try:
-        park_factors = pd.read_parquet(DASHBOARD_DIR / "park_factors.parquet")
+        park_factors = pd.read_parquet(DASHBOARD_DIR / "hr_park_factors.parquet")
         hitter_venues = pd.read_parquet(DASHBOARD_DIR / "hitter_venues.parquet")
         return park_factors, hitter_venues
     except FileNotFoundError:

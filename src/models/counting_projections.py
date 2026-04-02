@@ -68,10 +68,17 @@ def _shrinkage_rate(
     weight_col: str = "pa",
     pop_mean: float | None = None,
     shrinkage_k: float = 3.0,
+    age: int | None = None,
 ) -> tuple[float, float]:
     """Compute shrinkage rate estimate with Marcel-style weighting.
 
     Returns (mean, std) for the rate.
+
+    Parameters
+    ----------
+    age : int | None
+        Player age. Young players (<=25) get reduced shrinkage so their
+        recent performance carries more weight (development signal).
     """
     if player_hist.empty:
         return (pop_mean or 0.0, 0.05)
@@ -84,6 +91,11 @@ def _shrinkage_rate(
 
     # Weighted mean
     weighted = sum(v * w for v, w in zip(vals, weights)) / total_w
+
+    # Reduce shrinkage for young players — recent performance more likely
+    # represents genuine development than noise.
+    if age is not None and age <= 25:
+        shrinkage_k = shrinkage_k * 0.67
 
     # Population regression
     if pop_mean is not None:
@@ -263,9 +275,11 @@ def project_hitter_counting(
                     & (hitter_extended["season"] <= from_season)
                 ].sort_values("season", ascending=False)
 
+                player_age = int(player.get("age", 28))
                 if cfg.name == "total_hr":
                     mean_r, std_r = _shrinkage_rate(
-                        player_hist, "hr_rate", "pa", pop_hr_rate, shrinkage_k=4.0
+                        player_hist, "hr_rate", "pa", pop_hr_rate,
+                        shrinkage_k=4.0, age=player_age,
                     )
                 elif cfg.name == "total_sb":
                     # Era-adjust pre-2023 SB rates
@@ -273,11 +287,12 @@ def project_hitter_counting(
                     if "sb_per_game" in hist.columns:
                         hist.loc[hist["season"] < 2023, "sb_per_game"] *= SB_ERA_FACTOR_PRE_2023
                     mean_r, std_r = _shrinkage_rate(
-                        hist, "sb_per_game", "games", pop_sb_rate, shrinkage_k=3.0
+                        hist, "sb_per_game", "games", pop_sb_rate,
+                        shrinkage_k=3.0, age=player_age,
                     )
                 else:
                     mean_r, std_r = _shrinkage_rate(
-                        player_hist, cfg.rate_col, "pa"
+                        player_hist, cfg.rate_col, "pa", age=player_age,
                     )
 
                 rate_samples = rng.normal(mean_r, std_r, size=n_draws)
@@ -485,10 +500,11 @@ def project_pitcher_counting(
             else:
                 # Shrinkage for outs_per_bf / er_per_bf
                 pop_mean = pop_outs_per_bf if cfg.name == "total_outs" else pop_er_per_bf
+                pitcher_age = int(player.get("age", 28))
                 if cfg.rate_col in player_hist.columns:
                     mean_r, std_r = _shrinkage_rate(
                         player_hist, cfg.rate_col, "batters_faced",
-                        pop_mean, shrinkage_k=3.0
+                        pop_mean, shrinkage_k=3.0, age=pitcher_age,
                     )
                 else:
                     mean_r, std_r = pop_mean, pop_mean * 0.30

@@ -19,7 +19,12 @@ import pandas as pd
 from scipy.stats import poisson
 from sklearn.metrics import brier_score_loss
 
-from src.evaluation.metrics import compute_ece, compute_mce, compute_temperature
+from src.evaluation.metrics import (
+    compute_ece,
+    compute_log_loss,
+    compute_mce,
+    compute_temperature,
+)
 
 from src.data.feature_eng import (
     build_multi_season_pitcher_k_data,
@@ -534,6 +539,8 @@ def compute_game_k_metrics(
             "mae_expected": np.nan,
             "brier_scores": {},
             "avg_brier": np.nan,
+            "log_losses": {},
+            "avg_log_loss": np.nan,
             "calibration_df": pd.DataFrame(),
             "coverage_50": np.nan,
             "coverage_80": np.nan,
@@ -547,8 +554,9 @@ def compute_game_k_metrics(
     rmse = float(np.sqrt(np.mean(errors ** 2)))
     mae = float(np.mean(np.abs(errors)))
 
-    # Brier scores per line
+    # Brier scores and log loss per line
     brier_scores: dict[float, float] = {}
+    log_losses: dict[float, float] = {}
     for line in lines:
         col = f"p_over_{line:.1f}".replace(".", "_")
         if col not in predictions.columns:
@@ -556,8 +564,10 @@ def compute_game_k_metrics(
         y_true = (predictions["actual_k"] > line).astype(float).values
         y_prob = predictions[col].values
         brier_scores[line] = float(brier_score_loss(y_true, y_prob))
+        log_losses[line] = compute_log_loss(y_prob, y_true)
 
     avg_brier = float(np.mean(list(brier_scores.values()))) if brier_scores else np.nan
+    avg_log_loss = float(np.mean(list(log_losses.values()))) if log_losses else np.nan
 
     # Calibration
     calibration_df = compute_calibration_by_line(predictions, lines)
@@ -617,6 +627,8 @@ def compute_game_k_metrics(
         "mae_expected": mae,
         "brier_scores": brier_scores,
         "avg_brier": avg_brier,
+        "log_losses": log_losses,
+        "avg_log_loss": avg_log_loss,
         "calibration_df": calibration_df,
         "coverage_50": coverage_50,
         "coverage_80": coverage_80,
@@ -807,6 +819,7 @@ def run_full_game_k_backtest(
             "rmse": metrics["rmse_expected"],
             "mae": metrics["mae_expected"],
             "avg_brier": metrics["avg_brier"],
+            "avg_log_loss": metrics["avg_log_loss"],
             "coverage_50": metrics["coverage_50"],
             "coverage_80": metrics["coverage_80"],
             "coverage_90": metrics["coverage_90"],
@@ -828,9 +841,9 @@ def run_full_game_k_backtest(
 
         logger.info(
             "Fold results: RMSE=%.3f, MAE=%.3f, Brier=%.4f, "
-            "Coverage(50/80/90)=%.2f/%.2f/%.2f",
+            "LogLoss=%.4f, Coverage(50/80/90)=%.2f/%.2f/%.2f",
             metrics["rmse_expected"], metrics["mae_expected"],
-            metrics["avg_brier"],
+            metrics["avg_brier"], metrics["avg_log_loss"],
             metrics["coverage_50"], metrics["coverage_80"],
             metrics["coverage_90"],
         )
@@ -841,9 +854,10 @@ def run_full_game_k_backtest(
         all_pred_df = pd.concat(all_predictions, ignore_index=True)
         overall = compute_game_k_metrics(all_pred_df)
         logger.info(
-            "Overall: RMSE=%.3f, MAE=%.3f, Brier=%.4f, n=%d",
+            "Overall: RMSE=%.3f, MAE=%.3f, Brier=%.4f, LogLoss=%.4f, n=%d",
             overall["rmse_expected"], overall["mae_expected"],
-            overall["avg_brier"], overall["n_games"],
+            overall["avg_brier"], overall["avg_log_loss"],
+            overall["n_games"],
         )
 
     return results_df
@@ -1121,6 +1135,7 @@ def run_full_game_backtest(
             "rmse": metrics["rmse_expected"],
             "mae": metrics["mae_expected"],
             "avg_brier": metrics["avg_brier"],
+            "avg_log_loss": metrics["avg_log_loss"],
             "coverage_50": metrics["coverage_50"],
             "coverage_80": metrics["coverage_80"],
             "coverage_90": metrics["coverage_90"],
@@ -1139,9 +1154,9 @@ def run_full_game_backtest(
         all_k_predictions.append(predictions)
 
         logger.info(
-            "K: RMSE=%.3f, MAE=%.3f, Brier=%.4f",
+            "K: RMSE=%.3f, MAE=%.3f, Brier=%.4f, LogLoss=%.4f",
             metrics["rmse_expected"], metrics["mae_expected"],
-            metrics["avg_brier"],
+            metrics["avg_brier"], metrics["avg_log_loss"],
         )
 
         # --- Additional stat predictions ---
@@ -1220,9 +1235,10 @@ def run_full_game_backtest(
         all_pred_df = pd.concat(all_k_predictions, ignore_index=True)
         overall = compute_game_k_metrics(all_pred_df)
         logger.info(
-            "Overall K: RMSE=%.3f, MAE=%.3f, Brier=%.4f, n=%d",
+            "Overall K: RMSE=%.3f, MAE=%.3f, Brier=%.4f, LogLoss=%.4f, n=%d",
             overall["rmse_expected"], overall["mae_expected"],
-            overall["avg_brier"], overall["n_games"],
+            overall["avg_brier"], overall["avg_log_loss"],
+            overall["n_games"],
         )
 
     return k_results, stat_results

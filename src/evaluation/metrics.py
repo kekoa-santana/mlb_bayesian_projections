@@ -1,7 +1,7 @@
 """
 Enhanced evaluation metrics for game-level prop predictions.
 
-Provides CRPS, ECE, MCE, and temperature scaling diagnostics
+Provides log loss, CRPS, ECE, MCE, and temperature scaling diagnostics
 that go beyond Brier score for full-distribution evaluation.
 """
 from __future__ import annotations
@@ -14,6 +14,41 @@ from scipy.special import expit, logit
 from scipy.stats import kstest
 
 logger = logging.getLogger(__name__)
+
+
+def compute_log_loss(
+    predicted_probs: np.ndarray,
+    actual_outcomes: np.ndarray,
+    eps: float = 1e-7,
+) -> float:
+    """Binary log loss (negative log-likelihood).
+
+    Penalizes confidently wrong predictions much harder than Brier score,
+    making it more relevant for betting applications where a confident
+    wrong bet costs more.
+
+    Parameters
+    ----------
+    predicted_probs : np.ndarray
+        Predicted probabilities, shape (n,).
+    actual_outcomes : np.ndarray
+        Binary outcomes (0 or 1), shape (n,).
+    eps : float
+        Clipping bound to avoid log(0). Probabilities are clipped
+        to [eps, 1 - eps].
+
+    Returns
+    -------
+    float
+        Log loss value. Lower is better. Perfect = 0, random = ln(2) ~ 0.693.
+    """
+    n = len(predicted_probs)
+    if n == 0:
+        return np.nan
+
+    p = np.clip(np.asarray(predicted_probs, dtype=float), eps, 1.0 - eps)
+    y = np.asarray(actual_outcomes, dtype=float)
+    return float(-np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))
 
 
 def compute_crps_single(observed: float, samples: np.ndarray) -> float:
@@ -250,6 +285,62 @@ def compute_posterior_calibration_t(
         return 1.0
 
     return float(z_target / z_actual)
+
+
+def compute_sharpness(predicted_probs: np.ndarray) -> dict[str, float]:
+    """Measure how decisive/actionable a model's probability predictions are.
+
+    A model outputting P(over)=0.50 on everything is useless for betting
+    even if perfectly calibrated. Sharpness quantifies how often the model
+    produces strong signals away from 50/50.
+
+    Parameters
+    ----------
+    predicted_probs : np.ndarray
+        Predicted probabilities in [0, 1], shape (n,).
+
+    Returns
+    -------
+    dict[str, float]
+        mean_confidence : Mean of |p - 0.5| (higher = sharper).
+        pct_actionable_60 : % of predictions with p > 0.60 or p < 0.40.
+        pct_actionable_65 : % of predictions with p > 0.65 or p < 0.35.
+        pct_actionable_70 : % of predictions with p > 0.70 or p < 0.30.
+        entropy : Average binary entropy (lower = sharper).
+    """
+    p = np.asarray(predicted_probs, dtype=float)
+    n = len(p)
+    if n == 0:
+        return {
+            "mean_confidence": np.nan,
+            "pct_actionable_60": np.nan,
+            "pct_actionable_65": np.nan,
+            "pct_actionable_70": np.nan,
+            "entropy": np.nan,
+        }
+
+    # Mean confidence: average distance from 0.5
+    mean_confidence = float(np.mean(np.abs(p - 0.5)))
+
+    # Actionable percentages at various thresholds
+    pct_actionable_60 = float(np.mean((p > 0.60) | (p < 0.40)) * 100)
+    pct_actionable_65 = float(np.mean((p > 0.65) | (p < 0.35)) * 100)
+    pct_actionable_70 = float(np.mean((p > 0.70) | (p < 0.30)) * 100)
+
+    # Average binary entropy: -[p*log(p) + (1-p)*log(1-p)]
+    p_clipped = np.clip(p, 1e-10, 1 - 1e-10)
+    entropy = float(np.mean(
+        -(p_clipped * np.log2(p_clipped)
+          + (1 - p_clipped) * np.log2(1 - p_clipped))
+    ))
+
+    return {
+        "mean_confidence": mean_confidence,
+        "pct_actionable_60": pct_actionable_60,
+        "pct_actionable_65": pct_actionable_65,
+        "pct_actionable_70": pct_actionable_70,
+        "entropy": entropy,
+    }
 
 
 def compute_ppc_pvalues(

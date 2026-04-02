@@ -124,8 +124,12 @@ def _print_results(
 
         if "k_avg_brier" in row and pd.notna(row["k_avg_brier"]):
             print(f"  K Brier: {row['k_avg_brier']:.4f}")
+        if "k_avg_log_loss" in row and pd.notna(row["k_avg_log_loss"]):
+            print(f"  K Log Loss: {row['k_avg_log_loss']:.4f}")
         if "outs_avg_brier" in row and pd.notna(row["outs_avg_brier"]):
             print(f"  Outs Brier: {row['outs_avg_brier']:.4f}")
+        if "outs_avg_log_loss" in row and pd.notna(row["outs_avg_log_loss"]):
+            print(f"  Outs Log Loss: {row['outs_avg_log_loss']:.4f}")
 
         for ci in ("50", "80", "90"):
             key = f"k_coverage_{ci}"
@@ -143,6 +147,18 @@ def _print_results(
         if "pitches_rmse" in row and pd.notna(row["pitches_rmse"]):
             print(f"  PIT: RMSE={row['pitches_rmse']:.3f}")
 
+        # Sharpness
+        for prefix, label in [("k", "K"), ("outs", "Outs")]:
+            conf_key = f"{prefix}_sharpness_mean_confidence"
+            if conf_key in row and pd.notna(row[conf_key]):
+                act60 = row.get(f"{prefix}_sharpness_pct_actionable_60", float("nan"))
+                act65 = row.get(f"{prefix}_sharpness_pct_actionable_65", float("nan"))
+                act70 = row.get(f"{prefix}_sharpness_pct_actionable_70", float("nan"))
+                ent = row.get(f"{prefix}_sharpness_entropy", float("nan"))
+                print(f"  {label} Sharpness: conf={row[conf_key]:.3f}  "
+                      f"act60={act60:.1f}%  act65={act65:.1f}%  "
+                      f"act70={act70:.1f}%  entropy={ent:.3f}")
+
     # Overall averages
     print("\n--- Overall Averages ---")
     for stat in ("k", "bb", "h", "hr", "outs"):
@@ -154,8 +170,22 @@ def _print_results(
 
     if "k_avg_brier" in summary.columns:
         print(f"  K Avg Brier: {summary['k_avg_brier'].mean():.4f}")
+    if "k_avg_log_loss" in summary.columns:
+        print(f"  K Avg Log Loss: {summary['k_avg_log_loss'].mean():.4f}")
     if "outs_avg_brier" in summary.columns:
         print(f"  Outs Avg Brier: {summary['outs_avg_brier'].mean():.4f}")
+    if "outs_avg_log_loss" in summary.columns:
+        print(f"  Outs Avg Log Loss: {summary['outs_avg_log_loss'].mean():.4f}")
+
+    # Sharpness averages
+    for prefix, label in [("k", "K"), ("outs", "Outs")]:
+        conf_col = f"{prefix}_sharpness_mean_confidence"
+        if conf_col in summary.columns:
+            print(f"  {label} Sharpness: conf={summary[conf_col].mean():.3f}  "
+                  f"act60={summary[f'{prefix}_sharpness_pct_actionable_60'].mean():.1f}%  "
+                  f"act65={summary[f'{prefix}_sharpness_pct_actionable_65'].mean():.1f}%  "
+                  f"act70={summary[f'{prefix}_sharpness_pct_actionable_70'].mean():.1f}%  "
+                  f"entropy={summary[f'{prefix}_sharpness_entropy'].mean():.3f}")
 
     # Comparison targets
     print("\n--- vs Current Layer 3 Baseline ---")

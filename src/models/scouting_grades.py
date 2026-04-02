@@ -1090,8 +1090,8 @@ def _compute_future_grade(
 
     # Upside multiplier: 0-1
     upside = 0.5 * trajectory + 0.5 * age_score
-    # Center at 0.35 so average prospect gets slight positive adjustment
-    adjustment = (upside - 0.35) * 23  # range: ~-8 to +15
+    # Center at 0.45 so average prospect gets slight positive adjustment
+    adjustment = (upside - 0.45) * 35  # range: ~-16 to +19
 
     future_raw = present + adjustment
     return future_raw.apply(

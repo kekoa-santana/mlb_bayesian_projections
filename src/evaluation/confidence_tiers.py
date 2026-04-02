@@ -26,6 +26,7 @@ class ConfidenceTier:
     tier_int: int          # 3=HIGH, 2=MEDIUM, 1=LOW
     explanation: str       # Human-readable explanation
     avg_brier: float       # Average Brier score
+    avg_log_loss: float    # Average log loss (negative log-likelihood)
     ece: float             # Expected Calibration Error
     brier_improvement: float  # % improvement over baseline
     crps: float            # CRPS score (NaN if unavailable)
@@ -117,6 +118,11 @@ def assign_confidence_tiers(
 
         # Average metrics across folds
         avg_brier = float(prop_data["avg_brier"].mean())
+        avg_log_loss = (
+            float(prop_data["avg_log_loss"].mean())
+            if "avg_log_loss" in prop_data.columns
+            else np.nan
+        )
         avg_ece = float(prop_data["ece"].mean()) if "ece" in prop_data.columns else np.nan
         avg_crps = float(prop_data["crps"].mean()) if "crps" in prop_data.columns else np.nan
 
@@ -170,6 +176,7 @@ def assign_confidence_tiers(
             tier_int=tier_int,
             explanation=explanation,
             avg_brier=avg_brier,
+            avg_log_loss=avg_log_loss if not np.isnan(avg_log_loss) else -1.0,
             ece=avg_ece if not np.isnan(avg_ece) else -1.0,
             brier_improvement=brier_improvement,
             crps=avg_crps if not np.isnan(avg_crps) else -1.0,
@@ -197,7 +204,8 @@ def tiers_to_dataframe(tiers: list[ConfidenceTier]) -> pd.DataFrame:
     -------
     pd.DataFrame
         Columns: prop, side, stat, tier, tier_int, explanation,
-        avg_brier, ece, brier_improvement, crps, best_line, best_win_rate.
+        avg_brier, avg_log_loss, ece, brier_improvement, crps,
+        best_line, best_win_rate.
     """
     records = []
     for t in tiers:
@@ -209,6 +217,7 @@ def tiers_to_dataframe(tiers: list[ConfidenceTier]) -> pd.DataFrame:
             "tier_int": t.tier_int,
             "explanation": t.explanation,
             "avg_brier": t.avg_brier,
+            "avg_log_loss": t.avg_log_loss,
             "ece": t.ece,
             "brier_improvement": t.brier_improvement,
             "crps": t.crps,

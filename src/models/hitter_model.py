@@ -606,6 +606,16 @@ def extract_rate_samples(
 
         innovation = rng.normal(0, sigma_draws)
 
+        # Less regression for young developing players (age <= 25).
+        # A 22-year-old who genuinely improved should carry that forward
+        # more than a 32-year-old's fluctuation.
+        row_data = df.loc[pos]
+        age = row_data.get("age", None)
+        if age is not None and age <= 25:
+            effective_rho = rho_draws * 0.92
+        else:
+            effective_rho = rho_draws
+
         if cfg.likelihood == "binomial":
             # Project on logit scale with AR(1)
             # Treat logit(rate) - alpha as the total deviation (season_effect
@@ -615,12 +625,12 @@ def extract_rate_samples(
             eps = np.clip(samples, 1e-6, 1 - 1e-6)
             logit_samples = np.log(eps / (1 - eps))
             deviation_last = logit_samples - alpha_draws
-            new_deviation = rho_draws * deviation_last + innovation
+            new_deviation = effective_rho * deviation_last + innovation
             samples = 1.0 / (1.0 + np.exp(-(alpha_draws + new_deviation)))
         else:
             # Project on natural scale with AR(1)
             deviation_last = samples - alpha_draws
-            new_deviation = rho_draws * deviation_last + innovation
+            new_deviation = effective_rho * deviation_last + innovation
             samples = alpha_draws + new_deviation
 
     return samples

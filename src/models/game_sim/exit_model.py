@@ -3,9 +3,9 @@ Leverage-aware pitcher exit model.
 
 Predicts the probability that a starting pitcher is removed after each PA,
 based on cumulative pitch count, game state (inning, outs, score, runners),
-recent trouble, and pitcher/team tendencies.
+recent trouble, blow-up indicators, manager tendencies, and pitcher stamina.
 
-Uses logistic regression trained on historical starter exit data.
+Uses HistGradientBoostingClassifier trained on historical starter exit data.
 """
 from __future__ import annotations
 
@@ -16,8 +16,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import HistGradientBoostingClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +40,9 @@ DEFAULT_STD_EXIT_PITCHES = 14.0
 
 # Shrinkage for pitcher-specific tendencies
 _SHRINKAGE_K = 10  # starts needed for full reliability
+
+# Population mean exit pitch count — for stamina z-score feature
+_POP_MEAN_EXIT_PITCHES = 88.0
 
 
 def _encode_score_diff(score_diff: int | np.ndarray) -> int | np.ndarray:
@@ -76,22 +78,24 @@ def _encode_runners(runners: int | np.ndarray) -> int | np.ndarray:
 
 
 class ExitModel:
-    """Logistic regression model for pitcher exit probability.
+    """GBM model for pitcher exit probability.
 
-    The model predicts P(exit | game_state) after each PA. Features are
-    designed to capture pitch count fatigue, leverage, and manager tendencies.
+    The model predicts P(exit | game_state) after each PA. Features capture
+    pitch count fatigue, leverage, manager tendencies, blow-up indicators,
+    and sticky-inning effects.
 
     Attributes
     ----------
-    model : LogisticRegression or None
+    model : HistGradientBoostingClassifier or None
         Fitted model (None before training).
-    scaler : StandardScaler or None
-        Feature scaler (None before training).
+    scaler : object or None
+        Legacy scaler for backward compat with old LogReg .pkl files.
+        Not used for GBM models.
     """
 
     def __init__(self) -> None:
-        self.model: LogisticRegression | None = None
-        self.scaler: StandardScaler | None = None
+        self.model: HistGradientBoostingClassifier | None = None
+        self.scaler: object | None = None  # kept for backward compat
         self._feature_names: list[str] = []
 
     def _build_features(
@@ -104,6 +108,9 @@ class ExitModel:
         tto: np.ndarray,
         recent_trouble: np.ndarray,
         pitcher_avg_pitches: np.ndarray,
+        runs_this_inning: np.ndarray | None = None,
+        blowup_recent_3pa: np.ndarray | None = None,
+        manager_pull_tendency: np.ndarray | None = None,
     ) -> np.ndarray:
         """Build feature matrix from game state arrays.
 
@@ -125,6 +132,12 @@ class ExitModel:
             Count of BB/H in last 2 PAs.
         pitcher_avg_pitches : np.ndarray
             Pitcher's historical average exit pitch count.
+        runs_this_inning : np.ndarray, optional
+            Runs allowed in the current inning (blow-up indicator).
+        blowup_recent_3pa : np.ndarray, optional
+            Damage events (BB/H/HBP) in last 3 PAs.
+        manager_pull_tendency : np.ndarray, optional
+            Team's avg starter exit pitch count (manager proxy).
 
         Returns
         -------
@@ -133,12 +146,17 @@ class ExitModel:
         """
         n = len(cumulative_pitches)
 
+        # Ensure pitcher_avg_pitches is broadcast to length n
+        _avg_pitches = np.broadcast_to(
+            np.asarray(pitcher_avg_pitches, dtype=float), n
+        ).copy()
+
         # Pitch count features
         pitches = cumulative_pitches.astype(float)
         pitches_sq = pitches ** 2 / 10000.0  # Quadratic term, scaled
 
         # Deviation from pitcher's expected exit point
-        pitches_vs_avg = pitches - pitcher_avg_pitches
+        pitches_vs_avg = pitches - _avg_pitches
 
         # Inning end indicator (outs = 0 means just completed an inning)
         at_inning_start = (inning_outs == 0).astype(float)
@@ -155,7 +173,7 @@ class ExitModel:
         tto_float = tto.astype(float)
         tto_3plus = (tto >= 3).astype(float)
 
-        # Recent trouble
+        # Recent trouble (2-PA window)
         trouble = recent_trouble.astype(float)
         in_trouble = (recent_trouble >= 2).astype(float)
 
@@ -164,6 +182,39 @@ class ExitModel:
 
         # Interaction: runners on × high pitch count
         pitches_x_runners = pitches * runners_on / 100.0
+
+        # --- New features ---
+
+        # Blow-up: runs scored this inning
+        if runs_this_inning is not None:
+            blowup_runs = np.asarray(runs_this_inning, dtype=float)
+        else:
+            blowup_runs = np.zeros(n, dtype=float)
+
+        # Blow-up: damage events in last 3 PAs (wider trouble window)
+        if blowup_recent_3pa is not None:
+            trouble_3pa = np.asarray(blowup_recent_3pa, dtype=float)
+        else:
+            trouble_3pa = trouble  # fall back to 2-PA trouble
+
+        # Manager pull tendency (team avg exit pitch count)
+        if manager_pull_tendency is not None:
+            mgr_tend = np.asarray(manager_pull_tendency, dtype=float)
+        else:
+            mgr_tend = np.full(n, DEFAULT_AVG_EXIT_PITCHES, dtype=float)
+
+        # Sticky inning: strong between-inning pull preference at high pitches
+        # at_inning_start × max(0, pitches - 80) / 10 → cliff effect > 80 pitches
+        sticky_high = at_inning_start * np.maximum(pitches - 80.0, 0.0) / 10.0
+
+        # Mid-inning stickiness: reluctance to pull mid-inning until very high
+        # mid_inning × max(0, pitches - 90) / 10 → managers tolerate more mid-inning
+        mid_inn_sticky = mid_inning * np.maximum(pitches - 90.0, 0.0) / 10.0
+
+        # Pitcher stamina z-score (standardized vs population)
+        pitcher_stamina_z = (
+            _avg_pitches - _POP_MEAN_EXIT_PITCHES
+        ) / DEFAULT_STD_EXIT_PITCHES
 
         features = np.column_stack([
             pitches,
@@ -181,6 +232,13 @@ class ExitModel:
             in_trouble,
             pitches_x_inning_start,
             pitches_x_runners,
+            # New features
+            blowup_runs,
+            trouble_3pa,
+            mgr_tend,
+            sticky_high,
+            mid_inn_sticky,
+            pitcher_stamina_z,
         ])
 
         self._feature_names = [
@@ -190,6 +248,8 @@ class ExitModel:
             "tto", "tto_3plus",
             "trouble", "in_trouble",
             "pitches_x_inning_start", "pitches_x_runners",
+            "blowup_runs", "trouble_3pa", "mgr_tend",
+            "sticky_high", "mid_inn_sticky", "pitcher_stamina_z",
         ]
 
         return features
@@ -207,7 +267,7 @@ class ExitModel:
             Output of get_exit_model_training_data(). One row per PA.
         pitcher_tendencies : pd.DataFrame, optional
             Output of get_pitcher_exit_tendencies(). Per-pitcher avg exit
-            pitch counts.
+            pitch counts including team_avg_pitches.
 
         Returns
         -------
@@ -225,16 +285,32 @@ class ExitModel:
             "hit_by_pitch",
         ]).astype(int)
 
-        # Rolling 2-PA trouble count within each pitcher-game
-        df["recent_trouble"] = (
-            df.groupby(["pitcher_id", "game_pk"])["is_trouble"]
-            .transform(lambda x: x.rolling(2, min_periods=1).sum().shift(0))
-        )
-        # The rolling should look at the *current* and previous PA
-        # Recompute: include current PA outcome for exit decision
+        # Rolling 2-PA trouble count (current + previous PA)
         df["recent_trouble"] = (
             df.groupby(["pitcher_id", "game_pk"])["is_trouble"]
             .transform(lambda x: x.rolling(2, min_periods=1).sum())
+        )
+
+        # Rolling 3-PA trouble count (wider blow-up window)
+        df["blowup_recent_3pa"] = (
+            df.groupby(["pitcher_id", "game_pk"])["is_trouble"]
+            .transform(lambda x: x.rolling(3, min_periods=1).sum())
+        )
+
+        # Runs scored this inning (blow-up indicator)
+        # Approximate: run-scoring events within current inning
+        df["is_run_event"] = df["events"].isin([
+            "home_run", "single", "double", "triple",
+            "sac_fly", "sac_fly_double_play",
+        ]).astype(int)
+        # Track inning boundaries by changes in the inning column
+        df["inning_group"] = (
+            df.groupby(["pitcher_id", "game_pk"])["inning"]
+            .transform(lambda x: (x != x.shift()).cumsum())
+        )
+        df["runs_this_inning"] = (
+            df.groupby(["pitcher_id", "game_pk", "inning_group"])["is_run_event"]
+            .transform("cumsum")
         )
 
         # TTO from pitcher_pa_number
@@ -243,29 +319,37 @@ class ExitModel:
         # Inning outs
         df["inning_outs"] = df["outs_when_up"].astype(int)
 
-        # Runners: approximate from game state
-        # We don't have exact runner data, so use a proxy:
-        # recent non-out events suggest runners on base
+        # Runners: approximate from recent non-out events
         df["runners"] = (
             df.groupby(["pitcher_id", "game_pk"])["is_trouble"]
             .transform(lambda x: x.rolling(3, min_periods=1).sum())
         ).clip(0, 3).astype(int)
 
-        # Pitcher average exit pitches
+        # Pitcher average exit pitches + manager tendency
         if pitcher_tendencies is not None and not pitcher_tendencies.empty:
-            # For each row, look up pitcher's avg from *prior* seasons
-            # to avoid leakage
+            # Look up from *prior* seasons to avoid leakage
             tend_shifted = pitcher_tendencies.copy()
             tend_shifted["season"] = tend_shifted["season"] + 1
 
+            merge_cols = ["pitcher_id", "season", "avg_pitches"]
+            if "team_avg_pitches" in tend_shifted.columns:
+                merge_cols.append("team_avg_pitches")
+
             df = df.merge(
-                tend_shifted[["pitcher_id", "season", "avg_pitches"]],
+                tend_shifted[merge_cols],
                 on=["pitcher_id", "season"],
                 how="left",
             )
             df["avg_pitches"] = df["avg_pitches"].fillna(DEFAULT_AVG_EXIT_PITCHES)
+            if "team_avg_pitches" in df.columns:
+                df["team_avg_pitches"] = df["team_avg_pitches"].fillna(
+                    DEFAULT_AVG_EXIT_PITCHES
+                )
+            else:
+                df["team_avg_pitches"] = DEFAULT_AVG_EXIT_PITCHES
         else:
             df["avg_pitches"] = DEFAULT_AVG_EXIT_PITCHES
+            df["team_avg_pitches"] = DEFAULT_AVG_EXIT_PITCHES
 
         # Build feature matrix
         X = self._build_features(
@@ -277,26 +361,30 @@ class ExitModel:
             tto=df["tto"].values,
             recent_trouble=df["recent_trouble"].values,
             pitcher_avg_pitches=df["avg_pitches"].values,
+            runs_this_inning=df["runs_this_inning"].values,
+            blowup_recent_3pa=df["blowup_recent_3pa"].values,
+            manager_pull_tendency=df["team_avg_pitches"].values,
         )
         y = df["is_last_pa"].values
 
-        # Scale features
-        self.scaler = StandardScaler()
-        X_scaled = self.scaler.fit_transform(X)
+        # GBM does not need scaling
+        self.scaler = None
 
-        # Fit logistic regression — no class weight balancing so that
-        # predicted probabilities reflect the true per-PA exit rate
-        self.model = LogisticRegression(
-            max_iter=1000,
-            C=1.0,
+        # Fit gradient boosting classifier — shallow trees to prevent
+        # overfitting, captures nonlinear interactions that LogReg missed
+        self.model = HistGradientBoostingClassifier(
+            max_iter=200,
+            max_depth=4,
+            learning_rate=0.1,
+            min_samples_leaf=100,
             random_state=42,
         )
-        self.model.fit(X_scaled, y)
+        self.model.fit(X, y)
 
         # Compute metrics
-        y_pred_proba = self.model.predict_proba(X_scaled)[:, 1]
+        y_pred_proba = self.model.predict_proba(X)[:, 1]
         auc = roc_auc_score(y, y_pred_proba)
-        accuracy = self.model.score(X_scaled, y)
+        accuracy = float((y == (y_pred_proba > 0.5)).mean())
 
         metrics = {
             "accuracy": accuracy,
@@ -311,15 +399,15 @@ class ExitModel:
             auc, accuracy, len(y), y.mean() * 100,
         )
 
-        # Log feature importances
-        if hasattr(self.model, "coef_"):
-            coefs = self.model.coef_[0]
-            for name, coef in sorted(
-                zip(self._feature_names, coefs),
-                key=lambda x: abs(x[1]),
+        # Log feature importances (GBM permutation-based)
+        if hasattr(self.model, "feature_importances_"):
+            importances = self.model.feature_importances_
+            for name, imp in sorted(
+                zip(self._feature_names, importances),
+                key=lambda x: x[1],
                 reverse=True,
             ):
-                logger.debug("  %s: %.4f", name, coef)
+                logger.debug("  %s: %.4f", name, imp)
 
         return metrics
 
@@ -333,6 +421,10 @@ class ExitModel:
         tto: int | np.ndarray,
         recent_trouble: int | np.ndarray,
         pitcher_avg_pitches: float | np.ndarray,
+        *,
+        runs_this_inning: int | np.ndarray = 0,
+        blowup_recent_3pa: int | np.ndarray = 0,
+        manager_pull_tendency: float | np.ndarray = 88.0,
     ) -> float | np.ndarray:
         """Predict probability of pitcher exit after this PA.
 
@@ -354,13 +446,19 @@ class ExitModel:
             Count of BB/H in last 2 PAs.
         pitcher_avg_pitches : float or np.ndarray
             Pitcher's historical average exit pitch count.
+        runs_this_inning : int or np.ndarray
+            Runs allowed in current inning (blow-up indicator).
+        blowup_recent_3pa : int or np.ndarray
+            Damage events in last 3 PAs.
+        manager_pull_tendency : float or np.ndarray
+            Team's avg starter exit pitch count (manager proxy).
 
         Returns
         -------
         float or np.ndarray
             Exit probability.
         """
-        if self.model is None or self.scaler is None:
+        if self.model is None:
             return self._fallback_exit_prob(cumulative_pitches, pitcher_avg_pitches)
 
         # Ensure arrays
@@ -371,9 +469,32 @@ class ExitModel:
         is_scalar = np.isscalar(inputs[0])
         inputs = [np.atleast_1d(np.asarray(x, dtype=float)) for x in inputs]
 
-        X = self._build_features(*inputs)
-        X_scaled = self.scaler.transform(X)
-        probs = self.model.predict_proba(X_scaled)[:, 1]
+        # New feature arrays
+        n = len(inputs[0])
+        new_inputs = [
+            np.atleast_1d(np.broadcast_to(
+                np.asarray(runs_this_inning, dtype=float), n
+            ).copy()),
+            np.atleast_1d(np.broadcast_to(
+                np.asarray(blowup_recent_3pa, dtype=float), n
+            ).copy()),
+            np.atleast_1d(np.broadcast_to(
+                np.asarray(manager_pull_tendency, dtype=float), n
+            ).copy()),
+        ]
+
+        X = self._build_features(
+            *inputs,
+            runs_this_inning=new_inputs[0],
+            blowup_recent_3pa=new_inputs[1],
+            manager_pull_tendency=new_inputs[2],
+        )
+
+        # GBM models don't need scaling; legacy LogReg models do
+        if self.scaler is not None:
+            X = self.scaler.transform(X)
+
+        probs = self.model.predict_proba(X)[:, 1]
 
         # Hard caps
         probs = np.where(
@@ -427,6 +548,7 @@ class ExitModel:
                 "model": self.model,
                 "scaler": self.scaler,
                 "feature_names": self._feature_names,
+                "model_type": "gbm",
             }, f)
         logger.info("Exit model saved to %s", path)
 
@@ -442,6 +564,9 @@ class ExitModel:
         with open(path, "rb") as f:
             data = pickle.load(f)
         self.model = data["model"]
-        self.scaler = data["scaler"]
+        self.scaler = data.get("scaler")  # None for GBM models
         self._feature_names = data["feature_names"]
-        logger.info("Exit model loaded from %s", path)
+        logger.info(
+            "Exit model loaded from %s (type=%s)",
+            path, data.get("model_type", "logreg"),
+        )

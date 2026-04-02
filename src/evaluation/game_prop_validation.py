@@ -33,7 +33,9 @@ from src.data.feature_eng import (
 from src.evaluation.metrics import (
     compute_crps_single,
     compute_ece,
+    compute_log_loss,
     compute_mce,
+    compute_sharpness,
     compute_temperature,
 )
 from src.models.bf_model import (
@@ -130,7 +132,7 @@ BATTER_PROP_CONFIGS: dict[str, GamePropConfig] = {
     ),
     "hr": GamePropConfig(
         "hr", "batter", "hr_rate", "home_runs", True, "poisson",
-        "barrel_rate", True, [0.5, 1.5],
+        "barrel_rate", True, [0.5, 1.5], derived=True,
     ),
     "h": GamePropConfig(
         "h", "batter", "h_rate", "hits", False, "binomial",
@@ -724,13 +726,12 @@ def _extract_all_bayesian_batter_posteriors(
 
     all_posteriors: dict[str, dict[int, np.ndarray]] = {}
 
-    # Batter stats may use "hr_rate" instead of "hr_per_bf"
+    # Core rate stats + component stats for HR composition
     stat_keys = ["k_rate", "bb_rate"]
-    # Check which HR key exists in hitter configs
-    for hr_key in ("hr_rate", "hr_per_pa"):
-        if hr_key in HITTER_STAT_CONFIGS:
-            stat_keys.append(hr_key)
-            break
+    # Always extract fb_rate + hr_per_fb for HR/PA composition
+    for component_key in ("fb_rate", "hr_per_fb"):
+        if component_key in HITTER_STAT_CONFIGS:
+            stat_keys.append(component_key)
 
     for stat_key in stat_keys:
         if stat_key not in HITTER_STAT_CONFIGS:
@@ -762,6 +763,16 @@ def _extract_all_bayesian_batter_posteriors(
             "Extracted batter %s posteriors for %d batters",
             stat_key, len(posteriors),
         )
+
+    # Compose HR/PA = HR/FB × FB% × BIP% if component posteriors available
+    if "hr_per_fb" in all_posteriors and "fb_rate" in all_posteriors:
+        from src.models.derived_stats import derive_batter_hr_rate_batch
+        composed_hr = derive_batter_hr_rate_batch(all_posteriors)
+        if composed_hr:
+            all_posteriors["hr_rate"] = composed_hr
+            logger.info(
+                "Composed hr_rate posteriors for %d batters", len(composed_hr),
+            )
 
     return all_posteriors
 
@@ -1199,20 +1210,27 @@ def _build_batter_prop_predictions(
     season_totals: pd.DataFrame | None = None
 
     if config.derived:
-        # Derived path: train K%, BB%, HR% Bayesian models, then derive
-        # H/PA from their posteriors + shrunk BABIP.
+        # Derived path: train component Bayesian models, then compose.
+        # HR: hr_rate = hr_per_fb × fb_rate × bip_rate
+        # H:  h_rate from K%, BB%, composed HR% + shrunk BABIP
         all_posteriors = _extract_all_bayesian_batter_posteriors(
             train_seasons, draws, tune, chains, random_seed,
         )
-        babip_data = _load_batter_babip_data(train_seasons)
-        derived = derive_batter_rates_batch(
-            batter_posteriors=all_posteriors,
-            batter_babip_data=babip_data,
-            rng=rng,
-        )
-        if derived:
-            batter_posteriors = derived
+
+        if config.stat_name == "hr" and "hr_rate" in all_posteriors:
+            # HR prop: composed posteriors already created by extraction
+            batter_posteriors = all_posteriors["hr_rate"]
         else:
+            # H prop: derive from K%, BB%, HR% + BABIP shrinkage
+            babip_data = _load_batter_babip_data(train_seasons)
+            derived = derive_batter_rates_batch(
+                batter_posteriors=all_posteriors,
+                batter_babip_data=babip_data,
+                rng=rng,
+            )
+            batter_posteriors = derived if derived else {}
+
+        if not batter_posteriors:
             # Fallback to shrinkage if derived path fails
             logger.warning(
                 "Derived path returned no results for batter %s, "
@@ -1554,8 +1572,9 @@ def compute_game_prop_metrics(
     rmse = float(np.sqrt(np.mean(errors ** 2)))
     mae = float(np.mean(np.abs(errors)))
 
-    # Brier scores per line
+    # Brier scores and log loss per line
     brier_scores: dict[float, float] = {}
+    log_losses: dict[float, float] = {}
     for line in lines:
         col = f"p_over_{line:.1f}".replace(".", "_")
         if col not in predictions.columns:
@@ -1566,8 +1585,10 @@ def compute_game_prop_metrics(
         if y_true.std() == 0:
             continue
         brier_scores[line] = float(brier_score_loss(y_true, y_prob))
+        log_losses[line] = compute_log_loss(y_prob, y_true)
 
     avg_brier = float(np.mean(list(brier_scores.values()))) if brier_scores else np.nan
+    avg_log_loss = float(np.mean(list(log_losses.values()))) if log_losses else np.nan
 
     # CRPS (if samples available)
     crps = np.nan
@@ -1603,6 +1624,17 @@ def compute_game_prop_metrics(
     avg_mce = float(np.mean(list(mce_per_line.values()))) if mce_per_line else np.nan
     avg_temp = float(np.mean(list(temp_per_line.values()))) if temp_per_line else np.nan
 
+    # Sharpness — aggregate across all lines
+    all_probs: list[np.ndarray] = []
+    for line in lines:
+        col = f"p_over_{line:.1f}".replace(".", "_")
+        if col in predictions.columns:
+            all_probs.append(np.clip(predictions[col].values, 0, 1))
+    if all_probs:
+        sharpness = compute_sharpness(np.concatenate(all_probs))
+    else:
+        sharpness = compute_sharpness(np.array([]))
+
     # Coverage intervals
     coverage_50 = np.nan
     coverage_80 = np.nan
@@ -1631,6 +1663,8 @@ def compute_game_prop_metrics(
         "mae": mae,
         "brier_scores": brier_scores,
         "avg_brier": avg_brier,
+        "log_losses": log_losses,
+        "avg_log_loss": avg_log_loss,
         "crps": crps,
         "ece": avg_ece,
         "ece_per_line": ece_per_line,
@@ -1638,6 +1672,11 @@ def compute_game_prop_metrics(
         "mce_per_line": mce_per_line,
         "temperature": avg_temp,
         "temperature_per_line": temp_per_line,
+        "sharpness_mean_confidence": sharpness["mean_confidence"],
+        "sharpness_pct_actionable_60": sharpness["pct_actionable_60"],
+        "sharpness_pct_actionable_65": sharpness["pct_actionable_65"],
+        "sharpness_pct_actionable_70": sharpness["pct_actionable_70"],
+        "sharpness_entropy": sharpness["entropy"],
         "coverage_50": coverage_50,
         "coverage_80": coverage_80,
         "coverage_90": coverage_90,
@@ -1655,6 +1694,8 @@ def _empty_metrics() -> dict[str, Any]:
         "mae": np.nan,
         "brier_scores": {},
         "avg_brier": np.nan,
+        "log_losses": {},
+        "avg_log_loss": np.nan,
         "crps": np.nan,
         "ece": np.nan,
         "ece_per_line": {},
@@ -1662,6 +1703,11 @@ def _empty_metrics() -> dict[str, Any]:
         "mce_per_line": {},
         "temperature": np.nan,
         "temperature_per_line": {},
+        "sharpness_mean_confidence": np.nan,
+        "sharpness_pct_actionable_60": np.nan,
+        "sharpness_pct_actionable_65": np.nan,
+        "sharpness_pct_actionable_70": np.nan,
+        "sharpness_entropy": np.nan,
         "coverage_50": np.nan,
         "coverage_80": np.nan,
         "coverage_90": np.nan,
@@ -1751,31 +1797,44 @@ def run_full_game_prop_backtest(
             "rmse": metrics["rmse"],
             "mae": metrics["mae"],
             "avg_brier": metrics["avg_brier"],
+            "avg_log_loss": metrics["avg_log_loss"],
             "crps": metrics["crps"],
             "ece": metrics["ece"],
             "mce": metrics["mce"],
             "temperature": metrics["temperature"],
+            "sharpness_mean_confidence": metrics["sharpness_mean_confidence"],
+            "sharpness_pct_actionable_60": metrics["sharpness_pct_actionable_60"],
+            "sharpness_pct_actionable_65": metrics["sharpness_pct_actionable_65"],
+            "sharpness_pct_actionable_70": metrics["sharpness_pct_actionable_70"],
+            "sharpness_entropy": metrics["sharpness_entropy"],
             "coverage_50": metrics["coverage_50"],
             "coverage_80": metrics["coverage_80"],
             "coverage_90": metrics["coverage_90"],
             "coverage_95": metrics["coverage_95"],
         }
 
-        # Add per-line Brier scores
+        # Add per-line Brier scores and log losses
         for line, brier in metrics["brier_scores"].items():
             fold_rec[f"brier_{line:.1f}".replace(".", "_")] = brier
+        for line, ll in metrics["log_losses"].items():
+            fold_rec[f"log_loss_{line:.1f}".replace(".", "_")] = ll
 
         fold_results.append(fold_rec)
         predictions["fold_test_season"] = test_season
         all_predictions.append(predictions)
 
         logger.info(
-            "Fold results: RMSE=%.3f, MAE=%.3f, Brier=%.4f, "
-            "ECE=%.4f, Temp=%.3f, Coverage(50/80/90)=%.2f/%.2f/%.2f",
+            "Fold results: RMSE=%.3f, MAE=%.3f, Brier=%.4f, LogLoss=%.4f, "
+            "ECE=%.4f, Temp=%.3f, Coverage(50/80/90)=%.2f/%.2f/%.2f, "
+            "Sharpness(conf=%.3f, act60=%.1f%%, entropy=%.3f)",
             metrics["rmse"], metrics["mae"], metrics["avg_brier"],
+            metrics["avg_log_loss"],
             metrics.get("ece", np.nan), metrics.get("temperature", np.nan),
             metrics["coverage_50"], metrics["coverage_80"],
             metrics["coverage_90"],
+            metrics["sharpness_mean_confidence"],
+            metrics["sharpness_pct_actionable_60"],
+            metrics["sharpness_entropy"],
         )
 
     summary_df = pd.DataFrame(fold_results)
@@ -1786,10 +1845,12 @@ def run_full_game_prop_backtest(
         # Overall metrics across all folds
         overall = compute_game_prop_metrics(config, all_pred_df)
         logger.info(
-            "Overall [%s %s]: RMSE=%.3f, MAE=%.3f, Brier=%.4f, n=%d",
+            "Overall [%s %s]: RMSE=%.3f, MAE=%.3f, Brier=%.4f, "
+            "LogLoss=%.4f, n=%d",
             config.side, config.stat_name,
             overall["rmse"], overall["mae"],
-            overall["avg_brier"], overall["n_games"],
+            overall["avg_brier"], overall["avg_log_loss"],
+            overall["n_games"],
         )
     else:
         all_pred_df = pd.DataFrame()
@@ -1967,6 +2028,7 @@ def compute_stratified_metrics(
                 "rmse": metrics["rmse"],
                 "mae": metrics["mae"],
                 "avg_brier": metrics["avg_brier"],
+                "avg_log_loss": metrics["avg_log_loss"],
                 "ece": metrics["ece"],
                 "temperature": metrics["temperature"],
                 "coverage_80": metrics["coverage_80"],

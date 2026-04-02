@@ -39,30 +39,39 @@ CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
 # ---------------------------------------------------------------------------
 # Component weights (sum to 1.0)
 # ---------------------------------------------------------------------------
+# Balanced ranking: best overall prospect quality.
+# FG scouting captures tools/ceiling that stats alone miss (arm strength,
+# bat speed, raw power, body projection).  Age-for-level doubled from
+# prior version because a 19yo doing it at AA is fundamentally different
+# from a 24yo doing the same thing.  Readiness lowered — it measures
+# "who gets called up next", not "who is the best prospect".
 _WEIGHTS = {
-    "readiness": 0.25,
-    "rate_quality": 0.30,
-    "age_rel": 0.15,
-    "trajectory": 0.15,
-    "positional": 0.15,
-}
-
-# Impact score: upside-focused (lower readiness, higher quality + trajectory)
-_IMPACT_WEIGHTS = {
     "readiness": 0.10,
-    "rate_quality": 0.35,
-    "age_rel": 0.15,
-    "trajectory": 0.25,
-    "positional": 0.15,
+    "rate_quality": 0.25,
+    "age_rel": 0.20,
+    "trajectory": 0.15,
+    "positional": 0.10,
+    "scouting": 0.20,
 }
 
-# Floor/ETA score: readiness-focused (higher readiness + age, lower trajectory)
-_FLOOR_WEIGHTS = {
-    "readiness": 0.40,
-    "rate_quality": 0.20,
+# Impact score: upside-focused (max ceiling)
+_IMPACT_WEIGHTS = {
+    "readiness": 0.05,
+    "rate_quality": 0.25,
     "age_rel": 0.20,
+    "trajectory": 0.20,
+    "positional": 0.10,
+    "scouting": 0.20,
+}
+
+# Floor/ETA score: readiness-focused (who contributes soonest)
+_FLOOR_WEIGHTS = {
+    "readiness": 0.35,
+    "rate_quality": 0.20,
+    "age_rel": 0.10,
     "trajectory": 0.10,
     "positional": 0.10,
+    "scouting": 0.15,
 }
 
 # ---------------------------------------------------------------------------
@@ -480,6 +489,21 @@ def _load_fg_rankings(season: int) -> pd.DataFrame:
         "fg_org_rank", "fg_risk", "fg_eta"]]
 
 
+def _fv_to_scouting_score(fv: pd.Series) -> pd.Series:
+    """Convert FanGraphs Future Value (20-80 scale) to 0-1 scouting score.
+
+    FV represents integrated scouting judgment — tools, ceiling, body
+    projection, makeup — that pure stats can't capture.  Maps FV onto
+    a 0-1 scale: FV 20 → 0.0, FV 50 → 0.50, FV 70 → 0.83, FV 80 → 1.0.
+
+    Prospects WITHOUT FG coverage get a neutral 0.40 (slightly below
+    average — if scouts haven't ranked you, you're probably not elite).
+    """
+    # Linear mapping: score = (FV - 20) / 60, clipped to [0, 1]
+    score = (fv - 20.0) / 60.0
+    return score.clip(0, 1).fillna(0.40)
+
+
 def _compute_composite_scores(
     df: pd.DataFrame,
     weights: dict[str, float],
@@ -489,11 +513,23 @@ def _compute_composite_scores(
     Rate quality is age-adjusted using a concave (power-law) form so
     that extreme age outliers (19 yo at AA) get a larger boost than
     the old linear 0.85-1.15 range provided.
+
+    Scouting component uses FG Future Value when available, falling
+    back to a neutral score for prospects without FG coverage.
     """
     # Concave age adjustment: amplifies extreme youth more than linear
     # age_score ~0.0 (old): adj = 0.80, ~0.5 (avg): adj = 0.99, ~1.0 (young): adj = 1.20
     age_adj = 0.80 + 0.40 * df["comp_age"] ** 0.7
     adj_rate_quality = (df["comp_rate_quality"] * age_adj).clip(0, 1)
+
+    # Scouting score from FG Future Value (if available)
+    scouting_wt = weights.get("scouting", 0.0)
+    if scouting_wt > 0 and "fg_future_value" in df.columns:
+        comp_scouting = _fv_to_scouting_score(df["fg_future_value"])
+    elif scouting_wt > 0:
+        comp_scouting = pd.Series(0.40, index=df.index)
+    else:
+        comp_scouting = pd.Series(0.0, index=df.index)
 
     return (
         weights["readiness"] * df["comp_readiness"]
@@ -501,6 +537,7 @@ def _compute_composite_scores(
         + weights["age_rel"] * df["comp_age"]
         + weights["trajectory"] * df["comp_trajectory"]
         + weights["positional"] * df["comp_positional"]
+        + scouting_wt * comp_scouting
     )
 
 
@@ -1048,6 +1085,20 @@ def rank_prospects(
     df["comp_positional"] = _compute_positional_score(df)
 
     # -------------------------------------------------------------------
+    # Merge FanGraphs FV BEFORE composite (used in scouting component)
+    # -------------------------------------------------------------------
+    fg = _load_fg_rankings(projection_season)
+    if not fg.empty:
+        df = df.merge(fg, on="player_id", how="left")
+        logger.info("Merged FG rankings for %d prospects", df["fg_future_value"].notna().sum())
+    else:
+        df["fg_future_value"] = np.nan
+        df["fg_overall_rank"] = np.nan
+        df["fg_org_rank"] = np.nan
+        df["fg_risk"] = np.nan
+        df["fg_eta"] = np.nan
+
+    # -------------------------------------------------------------------
     # Composite scores: balanced, impact, and floor/ETA
     # -------------------------------------------------------------------
     df["tdd_prospect_score"] = _compute_composite_scores(df, weights)
@@ -1064,20 +1115,6 @@ def rank_prospects(
         bins=[0, 0.25, 0.40, 0.55, 0.70, 1.0],
         labels=["Org Filler", "Developing", "Solid", "Impact", "Elite"],
     )
-
-    # -------------------------------------------------------------------
-    # Merge FanGraphs FV for display (clearly labeled)
-    # -------------------------------------------------------------------
-    fg = _load_fg_rankings(projection_season)
-    if not fg.empty:
-        df = df.merge(fg, on="player_id", how="left")
-        logger.info("Merged FG rankings for %d prospects", df["fg_future_value"].notna().sum())
-    else:
-        df["fg_future_value"] = np.nan
-        df["fg_overall_rank"] = np.nan
-        df["fg_org_rank"] = np.nan
-        df["fg_risk"] = np.nan
-        df["fg_eta"] = np.nan
 
     # -------------------------------------------------------------------
     # Scouting grades (20-80 tool grades + diamond rating)
@@ -1266,6 +1303,19 @@ def rank_pitching_prospects(
     df["comp_positional"] = _compute_pitcher_positional_score(df)
 
     # -------------------------------------------------------------------
+    # Merge FanGraphs FV BEFORE composite (used in scouting component)
+    # -------------------------------------------------------------------
+    fg = _load_fg_rankings(projection_season)
+    if not fg.empty:
+        df = df.merge(fg, on="player_id", how="left")
+    else:
+        df["fg_future_value"] = np.nan
+        df["fg_overall_rank"] = np.nan
+        df["fg_org_rank"] = np.nan
+        df["fg_risk"] = np.nan
+        df["fg_eta"] = np.nan
+
+    # -------------------------------------------------------------------
     # Composite scores: balanced, impact, and floor/ETA
     # -------------------------------------------------------------------
     df["tdd_prospect_score"] = _compute_composite_scores(df, weights)
@@ -1282,19 +1332,6 @@ def rank_pitching_prospects(
         bins=[0, 0.25, 0.40, 0.55, 0.70, 1.0],
         labels=["Org Filler", "Developing", "Solid", "Impact", "Elite"],
     )
-
-    # -------------------------------------------------------------------
-    # Merge FanGraphs FV for display
-    # -------------------------------------------------------------------
-    fg = _load_fg_rankings(projection_season)
-    if not fg.empty:
-        df = df.merge(fg, on="player_id", how="left")
-    else:
-        df["fg_future_value"] = np.nan
-        df["fg_overall_rank"] = np.nan
-        df["fg_org_rank"] = np.nan
-        df["fg_risk"] = np.nan
-        df["fg_eta"] = np.nan
 
     # -------------------------------------------------------------------
     # Scouting grades (20-80 tool grades + diamond rating)

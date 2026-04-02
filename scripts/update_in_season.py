@@ -141,12 +141,24 @@ def get_observed_pitcher_totals() -> pd.DataFrame:
 
 
 def update_projections_step() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Step 1: Conjugate-update rate projections."""
+    """Step 1: Conjugate-update rate projections.
+
+    After loading preseason snapshots, merges MiLB-informed priors for
+    rookies who lack preseason projections via the prospect bridge.
+    """
     from src.models.in_season_updater import update_projections
+    from src.models.prospect_bridge import build_rookie_priors, merge_rookie_priors
+
+    # Build MiLB-informed priors for rookies
+    h_rookie_priors, p_rookie_priors = build_rookie_priors(SEASON)
 
     # Hitters
     h_preseason = load_preseason_snapshot("hitter")
     h_obs = get_observed_hitter_totals()
+
+    # Merge rookie priors into preseason (fill gaps, don't overwrite)
+    if not h_preseason.empty and not h_rookie_priors.empty:
+        h_preseason = merge_rookie_priors(h_preseason, h_rookie_priors, "batter_id")
 
     if h_preseason.empty:
         logger.error("No hitter preseason projections — skipping hitter update")
@@ -167,6 +179,10 @@ def update_projections_step() -> tuple[pd.DataFrame, pd.DataFrame]:
     # Pitchers
     p_preseason = load_preseason_snapshot("pitcher")
     p_obs = get_observed_pitcher_totals()
+
+    # Merge rookie priors into preseason (fill gaps, don't overwrite)
+    if not p_preseason.empty and not p_rookie_priors.empty:
+        p_preseason = merge_rookie_priors(p_preseason, p_rookie_priors, "pitcher_id")
 
     if p_preseason.empty:
         logger.error("No pitcher preseason projections — skipping pitcher update")
@@ -204,7 +220,7 @@ def update_k_samples_step() -> dict[str, np.ndarray]:
 
     updated = update_pitcher_k_samples(
         preseason_samples, p_obs,
-        min_bf=10, n_samples=8000,
+        min_bf=10, n_samples=1000,
     )
     logger.info("Updated K%% samples: %d pitchers", len(updated))
     return updated
@@ -235,7 +251,7 @@ def update_rate_samples_step(
         trials_col=trials_col,
         successes_col=successes_col,
         league_avg=league_avg,
-        min_trials=10, n_samples=8000,
+        min_trials=10, n_samples=1000,
     )
     logger.info("Updated %s samples: %d pitchers", stat_name, len(updated))
     return updated
@@ -266,7 +282,7 @@ def update_hitter_rate_samples_step(
         trials_col=trials_col,
         successes_col=successes_col,
         league_avg=league_avg,
-        min_trials=10, n_samples=8000,
+        min_trials=10, n_samples=1000,
     )
     logger.info("Updated hitter %s samples: %d batters", stat_name, len(updated))
     return updated
@@ -297,10 +313,17 @@ def simulate_todays_games(
     pitcher_proj: pd.DataFrame,
     bf_priors: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Step 4: Run K simulations for each starting pitcher."""
-    from src.models.bf_model import get_bf_distribution
-    from src.models.game_k_model import compute_k_over_probs, simulate_game_ks
-    from src.models.matchup import score_matchup
+    """Step 4: Run PA-by-PA simulations for each starting pitcher.
+
+    Uses the full game simulator (simulate_game) with exit model,
+    matchup lifts, TTO adjustments, and pitch count features for
+    comprehensive stat distributions (K, BB, H, HR, IP, pitches).
+    """
+    from src.models.game_sim.exit_model import ExitModel
+    from src.models.game_sim.simulator import simulate_game, compute_stamina_offset
+    from src.models.game_sim.pitch_count_model import build_pitch_count_features
+    from src.models.game_sim.tto_model import build_all_tto_lifts
+    from src.models.matchup import score_matchup_for_stat
     from src.data.league_baselines import get_baselines_dict
 
     # Load matchup data
@@ -308,8 +331,35 @@ def simulate_todays_games(
     vuln_path = DASHBOARD_DIR / "hitter_vuln_career.parquet"
     arsenal_df = pd.read_parquet(arsenal_path) if arsenal_path.exists() else pd.DataFrame()
     vuln_df = pd.read_parquet(vuln_path) if vuln_path.exists() else pd.DataFrame()
+    baselines_pt = get_baselines_dict(seasons=list(range(2020, SEASON)), recency_weights="equal")
 
-    baselines_pt = get_baselines_dict(grouping="pitch_type", recency_weights="marcel")
+    # Load exit model
+    exit_model = ExitModel()
+    exit_model_path = DASHBOARD_DIR / "exit_model.pkl"
+    if exit_model_path.exists():
+        exit_model.load(exit_model_path)
+    else:
+        logger.warning("No exit model found at %s — using fallback", exit_model_path)
+
+    # Load BB% and HR/BF samples
+    bb_npz_path = DASHBOARD_DIR / "pitcher_bb_samples.npz"
+    hr_npz_path = DASHBOARD_DIR / "pitcher_hr_samples.npz"
+    bb_npz = dict(np.load(bb_npz_path)) if bb_npz_path.exists() else {}
+    hr_npz = dict(np.load(hr_npz_path)) if hr_npz_path.exists() else {}
+
+    # Load exit tendencies, pitch count features, TTO profiles
+    tend_path = DASHBOARD_DIR / "pitcher_exit_tendencies.parquet"
+    exit_tend = pd.read_parquet(tend_path) if tend_path.exists() else pd.DataFrame()
+
+    pc_pitcher_path = DASHBOARD_DIR / "pitcher_pitch_count_features.parquet"
+    pc_batter_path = DASHBOARD_DIR / "batter_pitch_count_features.parquet"
+    pitcher_pc = pd.read_parquet(pc_pitcher_path) if pc_pitcher_path.exists() else pd.DataFrame()
+    batter_pc = pd.read_parquet(pc_batter_path) if pc_batter_path.exists() else pd.DataFrame()
+
+    tto_path = DASHBOARD_DIR / "tto_profiles.parquet"
+    tto_profiles = pd.read_parquet(tto_path) if tto_path.exists() else pd.DataFrame()
+
+    last_train = SEASON - 1
 
     results = []
     for _, game in schedule.iterrows():
@@ -327,57 +377,130 @@ def simulate_todays_games(
             if pid_str not in k_samples:
                 continue
 
-            samples = k_samples[pid_str]
+            k_samp = k_samples[pid_str]
+            bb_samp = bb_npz.get(pid_str)
+            hr_samp = hr_npz.get(pid_str)
 
-            # BF distribution
-            bf_info = get_bf_distribution(pid, SEASON - 1, bf_priors)
-            bf_mu = bf_info["mu_bf"]
-            bf_sigma = bf_info["sigma_bf"]
+            # Fall back to league-average samples if missing
+            rng_fb = np.random.default_rng(42 + pid)
+            if bb_samp is None:
+                bb_samp = rng_fb.beta(8, 90, size=len(k_samp))
+            if hr_samp is None:
+                hr_samp = rng_fb.beta(3, 95, size=len(k_samp))
 
-            # Lineup matchup lifts
-            lineup_lifts = None
+            # Opposing lineup and matchup lifts
             opp_side = "home" if side == "away" else "away"
             opp_team_id = game.get(f"{opp_side}_team_id")
 
+            lineup_lifts: dict[str, np.ndarray] = {
+                "k": np.zeros(9), "bb": np.zeros(9), "hr": np.zeros(9),
+            }
+            lineup_ids: list[int] = []
+            has_lineup = False
+
             if not lineups.empty and not arsenal_df.empty and not vuln_df.empty:
                 game_lu = lineups[
-                    (lineups["game_pk"] == gpk) &
-                    (lineups["team_id"] == opp_team_id)
+                    (lineups["game_pk"] == gpk)
+                    & (lineups["team_id"] == opp_team_id)
                 ].sort_values("batting_order")
 
                 if len(game_lu) >= 9:
-                    lifts = []
-                    for _, brow in game_lu.head(9).iterrows():
-                        bid = int(brow["batter_id"])
-                        m = score_matchup(
-                            pid, bid, arsenal_df, vuln_df, baselines_pt,
-                        )
-                        lift = m.get("matchup_k_logit_lift", 0.0)
-                        lifts.append(0.0 if np.isnan(lift) else lift)
-                    lineup_lifts = np.array(lifts)
+                    lineup_ids = [int(b) for b in game_lu.head(9)["batter_id"]]
+                    has_lineup = True
+                    for i, bid in enumerate(lineup_ids):
+                        for stat in ("k", "bb", "hr"):
+                            try:
+                                res = score_matchup_for_stat(
+                                    stat, pid, bid,
+                                    arsenal_df, vuln_df, baselines_pt,
+                                )
+                                v = res.get(f"matchup_{stat}_logit_lift", 0.0)
+                                if isinstance(v, float) and np.isnan(v):
+                                    v = 0.0
+                            except Exception:
+                                v = 0.0
+                            lineup_lifts[stat][i] = v
 
-            # Simulate
-            game_ks = simulate_game_ks(
-                pitcher_k_rate_samples=samples,
-                bf_mu=float(bf_mu),
-                bf_sigma=float(bf_sigma),
-                lineup_matchup_lifts=lineup_lifts,
-                n_draws=10000,
-                random_seed=42 + gpk,
-            )
+            # TTO lifts
+            tto_lifts: dict[str, np.ndarray] = {
+                "k": np.zeros(3), "bb": np.zeros(3), "hr": np.zeros(3),
+            }
+            if not tto_profiles.empty:
+                try:
+                    tto_lifts = build_all_tto_lifts(tto_profiles, pid, last_train)
+                except Exception:
+                    pass
 
-            k_over = compute_k_over_probs(game_ks)
+            # Pitch count features
+            pitcher_adj = 0.0
+            batter_adjs = np.zeros(9)
+            if not pitcher_pc.empty and not batter_pc.empty and lineup_ids:
+                try:
+                    pitcher_adj, batter_adjs = build_pitch_count_features(
+                        pitcher_features=pitcher_pc,
+                        batter_features=batter_pc,
+                        pitcher_id=pid,
+                        batter_ids=lineup_ids,
+                        season=last_train,
+                    )
+                except Exception:
+                    pass
 
-            # Get P(over) for common lines
+            # Pitcher exit tendencies + stamina offset + manager tendency
+            avg_pitches = 88.0
+            avg_ip = 5.28
+            team_avg_p = 88.0
+            if not exit_tend.empty:
+                tend_row = exit_tend[exit_tend["pitcher_id"] == pid]
+                if len(tend_row) > 0:
+                    tr = tend_row.iloc[-1]
+                    avg_pitches = float(tr.get("avg_pitches", 88.0))
+                    avg_ip = float(tr.get("avg_ip", 5.28)) if pd.notna(tr.get("avg_ip")) else 5.28
+                    team_avg_p = float(tr.get("team_avg_pitches", 88.0)) if pd.notna(tr.get("team_avg_pitches")) else 88.0
+            stamina_offset = compute_stamina_offset(avg_ip)
+
+            # Run PA-by-PA simulation
+            try:
+                sim = simulate_game(
+                    pitcher_k_rate_samples=k_samp,
+                    pitcher_bb_rate_samples=bb_samp,
+                    pitcher_hr_rate_samples=hr_samp,
+                    lineup_matchup_lifts=lineup_lifts,
+                    tto_lifts=tto_lifts,
+                    pitcher_ppa_adj=pitcher_adj,
+                    batter_ppa_adjs=batter_adjs,
+                    exit_model=exit_model,
+                    pitcher_avg_pitches=avg_pitches,
+                    exit_calibration_offset=stamina_offset,
+                    manager_pull_tendency=team_avg_p,
+                    n_sims=10000,
+                    random_seed=42 + gpk,
+                )
+            except Exception as e:
+                logger.warning("Sim failed for pitcher %d game %d: %s", pid, gpk, e)
+                continue
+
+            summary = sim.summary()
+            ip_samples = sim.ip_samples()
+
+            # P(over) for common K lines
+            k_over = sim.over_probs("k")
             p_over_dict = {}
             for _, kr in k_over.iterrows():
                 line = kr["line"]
                 if line in (4.5, 5.5, 6.5, 7.5):
                     p_over_dict[f"p_over_{line:.1f}".replace(".", "_")] = kr["p_over"]
 
+            # P(over) for outs lines
+            outs_over = sim.over_probs("outs")
+            for _, or_ in outs_over.iterrows():
+                line = or_["line"]
+                if line in (14.5, 15.5, 16.5, 17.5, 18.5):
+                    p_over_dict[f"p_outs_over_{line:.1f}".replace(".", "_")] = or_["p_over"]
+
             # Pitcher projection info
             p_row = pitcher_proj[pitcher_proj["pitcher_id"] == pid]
-            proj_k_rate = float(p_row.iloc[0]["projected_k_rate"]) if not p_row.empty else np.mean(samples)
+            proj_k_rate = float(p_row.iloc[0]["projected_k_rate"]) if not p_row.empty else float(np.mean(k_samp))
             composite = float(p_row.iloc[0].get("composite_score", 0)) if not p_row.empty else 0.0
 
             results.append({
@@ -389,15 +512,371 @@ def simulate_todays_games(
                 "opp_abbr": game.get(f"{opp_side}_abbr", ""),
                 "projected_k_rate": proj_k_rate,
                 "composite_score": composite,
-                "expected_k": float(np.mean(game_ks)),
-                "k_std": float(np.std(game_ks)),
-                "median_k": float(np.median(game_ks)),
-                "has_lineup": lineup_lifts is not None,
-                "avg_matchup_lift": float(np.mean(lineup_lifts)) if lineup_lifts is not None else 0.0,
+                "expected_k": summary["k"]["mean"],
+                "k_std": summary["k"]["std"],
+                "median_k": summary["k"]["median"],
+                "expected_bb": summary["bb"]["mean"],
+                "expected_h": summary["h"]["mean"],
+                "expected_hr": summary["hr"]["mean"],
+                "expected_ip": float(np.mean(ip_samples)),
+                "expected_pitches": summary["pitch_count"]["mean"],
+                "expected_outs": summary["outs"]["mean"],
+                "expected_runs": summary["runs"]["mean"],
+                "has_lineup": has_lineup,
+                "avg_matchup_lift": float(np.mean(lineup_lifts["k"])),
                 **p_over_dict,
             })
 
     return pd.DataFrame(results)
+
+
+def update_season_stats_step() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Step 5: Query 2026 traditional stats for season leaders."""
+    from src.data.queries import (
+        get_hitter_traditional_stats,
+        get_pitcher_traditional_stats,
+    )
+
+    h_trad = pd.DataFrame()
+    p_trad = pd.DataFrame()
+
+    try:
+        h_trad = get_hitter_traditional_stats(SEASON)
+        if not h_trad.empty:
+            h_trad.to_parquet(
+                DASHBOARD_DIR / "hitter_traditional.parquet", index=False,
+            )
+            logger.info(
+                "Saved 2026 hitter traditional stats: %d players", len(h_trad),
+            )
+        else:
+            logger.info("No 2026 hitter traditional stats yet")
+    except Exception as e:
+        logger.warning("Hitter traditional stats failed: %s", e)
+
+    try:
+        p_trad = get_pitcher_traditional_stats(SEASON)
+        if not p_trad.empty:
+            p_trad.to_parquet(
+                DASHBOARD_DIR / "pitcher_traditional.parquet", index=False,
+            )
+            logger.info(
+                "Saved 2026 pitcher traditional stats: %d players", len(p_trad),
+            )
+        else:
+            logger.info("No 2026 pitcher traditional stats yet")
+    except Exception as e:
+        logger.warning("Pitcher traditional stats failed: %s", e)
+
+    return h_trad, p_trad
+
+
+def refresh_prospect_rankings() -> None:
+    """Weekly: Re-score readiness, re-rank prospects, update comps.
+
+    Loads current MiLB translated data from cache, re-trains the
+    readiness model, re-runs TDD prospect rankings for both batters
+    and pitchers, and refreshes prospect-to-MLB comps.  All outputs
+    are written to the dashboard directory.
+    """
+    import shutil
+
+    logger.info("=" * 60)
+    logger.info("Weekly prospect rankings refresh (season %d)...", SEASON)
+
+    cached_dir = PROJECT_ROOT / "data" / "cached"
+
+    # Rebuild MiLB translations with current season data so new AAA/AA
+    # performance (e.g. a prospect demolishing AAA) flows into rankings.
+    try:
+        from src.data.feature_eng import build_milb_translated_data
+
+        seasons = [y for y in range(2005, SEASON + 1) if y != 2020]
+        logger.info("Rebuilding MiLB translations for %d-%d...", seasons[0], seasons[-1])
+        build_milb_translated_data(seasons=seasons, force_rebuild=True)
+        logger.info("MiLB translations rebuilt (includes %d data)", SEASON)
+    except Exception:
+        logger.exception("Failed to rebuild MiLB translations — using cached data")
+
+    # Guard: check for MiLB translated data
+    batter_path = cached_dir / "milb_translated_batters.parquet"
+    pitcher_path = cached_dir / "milb_translated_pitchers.parquet"
+    if not batter_path.exists() or not pitcher_path.exists():
+        logger.warning(
+            "MiLB translated data not found in %s — skipping prospect refresh. "
+            "Run build_milb_translations.py first.",
+            cached_dir,
+        )
+        return
+
+    # Copy MiLB translated data to dashboard
+    milb_files = {
+        "milb_translated_batters.parquet": "MiLB translated batters",
+        "milb_translated_pitchers.parquet": "MiLB translated pitchers",
+    }
+    for fname, label in milb_files.items():
+        src_path = cached_dir / fname
+        if src_path.exists():
+            shutil.copy2(src_path, DASHBOARD_DIR / fname)
+            logger.info("Copied %s to dashboard", label)
+
+    # 1. Re-score readiness
+    n_batters_ranked = 0
+    n_pitchers_ranked = 0
+
+    try:
+        from src.models.mlb_readiness import train_readiness_model, score_prospects
+        from src.data.db import read_sql
+
+        bundle = train_readiness_model()
+        prospects_df = score_prospects(projection_season=SEASON)
+        logger.info(
+            "Readiness model: AUC=%.3f, scored %d prospects",
+            bundle["train_auc"], len(prospects_df),
+        )
+
+        # Merge with FanGraphs rankings
+        rankings = read_sql(
+            "SELECT player_id, player_name, org, position, overall_rank, "
+            "org_rank, future_value, risk, eta, source "
+            "FROM production.dim_prospect_ranking "
+            f"WHERE season = {SEASON}",
+            {},
+        )
+        if not rankings.empty:
+            rankings = rankings.sort_values(
+                "source", ascending=True,
+            ).drop_duplicates("player_id", keep="first")
+            logger.info("FanGraphs rankings: %d prospects for %d", len(rankings), SEASON)
+
+        if not prospects_df.empty:
+            readiness_cols = [
+                "player_id", "name", "pos_group", "primary_position",
+                "max_level", "max_level_num", "readiness_score", "readiness_tier",
+                "wtd_k_pct", "wtd_bb_pct", "wtd_iso", "k_bb_diff", "sb_rate",
+                "youngest_age_rel", "min_age", "career_milb_pa",
+                "n_above", "total_at_pos_in_org",
+            ]
+            available_cols = [c for c in readiness_cols if c in prospects_df.columns]
+            prospect_out = prospects_df[available_cols].copy()
+
+            if not rankings.empty:
+                fg_cols = ["player_id", "org", "overall_rank", "org_rank", "risk", "eta"]
+                fg_available = [c for c in fg_cols if c in rankings.columns]
+                prospect_out = prospect_out.merge(
+                    rankings[fg_available], on="player_id", how="left",
+                )
+
+            prospect_out.to_parquet(
+                DASHBOARD_DIR / "prospect_readiness.parquet", index=False,
+            )
+            logger.info("Saved prospect_readiness.parquet: %d rows", len(prospect_out))
+
+    except Exception:
+        logger.exception("Failed to update prospect readiness scores")
+
+    # 2. Re-run TDD prospect rankings
+    try:
+        from src.models.prospect_ranking import rank_prospects, rank_pitching_prospects
+
+        prospect_rankings = rank_prospects(projection_season=SEASON)
+        if not prospect_rankings.empty:
+            prospect_rankings.to_parquet(
+                DASHBOARD_DIR / "prospect_rankings.parquet", index=False,
+            )
+            n_batters_ranked = len(prospect_rankings)
+            logger.info(
+                "Saved prospect_rankings.parquet: %d batters", n_batters_ranked,
+            )
+        else:
+            logger.warning("No batting prospect rankings generated")
+
+        pitching_rankings = rank_pitching_prospects(projection_season=SEASON)
+        if not pitching_rankings.empty:
+            pitching_rankings.to_parquet(
+                DASHBOARD_DIR / "pitching_prospect_rankings.parquet", index=False,
+            )
+            n_pitchers_ranked = len(pitching_rankings)
+            logger.info(
+                "Saved pitching_prospect_rankings.parquet: %d pitchers",
+                n_pitchers_ranked,
+            )
+        else:
+            logger.warning("No pitching prospect rankings generated")
+
+    except Exception:
+        logger.exception("Failed to update prospect rankings")
+
+    # 3. Re-run prospect comps
+    try:
+        from src.models.prospect_comps import find_all_comps
+
+        comps = find_all_comps(projection_season=SEASON)
+        for key, cdf in comps.items():
+            if not cdf.empty:
+                fname = f"prospect_comps_{key}.parquet"
+                cdf.to_parquet(DASHBOARD_DIR / fname, index=False)
+                logger.info("Saved %s: %d rows", fname, len(cdf))
+
+    except Exception:
+        logger.exception("Failed to update prospect comps")
+
+    logger.info(
+        "Prospect refresh complete: %d batters, %d pitchers ranked",
+        n_batters_ranked, n_pitchers_ranked,
+    )
+
+
+def update_weekly_rankings_step() -> None:
+    """Weekly: Re-rank players with 2026 observed data.
+
+    Uses the same ``rank_all`` engine as preseason, but pointed at
+    2026 observed stats + conjugate-updated projections.  The
+    exposure-conditioned scouting weight naturally shifts from
+    projection-dominant (early season) to production-dominant
+    (mid-season onward).
+    """
+    from src.models.player_rankings import rank_all
+
+    logger.info("=" * 60)
+    logger.info("Weekly player rankings refresh (season %d)...", SEASON)
+
+    try:
+        rankings = rank_all(
+            season=SEASON,
+            projection_season=SEASON,
+        )
+        for key, rdf in rankings.items():
+            if not rdf.empty:
+                fname = f"{key}_rankings.parquet"
+                rdf.to_parquet(DASHBOARD_DIR / fname, index=False)
+                logger.info("Saved %s: %d rows", fname, len(rdf))
+            else:
+                logger.warning("No %s rankings produced", key)
+    except Exception:
+        logger.exception("Failed to update player rankings")
+
+
+def update_weekly_team_step() -> None:
+    """Weekly: Update team ELO with 2026 games + rebuild power rankings."""
+    logger.info("=" * 60)
+    logger.info("Weekly team rankings refresh...")
+
+    # 1. Recompute ELO including 2026 games
+    try:
+        from src.data.team_queries import (
+            get_game_results,
+            get_team_info,
+            get_venue_run_factors,
+        )
+        from src.models.team_elo import (
+            compute_elo_history,
+            get_current_ratings,
+        )
+
+        elo_games = get_game_results()
+        elo_venue = get_venue_run_factors()
+        elo_team_info = get_team_info()
+        logger.info(
+            "ELO input: %d games (including 2026)", len(elo_games),
+        )
+
+        elo_ratings, elo_history = compute_elo_history(elo_games, elo_venue)
+        elo_current = get_current_ratings(elo_ratings, elo_team_info)
+        elo_current.to_parquet(
+            DASHBOARD_DIR / "team_elo.parquet", index=False,
+        )
+        logger.info("Saved updated team ELO: %d teams", len(elo_current))
+
+    except Exception:
+        logger.exception("Failed to update team ELO")
+        return
+
+    # 2. Rebuild team profiles + rankings
+    profiles = pd.DataFrame()
+    try:
+        from src.models.team_profiles import build_all_team_profiles
+        from src.models.team_rankings import rank_teams
+
+        profiles = build_all_team_profiles(
+            season=SEASON,
+            projection_season=SEASON,
+            elo_history=elo_history,
+        )
+        if not profiles.empty:
+            profiles.to_parquet(
+                DASHBOARD_DIR / "team_profiles.parquet", index=False,
+            )
+            logger.info("Saved team profiles: %d teams", len(profiles))
+
+            # Observed RS/RA for projected wins
+            obs_rs_ra = None
+            try:
+                from src.data.team_queries import get_game_results as _get_gr
+                from src.models.team_sim.league_season_sim import (
+                    compute_2h_weighted_rs_ra,
+                )
+                obs_rs_ra = compute_2h_weighted_rs_ra(
+                    _get_gr(), SEASON,
+                )
+            except Exception:
+                logger.warning("Could not compute observed RS/RA")
+
+            team_rankings = rank_teams(
+                profiles,
+                elo_ratings=elo_current,
+                observed_rs_ra=obs_rs_ra,
+            )
+            if not team_rankings.empty:
+                team_rankings.to_parquet(
+                    DASHBOARD_DIR / "team_rankings.parquet", index=False,
+                )
+                logger.info(
+                    "Saved team rankings: %d teams", len(team_rankings),
+                )
+    except Exception:
+        logger.exception("Failed to update team profiles/rankings")
+
+    # 3. Rebuild power rankings
+    try:
+        from src.models.team_rankings import build_power_rankings
+
+        h_rank_path = DASHBOARD_DIR / "hitters_rankings.parquet"
+        p_rank_path = DASHBOARD_DIR / "pitchers_rankings.parquet"
+        h_proj_path = DASHBOARD_DIR / "hitter_projections.parquet"
+        p_proj_path = DASHBOARD_DIR / "pitcher_projections.parquet"
+        roster_path = DASHBOARD_DIR / "roster.parquet"
+
+        if all(p.exists() for p in [h_rank_path, p_rank_path, roster_path]):
+            power = build_power_rankings(
+                elo_ratings=elo_current,
+                profiles=profiles,
+                current_roster=pd.read_parquet(roster_path),
+                hitter_rankings=pd.read_parquet(h_rank_path),
+                pitcher_rankings=pd.read_parquet(p_rank_path),
+                hitter_projections=(
+                    pd.read_parquet(h_proj_path) if h_proj_path.exists()
+                    else pd.DataFrame()
+                ),
+                pitcher_projections=(
+                    pd.read_parquet(p_proj_path) if p_proj_path.exists()
+                    else pd.DataFrame()
+                ),
+            )
+            if not power.empty:
+                power.to_parquet(
+                    DASHBOARD_DIR / "team_power_rankings.parquet",
+                    index=False,
+                )
+                logger.info(
+                    "Saved power rankings: %d teams", len(power),
+                )
+        else:
+            logger.warning(
+                "Skipping power rankings — missing required parquets",
+            )
+    except Exception:
+        logger.exception("Failed to update power rankings")
 
 
 def main() -> None:
@@ -406,6 +885,8 @@ def main() -> None:
                         help="Game date (YYYY-MM-DD). Default: today.")
     parser.add_argument("--skip-schedule", action="store_true",
                         help="Skip fetching schedule/lineups from MLB API.")
+    parser.add_argument("--weekly", action="store_true",
+                        help="Run weekly refresh: player, team, and prospect rankings.")
     args = parser.parse_args()
 
     game_date = args.date or date.today().isoformat()
@@ -523,6 +1004,19 @@ def main() -> None:
     else:
         logger.info("Step 4: Skipped (--skip-schedule)")
 
+    # Step 5: Update 2026 season stats (traditional stats for leaders page)
+    logger.info("Step 5: Updating 2026 season stats...")
+    h_trad, p_trad = update_season_stats_step()
+
+    # Step 6 (weekly only): Refresh player + team + prospect rankings
+    if args.weekly:
+        logger.info("Step 6: Weekly rankings refresh...")
+        update_weekly_rankings_step()
+        update_weekly_team_step()
+        refresh_prospect_rankings()
+    else:
+        logger.info("Step 6: Skipped (use --weekly to refresh rankings)")
+
     # Save update metadata
     metadata = {
         "last_updated": datetime.now().isoformat(),
@@ -536,6 +1030,9 @@ def main() -> None:
         "hitter_k_samples_count": len(h_k_samples),
         "hitter_bb_samples_count": len(h_bb_samples),
         "hitter_hr_samples_count": len(h_hr_samples),
+        "hitter_trad_count": len(h_trad),
+        "pitcher_trad_count": len(p_trad),
+        "weekly_refresh": args.weekly,
     }
     meta_path = DASHBOARD_DIR / "update_metadata.json"
     with open(meta_path, "w") as f:

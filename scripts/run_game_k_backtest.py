@@ -94,6 +94,8 @@ def _print_k_results(results: pd.DataFrame) -> None:
         print(f"Average RMSE:  {results['rmse'].mean():.3f}")
         print(f"Average MAE:   {results['mae'].mean():.3f}")
         print(f"Average Brier: {results['avg_brier'].mean():.4f}")
+        if "avg_log_loss" in results.columns:
+            print(f"Average Log Loss: {results['avg_log_loss'].mean():.4f}")
         print(f"Coverage 50/80/90: "
               f"{results['coverage_50'].mean():.0%} / "
               f"{results['coverage_80'].mean():.0%} / "

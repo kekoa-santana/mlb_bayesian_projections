@@ -426,9 +426,12 @@ def compute_projected_grades_with_ci(
     pitcher_ci = pd.DataFrame()
 
     if not hitter_statcast_proj.empty and not hitter_rankings.empty:
-        hitter_ci = hitter_rankings[["batter_id", "tools_rating",
-                                      "grade_hit", "grade_power", "grade_speed",
-                                      "grade_fielding", "grade_discipline"]].copy()
+        _hitter_rank_cols = ["batter_id", "tools_rating",
+                             "grade_hit", "grade_power", "grade_speed",
+                             "grade_fielding", "grade_discipline"]
+        if "age" in hitter_rankings.columns:
+            _hitter_rank_cols.append("age")
+        hitter_ci = hitter_rankings[_hitter_rank_cols].copy()
         hitter_ci = hitter_ci.rename(columns={"batter_id": "player_id"})
 
         # Merge projected SDs
@@ -447,7 +450,11 @@ def compute_projected_grades_with_ci(
             if available_sds:
                 avg_sd = hitter_ci[available_sds].mean(axis=1).fillna(0)
                 # Normalize: SD as fraction of population spread
-                grade_uncertainty = (avg_sd / avg_sd.median()).clip(0.5, 3.0) * 5
+                grade_uncertainty = (avg_sd / avg_sd.median()).clip(0.5, 5.0) * 5
+                # Younger players get wider CI — developmental upside/downside
+                if "age" in hitter_ci.columns:
+                    age_factor = ((28 - hitter_ci["age"]) / 10).clip(0, 1)
+                    grade_uncertainty = grade_uncertainty * (1 + 0.5 * age_factor)
                 hitter_ci[f"{grade_col}_lo"] = (hitter_ci[grade_col] - grade_uncertainty).clip(20, 80).astype(int)
                 hitter_ci[f"{grade_col}_hi"] = (hitter_ci[grade_col] + grade_uncertainty).clip(20, 80).astype(int)
             else:
@@ -455,10 +462,16 @@ def compute_projected_grades_with_ci(
                 hitter_ci[f"{grade_col}_hi"] = (hitter_ci[grade_col] + 5).clip(20, 80)
 
         # Speed and fielding: fixed uncertainty (speed very stable, fielding volatile)
-        hitter_ci["grade_speed_lo"] = (hitter_ci["grade_speed"] - 3).clip(20, 80)
-        hitter_ci["grade_speed_hi"] = (hitter_ci["grade_speed"] + 3).clip(20, 80)
-        hitter_ci["grade_fielding_lo"] = (hitter_ci["grade_fielding"] - 8).clip(20, 80)
-        hitter_ci["grade_fielding_hi"] = (hitter_ci["grade_fielding"] + 8).clip(20, 80)
+        _speed_unc = 3
+        _field_unc = 8
+        if "age" in hitter_ci.columns:
+            age_factor = ((28 - hitter_ci["age"]) / 10).clip(0, 1)
+            _speed_unc = _speed_unc * (1 + 0.5 * age_factor)
+            _field_unc = _field_unc * (1 + 0.5 * age_factor)
+        hitter_ci["grade_speed_lo"] = (hitter_ci["grade_speed"] - _speed_unc).clip(20, 80)
+        hitter_ci["grade_speed_hi"] = (hitter_ci["grade_speed"] + _speed_unc).clip(20, 80)
+        hitter_ci["grade_fielding_lo"] = (hitter_ci["grade_fielding"] - _field_unc).clip(20, 80)
+        hitter_ci["grade_fielding_hi"] = (hitter_ci["grade_fielding"] + _field_unc).clip(20, 80)
 
         # Diamond rating CI: propagate from tool CIs
         # Floor: all tools at their low end; Ceiling: all at their high end
@@ -472,9 +485,12 @@ def compute_projected_grades_with_ci(
         hitter_ci["tools_rating_hi"] = (dr + tool_uncertainty / 2).clip(1, 10).round(1)
 
     if not pitcher_statcast_proj.empty and not pitcher_rankings.empty:
-        pitcher_ci = pitcher_rankings[["pitcher_id", "tools_rating",
-                                        "grade_stuff", "grade_command",
-                                        "grade_durability"]].copy()
+        _pitcher_rank_cols = ["pitcher_id", "tools_rating",
+                              "grade_stuff", "grade_command",
+                              "grade_durability"]
+        if "age" in pitcher_rankings.columns:
+            _pitcher_rank_cols.append("age")
+        pitcher_ci = pitcher_rankings[_pitcher_rank_cols].copy()
         pitcher_ci = pitcher_ci.rename(columns={"pitcher_id": "player_id"})
         pitcher_ci = pitcher_ci.merge(pitcher_statcast_proj, on="player_id", how="left")
 
@@ -485,15 +501,23 @@ def compute_projected_grades_with_ci(
             available_sds = [c for c in sd_cols if c in pitcher_ci.columns]
             if available_sds:
                 avg_sd = pitcher_ci[available_sds].mean(axis=1).fillna(0)
-                grade_uncertainty = (avg_sd / avg_sd.median()).clip(0.5, 3.0) * 5
+                grade_uncertainty = (avg_sd / avg_sd.median()).clip(0.5, 5.0) * 5
+                # Younger players get wider CI — developmental upside/downside
+                if "age" in pitcher_ci.columns:
+                    age_factor = ((28 - pitcher_ci["age"]) / 10).clip(0, 1)
+                    grade_uncertainty = grade_uncertainty * (1 + 0.5 * age_factor)
                 pitcher_ci[f"{grade_col}_lo"] = (pitcher_ci[grade_col] - grade_uncertainty).clip(20, 80).astype(int)
                 pitcher_ci[f"{grade_col}_hi"] = (pitcher_ci[grade_col] + grade_uncertainty).clip(20, 80).astype(int)
             else:
                 pitcher_ci[f"{grade_col}_lo"] = (pitcher_ci[grade_col] - 5).clip(20, 80)
                 pitcher_ci[f"{grade_col}_hi"] = (pitcher_ci[grade_col] + 5).clip(20, 80)
 
-        pitcher_ci["grade_durability_lo"] = (pitcher_ci["grade_durability"] - 7).clip(20, 80)
-        pitcher_ci["grade_durability_hi"] = (pitcher_ci["grade_durability"] + 7).clip(20, 80)
+        _dur_unc = 7
+        if "age" in pitcher_ci.columns:
+            age_factor = ((28 - pitcher_ci["age"]) / 10).clip(0, 1)
+            _dur_unc = _dur_unc * (1 + 0.5 * age_factor)
+        pitcher_ci["grade_durability_lo"] = (pitcher_ci["grade_durability"] - _dur_unc).clip(20, 80)
+        pitcher_ci["grade_durability_hi"] = (pitcher_ci["grade_durability"] + _dur_unc).clip(20, 80)
 
         dr = pitcher_ci["tools_rating"]
         tool_uncertainty = (

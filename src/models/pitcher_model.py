@@ -516,6 +516,13 @@ def extract_rate_samples(
         else:
             rho_draws = np.ones(len(samples))  # fallback: pure random walk
 
+        # Less regression for young developing pitchers
+        age = df.loc[pos, "age"] if "age" in df.columns else None
+        if age is not None and age <= 25:
+            effective_rho = rho_draws * 0.92
+        else:
+            effective_rho = rho_draws
+
         # Project on logit scale with AR(1): next = rho * current_effect + innovation
         # The season_effect at the last observed season is already in the samples,
         # so we apply rho dampening + new innovation
@@ -536,7 +543,7 @@ def extract_rate_samples(
         # implicitly regresses both the season effect and covariates,
         # which is correct — covariate values also regress toward the mean.
         deviation_last = logit_samples - alpha_draws
-        new_deviation = rho_draws * deviation_last + innovation
+        new_deviation = effective_rho * deviation_last + innovation
         samples = 1.0 / (1.0 + np.exp(-(alpha_draws + new_deviation)))
 
     return samples

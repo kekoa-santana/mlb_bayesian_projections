@@ -427,6 +427,133 @@ def get_season_totals_by_pitcher_hand(season: int) -> pd.DataFrame:
     return read_sql(query, {"season": season})
 
 
+def get_league_platoon_baselines(
+    seasons: list[int] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Compute league-average platoon K% and BB% deltas (logit-scale).
+
+    Pools PA across *seasons* and computes the difference between
+    same-side / opposite-side rates and overall rates in logit space.
+
+    Parameters
+    ----------
+    seasons : list[int] | None
+        Seasons to pool.  Defaults to [2022, 2023, 2024, 2025].
+
+    Returns
+    -------
+    dict
+        ``{"platoon_k_logit": {"same": float, "opposite": float},
+           "platoon_bb_logit": {"same": float, "opposite": float},
+           "lg_k_rate": float, "lg_bb_rate": float,
+           "lg_gb_rate": float, "lg_fb_rate": float}``
+    """
+    if seasons is None:
+        seasons = [2022, 2023, 2024, 2025]
+
+    query = """
+    WITH stand_agg AS (
+        SELECT DISTINCT ON (fp.pa_id)
+            fp.pa_id,
+            fp.batter_stand
+        FROM production.fact_pitch fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE dg.season    = ANY(:seasons)
+          AND dg.game_type = 'R'
+          AND fp.batter_stand IS NOT NULL
+        ORDER BY fp.pa_id, fp.pitch_number
+    ),
+    pa_level AS (
+        SELECT
+            sa.batter_stand,
+            dp_p.pitch_hand,
+            CASE WHEN sa.batter_stand = dp_p.pitch_hand
+                 THEN 'same' ELSE 'opposite' END          AS platoon_side,
+            CASE WHEN fpa.events IN ('strikeout','strikeout_double_play')
+                 THEN 1 ELSE 0 END                        AS is_k,
+            CASE WHEN fpa.events IN ('walk','intent_walk')
+                 THEN 1 ELSE 0 END                        AS is_bb
+        FROM production.fact_pa fpa
+        JOIN production.dim_game dg    ON fpa.game_pk  = dg.game_pk
+        LEFT JOIN production.dim_player dp_p ON fpa.pitcher_id = dp_p.player_id
+        LEFT JOIN stand_agg sa               ON fpa.pa_id      = sa.pa_id
+        WHERE dg.season    = ANY(:seasons)
+          AND dg.game_type = 'R'
+          AND fpa.events IS NOT NULL
+          AND dp_p.pitch_hand IN ('L', 'R')
+    )
+    SELECT
+        platoon_side,
+        COUNT(*)                                   AS pa,
+        SUM(is_k)::float / COUNT(*)                AS k_rate,
+        SUM(is_bb)::float / COUNT(*)               AS bb_rate
+    FROM pa_level
+    GROUP BY platoon_side
+    ORDER BY platoon_side
+    """
+    df = read_sql(query, {"seasons": seasons})
+
+    # Also get league-average GB% and FB% from batted balls
+    bb_query = """
+    SELECT
+        COUNT(*)                                                              AS total_bip,
+        SUM(CASE WHEN sbb.launch_angle < 10 THEN 1 ELSE 0 END)::float
+            / NULLIF(COUNT(*), 0)                                             AS lg_gb_rate,
+        SUM(CASE WHEN sbb.launch_angle > 25 THEN 1 ELSE 0 END)::float
+            / NULLIF(COUNT(*), 0)                                             AS lg_fb_rate
+    FROM production.fact_pa fpa
+    JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
+    JOIN production.sat_batted_balls sbb ON fpa.pa_id = sbb.pa_id
+    WHERE dg.season    = ANY(:seasons)
+      AND dg.game_type = 'R'
+      AND sbb.launch_angle IS NOT NULL
+    """
+    bb_df = read_sql(bb_query, {"seasons": seasons})
+
+    def _logit(p: float) -> float:
+        p = max(1e-6, min(1 - 1e-6, p))
+        return float(np.log(p / (1.0 - p)))
+
+    overall_k = float(df["k_rate"].mean())  # simple avg of same/opposite
+    overall_bb = float(df["bb_rate"].mean())
+
+    # Weight by PA for true overall
+    total_pa = df["pa"].sum()
+    overall_k = float((df["k_rate"] * df["pa"]).sum() / total_pa)
+    overall_bb = float((df["bb_rate"] * df["pa"]).sum() / total_pa)
+
+    result: dict[str, dict[str, float] | float] = {
+        "platoon_k_logit": {},
+        "platoon_bb_logit": {},
+        "lg_k_rate": overall_k,
+        "lg_bb_rate": overall_bb,
+    }
+    for _, row in df.iterrows():
+        side = row["platoon_side"]
+        result["platoon_k_logit"][side] = _logit(row["k_rate"]) - _logit(overall_k)
+        result["platoon_bb_logit"][side] = _logit(row["bb_rate"]) - _logit(overall_bb)
+
+    if not bb_df.empty:
+        result["lg_gb_rate"] = float(bb_df["lg_gb_rate"].iloc[0])
+        result["lg_fb_rate"] = float(bb_df["lg_fb_rate"].iloc[0])
+    else:
+        result["lg_gb_rate"] = 0.446
+        result["lg_fb_rate"] = 0.321
+
+    logger.info(
+        "League platoon baselines (seasons %s): K logit same=%.3f opp=%.3f, "
+        "BB logit same=%.3f opp=%.3f, GB=%.3f FB=%.3f",
+        seasons,
+        result["platoon_k_logit"].get("same", 0),
+        result["platoon_k_logit"].get("opposite", 0),
+        result["platoon_bb_logit"].get("same", 0),
+        result["platoon_bb_logit"].get("opposite", 0),
+        result["lg_gb_rate"],
+        result["lg_fb_rate"],
+    )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 5. Pitcher season totals (from boxscores)
 # ---------------------------------------------------------------------------
@@ -3183,16 +3310,18 @@ def get_exit_model_training_data(seasons: list[int]) -> pd.DataFrame:
     WITH starter_games AS (
         -- Identify starter games and their total PA count
         SELECT
-            player_id AS pitcher_id,
-            game_pk,
-            season,
-            team_id,
-            pit_bf AS total_bf,
-            pit_pitches AS total_pitches
-        FROM production.fact_player_game_mlb
-        WHERE pit_is_starter = TRUE
-          AND season IN ({season_list})
-          AND pit_bf >= 3
+            fpg.player_id AS pitcher_id,
+            fpg.game_pk,
+            fpg.season,
+            fpg.team_id,
+            fpg.pit_bf AS total_bf,
+            fpg.pit_pitches AS total_pitches
+        FROM production.fact_player_game_mlb fpg
+        JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+        WHERE fpg.pit_is_starter = TRUE
+          AND dg.game_type = 'R'
+          AND fpg.season IN ({season_list})
+          AND fpg.pit_bf >= 3
     ),
     pa_with_cumulative AS (
         SELECT
@@ -3267,17 +3396,19 @@ def get_pitcher_exit_tendencies(seasons: list[int]) -> pd.DataFrame:
     query = f"""
     WITH pitcher_starts AS (
         SELECT
-            player_id AS pitcher_id,
-            season,
-            team_id,
-            pit_pitches,
-            pit_bf,
+            fpg.player_id AS pitcher_id,
+            fpg.season,
+            fpg.team_id,
+            fpg.pit_pitches,
+            fpg.pit_bf,
             -- Convert baseball IP notation (.1=1/3, .2=2/3) to true outs
-            FLOOR(pit_ip) * 3 + ROUND((pit_ip - FLOOR(pit_ip)) * 10) AS outs
-        FROM production.fact_player_game_mlb
-        WHERE pit_is_starter = TRUE
-          AND season IN ({season_list})
-          AND pit_bf >= 3
+            FLOOR(fpg.pit_ip) * 3 + ROUND((fpg.pit_ip - FLOOR(fpg.pit_ip)) * 10) AS outs
+        FROM production.fact_player_game_mlb fpg
+        JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+        WHERE fpg.pit_is_starter = TRUE
+          AND dg.game_type = 'R'
+          AND fpg.season IN ({season_list})
+          AND fpg.pit_bf >= 3
     ),
     pitcher_agg AS (
         SELECT
@@ -3342,18 +3473,20 @@ def get_team_bullpen_rates(seasons: list[int]) -> pd.DataFrame:
     season_list = ", ".join(str(s) for s in seasons)
     query = f"""
     SELECT
-        team_id,
-        season,
-        SUM(pit_k)::float   / NULLIF(SUM(pit_bf), 0) AS k_rate,
-        SUM(pit_bb)::float  / NULLIF(SUM(pit_bf), 0) AS bb_rate,
-        SUM(pit_hr)::float  / NULLIF(SUM(pit_bf), 0) AS hr_rate,
-        SUM(pit_bf) AS total_bf
-    FROM production.fact_player_game_mlb
-    WHERE pit_is_starter = FALSE
-      AND pit_bf >= 1
-      AND season IN ({season_list})
-    GROUP BY team_id, season
-    ORDER BY team_id, season
+        fpg.team_id,
+        fpg.season,
+        SUM(fpg.pit_k)::float   / NULLIF(SUM(fpg.pit_bf), 0) AS k_rate,
+        SUM(fpg.pit_bb)::float  / NULLIF(SUM(fpg.pit_bf), 0) AS bb_rate,
+        SUM(fpg.pit_hr)::float  / NULLIF(SUM(fpg.pit_bf), 0) AS hr_rate,
+        SUM(fpg.pit_bf) AS total_bf
+    FROM production.fact_player_game_mlb fpg
+    JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+    WHERE fpg.pit_is_starter = FALSE
+      AND dg.game_type = 'R'
+      AND fpg.pit_bf >= 1
+      AND fpg.season IN ({season_list})
+    GROUP BY fpg.team_id, fpg.season
+    ORDER BY fpg.team_id, fpg.season
     """
     logger.info("Fetching team bullpen rates for seasons %s", seasons)
     return read_sql(query)
@@ -3380,20 +3513,22 @@ def get_team_reliever_roster(
     season_list = ", ".join(str(s) for s in seasons)
     query = f"""
     SELECT
-        team_id,
-        season,
-        player_id AS pitcher_id,
-        SUM(pit_bf) AS bf,
-        SUM(pit_bf)::float / SUM(SUM(pit_bf)) OVER (
-            PARTITION BY team_id, season
+        fpg.team_id,
+        fpg.season,
+        fpg.player_id AS pitcher_id,
+        SUM(fpg.pit_bf) AS bf,
+        SUM(fpg.pit_bf)::float / SUM(SUM(fpg.pit_bf)) OVER (
+            PARTITION BY fpg.team_id, fpg.season
         ) AS bf_share
-    FROM production.fact_player_game_mlb
-    WHERE pit_is_starter = FALSE
-      AND pit_bf >= 1
-      AND season IN ({season_list})
-    GROUP BY team_id, season, player_id
-    HAVING SUM(pit_bf) >= {min_bf}
-    ORDER BY team_id, season, bf DESC
+    FROM production.fact_player_game_mlb fpg
+    JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+    WHERE fpg.pit_is_starter = FALSE
+      AND dg.game_type = 'R'
+      AND fpg.pit_bf >= 1
+      AND fpg.season IN ({season_list})
+    GROUP BY fpg.team_id, fpg.season, fpg.player_id
+    HAVING SUM(fpg.pit_bf) >= {min_bf}
+    ORDER BY fpg.team_id, fpg.season, bf DESC
     """
     logger.info("Fetching team reliever rosters for seasons %s", seasons)
     return read_sql(query)
@@ -3424,29 +3559,31 @@ def get_reliever_role_history(
     season_list = ", ".join(str(s) for s in seasons)
     query = f"""
     SELECT
-        player_id AS pitcher_id,
-        season,
+        fpg.player_id AS pitcher_id,
+        fpg.season,
         COUNT(*)                     AS games,
-        SUM(pit_sv)                  AS saves,
-        SUM(pit_hld)                 AS holds,
-        SUM(pit_bs)                  AS blown_saves,
-        SUM(pit_bf)                  AS bf,
-        SUM(pit_k)                   AS k,
-        SUM(pit_bb)                  AS bb,
-        SUM(pit_hr)                  AS hr,
-        SUM(pit_h)                   AS h,
-        SUM(pit_r)                   AS runs,
-        ROUND(SUM(pit_ip) * 3)::int  AS outs,
-        SUM(pit_pitches)             AS pitches,
-        SUM(pit_k)::float / NULLIF(SUM(pit_bf), 0) AS k_rate,
-        SUM(pit_bb)::float / NULLIF(SUM(pit_bf), 0) AS bb_rate
-    FROM production.fact_player_game_mlb
-    WHERE pit_is_starter = FALSE
-      AND pit_bf >= 1
-      AND season IN ({season_list})
-    GROUP BY player_id, season
+        SUM(fpg.pit_sv)                  AS saves,
+        SUM(fpg.pit_hld)                 AS holds,
+        SUM(fpg.pit_bs)                  AS blown_saves,
+        SUM(fpg.pit_bf)                  AS bf,
+        SUM(fpg.pit_k)                   AS k,
+        SUM(fpg.pit_bb)                  AS bb,
+        SUM(fpg.pit_hr)                  AS hr,
+        SUM(fpg.pit_h)                   AS h,
+        SUM(fpg.pit_r)                   AS runs,
+        ROUND(SUM(fpg.pit_ip) * 3)::int  AS outs,
+        SUM(fpg.pit_pitches)             AS pitches,
+        SUM(fpg.pit_k)::float / NULLIF(SUM(fpg.pit_bf), 0) AS k_rate,
+        SUM(fpg.pit_bb)::float / NULLIF(SUM(fpg.pit_bf), 0) AS bb_rate
+    FROM production.fact_player_game_mlb fpg
+    JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+    WHERE fpg.pit_is_starter = FALSE
+      AND dg.game_type = 'R'
+      AND fpg.pit_bf >= 1
+      AND fpg.season IN ({season_list})
+    GROUP BY fpg.player_id, fpg.season
     HAVING COUNT(*) >= {min_games}
-    ORDER BY player_id, season
+    ORDER BY fpg.player_id, fpg.season
     """
     logger.info("Fetching reliever role history for seasons %s (min_games=%d)", seasons, min_games)
     return read_sql(query)
@@ -3472,10 +3609,12 @@ def get_batter_game_actuals(season: int) -> pd.DataFrame:
     """
     query = """
     WITH starters AS (
-        SELECT player_id AS pitcher_id, game_pk, team_id AS pitcher_team_id
-        FROM production.fact_player_game_mlb
-        WHERE pit_is_starter = TRUE
-          AND season = :season
+        SELECT fpg.player_id AS pitcher_id, fpg.game_pk, fpg.team_id AS pitcher_team_id
+        FROM production.fact_player_game_mlb fpg
+        JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+        WHERE fpg.pit_is_starter = TRUE
+          AND dg.game_type = 'R'
+          AND fpg.season = :season
     )
     SELECT
         fg.player_id  AS batter_id,
@@ -3498,11 +3637,13 @@ def get_batter_game_actuals(season: int) -> pd.DataFrame:
         st.pitcher_id AS opp_starter_id,
         st.pitcher_team_id AS opp_team_id
     FROM production.fact_player_game_mlb fg
+    JOIN production.dim_game dg2 ON fg.game_pk = dg2.game_pk
     JOIN production.fact_lineup fl
       ON fg.player_id = fl.player_id AND fg.game_pk = fl.game_pk
     LEFT JOIN starters st
       ON fg.game_pk = st.game_pk AND st.pitcher_team_id != fg.team_id
     WHERE fg.player_role = 'batter'
+      AND dg2.game_type = 'R'
       AND fl.is_starter = TRUE
       AND fg.season = :season
       AND fg.bat_pa >= 1
@@ -4237,3 +4378,195 @@ def get_pitcher_breakout_features(
         box["milb_translated_k_pct"].notna().sum(),
     )
     return box
+
+
+# ---------------------------------------------------------------------------
+# Postseason stats (player-specific)
+# ---------------------------------------------------------------------------
+
+_PS_ROUND_ORDER = {"F": 1, "D": 2, "L": 3, "W": 4}
+
+
+def get_postseason_batter_stats(seasons: list[int]) -> pd.DataFrame:
+    """Per-batter postseason stats aggregated by season.
+
+    Queries ``fact_player_game_mlb`` joined with ``dim_game`` for
+    postseason game types (F=Wild Card, D=Division, L=LCS, W=World Series).
+
+    Parameters
+    ----------
+    seasons : list[int]
+        Seasons to include.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, season, ps_pa, ps_k, ps_bb, ps_hr, ps_h,
+        ps_tb, ps_k_rate, ps_bb_rate, ps_hr_rate, ps_iso,
+        best_round, num_rounds_played, ps_games.
+    """
+    if not seasons:
+        return pd.DataFrame()
+
+    season_list = ", ".join(str(s) for s in seasons)
+    query = f"""
+    WITH game_rounds AS (
+        SELECT
+            fpg.player_id                       AS batter_id,
+            fpg.season,
+            dg.game_type                        AS round,
+            fpg.bat_pa,
+            fpg.bat_k,
+            fpg.bat_bb,
+            fpg.bat_hr,
+            fpg.bat_h,
+            fpg.bat_tb
+        FROM production.fact_player_game_mlb fpg
+        JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+        WHERE fpg.player_role = 'batter'
+          AND dg.game_type IN ('F','D','L','W')
+          AND fpg.season IN ({season_list})
+          AND fpg.bat_pa > 0
+    ),
+    season_agg AS (
+        SELECT
+            batter_id,
+            season,
+            SUM(bat_pa)                                  AS ps_pa,
+            SUM(bat_k)                                   AS ps_k,
+            SUM(bat_bb)                                  AS ps_bb,
+            SUM(bat_hr)                                  AS ps_hr,
+            SUM(bat_h)                                   AS ps_h,
+            SUM(bat_tb)                                  AS ps_tb,
+            COUNT(*)                                     AS ps_games,
+            COUNT(DISTINCT round)                        AS num_rounds_played,
+            MAX(CASE round
+                WHEN 'W' THEN 4
+                WHEN 'L' THEN 3
+                WHEN 'D' THEN 2
+                WHEN 'F' THEN 1
+            END)                                         AS best_round_ord
+        FROM game_rounds
+        GROUP BY batter_id, season
+    )
+    SELECT
+        batter_id,
+        season,
+        ps_pa,
+        ps_k,
+        ps_bb,
+        ps_hr,
+        ps_h,
+        ps_tb,
+        ROUND(ps_k::numeric / NULLIF(ps_pa, 0), 4)     AS ps_k_rate,
+        ROUND(ps_bb::numeric / NULLIF(ps_pa, 0), 4)     AS ps_bb_rate,
+        ROUND(ps_hr::numeric / NULLIF(ps_pa, 0), 4)     AS ps_hr_rate,
+        ROUND((ps_tb - ps_h)::numeric / NULLIF(ps_pa - ps_bb, 0), 4)
+                                                          AS ps_iso,
+        CASE best_round_ord
+            WHEN 4 THEN 'W'
+            WHEN 3 THEN 'L'
+            WHEN 2 THEN 'D'
+            WHEN 1 THEN 'F'
+        END                                               AS best_round,
+        num_rounds_played,
+        ps_games
+    FROM season_agg
+    ORDER BY batter_id, season
+    """
+    logger.info("Fetching postseason batter stats for seasons %s", seasons)
+    return read_sql(query, {})
+
+
+def get_postseason_pitcher_stats(seasons: list[int]) -> pd.DataFrame:
+    """Per-pitcher postseason stats aggregated by season.
+
+    Queries ``fact_player_game_mlb`` joined with ``dim_game`` for
+    postseason game types (F=Wild Card, D=Division, L=LCS, W=World Series).
+
+    Parameters
+    ----------
+    seasons : list[int]
+        Seasons to include.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, season, ps_bf, ps_k, ps_bb, ps_hr, ps_h,
+        ps_k_rate, ps_bb_rate, ps_hr_rate, ps_ip, ps_games,
+        is_starter, best_round, num_rounds_played.
+    """
+    if not seasons:
+        return pd.DataFrame()
+
+    season_list = ", ".join(str(s) for s in seasons)
+    query = f"""
+    WITH game_rounds AS (
+        SELECT
+            fpg.player_id                       AS pitcher_id,
+            fpg.season,
+            dg.game_type                        AS round,
+            fpg.pit_bf,
+            fpg.pit_k,
+            fpg.pit_bb,
+            fpg.pit_hr,
+            fpg.pit_h,
+            fpg.pit_ip,
+            fpg.pit_is_starter
+        FROM production.fact_player_game_mlb fpg
+        JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+        WHERE fpg.player_role = 'pitcher'
+          AND dg.game_type IN ('F','D','L','W')
+          AND fpg.season IN ({season_list})
+          AND fpg.pit_bf > 0
+    ),
+    season_agg AS (
+        SELECT
+            pitcher_id,
+            season,
+            SUM(pit_bf)                                  AS ps_bf,
+            SUM(pit_k)                                   AS ps_k,
+            SUM(pit_bb)                                  AS ps_bb,
+            SUM(pit_hr)                                  AS ps_hr,
+            SUM(pit_h)                                   AS ps_h,
+            SUM(pit_ip)                                  AS ps_ip,
+            COUNT(*)                                     AS ps_games,
+            COUNT(DISTINCT round)                        AS num_rounds_played,
+            BOOL_OR(pit_is_starter)                      AS has_started,
+            SUM(CASE WHEN pit_is_starter THEN 1 ELSE 0 END)
+                                                          AS start_count,
+            MAX(CASE round
+                WHEN 'W' THEN 4
+                WHEN 'L' THEN 3
+                WHEN 'D' THEN 2
+                WHEN 'F' THEN 1
+            END)                                         AS best_round_ord
+        FROM game_rounds
+        GROUP BY pitcher_id, season
+    )
+    SELECT
+        pitcher_id,
+        season,
+        ps_bf,
+        ps_k,
+        ps_bb,
+        ps_hr,
+        ps_h,
+        ps_ip,
+        ps_games,
+        ROUND(ps_k::numeric / NULLIF(ps_bf, 0), 4)      AS ps_k_rate,
+        ROUND(ps_bb::numeric / NULLIF(ps_bf, 0), 4)      AS ps_bb_rate,
+        ROUND(ps_hr::numeric / NULLIF(ps_bf, 0), 4)      AS ps_hr_rate,
+        (start_count > ps_games / 2)                      AS is_starter,
+        CASE best_round_ord
+            WHEN 4 THEN 'W'
+            WHEN 3 THEN 'L'
+            WHEN 2 THEN 'D'
+            WHEN 1 THEN 'F'
+        END                                               AS best_round,
+        num_rounds_played
+    FROM season_agg
+    ORDER BY pitcher_id, season
+    """
+    logger.info("Fetching postseason pitcher stats for seasons %s", seasons)
+    return read_sql(query, {})

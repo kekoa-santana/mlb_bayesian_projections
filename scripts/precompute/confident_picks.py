@@ -407,7 +407,7 @@ def run(
                 season=last_train,
             )
 
-            # Pitcher avg pitches + stamina offset
+            # Pitcher avg pitches + stamina offset + manager tendency
             tend_row = tend_latest[tend_latest["pitcher_id"] == pitcher_id]
             avg_pitches = (
                 float(tend_row.iloc[0]["avg_pitches"])
@@ -418,6 +418,12 @@ def run(
                 if len(tend_row) > 0 and "avg_ip" in tend_row.columns
                 and pd.notna(tend_row.iloc[0].get("avg_ip"))
                 else 5.28
+            )
+            team_avg_p = (
+                float(tend_row.iloc[0]["team_avg_pitches"])
+                if len(tend_row) > 0 and "team_avg_pitches" in tend_row.columns
+                and pd.notna(tend_row.iloc[0].get("team_avg_pitches"))
+                else 88.0
             )
             stamina_offset = compute_stamina_offset(avg_ip)
 
@@ -451,6 +457,7 @@ def run(
                     umpire_k_lift=ump_k_lift + catcher_k_lift + platoon_k_lift,
                     umpire_bb_lift=ump_bb_lift + platoon_bb_lift,
                     weather_k_lift=wx_k_lift,
+                    manager_pull_tendency=team_avg_p,
                     n_sims=n_sims,
                     random_seed=42 + game_pk % 10000,
                 )

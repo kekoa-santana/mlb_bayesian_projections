@@ -53,7 +53,7 @@ _DEFAULT_EXIT_CALIBRATION_OFFSET = -0.35
 # (real std ≈ 0.49 IP across starters, 3.7–6.4 range).
 _STAMINA_POP_MEAN_IP = 5.28  # 2025 population mean IP for starters (10+ starts)
 _STAMINA_POP_STD_IP = 0.47   # 2025 population std
-_STAMINA_LOGIT_SCALE = 0.20  # logit shift per z-score of avg IP
+_STAMINA_LOGIT_SCALE = 0.45  # logit shift per z-score of avg IP
 
 
 def compute_stamina_offset(
@@ -186,6 +186,7 @@ def simulate_game(
     park_hr_lift: float = 0.0,
     weather_k_lift: float = 0.0,
     exit_calibration_offset: float = _DEFAULT_EXIT_CALIBRATION_OFFSET,
+    manager_pull_tendency: float = 88.0,
     n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> SimulationResult:
@@ -231,6 +232,8 @@ def simulate_game(
     exit_calibration_offset : float
         Logit-scale offset for exit model probabilities. Negative values
         reduce exit probability (pitcher stays in longer).
+    manager_pull_tendency : float
+        Team's avg starter exit pitch count (manager proxy).
     n_sims : int
         Number of Monte Carlo simulations.
     random_seed : int
@@ -265,6 +268,13 @@ def simulate_game(
         if stat not in tto_lifts:
             tto_lifts[stat] = np.zeros(3)
 
+    # Dampen matchup lifts — empirical calibration from 11,517 game
+    # walk-forward backtest (2023-2025). Raw pitch-type matchup scoring
+    # over-applies lifts by ~2x for K/BB. HR signal is near-zero.
+    lineup_matchup_lifts["k"] = lineup_matchup_lifts["k"] * 0.55
+    lineup_matchup_lifts["bb"] = lineup_matchup_lifts["bb"] * 0.40
+    lineup_matchup_lifts["hr"] = lineup_matchup_lifts["hr"] * 0.20
+
     # --- Game state arrays (all shape n_sims) ---
     pitches = np.zeros(n_sims, dtype=np.int32)
     outs = np.zeros(n_sims, dtype=np.int32)
@@ -286,6 +296,12 @@ def simulate_game(
     # Recent trouble tracker (last 2 PA: BB, H, HBP)
     recent_trouble = np.zeros(n_sims, dtype=np.int32)
     prev_trouble = np.zeros(n_sims, dtype=np.int32)
+
+    # 3-PA trouble tracker (blow-up detection)
+    prev_trouble_2 = np.zeros(n_sims, dtype=np.int32)
+
+    # Runs scored in current inning (blow-up indicator)
+    runs_this_inning = np.zeros(n_sims, dtype=np.int32)
 
     # Active mask — simulations where pitcher is still in the game
     active = np.ones(n_sims, dtype=bool)
@@ -415,13 +431,19 @@ def simulate_game(
         inning[active] = np.where(inning_over, inning[active] + 1, inning[active])
         inning_outs[active] = np.where(inning_over, 0, inning_outs[active])
         runners[active] = np.where(inning_over, 0, runners[active])
+        runs_this_inning[active] = np.where(inning_over, 0, runs_this_inning[active])
 
-        # Update recent trouble
+        # Update runs_this_inning with runs scored this PA
+        runs_this_inning[active] += runs_scored.astype(np.int32)
+
+        # Update recent trouble (2-PA and 3-PA windows)
         is_trouble = np.isin(
             outcomes,
             [PA_WALK, PA_HBP, PA_SINGLE, PA_DOUBLE, PA_TRIPLE, PA_HOME_RUN],
         ).astype(np.int32)
         new_recent = prev_trouble[active] + is_trouble
+        blowup_3pa = prev_trouble_2[active] + prev_trouble[active] + is_trouble
+        prev_trouble_2[active] = prev_trouble[active]
         prev_trouble[active] = is_trouble
         recent_trouble[active] = new_recent
 
@@ -446,6 +468,9 @@ def simulate_game(
             tto=current_tto,
             recent_trouble=recent_trouble[active],
             pitcher_avg_pitches=pitcher_avg_pitches,
+            runs_this_inning=runs_this_inning[active],
+            blowup_recent_3pa=blowup_3pa,
+            manager_pull_tendency=manager_pull_tendency,
         )
 
         # Apply calibration offset (logit scale)
@@ -497,6 +522,7 @@ def predict_game(
     park_bb_lift: float = 0.0,
     catcher_k_lift: float = 0.0,
     weather_k_lift: float = 0.0,
+    manager_pull_tendency: float = 88.0,
     n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> dict[str, Any]:
@@ -576,6 +602,7 @@ def predict_game(
         umpire_bb_lift=total_bb_lift,
         park_hr_lift=park_hr_lift,
         weather_k_lift=0.0,  # already folded into total_k_lift
+        manager_pull_tendency=manager_pull_tendency,
         n_sims=n_sims,
         random_seed=random_seed,
     )

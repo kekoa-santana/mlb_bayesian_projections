@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import brier_score_loss
 
+from src.evaluation.metrics import compute_log_loss, compute_sharpness
+
 from src.data.db import read_sql
 from src.data.feature_eng import (
     build_multi_season_hitter_data,
@@ -395,8 +397,11 @@ def build_batter_sim_predictions(
             "expected_k": summary["k"]["mean"],
             "std_k": summary["k"]["std"],
             "expected_bb": summary["bb"]["mean"],
+            "std_bb": summary["bb"]["std"],
             "expected_h": summary["h"]["mean"],
+            "std_h": summary["h"]["std"],
             "expected_hr": summary["hr"]["mean"],
+            "std_hr": summary["hr"]["std"],
             "expected_double": summary["double"]["mean"],
             "expected_triple": summary["triple"]["mean"],
             "expected_tb": summary["tb"]["mean"],
@@ -477,7 +482,7 @@ def compute_batter_sim_metrics(
         if np.std(actual) > 0 and np.std(expected) > 0:
             metrics[f"{stat}_corr"] = float(np.corrcoef(actual, expected)[0, 1])
 
-    # Brier scores for prop lines
+    # Brier scores and log loss for prop lines
     prop_cols = {
         "k_0.5": ("p_k_over_0_5", "actual_k", 0.5),
         "k_1.5": ("p_k_over_1_5", "actual_k", 1.5),
@@ -491,13 +496,71 @@ def compute_batter_sim_metrics(
         "double_0.5": ("p_double_over_0_5", "actual_double", 0.5),
         "triple_0.5": ("p_triple_over_0_5", "actual_triple", 0.5),
     }
-    brier_scores = {}
+    brier_scores: dict[str, float] = {}
+    log_losses: dict[str, float] = {}
     for label, (prob_col, act_col, line) in prop_cols.items():
         if prob_col in predictions.columns and act_col in predictions.columns:
             y_true = (predictions[act_col] > line).astype(float).values
             y_prob = predictions[prob_col].values
             brier_scores[label] = float(brier_score_loss(y_true, y_prob))
+            log_losses[label] = compute_log_loss(y_prob, y_true)
     metrics["brier_scores"] = brier_scores
+    metrics["log_losses"] = log_losses
+
+    # Per-stat aggregated Brier and log loss
+    for stat_prefix in ("k", "h", "hr", "tb", "double", "triple"):
+        stat_briers = {k: v for k, v in brier_scores.items()
+                       if k.startswith(stat_prefix + "_")}
+        stat_lls = {k: v for k, v in log_losses.items()
+                    if k.startswith(stat_prefix + "_")}
+        if stat_briers:
+            metrics[f"{stat_prefix}_avg_brier"] = float(
+                np.mean(list(stat_briers.values()))
+            )
+        if stat_lls:
+            metrics[f"{stat_prefix}_avg_log_loss"] = float(
+                np.mean(list(stat_lls.values()))
+            )
+
+    # Sharpness per stat group — pool all prop line probabilities for each
+    stat_prob_groups: dict[str, list[str]] = {
+        "k": ["p_k_over_0_5", "p_k_over_1_5"],
+        "h": ["p_h_over_0_5", "p_h_over_1_5", "p_h_over_2_5"],
+        "hr": ["p_hr_over_0_5"],
+        "tb": ["p_tb_over_0_5", "p_tb_over_1_5",
+               "p_tb_over_2_5", "p_tb_over_3_5"],
+    }
+    for stat_prefix, prob_cols_list in stat_prob_groups.items():
+        probs_all: list[np.ndarray] = []
+        for col in prob_cols_list:
+            if col in predictions.columns:
+                probs_all.append(predictions[col].values.astype(float))
+        if probs_all:
+            sharp = compute_sharpness(np.concatenate(probs_all))
+        else:
+            sharp = compute_sharpness(np.array([]))
+        for key, val in sharp.items():
+            metrics[f"{stat_prefix}_sharpness_{key}"] = val
+
+    # Coverage: credible interval coverage from mean + std for K and H
+    for stat in ("k", "h"):
+        exp_col = f"expected_{stat}"
+        std_col = f"std_{stat}" if f"std_{stat}" in predictions.columns else None
+        act_col = f"actual_{stat}"
+        if (
+            exp_col in predictions.columns
+            and std_col is not None
+            and act_col in predictions.columns
+        ):
+            expected = predictions[exp_col].values.astype(float)
+            std = predictions[std_col].values.astype(float)
+            actual = predictions[act_col].values.astype(float)
+            for ci_name, z in [("50", 0.6745), ("80", 1.2816), ("90", 1.6449)]:
+                lo = expected - z * std
+                hi = expected + z * std
+                metrics[f"{stat}_coverage_{ci_name}"] = float(
+                    np.mean((actual >= lo) & (actual <= hi))
+                )
 
     return metrics
 
@@ -563,20 +626,67 @@ def run_full_batter_sim_backtest(
             for label, score in metrics["brier_scores"].items():
                 fold_rec[f"brier_{label}"] = score
 
+        # Log losses
+        if "log_losses" in metrics:
+            for label, score in metrics["log_losses"].items():
+                fold_rec[f"logloss_{label}"] = score
+
+        # Per-stat avg Brier and log loss
+        for stat_prefix in ("k", "h", "hr", "tb", "double", "triple"):
+            for m in ("avg_brier", "avg_log_loss"):
+                key = f"{stat_prefix}_{m}"
+                if key in metrics:
+                    fold_rec[key] = metrics[key]
+
+        # Sharpness
+        for stat_prefix in ("k", "h", "hr", "tb"):
+            for skey in ("mean_confidence", "pct_actionable_60",
+                         "pct_actionable_65", "pct_actionable_70",
+                         "entropy"):
+                mkey = f"{stat_prefix}_sharpness_{skey}"
+                if mkey in metrics:
+                    fold_rec[mkey] = metrics[mkey]
+
+        # Coverage
+        for stat_prefix in ("k", "h"):
+            for ci in ("50", "80", "90"):
+                key = f"{stat_prefix}_coverage_{ci}"
+                if key in metrics:
+                    fold_rec[key] = metrics[key]
+
         fold_results.append(fold_rec)
         predictions["fold_test_season"] = test_season
         all_predictions.append(predictions)
 
         logger.info(
-            "Batter fold: K RMSE=%.3f, H RMSE=%.3f, HR RMSE=%.3f, "
-            "2B RMSE=%.3f, 3B RMSE=%.3f, TB RMSE=%.3f, n=%d",
+            "Batter fold: K RMSE=%.3f, K LogLoss=%.4f, "
+            "H RMSE=%.3f, H LogLoss=%.4f, "
+            "HR RMSE=%.3f, TB RMSE=%.3f, n=%d",
             fold_rec.get("k_rmse", np.nan),
+            fold_rec.get("k_avg_log_loss", np.nan),
             fold_rec.get("h_rmse", np.nan),
+            fold_rec.get("h_avg_log_loss", np.nan),
             fold_rec.get("hr_rmse", np.nan),
-            fold_rec.get("double_rmse", np.nan),
-            fold_rec.get("triple_rmse", np.nan),
             fold_rec.get("tb_rmse", np.nan),
             metrics["n_games"],
+        )
+        logger.info(
+            "  Coverage: K(50%%=%.1f%%, 80%%=%.1f%%, 90%%=%.1f%%) "
+            "H(50%%=%.1f%%, 80%%=%.1f%%, 90%%=%.1f%%)",
+            100 * fold_rec.get("k_coverage_50", np.nan),
+            100 * fold_rec.get("k_coverage_80", np.nan),
+            100 * fold_rec.get("k_coverage_90", np.nan),
+            100 * fold_rec.get("h_coverage_50", np.nan),
+            100 * fold_rec.get("h_coverage_80", np.nan),
+            100 * fold_rec.get("h_coverage_90", np.nan),
+        )
+        logger.info(
+            "  Sharpness: K(conf=%.3f, act60=%.1f%%) "
+            "H(conf=%.3f, act60=%.1f%%)",
+            fold_rec.get("k_sharpness_mean_confidence", np.nan),
+            fold_rec.get("k_sharpness_pct_actionable_60", np.nan),
+            fold_rec.get("h_sharpness_mean_confidence", np.nan),
+            fold_rec.get("h_sharpness_pct_actionable_60", np.nan),
         )
 
     summary = pd.DataFrame(fold_results)
@@ -602,5 +712,27 @@ def run_full_batter_sim_backtest(
             logger.info("  Brier scores:")
             for label, score in sorted(overall["brier_scores"].items()):
                 logger.info("    %s: %.4f", label, score)
+        if "log_losses" in overall:
+            logger.info("  Log losses:")
+            for label, score in sorted(overall["log_losses"].items()):
+                logger.info("    %s: %.4f", label, score)
+        for stat_prefix in ("k", "h"):
+            for ci in ("50", "80", "90"):
+                key = f"{stat_prefix}_coverage_{ci}"
+                if key in overall:
+                    logger.info("  %s Coverage %s%%: %.1f%%",
+                                stat_prefix.upper(), ci,
+                                100 * overall[key])
+        for stat_prefix in ("k", "h", "hr", "tb"):
+            conf_key = f"{stat_prefix}_sharpness_mean_confidence"
+            if conf_key in overall:
+                logger.info(
+                    "  %s Sharpness: conf=%.3f, act60=%.1f%%, entropy=%.3f",
+                    stat_prefix.upper(),
+                    overall[conf_key],
+                    overall.get(f"{stat_prefix}_sharpness_pct_actionable_60",
+                                np.nan),
+                    overall.get(f"{stat_prefix}_sharpness_entropy", np.nan),
+                )
 
     return summary, pred_df

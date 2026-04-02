@@ -16,6 +16,8 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import brier_score_loss
 
+from src.evaluation.metrics import compute_log_loss, compute_sharpness
+
 from src.data.db import read_sql
 from src.data.feature_eng import (
     build_multi_season_pitcher_data,
@@ -484,7 +486,7 @@ def build_game_sim_predictions(
         # TTO lifts
         tto_lifts = build_all_tto_lifts(tto_profiles, pitcher_id, last_train)
 
-        # Pitcher avg pitches
+        # Pitcher avg pitches + manager tendency
         tend_row = pitcher_tend_latest[
             pitcher_tend_latest["pitcher_id"] == pitcher_id
         ]
@@ -496,9 +498,16 @@ def build_game_sim_predictions(
                 and pd.notna(tend_row.iloc[0].get("avg_ip"))
                 else 5.28
             )
+            team_avg_p = (
+                float(tend_row.iloc[0]["team_avg_pitches"])
+                if "team_avg_pitches" in tend_row.columns
+                and pd.notna(tend_row.iloc[0].get("team_avg_pitches"))
+                else 88.0
+            )
         else:
             avg_pitches = 88.0
             avg_ip = 5.2
+            team_avg_p = 88.0
         stamina_offset = compute_stamina_offset(avg_ip)
 
         # Context lifts
@@ -534,6 +543,7 @@ def build_game_sim_predictions(
                 umpire_bb_lift=ump_bb,
                 park_hr_lift=park_hr,
                 weather_k_lift=wx_k,
+                manager_pull_tendency=team_avg_p,
                 n_sims=n_sims,
                 random_seed=random_seed + game_pk % 10000,
             )
@@ -682,8 +692,9 @@ def compute_game_sim_metrics(
         if np.std(actual) > 0 and np.std(expected) > 0:
             metrics[f"{stat}_corr"] = float(np.corrcoef(actual, expected)[0, 1])
 
-    # K-specific: Brier scores
+    # K-specific: Brier scores and log loss
     brier_scores: dict[float, float] = {}
+    k_log_losses: dict[float, float] = {}
     for line in k_lines:
         col = f"p_over_{line:.1f}".replace(".", "_")
         if col not in predictions.columns:
@@ -691,13 +702,18 @@ def compute_game_sim_metrics(
         y_true = (predictions["actual_k"] > line).astype(float).values
         y_prob = predictions[col].values
         brier_scores[line] = float(brier_score_loss(y_true, y_prob))
+        k_log_losses[line] = compute_log_loss(y_prob, y_true)
     metrics["k_brier_scores"] = brier_scores
     if brier_scores:
         metrics["k_avg_brier"] = float(np.mean(list(brier_scores.values())))
+    metrics["k_log_losses"] = k_log_losses
+    if k_log_losses:
+        metrics["k_avg_log_loss"] = float(np.mean(list(k_log_losses.values())))
 
-    # Outs Brier scores
+    # Outs Brier scores and log loss
     outs_lines = [14.5, 15.5, 16.5, 17.5, 18.5]
     outs_brier: dict[float, float] = {}
+    outs_log_losses: dict[float, float] = {}
     for line in outs_lines:
         col = f"p_outs_over_{line:.1f}".replace(".", "_")
         if col not in predictions.columns:
@@ -707,9 +723,40 @@ def compute_game_sim_metrics(
         y_true = (predictions["actual_outs"] > line).astype(float).values
         y_prob = predictions[col].values
         outs_brier[line] = float(brier_score_loss(y_true, y_prob))
+        outs_log_losses[line] = compute_log_loss(y_prob, y_true)
     metrics["outs_brier_scores"] = outs_brier
     if outs_brier:
         metrics["outs_avg_brier"] = float(np.mean(list(outs_brier.values())))
+    metrics["outs_log_losses"] = outs_log_losses
+    if outs_log_losses:
+        metrics["outs_avg_log_loss"] = float(np.mean(list(outs_log_losses.values())))
+
+    # K sharpness
+    k_lines_used = [3.5, 4.5, 5.5, 6.5, 7.5]
+    k_probs_all: list[np.ndarray] = []
+    for line in k_lines_used:
+        col = f"p_over_{line:.1f}".replace(".", "_")
+        if col in predictions.columns:
+            k_probs_all.append(predictions[col].values.astype(float))
+    if k_probs_all:
+        k_sharp = compute_sharpness(np.concatenate(k_probs_all))
+    else:
+        k_sharp = compute_sharpness(np.array([]))
+    for key, val in k_sharp.items():
+        metrics[f"k_sharpness_{key}"] = val
+
+    # Outs sharpness
+    outs_probs_all: list[np.ndarray] = []
+    for line in outs_lines:
+        col = f"p_outs_over_{line:.1f}".replace(".", "_")
+        if col in predictions.columns:
+            outs_probs_all.append(predictions[col].values.astype(float))
+    if outs_probs_all:
+        outs_sharp = compute_sharpness(np.concatenate(outs_probs_all))
+    else:
+        outs_sharp = compute_sharpness(np.array([]))
+    for key, val in outs_sharp.items():
+        metrics[f"outs_sharpness_{key}"] = val
 
     # K coverage
     if "std_k" in predictions.columns:
@@ -828,6 +875,8 @@ def run_full_game_sim_backtest(
         # K-specific
         if "k_avg_brier" in metrics:
             fold_rec["k_avg_brier"] = metrics["k_avg_brier"]
+        if "k_avg_log_loss" in metrics:
+            fold_rec["k_avg_log_loss"] = metrics["k_avg_log_loss"]
         for ci in ("50", "80", "90"):
             key = f"k_coverage_{ci}"
             if key in metrics:
@@ -836,10 +885,20 @@ def run_full_game_sim_backtest(
         # Outs-specific
         if "outs_avg_brier" in metrics:
             fold_rec["outs_avg_brier"] = metrics["outs_avg_brier"]
+        if "outs_avg_log_loss" in metrics:
+            fold_rec["outs_avg_log_loss"] = metrics["outs_avg_log_loss"]
         for ci in ("50", "80", "90"):
             key = f"outs_coverage_{ci}"
             if key in metrics:
                 fold_rec[key] = metrics[key]
+
+        # Sharpness
+        for prefix in ("k", "outs"):
+            for skey in ("mean_confidence", "pct_actionable_60",
+                         "pct_actionable_65", "pct_actionable_70", "entropy"):
+                mkey = f"{prefix}_sharpness_{skey}"
+                if mkey in metrics:
+                    fold_rec[mkey] = metrics[mkey]
 
         # IP
         for m in ("ip_rmse", "ip_mae"):
@@ -852,18 +911,31 @@ def run_full_game_sim_backtest(
 
         # Log summary
         logger.info(
-            "Fold results: K RMSE=%.3f, K Brier=%.4f, BB RMSE=%.3f, "
-            "H RMSE=%.3f, HR RMSE=%.3f, Outs RMSE=%.3f, Outs Brier=%.4f, "
+            "Fold results: K RMSE=%.3f, K Brier=%.4f, K LogLoss=%.4f, "
+            "BB RMSE=%.3f, H RMSE=%.3f, HR RMSE=%.3f, "
+            "Outs RMSE=%.3f, Outs Brier=%.4f, Outs LogLoss=%.4f, "
             "IP RMSE=%.3f, n=%d",
             fold_rec.get("k_rmse", np.nan),
             fold_rec.get("k_avg_brier", np.nan),
+            fold_rec.get("k_avg_log_loss", np.nan),
             fold_rec.get("bb_rmse", np.nan),
             fold_rec.get("h_rmse", np.nan),
             fold_rec.get("hr_rmse", np.nan),
             fold_rec.get("outs_rmse", np.nan),
             fold_rec.get("outs_avg_brier", np.nan),
+            fold_rec.get("outs_avg_log_loss", np.nan),
             fold_rec.get("ip_rmse", np.nan),
             metrics["n_games"],
+        )
+        logger.info(
+            "  Sharpness: K(conf=%.3f, act60=%.1f%%, entropy=%.3f) "
+            "Outs(conf=%.3f, act60=%.1f%%, entropy=%.3f)",
+            fold_rec.get("k_sharpness_mean_confidence", np.nan),
+            fold_rec.get("k_sharpness_pct_actionable_60", np.nan),
+            fold_rec.get("k_sharpness_entropy", np.nan),
+            fold_rec.get("outs_sharpness_mean_confidence", np.nan),
+            fold_rec.get("outs_sharpness_pct_actionable_60", np.nan),
+            fold_rec.get("outs_sharpness_entropy", np.nan),
         )
 
     summary_df = pd.DataFrame(fold_results)
@@ -889,9 +961,26 @@ def run_full_game_sim_backtest(
                 )
         if "k_avg_brier" in overall:
             logger.info("  K Avg Brier: %.4f", overall["k_avg_brier"])
+        if "k_avg_log_loss" in overall:
+            logger.info("  K Avg Log Loss: %.4f", overall["k_avg_log_loss"])
         if "outs_avg_brier" in overall:
             logger.info("  Outs Avg Brier: %.4f", overall["outs_avg_brier"])
+        if "outs_avg_log_loss" in overall:
+            logger.info("  Outs Avg Log Loss: %.4f", overall["outs_avg_log_loss"])
         if "ip_rmse" in overall:
             logger.info("  IP: RMSE=%.3f", overall["ip_rmse"])
+        for prefix, label in [("k", "K"), ("outs", "Outs")]:
+            mc_key = f"{prefix}_sharpness_mean_confidence"
+            if mc_key in overall:
+                logger.info(
+                    "  %s Sharpness: conf=%.3f, act60=%.1f%%, "
+                    "act65=%.1f%%, act70=%.1f%%, entropy=%.3f",
+                    label,
+                    overall[mc_key],
+                    overall.get(f"{prefix}_sharpness_pct_actionable_60", np.nan),
+                    overall.get(f"{prefix}_sharpness_pct_actionable_65", np.nan),
+                    overall.get(f"{prefix}_sharpness_pct_actionable_70", np.nan),
+                    overall.get(f"{prefix}_sharpness_entropy", np.nan),
+                )
 
     return summary_df, pred_df

@@ -45,7 +45,7 @@ def run(
         if pa < 50:
             continue
         # Beta(hr + 1, pa - hr + 1) posterior
-        hr_rate_samples = rng_hr.beta(hr + 1, pa - hr + 1, size=10_000)
+        hr_rate_samples = rng_hr.beta(hr + 1, pa - hr + 1, size=1_000)
         hr_samples_dict[str(bid)] = hr_rate_samples.astype(np.float32)
     np.savez_compressed(DASHBOARD_DIR / "hitter_hr_samples.npz", **hr_samples_dict)
     logger.info("Saved hitter HR Beta posterior samples for %d batters", len(hr_samples_dict))
