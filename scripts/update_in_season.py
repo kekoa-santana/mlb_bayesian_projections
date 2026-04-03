@@ -323,8 +323,15 @@ def simulate_todays_games(
     from src.models.game_sim.simulator import simulate_game, compute_stamina_offset
     from src.models.game_sim.pitch_count_model import build_pitch_count_features
     from src.models.game_sim.tto_model import build_all_tto_lifts
+    from src.models.game_sim.form_model import (
+        build_pitcher_form_lifts_batch,
+        build_batter_form_lifts_batch,
+        BatterFormLifts,
+        PitcherFormLifts,
+    )
     from src.models.matchup import score_matchup_for_stat
     from src.data.league_baselines import get_baselines_dict
+    from src.data.queries import get_rolling_form, get_rolling_hard_hit
 
     # Load matchup data
     arsenal_path = DASHBOARD_DIR / "pitcher_arsenal.parquet"
@@ -360,6 +367,58 @@ def simulate_todays_games(
     tto_profiles = pd.read_parquet(tto_path) if tto_path.exists() else pd.DataFrame()
 
     last_train = SEASON - 1
+
+    # --- Load rolling form data for momentum lifts ---
+    # Collect all pitcher IDs from today's schedule
+    pitcher_ids = set()
+    for side in ("away", "home"):
+        col = f"{side}_pitcher_id"
+        if col in schedule.columns:
+            pitcher_ids.update(
+                int(x) for x in schedule[col].dropna().unique()
+            )
+
+    # Collect all batter IDs from lineups
+    batter_ids = set()
+    if not lineups.empty and "batter_id" in lineups.columns:
+        batter_ids.update(
+            int(x) for x in lineups["batter_id"].dropna().unique()
+        )
+
+    # Batch-query rolling data and compute form lifts
+    pitcher_form_lifts: dict[int, PitcherFormLifts] = {}
+    batter_form_lifts: dict[int, BatterFormLifts] = {}
+
+    if pitcher_ids:
+        try:
+            pit_rolling = get_rolling_form(
+                list(pitcher_ids), player_role="pitcher", season=SEASON,
+            )
+            pitcher_form_lifts = build_pitcher_form_lifts_batch(pit_rolling)
+            logger.info(
+                "Computed pitcher form lifts for %d/%d pitchers",
+                len(pitcher_form_lifts), len(pitcher_ids),
+            )
+        except Exception as e:
+            logger.warning("Failed to load pitcher rolling form: %s", e)
+
+    if batter_ids:
+        try:
+            bat_rolling = get_rolling_form(
+                list(batter_ids), player_role="batter", season=SEASON,
+            )
+            hh_df = get_rolling_hard_hit(
+                list(batter_ids), season=SEASON, window=15,
+            )
+            batter_form_lifts = build_batter_form_lifts_batch(
+                bat_rolling, hard_hit_df=hh_df,
+            )
+            logger.info(
+                "Computed batter form lifts for %d/%d batters",
+                len(batter_form_lifts), len(batter_ids),
+            )
+        except Exception as e:
+            logger.warning("Failed to load batter rolling form: %s", e)
 
     results = []
     for _, game in schedule.iterrows():
@@ -459,6 +518,9 @@ def simulate_todays_games(
                     team_avg_p = float(tr.get("team_avg_pitches", 88.0)) if pd.notna(tr.get("team_avg_pitches")) else 88.0
             stamina_offset = compute_stamina_offset(avg_ip)
 
+            # Pitcher form lift (BB% only — K% form near-zero for pitchers)
+            pit_form = pitcher_form_lifts.get(pid, PitcherFormLifts())
+
             # Run PA-by-PA simulation
             try:
                 sim = simulate_game(
@@ -471,6 +533,7 @@ def simulate_todays_games(
                     batter_ppa_adjs=batter_adjs,
                     exit_model=exit_model,
                     pitcher_avg_pitches=avg_pitches,
+                    form_bb_lift=pit_form.bb_lift,
                     exit_calibration_offset=stamina_offset,
                     manager_pull_tendency=team_avg_p,
                     n_sims=10000,
@@ -745,6 +808,8 @@ def update_weekly_rankings_step() -> None:
         rankings = rank_all(
             season=SEASON,
             projection_season=SEASON,
+            min_pa=40,
+            min_bf=35,
         )
         for key, rdf in rankings.items():
             if not rdf.empty:

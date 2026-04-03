@@ -606,13 +606,25 @@ def extract_rate_samples(
 
         innovation = rng.normal(0, sigma_draws)
 
-        # Less regression for young developing players (age <= 25).
-        # A 22-year-old who genuinely improved should carry that forward
-        # more than a 32-year-old's fluctuation.
+        # Age-dependent persistence: young players' improvements are more
+        # likely real development (higher rho = less regression), while
+        # aging players' outlier seasons are more likely to revert.
+        # Research: peak age 26-29, accelerating decline after 33.
         row_data = df.loc[pos]
         age = row_data.get("age", None)
-        if age is not None and age <= 25:
-            effective_rho = rho_draws * 0.92
+        if age is not None:
+            if age <= 27:
+                # Development phase: breakouts persist more.
+                # Scale: age 21 → ×1.24, age 25 → ×1.08, age 27 → ×1.00
+                age_rho_mult = 1.0 + (27 - age) * 0.04
+            elif age <= 32:
+                # Prime: standard persistence
+                age_rho_mult = 1.0
+            else:
+                # Aging: career-bests regress harder.
+                # Scale: age 33 → ×0.92, age 35 → ×0.84, age 38 → ×0.72
+                age_rho_mult = max(0.70, 1.0 - (age - 32) * 0.05)
+            effective_rho = np.clip(rho_draws * age_rho_mult, 0, 0.99)
         else:
             effective_rho = rho_draws
 

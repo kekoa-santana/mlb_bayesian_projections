@@ -54,6 +54,12 @@ def run(
     from src.models.game_sim.batter_simulator import simulate_batter_game
     from src.models.game_sim.tto_model import build_all_tto_lifts
     from src.models.game_sim.pitch_count_model import build_pitch_count_features
+    from src.models.game_sim.form_model import (
+        build_pitcher_form_lifts_batch,
+        build_batter_form_lifts_batch,
+        BatterFormLifts,
+        PitcherFormLifts,
+    )
     from src.models.matchup import score_matchup_for_stat
     from src.models.bf_model import compute_pitcher_bf_priors
 
@@ -171,6 +177,49 @@ def run(
             )
     except FileNotFoundError:
         logger.info("No batter_ld_rate.parquet found; LD BABIP adjustments disabled")
+
+    # --- Rolling form lifts ---
+    pitcher_form_lifts: dict[int, PitcherFormLifts] = {}
+    batter_form_lifts: dict[int, BatterFormLifts] = {}
+    try:
+        from src.data.queries import get_rolling_form, get_rolling_hard_hit
+
+        # Collect pitcher IDs
+        _pit_ids = set()
+        for side in ("away", "home"):
+            col = f"{side}_pitcher_id"
+            if col in schedule.columns:
+                _pit_ids.update(
+                    int(x) for x in schedule[col].dropna().unique()
+                )
+        if _pit_ids:
+            _pit_roll = get_rolling_form(
+                list(_pit_ids), player_role="pitcher",
+            )
+            pitcher_form_lifts = build_pitcher_form_lifts_batch(_pit_roll)
+
+        # Collect batter IDs from confirmed lineups
+        _bat_ids: set[int] = set()
+        for bids in confirmed_lineups.values():
+            _bat_ids.update(bids)
+        if _bat_ids:
+            _bat_roll = get_rolling_form(
+                list(_bat_ids), player_role="batter",
+            )
+            _hh_df = get_rolling_hard_hit(list(_bat_ids), window=15)
+            batter_form_lifts = build_batter_form_lifts_batch(
+                _bat_roll, hard_hit_df=_hh_df,
+            )
+
+        logger.info(
+            "Rolling form lifts: %d pitchers, %d batters",
+            len(pitcher_form_lifts), len(batter_form_lifts),
+        )
+    except Exception:
+        logger.warning(
+            "Failed to load rolling form data — proceeding without form lifts",
+            exc_info=True,
+        )
 
     # Sprint speed BABIP adjustments (stacks with LD%)
     speed_babip_lookup: dict[int, float] = {}
@@ -441,7 +490,10 @@ def run(
                     catcher_id = int(team_catchers.iloc[0].get("player_id", 0))
                     catcher_k_lift = catcher_framing_lookup.get(catcher_id, 0.0)
 
-            # Run pitcher sim (with umpire/weather/catcher context)
+            # Pitcher form lift (BB% only)
+            pit_form = pitcher_form_lifts.get(pitcher_id, PitcherFormLifts())
+
+            # Run pitcher sim (with umpire/weather/catcher/form context)
             try:
                 sim = simulate_game(
                     pitcher_k_rate_samples=k_samples,
@@ -453,6 +505,7 @@ def run(
                     batter_ppa_adjs=batter_adjs,
                     exit_model=exit_model,
                     pitcher_avg_pitches=avg_pitches,
+                    form_bb_lift=pit_form.bb_lift,
                     exit_calibration_offset=stamina_offset,
                     umpire_k_lift=ump_k_lift + catcher_k_lift + platoon_k_lift,
                     umpire_bb_lift=ump_bb_lift + platoon_bb_lift,
@@ -633,6 +686,16 @@ def run(
                 for bid in padded_bids
             ])
 
+            # Build per-batter form lift arrays (shape 9)
+            lineup_form_k = np.zeros(9)
+            lineup_form_bb = np.zeros(9)
+            lineup_form_hr = np.zeros(9)
+            for order_idx, batter_id in enumerate(lineup_ids[:9]):
+                bf = batter_form_lifts.get(batter_id, BatterFormLifts())
+                lineup_form_k[order_idx] = bf.k_lift
+                lineup_form_bb[order_idx] = bf.bb_lift
+                lineup_form_hr[order_idx] = bf.hr_lift + bf.hh_lift
+
             # Run lineup simulation (single call for all 9 batters)
             try:
                 lineup_sim = simulate_lineup_game(
@@ -656,6 +719,9 @@ def run(
                     park_k_lift=park_k_lift,
                     park_hr_lift=park_hr_lift,
                     weather_k_lift=wx_k_lift,
+                    form_k_lifts=lineup_form_k,
+                    form_bb_lifts=lineup_form_bb,
+                    form_hr_lifts=lineup_form_hr,
                     n_sims=n_sims,
                     random_seed=42 + game_pk % 10000,
                 )
@@ -676,6 +742,10 @@ def run(
                 # avoids the lineup sim's PA inflation that biases TB)
                 bid_str = str(batter_id)
                 try:
+                    # Batter form lifts (K%, BB%, HR momentum)
+                    bat_form = batter_form_lifts.get(
+                        batter_id, BatterFormLifts(),
+                    )
                     batter_sim = simulate_batter_game(
                         batter_k_rate_samples=hitter_k_npz[bid_str],
                         batter_bb_rate_samples=hitter_bb_npz[bid_str],
@@ -702,6 +772,9 @@ def run(
                         umpire_k_lift=ump_k_lift,
                         umpire_bb_lift=ump_bb_lift,
                         weather_k_lift=wx_k_lift,
+                        form_k_lift=bat_form.k_lift,
+                        form_bb_lift=bat_form.bb_lift,
+                        form_hr_lift=bat_form.hr_lift + bat_form.hh_lift,
                         n_sims=n_sims,
                         random_seed=(
                             42 + game_pk % 10000 + batter_id % 1000

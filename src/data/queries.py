@@ -4570,3 +4570,130 @@ def get_postseason_pitcher_stats(seasons: list[int]) -> pd.DataFrame:
     """
     logger.info("Fetching postseason pitcher stats for seasons %s", seasons)
     return read_sql(query, {})
+
+
+# ---------------------------------------------------------------------------
+# Rolling momentum / form features
+# ---------------------------------------------------------------------------
+def get_rolling_form(
+    player_ids: list[int],
+    player_role: str = "batter",
+    season: int | None = None,
+) -> pd.DataFrame:
+    """Fetch most recent rolling 15g/30g form data for a set of players.
+
+    Returns the latest row per player from fact_player_form_rolling,
+    giving rolling counts and rates over the prior 15 and 30 games.
+
+    Parameters
+    ----------
+    player_ids : list[int]
+        Player IDs to fetch.
+    player_role : str
+        'batter' or 'pitcher'.
+    season : int, optional
+        If provided, restricts to this season's data only.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per player with rolling 15g/30g counts.
+    """
+    if not player_ids:
+        return pd.DataFrame()
+
+    id_list = ", ".join(str(int(pid)) for pid in player_ids)
+    season_filter = f"AND season = {int(season)}" if season else ""
+
+    query = f"""
+    WITH ranked AS (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY player_id
+                   ORDER BY game_date DESC, game_pk DESC
+               ) AS rn
+        FROM production.fact_player_form_rolling
+        WHERE player_id IN ({id_list})
+          AND player_role = :role
+          {season_filter}
+    )
+    SELECT *
+    FROM ranked
+    WHERE rn = 1
+    """
+    logger.info(
+        "Fetching rolling form for %d %ss", len(player_ids), player_role,
+    )
+    df = read_sql(query, {"role": player_role})
+    if "rn" in df.columns:
+        df = df.drop(columns=["rn"])
+    return df
+
+
+def get_rolling_hard_hit(
+    batter_ids: list[int],
+    season: int | None = None,
+    window: int = 15,
+) -> pd.DataFrame:
+    """Compute rolling hard-hit% for batters from Statcast BIP data.
+
+    Uses the most recent N games with BIP data per batter.
+
+    Parameters
+    ----------
+    batter_ids : list[int]
+        Batter IDs to fetch.
+    season : int, optional
+        Restrict to this season.
+    window : int
+        Number of recent games to include (default 15).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, bip_count, hard_hit_count, hard_hit_pct.
+    """
+    if not batter_ids:
+        return pd.DataFrame()
+
+    id_list = ", ".join(str(int(bid)) for bid in batter_ids)
+    season_filter = f"AND dg.season = {int(season)}" if season else ""
+
+    query = f"""
+    WITH game_bip AS (
+        SELECT
+            fp.batter_id,
+            fp.game_pk,
+            dg.game_date,
+            COUNT(*)                                   AS bip,
+            COUNT(*) FILTER (WHERE bb.hard_hit = TRUE) AS hard_hits
+        FROM production.sat_batted_balls bb
+        JOIN production.fact_pa fp ON bb.pa_id = fp.pa_id
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        WHERE fp.batter_id IN ({id_list})
+          AND dg.game_type = 'R'
+          {season_filter}
+        GROUP BY fp.batter_id, fp.game_pk, dg.game_date
+    ),
+    ranked AS (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY batter_id
+                   ORDER BY game_date DESC, game_pk DESC
+               ) AS rn
+        FROM game_bip
+    )
+    SELECT
+        batter_id,
+        SUM(bip)       AS bip_count,
+        SUM(hard_hits)  AS hard_hit_count,
+        SUM(hard_hits)::float / NULLIF(SUM(bip), 0) AS hard_hit_pct
+    FROM ranked
+    WHERE rn <= :window
+    GROUP BY batter_id
+    """
+    logger.info(
+        "Fetching rolling hard-hit%% for %d batters (window=%d)",
+        len(batter_ids), window,
+    )
+    return read_sql(query, {"window": window})

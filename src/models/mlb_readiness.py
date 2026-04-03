@@ -197,6 +197,7 @@ def _build_prospect_features(
             wtd_iso = (grp["translated_iso"] * grp["pa"]).sum() / total_pa
             wtd_hr_pa = (grp["translated_hr_pa"] * grp["pa"]).sum() / total_pa if "translated_hr_pa" in grp.columns else 0
         total_sb = grp["sb"].sum() if "sb" in grp.columns else 0
+        total_hbp = grp["hbp"].sum() if "hbp" in grp.columns else 0
 
         # GB rate (confidence × recency weighted, if available)
         if "translated_gb_pct" in grp.columns and grp["translated_gb_pct"].notna().any():
@@ -266,6 +267,7 @@ def _build_prospect_features(
             "avg_age_rel": grp["age_relative_to_level_avg"].mean(),
             "min_age": grp["age_at_level"].min(),
             "sb_rate": total_sb / total_pa,
+            "hbp_rate": total_hbp / total_pa,
             # New features
             "pa_weighted_level": pa_weighted_level,
             "games_at_max_level": games_at_max,

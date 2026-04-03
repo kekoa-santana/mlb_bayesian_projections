@@ -185,6 +185,7 @@ def simulate_game(
     park_bb_lift: float = 0.0,
     park_hr_lift: float = 0.0,
     weather_k_lift: float = 0.0,
+    form_bb_lift: float = 0.0,
     exit_calibration_offset: float = _DEFAULT_EXIT_CALIBRATION_OFFSET,
     manager_pull_tendency: float = 88.0,
     n_sims: int = 50_000,
@@ -229,6 +230,8 @@ def simulate_game(
         Park HR logit lift.
     weather_k_lift : float
         Weather K logit lift.
+    form_bb_lift : float
+        Pitcher rolling form BB% logit lift (from form_model).
     exit_calibration_offset : float
         Logit-scale offset for exit model probabilities. Negative values
         reduce exit probability (pitcher stays in longer).
@@ -360,6 +363,7 @@ def simulate_game(
             park_bb_lift=park_bb_lift,
             park_hr_lift=park_hr_lift,
             weather_k_lift=weather_k_lift,
+            form_bb_lift=form_bb_lift,
         )
 
         # --- 3. Draw PA outcomes ---

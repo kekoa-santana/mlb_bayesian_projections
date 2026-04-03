@@ -106,14 +106,21 @@ def _exposure_conditioned_scouting_weight(
 # Hitter sub-component weights (sum to 1.0)
 # ---------------------------------------------------------------------------
 _HITTER_WEIGHTS = {
-    "offense": 0.52,
-    "baserunning": 0.07,
-    "fielding": 0.16,
-    "health": 0.07,
-    "role": 0.04,
-    "trajectory": 0.10,
-    "versatility": 0.03,
-    "roster_value": 0.01,
+    "offense": 0.65,
+    "fielding": 0.13,
+    "baserunning": 0.06,
+    "trajectory": 0.08,
+    "positional_adj": 0.05,
+    "role": 0.02,
+    "versatility": 0.01,
+}
+
+# FanGraphs positional adjustment per 162 games (runs):
+# C: +12.5, SS: +7.5, 2B/3B/CF: +2.5, LF/RF: -7.5, 1B: -12.5, DH: -17.5
+# Normalized to 0-1 scale (DH=0, C=1)
+_POSITIONAL_OFFENSE_ADJ: dict[str, float] = {
+    "C": 1.00, "SS": 0.833, "CF": 0.667, "2B": 0.667, "3B": 0.667,
+    "LF": 0.333, "RF": 0.333, "1B": 0.167, "DH": 0.0,
 }
 
 # Offense sub-weights: dynamic blend based on PA (see _dynamic_blend_weights)
@@ -337,6 +344,12 @@ def _pitcher_age_factor(age: pd.Series) -> pd.Series:
 # ===================================================================
 # Position assignment
 # ===================================================================
+
+# When weighted_games tie across positions, pick one row per player (defensive value order).
+_POSITION_TIEBREAK_PRIORITY: dict[str, int] = {
+    "C": 0, "SS": 1, "2B": 2, "3B": 3, "CF": 4, "LF": 5, "RF": 6, "1B": 7, "DH": 8,
+}
+
 
 def _get_career_weighted_positions(season: int = 2025) -> pd.DataFrame:
     """Query career position starts with recency weighting.
@@ -644,11 +657,30 @@ def _assign_hitter_positions(season: int = 2025, min_starts: int = 20) -> pd.Dat
     career = _get_career_weighted_positions(season)
 
     if not career.empty:
-        primary = career[career["is_primary"]][["player_id", "position"]].copy()
-        # Filter by minimum weighted games
+        # Multiple rows can share max weighted_games (is_primary True for each tie).
+        # Enforce exactly one primary per player_id for downstream merges.
+        primary_cands = career[career["is_primary"]][
+            ["player_id", "position", "weighted_games"]
+        ].copy()
         top_weighted = career.groupby("player_id")["weighted_games"].max().reset_index()
         qualified = top_weighted[top_weighted["weighted_games"] >= min_starts]["player_id"]
-        primary = primary[primary["player_id"].isin(qualified)]
+        primary_cands = primary_cands[primary_cands["player_id"].isin(qualified)]
+        primary_cands["_pos_pri"] = primary_cands["position"].map(
+            _POSITION_TIEBREAK_PRIORITY,
+        ).fillna(99)
+        primary = (
+            primary_cands.sort_values(
+                ["player_id", "weighted_games", "_pos_pri"],
+                ascending=[True, False, True],
+            )
+            .drop_duplicates("player_id", keep="first")[["player_id", "position"]]
+        )
+        n_ties = len(primary_cands) - len(primary)
+        if n_ties > 0:
+            logger.info(
+                "Resolved %d tied-primary position rows → one row per player",
+                n_ties,
+            )
     else:
         primary = pd.DataFrame(columns=["player_id", "position"])
 
@@ -701,6 +733,13 @@ def _assign_hitter_positions(season: int = 2025, min_starts: int = 20) -> pd.Dat
         logger.warning("MLB API verification failed — using lineup-based positions",
                        exc_info=True)
 
+    n_before = len(assigned)
+    assigned = assigned.drop_duplicates(subset=["player_id"], keep="first")
+    if len(assigned) < n_before:
+        logger.warning(
+            "Dropped %d duplicate position rows (same player_id)",
+            n_before - len(assigned),
+        )
     return assigned
 
 
@@ -808,6 +847,7 @@ def _build_hitter_offense_score(
     proj: pd.DataFrame,
     observed: pd.DataFrame,
     aggressiveness: pd.DataFrame | None = None,
+    use_sim_wrc_plus: bool = True,
 ) -> pd.DataFrame:
     """Decomposed hitter offense: contact + decisions + damage.
 
@@ -832,6 +872,10 @@ def _build_hitter_offense_score(
         Observed season stats from ``fact_batting_advanced``.
     aggressiveness : pd.DataFrame, optional
         From ``get_hitter_aggressiveness()`` — chase_rate, two_strike_whiff_rate.
+    use_sim_wrc_plus : bool
+        If False, do not load ``hitter_counting_sim.parquet`` for the damage /
+        production buckets (avoids stale preseason sim during in-season
+        rankings when ``season == projection_season``).
 
     Returns
     -------
@@ -846,12 +890,15 @@ def _build_hitter_offense_score(
                 "barrel_pct_multiyear", "hard_hit_pct_multiyear"]
     obs_cols = [c for c in obs_cols if c in observed.columns]
     proj_cols = ["batter_id", "projected_k_rate", "projected_bb_rate",
-                  "projected_hr_per_fb", "composite_score"]
+                  "projected_hr_per_fb", "projected_gb_rate", "projected_woba",
+                  "composite_score"]
     if "age" in proj.columns:
         proj_cols.append("age")
-    merged = proj[proj_cols].merge(
-        observed[obs_cols],
-        on="batter_id", how="inner",
+    proj_sub = proj[proj_cols].drop_duplicates("batter_id", keep="first")
+    obs_sub = observed[obs_cols].drop_duplicates("batter_id", keep="first")
+    merged = proj_sub.merge(
+        obs_sub,
+        on="batter_id", how="left",
     )
 
     if merged.empty:
@@ -859,7 +906,7 @@ def _build_hitter_offense_score(
                                       "contact_skill", "decision_skill",
                                       "damage_skill", "production_skill"])
 
-    pa = merged["pa"]
+    pa = merged["pa"].fillna(0)
 
     # Merge aggressiveness (chase, 2-strike whiff) if provided
     if aggressiveness is not None and not aggressiveness.empty:
@@ -868,22 +915,27 @@ def _build_hitter_offense_score(
             if c in aggressiveness.columns:
                 agg_cols.append(c)
         if len(agg_cols) > 1:
-            merged = merged.merge(aggressiveness[agg_cols], on="batter_id", how="left")
+            agg_sub = aggressiveness[agg_cols].drop_duplicates("batter_id", keep="first")
+            merged = merged.merge(agg_sub, on="batter_id", how="left")
 
     # Optionally load sim wRC+ for damage bucket
     sim_path = DASHBOARD_DIR / "hitter_counting_sim.parquet"
     has_sim = False
-    if sim_path.exists():
+    if use_sim_wrc_plus and sim_path.exists():
         sim_df = pd.read_parquet(sim_path)
         if "projected_wrc_plus_mean" in sim_df.columns:
-            merged = merged.merge(
-                sim_df[["batter_id", "projected_wrc_plus_mean"]],
-                on="batter_id", how="left",
+            sim_df = sim_df[["batter_id", "projected_wrc_plus_mean"]].drop_duplicates(
+                "batter_id", keep="first",
             )
+            merged = merged.merge(sim_df, on="batter_id", how="left")
             has_sim = merged["projected_wrc_plus_mean"].notna().any()
             if has_sim:
                 logger.info("Offense using sim wRC+ for damage bucket (%d hitters)",
                             merged["projected_wrc_plus_mean"].notna().sum())
+    elif not use_sim_wrc_plus:
+        logger.info(
+            "Skipping hitter_counting_sim wRC+ (in-season / stale-sim guard)",
+        )
 
     # =================================================================
     # Bucket 1: CONTACT SKILL (stabilizes ~150 PA)
@@ -892,8 +944,9 @@ def _build_hitter_offense_score(
     # =================================================================
     proj_contact = _inv_zscore_pctl(merged["projected_k_rate"])
     obs_k = _inv_zscore_pctl(merged["k_pct"]) if "k_pct" in merged.columns else proj_contact
+    obs_k = obs_k.fillna(proj_contact)  # NaN-safe: left-joined players use projection
 
-    contact_trust = _stat_family_trust(pa, min_pa=100, full_pa=350)
+    contact_trust = _stat_family_trust(pa, min_pa=60, full_pa=350)
     merged["contact_skill"] = (1 - contact_trust) * proj_contact + contact_trust * obs_k
 
     # =================================================================
@@ -919,7 +972,7 @@ def _build_hitter_offense_score(
 
     obs_decisions = sum(w * p for w, p in zip(obs_decision_weights, obs_decision_parts))
 
-    decision_trust = _stat_family_trust(pa, min_pa=150, full_pa=450)
+    decision_trust = _stat_family_trust(pa, min_pa=100, full_pa=450)
     merged["decision_skill"] = (1 - decision_trust) * proj_decisions + decision_trust * obs_decisions
 
     # =================================================================
@@ -932,7 +985,9 @@ def _build_hitter_offense_score(
     if has_sim:
         proj_damage = _zscore_pctl(merged["projected_wrc_plus_mean"].fillna(100))
     else:
-        proj_damage = _zscore_pctl(merged["projected_hr_per_fb"])
+        # Without sim wRC+, use Bayesian projected wOBA.  Age-dependent
+        # rho in hitter_model.py handles development vs aging regression.
+        proj_damage = _zscore_pctl(merged["projected_woba"].fillna(0.310))
 
     # Use multi-year recency-weighted Statcast when available (smooths
     # outlier single seasons like Springer's 2025 career-best at 35).
@@ -1009,7 +1064,7 @@ def _build_hitter_offense_score(
         aging_spike_penalty = np.where(is_aging_spike, spike_factor, 1.0)
 
     damage_trust = (
-        _stat_family_trust(pa, min_pa=200, full_pa=550)
+        _stat_family_trust(pa, min_pa=150, full_pa=550)
         * age_trust * damage_dev_trust * aging_spike_penalty
     )
     merged["damage_skill"] = (1 - damage_trust) * proj_damage + damage_trust * obs_damage
@@ -1024,7 +1079,8 @@ def _build_hitter_offense_score(
     if has_sim:
         proj_production = _zscore_pctl(merged["projected_wrc_plus_mean"].fillna(100))
     else:
-        proj_production = pd.Series(0.5, index=merged.index)
+        # Without sim wRC+, use Bayesian projected wOBA.
+        proj_production = _zscore_pctl(merged["projected_woba"].fillna(0.310))
 
     # Use multi-year recency-weighted wRC+ when available (same smoothing
     # as damage bucket — prevents single-season outliers from dominating).
@@ -1062,7 +1118,7 @@ def _build_hitter_offense_score(
         aging_spike_prod = np.where(is_wrc_spike, spike_factor_wrc, 1.0)
 
     production_trust = (
-        _stat_family_trust(pa, min_pa=150, full_pa=500)
+        _stat_family_trust(pa, min_pa=100, full_pa=500)
         * age_trust * production_dev_trust * aging_spike_prod
     )
 
@@ -1084,10 +1140,15 @@ def _build_hitter_offense_score(
         + 0.35 * merged["production_skill"]
     )
 
-    # Small-sample dampening toward league average (same as before)
+    # Small-sample dampening toward league average.  Only kicks in once PA
+    # reaches the contact-trust floor (100) — below that, all trust ramps
+    # give 0% observed weight so the score is already projection-based and
+    # dampening would just compress differentiation (harmful early-season
+    # when everyone has <100 PA).
     pa_confidence = ((pa - 150) / (400 - 150)).clip(0, 1)
     dampening = 0.50 * (1.0 - pa_confidence)
-    merged["offense_score"] = merged["offense_score"] * (1 - dampening) + 0.50 * dampening
+    damped = merged["offense_score"] * (1 - dampening) + 0.50 * dampening
+    merged["offense_score"] = np.where(pa >= 60, damped, merged["offense_score"])
 
     return merged[["batter_id", "offense_score", "contact_skill",
                     "decision_skill", "damage_skill", "production_skill"]]
@@ -1117,11 +1178,14 @@ def _build_hitter_baserunning_score(season: int = 2025) -> pd.DataFrame:
 
     proj = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet")
 
-    # Sprint speed + HP-to-1B from Statcast
+    # Sprint speed + HP-to-1B from Statcast (fall back to prior season
+    # when current season data isn't available yet — e.g. early April)
     speed_df = read_sql(f"""
-        SELECT player_id AS batter_id, sprint_speed, hp_to_1b
+        SELECT DISTINCT ON (player_id)
+               player_id AS batter_id, sprint_speed, hp_to_1b
         FROM staging.statcast_sprint_speed
-        WHERE season = {season}
+        WHERE season BETWEEN {season - 1} AND {season}
+        ORDER BY player_id, season DESC
     """, {})
 
     # Observed SB/CS (2-year window for stability)
@@ -1719,8 +1783,17 @@ def rank_hitters(
     """
     from src.data.db import read_sql
 
-    # Load projections
+    # Load projections (defensive: parquet / upstream must be one row per batter)
     proj = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet")
+    _n_proj = len(proj)
+    if "pa" in proj.columns:
+        proj = proj.sort_values("pa", ascending=False)
+    proj = proj.drop_duplicates("batter_id", keep="first").reset_index(drop=True)
+    if len(proj) < _n_proj:
+        logger.warning(
+            "Deduped hitter_projections: %d → %d rows (duplicate batter_id)",
+            _n_proj, len(proj),
+        )
 
     # Load observed stats
     observed = read_sql(f"""
@@ -1805,6 +1878,16 @@ def rank_hitters(
     except Exception:
         logger.warning("Could not load multi-year observed stats", exc_info=True)
 
+    _n_obs = len(observed)
+    observed = observed.sort_values("pa", ascending=False).drop_duplicates(
+        "batter_id", keep="first",
+    ).reset_index(drop=True)
+    if len(observed) < _n_obs:
+        logger.warning(
+            "Deduped fact_batting_advanced rows: %d → %d (duplicate batter_id)",
+            _n_obs, len(observed),
+        )
+
     # Position assignments
     positions = _assign_hitter_positions(season=season)
 
@@ -1812,8 +1895,15 @@ def rank_hitters(
     from src.data.queries import get_hitter_aggressiveness
     aggressiveness = get_hitter_aggressiveness(season)
 
+    # Preseason: allow sim wRC+ from hitter_counting_sim. In-season
+    # (season == projection_season) skip — weekly refresh does not rebuild sim.
+    use_hitter_sim = season != projection_season
+
     # Build sub-scores
-    offense = _build_hitter_offense_score(proj, observed, aggressiveness=aggressiveness)
+    offense = _build_hitter_offense_score(
+        proj, observed, aggressiveness=aggressiveness,
+        use_sim_wrc_plus=use_hitter_sim,
+    )
     baserunning = _build_hitter_baserunning_score(season=season)
     platoon = _build_hitter_platoon_modifier(season=season)
     fielding = _build_hitter_fielding_score(season=season)
@@ -1833,20 +1923,21 @@ def rank_hitters(
     for extra in ["woba_raw", "pf_r"]:
         if extra in observed.columns:
             obs_cols.append(extra)
-    base = base.merge(observed[obs_cols], on="batter_id", how="inner")
+    base = base.merge(observed[obs_cols], on="batter_id", how="left")
 
     # Merge aggressiveness data for discipline modifier and display
     if not aggressiveness.empty:
-        base = base.merge(
-            aggressiveness[["batter_id", "chase_rate", "two_strike_whiff_rate"]],
-            on="batter_id", how="left",
-        )
+        _agg = aggressiveness[
+            ["batter_id", "chase_rate", "two_strike_whiff_rate"]
+        ].drop_duplicates("batter_id", keep="first")
+        base = base.merge(_agg, on="batter_id", how="left")
 
-    # Merge position
+    # Merge position (left join — players without position data default to DH)
     base = base.merge(
         positions.rename(columns={"player_id": "batter_id"}),
-        on="batter_id", how="inner",
+        on="batter_id", how="left",
     )
+    base["position"] = base["position"].fillna("DH")
 
     # Merge sub-scores
     base = base.merge(offense, on="batter_id", how="left")
@@ -1866,9 +1957,9 @@ def rank_hitters(
     base = base.merge(playing_time, on="batter_id", how="left")
     base = base.merge(trajectory, on="batter_id", how="left")
 
-    # Merge sim-based counting projections for display
+    # Merge sim-based counting projections for display (same guard as offense)
     sim_path = DASHBOARD_DIR / "hitter_counting_sim.parquet"
-    if sim_path.exists():
+    if use_hitter_sim and sim_path.exists():
         sim_df = pd.read_parquet(sim_path)
         sim_cols = ["batter_id", "total_k_mean", "total_bb_mean", "total_hr_mean",
                      "total_h_mean", "total_r_mean", "total_rbi_mean", "total_sb_mean",
@@ -1876,7 +1967,8 @@ def rank_hitters(
                      "projected_wraa_mean", "projected_ops_mean", "projected_avg_mean",
                      "dk_season_mean", "espn_season_mean", "total_games_mean", "total_pa_mean"]
         sim_cols = [c for c in sim_cols if c in sim_df.columns]
-        base = base.merge(sim_df[sim_cols], on="batter_id", how="left")
+        sim_df = sim_df[sim_cols].drop_duplicates("batter_id", keep="first")
+        base = base.merge(sim_df, on="batter_id", how="left")
         logger.info("Merged hitter sim projections for %d batters",
                      base["projected_wrc_plus_mean"].notna().sum() if "projected_wrc_plus_mean" in base.columns else 0)
 
@@ -1890,7 +1982,8 @@ def rank_hitters(
             "prob_power_surge", "prob_diamond_in_the_rough",
         ]
         available_bc = [c for c in breakout_cols if c in breakout_df.columns]
-        base = base.merge(breakout_df[available_bc], on="batter_id", how="left")
+        _bo = breakout_df[available_bc].drop_duplicates("batter_id", keep="first")
+        base = base.merge(_bo, on="batter_id", how="left")
     else:
         for col in ["breakout_type", "breakout_tier", "breakout_hole"]:
             base[col] = ""
@@ -2018,6 +2111,9 @@ def rank_hitters(
     base["fielding_combined"] = _pctl(base["fielding_combined"])
     base["baserunning_score"] = _pctl(base["baserunning_score"])
 
+    # Positional adjustment (FanGraphs-standard run values, 0-1 scale)
+    base["positional_adj"] = base["position"].map(_POSITIONAL_OFFENSE_ADJ).fillna(0.333)
+
     # For DH: redistribute fielding weight to offense + baserunning.
     # DHs are evaluated purely on production — no artificial cap.
     is_dh = base["position"] == "DH"
@@ -2040,21 +2136,20 @@ def rank_hitters(
         (_HITTER_WEIGHTS["offense"] + eff_offense_boost) * base["offense_score"]
         + _HITTER_WEIGHTS["baserunning"] * base["baserunning_score"]
         + eff_fielding_wt * base["fielding_combined"]
-        + _HITTER_WEIGHTS["health"] * base["health_adj"]
+        + _HITTER_WEIGHTS["positional_adj"] * base["positional_adj"]
         + _HITTER_WEIGHTS["role"] * base["role_score"]
         + _HITTER_WEIGHTS["trajectory"] * base["trajectory_score"]
         + _HITTER_WEIGHTS["versatility"] * base["versatility_score"]
-        + _HITTER_WEIGHTS["roster_value"] * base["roster_value_score"]
     )
-    # DH composite: fielding weight fully redistributed (no dampening needed)
+    # DH composite: fielding + positional weight fully redistributed
+    dh_pos_wt = _HITTER_WEIGHTS["positional_adj"]  # DH positional_adj = 0.0, so this zeroes out
     base.loc[is_dh, "tdd_value_score"] = (
         dh_offense_wt * base.loc[is_dh, "offense_score"]
         + dh_baserunning_wt * base.loc[is_dh, "baserunning_score"]
-        + _HITTER_WEIGHTS["health"] * base.loc[is_dh, "health_adj"]
+        + dh_pos_wt * base.loc[is_dh, "positional_adj"]
         + _HITTER_WEIGHTS["role"] * base.loc[is_dh, "role_score"]
         + _HITTER_WEIGHTS["trajectory"] * base.loc[is_dh, "trajectory_score"]
         + _HITTER_WEIGHTS["versatility"] * base.loc[is_dh, "versatility_score"]
-        + _HITTER_WEIGHTS["roster_value"] * base.loc[is_dh, "roster_value_score"]
     )
 
     # --- Two-way player bonus ---
@@ -2264,7 +2359,7 @@ def rank_hitters(
         "baserunning_score", "platoon_score",
         "fielding_combined", "framing_score", "pt_score",
         "health_adj", "role_score", "versatility_score", "roster_value_score",
-        "trajectory_score", "two_way_bonus",
+        "positional_adj", "trajectory_score", "two_way_bonus",
         # Health
         "health_score", "health_label",
         # Observed
@@ -2379,20 +2474,26 @@ def _build_pitcher_stuff_score(
     pd.DataFrame
         Columns: pitcher_id, stuff_score.
     """
-    merged = proj[["pitcher_id", "projected_k_rate", "projected_hr_per_bf",
-                    "whiff_rate", "gb_pct"]].merge(
-        observed[["pitcher_id", "swstr_pct", "csw_pct", "xwoba_against",
-                   "barrel_pct_against", "hard_hit_pct_against"]],
-        on="pitcher_id", how="inner",
-    )
+    p_sub = proj[
+        ["pitcher_id", "projected_k_rate", "projected_hr_per_bf",
+         "whiff_rate", "gb_pct"]
+    ].drop_duplicates("pitcher_id", keep="first")
+    o_cols = ["pitcher_id", "swstr_pct", "csw_pct", "xwoba_against",
+              "barrel_pct_against", "hard_hit_pct_against"]
+    if "batters_faced" in observed.columns:
+        o_cols.append("batters_faced")
+    o_sub = observed[o_cols].drop_duplicates("pitcher_id", keep="first")
+    merged = p_sub.merge(o_sub, on="pitcher_id", how="left")
 
     if merged.empty:
         return pd.DataFrame(columns=["pitcher_id", "stuff_score"])
 
+    bf = merged["batters_faced"].fillna(0) if "batters_faced" in merged.columns else pd.Series(0, index=merged.index)
+
     # Merge run values and compute Stuff+ if available
     has_stuff_plus = False
     if run_values is not None and not run_values.empty:
-        rv_dedup = run_values[["pitcher_id", "weighted_rv_per_100"]].drop_duplicates()
+        rv_dedup = run_values[["pitcher_id", "weighted_rv_per_100"]].drop_duplicates("pitcher_id", keep="first")
         merged = merged.merge(rv_dedup, on="pitcher_id", how="left")
 
         # Compute arsenal Stuff+ (league-normalized, 100 = average)
@@ -2432,7 +2533,13 @@ def _build_pitcher_stuff_score(
     else:
         observed_score = 0.30 * obs_swstr + 0.30 * obs_csw + 0.25 * obs_xwoba + 0.15 * obs_barrel
 
-    merged["stuff_score"] = _PROJ_WEIGHT_BASE * projected + _OBS_WEIGHT_BASE * observed_score
+    # BF-based trust ramp: SwStr%/CSW% stabilize ~150 pitches (~40 BF),
+    # but full stuff picture needs ~300 BF.  At low BF, lean on projections.
+    stuff_trust = _stat_family_trust(bf, min_pa=75, full_pa=300)
+    obs_weight = _OBS_WEIGHT_BASE * stuff_trust
+    # Fill NaN observed (no in-season data) with projected so blend is clean
+    observed_score = observed_score.fillna(projected)
+    merged["stuff_score"] = (1 - obs_weight) * projected + obs_weight * observed_score
 
     # Preserve Stuff+ for output display
     cols = ["pitcher_id", "stuff_score"]
@@ -2462,18 +2569,25 @@ def _build_pitcher_command_score(
     pd.DataFrame
         Columns: pitcher_id, command_score.
     """
-    merged = proj[["pitcher_id", "projected_bb_rate"]].merge(
-        observed[["pitcher_id", "bb_pct", "zone_pct", "chase_pct"]],
-        on="pitcher_id", how="inner",
+    p_sub = proj[["pitcher_id", "projected_bb_rate"]].drop_duplicates(
+        "pitcher_id", keep="first",
     )
+    o_cols = ["pitcher_id", "bb_pct", "zone_pct", "chase_pct"]
+    if "batters_faced" in observed.columns:
+        o_cols.append("batters_faced")
+    o_sub = observed[o_cols].drop_duplicates("pitcher_id", keep="first")
+    merged = p_sub.merge(o_sub, on="pitcher_id", how="left")
 
     if merged.empty:
         return pd.DataFrame(columns=["pitcher_id", "command_score"])
+
+    bf = merged["batters_faced"].fillna(0) if "batters_faced" in merged.columns else pd.Series(0, index=merged.index)
 
     # Merge efficiency data if available
     if efficiency is not None and not efficiency.empty:
         eff_cols = ["pitcher_id", "first_strike_pct", "putaway_rate"]
         eff_subset = efficiency[[c for c in eff_cols if c in efficiency.columns]].copy()
+        eff_subset = eff_subset.drop_duplicates("pitcher_id", keep="first")
         merged = merged.merge(eff_subset, on="pitcher_id", how="left")
 
     # Lower BB% = better command
@@ -2494,12 +2608,17 @@ def _build_pitcher_command_score(
     else:
         observed_cmd = 0.40 * obs_bb + 0.30 * obs_zone + 0.30 * obs_chase
 
-    merged["command_score"] = _PROJ_WEIGHT_BASE * projected_cmd + _OBS_WEIGHT_BASE * observed_cmd
+    # BF-based trust ramp: BB% less stable than whiff metrics, needs more BF.
+    cmd_trust = _stat_family_trust(bf, min_pa=100, full_pa=400)
+    obs_cmd_weight = _OBS_WEIGHT_BASE * cmd_trust
+    observed_cmd = observed_cmd.fillna(projected_cmd)
+    merged["command_score"] = (1 - obs_cmd_weight) * projected_cmd + obs_cmd_weight * observed_cmd
     return merged[["pitcher_id", "command_score"]]
 
 
 def _build_pitcher_workload_score(
     health_df: pd.DataFrame | None = None,
+    use_counting_sim: bool = True,
 ) -> pd.DataFrame:
     """Score projected workload from sim-based counting projections + health.
 
@@ -2513,6 +2632,9 @@ def _build_pitcher_workload_score(
         Pre-loaded health scores (columns: player_id, health_score,
         health_label).  When provided the disk read of
         ``health_scores.parquet`` is skipped.
+    use_counting_sim : bool
+        If False, skip sim parquet and use ``pitcher_counting.parquet`` only
+        (in-season weekly refresh does not rebuild sim).
 
     Returns
     -------
@@ -2524,8 +2646,9 @@ def _build_pitcher_workload_score(
     sim_path = DASHBOARD_DIR / "pitcher_counting_sim.parquet"
     old_path = DASHBOARD_DIR / "pitcher_counting.parquet"
 
-    if sim_path.exists():
+    if use_counting_sim and sim_path.exists():
         counting = pd.read_parquet(sim_path)
+        counting = counting.drop_duplicates("pitcher_id", keep="first")
         # Sim has projected_ip_mean and total_games_mean
         ip_pctl = _pctl(counting["projected_ip_mean"].fillna(0))
         games_pctl = _pctl(counting["total_games_mean"].fillna(0))
@@ -2533,8 +2656,12 @@ def _build_pitcher_workload_score(
         logger.info("Workload score from sim parquet: %d pitchers", len(counting))
     elif old_path.exists():
         counting = pd.read_parquet(old_path)
+        counting = counting.drop_duplicates("pitcher_id", keep="first")
         base_workload = _pctl(counting["projected_bf_mean"])
-        logger.info("Workload score from old counting parquet (sim not found)")
+        logger.info(
+            "Workload score from old counting parquet (%s)",
+            "sim disabled (in-season)" if not use_counting_sim else "sim not found",
+        )
     else:
         logger.warning("No counting parquet found for workload score")
         return pd.DataFrame(columns=["pitcher_id", "workload_score"])
@@ -2547,13 +2674,12 @@ def _build_pitcher_workload_score(
             if health_path.exists():
                 health_df = pd.read_parquet(health_path)
         if health_df is not None and not health_df.empty:
-            counting = counting.merge(
-                health_df[["player_id", "health_score", "health_label"]].rename(
-                    columns={"player_id": "pitcher_id"}
-                ),
-                on="pitcher_id",
-                how="left",
+            _h = health_df[
+                ["player_id", "health_score", "health_label"]
+            ].rename(columns={"player_id": "pitcher_id"}).drop_duplicates(
+                "pitcher_id", keep="first",
             )
+            counting = counting.merge(_h, on="pitcher_id", how="left")
             has_health = True
 
     if has_health:
@@ -2757,6 +2883,15 @@ def rank_pitchers(
 
     # Load projections
     proj = pd.read_parquet(DASHBOARD_DIR / "pitcher_projections.parquet")
+    _n_pp = len(proj)
+    if "batters_faced" in proj.columns:
+        proj = proj.sort_values("batters_faced", ascending=False)
+    proj = proj.drop_duplicates("pitcher_id", keep="first").reset_index(drop=True)
+    if len(proj) < _n_pp:
+        logger.warning(
+            "Deduped pitcher_projections: %d → %d rows (duplicate pitcher_id)",
+            _n_pp, len(proj),
+        )
 
     # Load observed stats
     observed = read_sql(f"""
@@ -2767,6 +2902,15 @@ def rank_pitchers(
         FROM production.fact_pitching_advanced
         WHERE season = {season} AND batters_faced >= {min_bf}
     """, {})
+    _n_po = len(observed)
+    observed = observed.sort_values("batters_faced", ascending=False).drop_duplicates(
+        "pitcher_id", keep="first",
+    ).reset_index(drop=True)
+    if len(observed) < _n_po:
+        logger.warning(
+            "Deduped fact_pitching_advanced: %d → %d (duplicate pitcher_id)",
+            _n_po, len(observed),
+        )
 
     # Role assignment — prefer in-memory roles, then disk, then heuristic
     rp_roles = pitcher_roles_df
@@ -2794,15 +2938,21 @@ def rank_pitchers(
         roles = _assign_pitcher_roles()
         roles["role_detail"] = roles["role"]
 
+    roles = roles.drop_duplicates("pitcher_id", keep="first")
+
     # Load run values and efficiency for enhanced scoring
     from src.data.queries import get_pitcher_run_values, get_pitcher_efficiency
     run_values = get_pitcher_run_values(season)
     efficiency = get_pitcher_efficiency(season)
 
+    use_pitcher_sim = season != projection_season
+
     # Build sub-scores
     stuff = _build_pitcher_stuff_score(proj, observed, run_values=run_values)
     command = _build_pitcher_command_score(proj, observed, efficiency=efficiency)
-    workload = _build_pitcher_workload_score(health_df=health_df)
+    workload = _build_pitcher_workload_score(
+        health_df=health_df, use_counting_sim=use_pitcher_sim,
+    )
     durability = _build_pitcher_innings_durability()
     trajectory = _build_pitcher_trajectory_score(season=season)
 
@@ -2818,11 +2968,11 @@ def rank_pitchers(
     base_cols = [c for c in base_cols if c in proj.columns]
     base = proj[base_cols].copy()
 
-    # Merge observed for display
+    # Merge observed for display (left join — include projected-only pitchers)
     base = base.merge(
         observed[["pitcher_id", "batters_faced", "k_pct", "bb_pct",
                    "swstr_pct", "csw_pct", "xwoba_against", "woba_against"]],
-        on="pitcher_id", how="inner",
+        on="pitcher_id", how="left",
     )
 
     # Merge run values for display
@@ -2832,10 +2982,10 @@ def rank_pitchers(
 
     # Merge efficiency for display
     if not efficiency.empty:
-        base = base.merge(
-            efficiency[["pitcher_id", "first_strike_pct", "putaway_rate"]],
-            on="pitcher_id", how="left",
-        )
+        _eff = efficiency[
+            ["pitcher_id", "first_strike_pct", "putaway_rate"]
+        ].drop_duplicates("pitcher_id", keep="first")
+        base = base.merge(_eff, on="pitcher_id", how="left")
 
     # Merge role
     base = base.merge(roles, on="pitcher_id", how="left")
@@ -2847,16 +2997,17 @@ def rank_pitchers(
         base["role_detail"] = base["role"]
     base["role_detail"] = base["role_detail"].fillna(base["role"])
 
-    # Merge sim-based counting projections for display
+    # Merge sim-based counting projections for display (same guard as workload)
     sim_path = DASHBOARD_DIR / "pitcher_counting_sim.parquet"
-    if sim_path.exists():
+    if use_pitcher_sim and sim_path.exists():
         sim_df = pd.read_parquet(sim_path)
         sim_cols = ["pitcher_id", "total_k_mean", "total_bb_mean", "total_sv_mean",
                      "total_hld_mean", "projected_ip_mean", "projected_era_mean",
                      "projected_fip_era_mean", "projected_whip_mean",
                      "dk_season_mean", "espn_season_mean", "total_games_mean"]
         sim_cols = [c for c in sim_cols if c in sim_df.columns]
-        base = base.merge(sim_df[sim_cols], on="pitcher_id", how="left")
+        sim_df = sim_df[sim_cols].drop_duplicates("pitcher_id", keep="first")
+        base = base.merge(sim_df, on="pitcher_id", how="left")
         logger.info("Merged sim projections for %d pitchers", base["total_k_mean"].notna().sum())
 
     # Merge sub-scores
@@ -2876,7 +3027,8 @@ def rank_pitchers(
             "prob_stuff_dominant", "prob_command_leap", "prob_era_correction",
         ]
         available_pbc = [c for c in p_bo_cols if c in p_bo.columns]
-        base = base.merge(p_bo[available_pbc], on="pitcher_id", how="left")
+        _pbo = p_bo[available_pbc].drop_duplicates("pitcher_id", keep="first")
+        base = base.merge(_pbo, on="pitcher_id", how="left")
     else:
         for col in ["breakout_type", "breakout_tier", "breakout_hole"]:
             base[col] = ""

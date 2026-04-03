@@ -516,10 +516,17 @@ def extract_rate_samples(
         else:
             rho_draws = np.ones(len(samples))  # fallback: pure random walk
 
-        # Less regression for young developing pitchers
+        # Age-dependent persistence: young pitchers' improvements persist
+        # more (development), aging pitchers' outliers regress harder.
         age = df.loc[pos, "age"] if "age" in df.columns else None
-        if age is not None and age <= 25:
-            effective_rho = rho_draws * 0.92
+        if age is not None:
+            if age <= 27:
+                age_rho_mult = 1.0 + (27 - age) * 0.04
+            elif age <= 32:
+                age_rho_mult = 1.0
+            else:
+                age_rho_mult = max(0.70, 1.0 - (age - 32) * 0.05)
+            effective_rho = np.clip(rho_draws * age_rho_mult, 0, 0.99)
         else:
             effective_rho = rho_draws
 

@@ -160,6 +160,9 @@ def simulate_batter_game(
     park_hr_lift: float = 0.0,
     park_h_babip_adj: float = 0.0,
     weather_k_lift: float = 0.0,
+    form_k_lift: float = 0.0,
+    form_bb_lift: float = 0.0,
+    form_hr_lift: float = 0.0,
     n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> BatterSimulationResult:
@@ -207,6 +210,12 @@ def simulate_batter_game(
         Park factor BABIP adjustment for hits.
     weather_k_lift : float
         Weather K adjustment on logit scale.
+    form_k_lift : float
+        Batter rolling form K% logit lift (from form_model).
+    form_bb_lift : float
+        Batter rolling form BB% logit lift.
+    form_hr_lift : float
+        Batter rolling form HR logit lift (includes HR/PA accel + hard-hit).
     n_sims : int
         Number of simulations.
     random_seed : int
@@ -307,16 +316,19 @@ def simulate_batter_game(
             bullpen_hr_lift + bullpen_matchup_hr_lift,
         )
 
-        # Final adjusted rates
+        # Final adjusted rates (including rolling form lifts)
         k_rate_adj = expit(
             k_logit_base + k_pitcher_lift
             + umpire_k_lift + park_k_lift + weather_k_lift
+            + form_k_lift
         )
         bb_rate_adj = expit(
             bb_logit_base + bb_pitcher_lift + umpire_bb_lift + park_bb_lift
+            + form_bb_lift
         )
         hr_rate_adj = expit(
             hr_logit_base + hr_pitcher_lift + park_hr_lift
+            + form_hr_lift
         )
 
         # Draw outcomes

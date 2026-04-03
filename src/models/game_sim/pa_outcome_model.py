@@ -122,6 +122,7 @@ class PAOutcomeModel:
         park_bb_lift: float = 0.0,
         park_hr_lift: float = 0.0,
         weather_k_lift: float = 0.0,
+        form_bb_lift: float = 0.0,
     ) -> dict[str, float | np.ndarray]:
         """Compute adjusted PA outcome probabilities.
 
@@ -149,6 +150,8 @@ class PAOutcomeModel:
             Park factor logit lifts for K, BB, and HR.
         weather_k_lift : float
             Weather K logit lift.
+        form_bb_lift : float
+            Pitcher rolling form BB% logit lift (from form_model).
 
         Returns
         -------
@@ -164,11 +167,12 @@ class PAOutcomeModel:
         )
         k_prob = expit(k_logit)
 
-        # BB probability (with calibration offset)
+        # BB probability (with calibration offset + pitcher form)
         bb_logit = (
             self._safe_logit(pitcher_bb_rate)
             + matchup_bb_lift + tto_bb_lift + fatigue_bb_lift
             + umpire_bb_lift + park_bb_lift
+            + form_bb_lift
             + _CALIBRATION_BB_OFFSET
         )
         bb_prob = expit(bb_logit)

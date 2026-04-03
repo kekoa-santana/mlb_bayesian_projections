@@ -37,57 +37,81 @@ logger = logging.getLogger(__name__)
 CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
 
 # ---------------------------------------------------------------------------
-# Component weights (sum to 1.0)
+# Batter component weights (sum to 1.0)
 # ---------------------------------------------------------------------------
-# Balanced ranking: best overall prospect quality.
-# FG scouting captures tools/ceiling that stats alone miss (arm strength,
-# bat speed, raw power, body projection).  Age-for-level doubled from
-# prior version because a 19yo doing it at AA is fundamentally different
-# from a 24yo doing the same thing.  Readiness lowered — it measures
-# "who gets called up next", not "who is the best prospect".
+# Fully data-driven: no external scouting (FG FV) or readiness.
+# pwOBA is the core BABIP-stripped quality signal (R²=0.790).
+# Diamond Rating is internal tool grades (position-aware 20-80).
+# Age-for-level is the key differentiator — doing it young matters.
 _WEIGHTS = {
-    "readiness": 0.10,
-    "rate_quality": 0.25,
+    "pwoba": 0.35,
+    "diamond_rating": 0.15,
     "age_rel": 0.20,
     "trajectory": 0.15,
-    "positional": 0.10,
-    "scouting": 0.20,
+    "rate_quality": 0.10,
+    "positional": 0.05,
 }
 
 # Impact score: upside-focused (max ceiling)
 _IMPACT_WEIGHTS = {
-    "readiness": 0.05,
-    "rate_quality": 0.25,
-    "age_rel": 0.20,
+    "pwoba": 0.30,
+    "diamond_rating": 0.15,
+    "age_rel": 0.25,
     "trajectory": 0.20,
-    "positional": 0.10,
-    "scouting": 0.20,
+    "rate_quality": 0.10,
+    "positional": 0.00,
 }
 
-# Floor/ETA score: readiness-focused (who contributes soonest)
+# Floor/ETA score: proven production at scarce positions
 _FLOOR_WEIGHTS = {
-    "readiness": 0.35,
-    "rate_quality": 0.20,
+    "pwoba": 0.35,
+    "diamond_rating": 0.10,
     "age_rel": 0.10,
     "trajectory": 0.10,
+    "rate_quality": 0.10,
+    "positional": 0.25,
+}
+
+# Pitcher weights (no pwOBA — pitcher_quality serves same role)
+_PITCHER_WEIGHTS = {
+    "pitcher_quality": 0.40,
+    "diamond_rating": 0.15,
+    "age_rel": 0.20,
+    "trajectory": 0.15,
     "positional": 0.10,
-    "scouting": 0.15,
+}
+
+_PITCHER_IMPACT_WEIGHTS = {
+    "pitcher_quality": 0.30,
+    "diamond_rating": 0.15,
+    "age_rel": 0.25,
+    "trajectory": 0.25,
+    "positional": 0.05,
+}
+
+_PITCHER_FLOOR_WEIGHTS = {
+    "pitcher_quality": 0.40,
+    "diamond_rating": 0.10,
+    "age_rel": 0.10,
+    "trajectory": 0.10,
+    "positional": 0.30,
 }
 
 # ---------------------------------------------------------------------------
 # Positional scarcity multipliers (defensive spectrum)
-# Higher = scarcer / more valuable position
+# Compressed range (0.40-0.80) so position matters but doesn't dominate.
+# A great hitter at 1B should still rank well — the best bat wins.
 # ---------------------------------------------------------------------------
 _POS_SCARCITY = {
-    "C": 1.00,
-    "SS": 0.90,
-    "CF": 0.80,
-    "2B": 0.70,
-    "3B": 0.65,
+    "C": 0.80,
+    "SS": 0.75,
+    "CF": 0.70,
+    "2B": 0.65,
+    "3B": 0.60,
     "RF": 0.55,
-    "LF": 0.45,
-    "1B": 0.30,
-    "DH": 0.20,
+    "LF": 0.50,
+    "1B": 0.45,
+    "DH": 0.40,
 }
 
 # Pitcher positional scarcity (SP > RP)
@@ -434,7 +458,14 @@ def _compute_games_played_ratio(
             scores[pid] = 0.5
             continue
 
-        # Use most recent 2 seasons, recency-weighted
+        # Drop in-progress seasons (<30 games) — a 5-game AAA stint
+        # in early April shouldn't tank a prospect's availability score.
+        by_season = by_season[by_season >= 30]
+        if by_season.empty:
+            scores[pid] = 0.5
+            continue
+
+        # Use most recent 2 completed seasons, recency-weighted
         recent = by_season.sort_index().tail(2)
         if len(recent) == 2:
             wtd_games = 0.4 * recent.iloc[0] + 0.6 * recent.iloc[1]
@@ -489,19 +520,41 @@ def _load_fg_rankings(season: int) -> pd.DataFrame:
         "fg_org_rank", "fg_risk", "fg_eta"]]
 
 
-def _fv_to_scouting_score(fv: pd.Series) -> pd.Series:
-    """Convert FanGraphs Future Value (20-80 scale) to 0-1 scouting score.
+# ---------------------------------------------------------------------------
+# pwOBA — Peripheral wOBA (BABIP-stripped quality signal)
+# ---------------------------------------------------------------------------
+# Fit on 8,873 MLB player-seasons (2000-2025, 200+ PA), R²=0.790
+_PWOBA_COEFS = {
+    "intercept": 0.199,
+    "k_pct": -0.228,
+    "bb_pct": 0.347,
+    "iso": 0.575,
+    "gb_pct": 0.078,
+    "sb_rate": 0.160,
+    "hbp_pct": 0.400,
+}
+_LEAGUE_AVG_HBP_RATE = 0.012
 
-    FV represents integrated scouting judgment — tools, ceiling, body
-    projection, makeup — that pure stats can't capture.  Maps FV onto
-    a 0-1 scale: FV 20 → 0.0, FV 50 → 0.50, FV 70 → 0.83, FV 80 → 1.0.
 
-    Prospects WITHOUT FG coverage get a neutral 0.40 (slightly below
-    average — if scouts haven't ranked you, you're probably not elite).
+def _compute_pwoba(df: pd.DataFrame) -> pd.Series:
+    """Compute peripheral wOBA from translated MiLB rates.
+
+    Returns raw pwOBA value (typically 0.250-0.400 range).
+    Uses league-average HBP rate when prospect HBP data is missing.
     """
-    # Linear mapping: score = (FV - 20) / 60, clipped to [0, 1]
-    score = (fv - 20.0) / 60.0
-    return score.clip(0, 1).fillna(0.40)
+    hbp = df["hbp_rate"].fillna(_LEAGUE_AVG_HBP_RATE) if "hbp_rate" in df.columns else _LEAGUE_AVG_HBP_RATE
+    gb = df["wtd_gb_pct"].fillna(0.44) if "wtd_gb_pct" in df.columns else 0.44
+    sb = df["sb_rate"].fillna(0.0) if "sb_rate" in df.columns else 0.0
+
+    return (
+        _PWOBA_COEFS["intercept"]
+        + _PWOBA_COEFS["k_pct"] * df["wtd_k_pct"]
+        + _PWOBA_COEFS["bb_pct"] * df["wtd_bb_pct"]
+        + _PWOBA_COEFS["iso"] * df["wtd_iso"]
+        + _PWOBA_COEFS["gb_pct"] * gb
+        + _PWOBA_COEFS["sb_rate"] * sb
+        + _PWOBA_COEFS["hbp_pct"] * hbp
+    )
 
 
 def _compute_composite_scores(
@@ -510,35 +563,52 @@ def _compute_composite_scores(
 ) -> pd.Series:
     """Compute weighted composite from component scores.
 
-    Rate quality is age-adjusted using a concave (power-law) form so
-    that extreme age outliers (19 yo at AA) get a larger boost than
-    the old linear 0.85-1.15 range provided.
+    Fully data-driven: uses pwOBA (batters) or pitcher_quality (pitchers)
+    as the core quality signal, internal Diamond Rating for tool grades,
+    and age/trajectory/positional components.
 
-    Scouting component uses FG Future Value when available, falling
-    back to a neutral score for prospects without FG coverage.
+    The concave age adjustment amplifies the quality signal for young
+    prospects: a 19yo posting .330 pwOBA at AA is far more valuable
+    than a 24yo doing the same.
     """
-    # Concave age adjustment: amplifies extreme youth more than linear
+    score = pd.Series(0.0, index=df.index)
+
+    # Concave age adjustment: applied to the primary quality signal
     # age_score ~0.0 (old): adj = 0.80, ~0.5 (avg): adj = 0.99, ~1.0 (young): adj = 1.20
     age_adj = 0.80 + 0.40 * df["comp_age"] ** 0.7
-    adj_rate_quality = (df["comp_rate_quality"] * age_adj).clip(0, 1)
 
-    # Scouting score from FG Future Value (if available)
-    scouting_wt = weights.get("scouting", 0.0)
-    if scouting_wt > 0 and "fg_future_value" in df.columns:
-        comp_scouting = _fv_to_scouting_score(df["fg_future_value"])
-    elif scouting_wt > 0:
-        comp_scouting = pd.Series(0.40, index=df.index)
-    else:
-        comp_scouting = pd.Series(0.0, index=df.index)
+    # Batter quality: pwOBA (age-adjusted)
+    if "pwoba" in weights and "comp_pwoba" in df.columns:
+        adj_pwoba = (df["comp_pwoba"] * age_adj).clip(0, 1)
+        score += weights["pwoba"] * adj_pwoba
 
-    return (
-        weights["readiness"] * df["comp_readiness"]
-        + weights["rate_quality"] * adj_rate_quality
-        + weights["age_rel"] * df["comp_age"]
-        + weights["trajectory"] * df["comp_trajectory"]
-        + weights["positional"] * df["comp_positional"]
-        + scouting_wt * comp_scouting
-    )
+    # Pitcher quality: rate quality (age-adjusted) — same role as pwOBA for batters
+    if "pitcher_quality" in weights and "comp_rate_quality" in df.columns:
+        adj_quality = (df["comp_rate_quality"] * age_adj).clip(0, 1)
+        score += weights["pitcher_quality"] * adj_quality
+
+    # Profile balance (rate quality for batters — NOT age-adjusted)
+    if "rate_quality" in weights and "comp_rate_quality" in df.columns:
+        score += weights["rate_quality"] * df["comp_rate_quality"]
+
+    # Internal tool grades (Diamond Rating 0-10 → 0-1)
+    if "diamond_rating" in weights:
+        comp_diamond = df.get("comp_diamond", pd.Series(0.50, index=df.index))
+        score += weights["diamond_rating"] * comp_diamond
+
+    # Age-for-level
+    if "age_rel" in weights:
+        score += weights["age_rel"] * df["comp_age"]
+
+    # Trajectory
+    if "trajectory" in weights:
+        score += weights["trajectory"] * df["comp_trajectory"]
+
+    # Positional scarcity
+    if "positional" in weights:
+        score += weights["positional"] * df["comp_positional"]
+
+    return score
 
 
 # ===================================================================
@@ -997,11 +1067,7 @@ def rank_prospects(
     if milb_df is None:
         milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_batters.parquet")
 
-    # Apply FV-conditioned translation adjustments before aggregation
-    fv_map = _get_prospect_fv_map(set(milb_df["player_id"].unique()))
-    if fv_map:
-        from src.data.milb_translation import apply_fv_adjustments
-        milb_df = apply_fv_adjustments(milb_df, fv_map, "batter")
+    # No FV-conditioned adjustments — translations stand on their own stats.
 
     if readiness_df is None:
         from src.models.mlb_readiness import score_prospects
@@ -1038,12 +1104,18 @@ def rank_prospects(
     df = _blend_mlb_debut_batter_rates(df)
 
     # -------------------------------------------------------------------
-    # Component 1: Readiness (already 0-1 probability)
+    # Readiness (kept for display / future callup prediction, NOT scored)
     # -------------------------------------------------------------------
     df["comp_readiness"] = df["readiness_score"]
 
     # -------------------------------------------------------------------
-    # Component 2: Translated rate quality (with contact metrics)
+    # Component 1: pwOBA quality (BABIP-stripped offensive production)
+    # -------------------------------------------------------------------
+    df["pwoba"] = _compute_pwoba(df)
+    df["comp_pwoba"] = df["pwoba"].rank(pct=True, method="average")
+
+    # -------------------------------------------------------------------
+    # Component 2: Rate quality / profile balance
     # -------------------------------------------------------------------
     df["comp_rate_quality"] = _compute_batter_rate_quality(df)
 
@@ -1069,7 +1141,6 @@ def rank_prospects(
     transition_scores = _compute_transition_velocity(prospect_ids)
     transition_vel = df["player_id"].map(transition_scores).fillna(0.5)
 
-    # Blend: transition velocity available -> use it; otherwise fall back to prior blend
     has_transition = df["player_id"].map(lambda x: x in transition_scores)
     df["comp_trajectory"] = np.where(
         has_transition,
@@ -1085,12 +1156,33 @@ def rank_prospects(
     df["comp_positional"] = _compute_positional_score(df)
 
     # -------------------------------------------------------------------
-    # Merge FanGraphs FV BEFORE composite (used in scouting component)
+    # Component 6: Diamond Rating (internal tool grades, position-aware)
+    # Must be computed BEFORE composite so it feeds into scoring.
+    # -------------------------------------------------------------------
+    try:
+        from src.models.scouting_grades import grade_prospect_hitter
+        prospect_grades = grade_prospect_hitter(df, season=projection_season - 1)
+        if not prospect_grades.empty:
+            df = df.merge(prospect_grades, on="player_id", how="left")
+            logger.info("Scouting grades computed for %d batting prospects",
+                        prospect_grades["tools_rating"].notna().sum())
+    except Exception:
+        logger.warning("Could not compute prospect scouting grades", exc_info=True)
+
+    # Convert Diamond Rating (0-10) to 0-1 component score
+    if "tools_rating" in df.columns:
+        df["comp_diamond"] = (df["tools_rating"].fillna(5.0) / 10.0).clip(0, 1)
+    else:
+        df["comp_diamond"] = 0.50
+
+    # -------------------------------------------------------------------
+    # Merge FanGraphs FV for display only (NOT used in scoring)
     # -------------------------------------------------------------------
     fg = _load_fg_rankings(projection_season)
     if not fg.empty:
         df = df.merge(fg, on="player_id", how="left")
-        logger.info("Merged FG rankings for %d prospects", df["fg_future_value"].notna().sum())
+        logger.info("Merged FG rankings for %d prospects (display only)",
+                     df["fg_future_value"].notna().sum())
     else:
         df["fg_future_value"] = np.nan
         df["fg_overall_rank"] = np.nan
@@ -1112,22 +1204,9 @@ def rank_prospects(
     # Tier labels
     df["tdd_tier"] = pd.cut(
         df["tdd_prospect_score"],
-        bins=[0, 0.25, 0.40, 0.55, 0.70, 1.0],
+        bins=[0, 0.35, 0.50, 0.65, 0.78, 1.0],
         labels=["Org Filler", "Developing", "Solid", "Impact", "Elite"],
     )
-
-    # -------------------------------------------------------------------
-    # Scouting grades (20-80 tool grades + diamond rating)
-    # -------------------------------------------------------------------
-    try:
-        from src.models.scouting_grades import grade_prospect_hitter
-        prospect_grades = grade_prospect_hitter(df, season=projection_season - 1)
-        if not prospect_grades.empty:
-            df = df.merge(prospect_grades, on="player_id", how="left")
-            logger.info("Scouting grades computed for %d batting prospects",
-                        prospect_grades["tools_rating"].notna().sum())
-    except Exception:
-        logger.warning("Could not compute prospect scouting grades", exc_info=True)
 
     # -------------------------------------------------------------------
     # Select output columns
@@ -1139,8 +1218,11 @@ def rank_prospects(
         # TDD scores
         "tdd_prospect_score", "tdd_tier",
         "impact_score", "floor_eta_score",
-        "comp_readiness", "comp_rate_quality", "comp_age",
+        # Component scores
+        "comp_pwoba", "pwoba", "comp_diamond",
+        "comp_rate_quality", "comp_age",
         "comp_trajectory", "comp_positional",
+        "comp_readiness",
         # Translated stats (blended with MLB debut data when available)
         "wtd_k_pct", "wtd_bb_pct", "wtd_iso", "wtd_hr_pa", "wtd_gb_pct",
         "k_bb_diff", "sb_rate",
@@ -1230,11 +1312,7 @@ def rank_pitching_prospects(
         logger.info("Excluded %d pitchers with >= %d MLB BF from prospect pool",
                      n_before - n_after, _MAX_MLB_BF_PROSPECT)
 
-    # Apply FV-conditioned translation adjustments before aggregation
-    fv_map = _get_prospect_fv_map(set(milb_recent["player_id"].unique()))
-    if fv_map:
-        from src.data.milb_translation import apply_fv_adjustments
-        milb_recent = apply_fv_adjustments(milb_recent, fv_map, "pitcher")
+    # No FV-conditioned adjustments — translations stand on their own stats.
 
     # Build features
     df = _build_pitcher_prospect_features(milb_recent)
@@ -1303,7 +1381,25 @@ def rank_pitching_prospects(
     df["comp_positional"] = _compute_pitcher_positional_score(df)
 
     # -------------------------------------------------------------------
-    # Merge FanGraphs FV BEFORE composite (used in scouting component)
+    # Component 6: Diamond Rating (internal pitcher tool grades)
+    # -------------------------------------------------------------------
+    try:
+        from src.models.scouting_grades import grade_prospect_pitcher
+        prospect_grades = grade_prospect_pitcher(df, season=projection_season - 1)
+        if not prospect_grades.empty:
+            df = df.merge(prospect_grades, on="player_id", how="left")
+            logger.info("Scouting grades computed for %d pitching prospects",
+                        prospect_grades["tools_rating"].notna().sum())
+    except Exception:
+        logger.warning("Could not compute pitching prospect scouting grades", exc_info=True)
+
+    if "tools_rating" in df.columns:
+        df["comp_diamond"] = (df["tools_rating"].fillna(5.0) / 10.0).clip(0, 1)
+    else:
+        df["comp_diamond"] = 0.50
+
+    # -------------------------------------------------------------------
+    # Merge FanGraphs FV for display only (NOT used in scoring)
     # -------------------------------------------------------------------
     fg = _load_fg_rankings(projection_season)
     if not fg.empty:
@@ -1316,11 +1412,12 @@ def rank_pitching_prospects(
         df["fg_eta"] = np.nan
 
     # -------------------------------------------------------------------
-    # Composite scores: balanced, impact, and floor/ETA
+    # Composite scores: pitcher-specific weights
     # -------------------------------------------------------------------
-    df["tdd_prospect_score"] = _compute_composite_scores(df, weights)
-    df["impact_score"] = _compute_composite_scores(df, _IMPACT_WEIGHTS)
-    df["floor_eta_score"] = _compute_composite_scores(df, _FLOOR_WEIGHTS)
+    p_weights = weights if "pitcher_quality" in weights else _PITCHER_WEIGHTS
+    df["tdd_prospect_score"] = _compute_composite_scores(df, p_weights)
+    df["impact_score"] = _compute_composite_scores(df, _PITCHER_IMPACT_WEIGHTS)
+    df["floor_eta_score"] = _compute_composite_scores(df, _PITCHER_FLOOR_WEIGHTS)
 
     # Rank
     df = df.sort_values("tdd_prospect_score", ascending=False).reset_index(drop=True)
@@ -1329,22 +1426,9 @@ def rank_pitching_prospects(
     # Tier labels
     df["tdd_tier"] = pd.cut(
         df["tdd_prospect_score"],
-        bins=[0, 0.25, 0.40, 0.55, 0.70, 1.0],
+        bins=[0, 0.35, 0.50, 0.65, 0.78, 1.0],
         labels=["Org Filler", "Developing", "Solid", "Impact", "Elite"],
     )
-
-    # -------------------------------------------------------------------
-    # Scouting grades (20-80 tool grades + diamond rating)
-    # -------------------------------------------------------------------
-    try:
-        from src.models.scouting_grades import grade_prospect_pitcher
-        prospect_grades = grade_prospect_pitcher(df, season=projection_season - 1)
-        if not prospect_grades.empty:
-            df = df.merge(prospect_grades, on="player_id", how="left")
-            logger.info("Scouting grades computed for %d pitching prospects",
-                        prospect_grades["tools_rating"].notna().sum())
-    except Exception:
-        logger.warning("Could not compute pitching prospect scouting grades", exc_info=True)
 
     # -------------------------------------------------------------------
     # Select output columns
@@ -1356,8 +1440,10 @@ def rank_pitching_prospects(
         # TDD scores
         "tdd_prospect_score", "tdd_tier",
         "impact_score", "floor_eta_score",
-        "comp_readiness", "comp_rate_quality", "comp_age",
+        # Component scores
+        "comp_diamond", "comp_rate_quality", "comp_age",
         "comp_trajectory", "comp_positional",
+        "comp_readiness",
         # Translated stats (blended with MLB debut data when available)
         "wtd_k_pct", "wtd_bb_pct", "wtd_hr_bf", "k_bb_diff",
         "career_milb_bf", "youngest_age_rel", "sp_pct",

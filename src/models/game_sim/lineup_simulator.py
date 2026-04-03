@@ -423,6 +423,10 @@ def _simulate_half_inning(
     park_bb_lift: float,
     park_hr_lift: float,
     weather_k_lift: float,
+    # Per-batter form lifts (9,) arrays
+    form_k_lifts: np.ndarray,
+    form_bb_lifts: np.ndarray,
+    form_hr_lifts: np.ndarray,
     # Models and RNG
     pa_model: PAOutcomeModel,
     rng: np.random.Generator,
@@ -522,9 +526,13 @@ def _simulate_half_inning(
 
         k_rate = expit(
             k_logit + k_pitch + umpire_k_lift + park_k_lift + weather_k_lift
+            + form_k_lifts[slot]
         )
-        bb_rate = expit(bb_logit + bb_pitch + umpire_bb_lift + park_bb_lift)
-        hr_rate = expit(hr_logit + hr_pitch + park_hr_lift)
+        bb_rate = expit(
+            bb_logit + bb_pitch + umpire_bb_lift + park_bb_lift
+            + form_bb_lifts[slot]
+        )
+        hr_rate = expit(hr_logit + hr_pitch + park_hr_lift + form_hr_lifts[slot])
 
         # --- Draw PA outcomes ---
         probs = pa_model.compute_pa_probs(
@@ -863,6 +871,9 @@ def simulate_lineup_game(
     park_hr_lift: float = 0.0,
     park_h_babip_adj: float = 0.0,
     weather_k_lift: float = 0.0,
+    form_k_lifts: np.ndarray | None = None,
+    form_bb_lifts: np.ndarray | None = None,
+    form_hr_lifts: np.ndarray | None = None,
     n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> LineupSimulationResult:
@@ -905,6 +916,12 @@ def simulate_lineup_game(
         Park factor BABIP adjustment for hits (stacks with batter_babip_adjs).
     weather_k_lift : float
         Weather-based K adjustment on logit scale.
+    form_k_lifts : np.ndarray, optional
+        Shape (9,) per-batter rolling form K% logit lifts.
+    form_bb_lifts : np.ndarray, optional
+        Shape (9,) per-batter rolling form BB% logit lifts.
+    form_hr_lifts : np.ndarray, optional
+        Shape (9,) per-batter rolling form HR logit lifts (HR/PA accel + hard-hit).
     n_sims : int
         Number of Monte Carlo simulations.
     random_seed : int
@@ -933,6 +950,12 @@ def simulate_lineup_game(
         bullpen_matchup_hr_lifts = np.zeros(LINEUP_SIZE)
     if batter_babip_adjs is None:
         batter_babip_adjs = np.zeros(LINEUP_SIZE)
+    if form_k_lifts is None:
+        form_k_lifts = np.zeros(LINEUP_SIZE)
+    if form_bb_lifts is None:
+        form_bb_lifts = np.zeros(LINEUP_SIZE)
+    if form_hr_lifts is None:
+        form_hr_lifts = np.zeros(LINEUP_SIZE)
 
     # Dampen matchup lifts — empirical calibration from 11,517 game
     # walk-forward backtest (2023-2025). Raw pitch-type matchup scoring
@@ -1025,6 +1048,7 @@ def simulate_lineup_game(
             umpire_k_lift, umpire_bb_lift,
             park_k_lift, park_bb_lift, park_hr_lift,
             weather_k_lift,
+            form_k_lifts, form_bb_lifts, form_hr_lifts,
             pa_model, rng,
         )
 
@@ -1350,6 +1374,7 @@ def simulate_full_game_both_teams(
             umpire_k_lift, umpire_bb_lift,
             park_k_lift, park_bb_lift, park_hr_lift,
             weather_k_lift,
+            np.zeros(LINEUP_SIZE), np.zeros(LINEUP_SIZE), np.zeros(LINEUP_SIZE),
             pa_model, rng,
         )
 
@@ -1385,6 +1410,7 @@ def simulate_full_game_both_teams(
             umpire_k_lift, umpire_bb_lift,
             park_k_lift, park_bb_lift, park_hr_lift,
             weather_k_lift,
+            np.zeros(LINEUP_SIZE), np.zeros(LINEUP_SIZE), np.zeros(LINEUP_SIZE),
             pa_model, rng,
         )
 
