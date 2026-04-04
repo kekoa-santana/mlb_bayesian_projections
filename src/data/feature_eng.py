@@ -663,6 +663,43 @@ def build_multi_season_hitter_data(
                 if col not in df.columns:
                     df[col] = np.nan
 
+        # Merge advanced batting stats (xSLG, avg_ev_fb) from fact_batting_advanced
+        # and sat_batted_balls for model covariates.
+        try:
+            from src.data.db import read_sql as _read_sql
+            adv = _read_sql(
+                "SELECT batter_id, xslg FROM production.fact_batting_advanced"
+                " WHERE season = :season",
+                {"season": s},
+            )
+            if not adv.empty:
+                df = df.merge(adv, on="batter_id", how="left")
+        except Exception:
+            logger.debug("No fact_batting_advanced for %d", s)
+        if "xslg" not in df.columns:
+            df["xslg"] = np.nan
+
+        try:
+            from src.data.db import read_sql as _read_sql
+            ev_fb = _read_sql("""
+                SELECT fpa.batter_id,
+                       AVG(sbb.launch_speed) AS avg_ev_fb
+                FROM production.fact_pa fpa
+                JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
+                JOIN production.sat_batted_balls sbb ON fpa.pa_id = sbb.pa_id
+                WHERE dg.season = :season AND dg.game_type = 'R'
+                  AND sbb.bb_type = 'fly_ball'
+                  AND sbb.launch_speed != 'NaN'
+                GROUP BY fpa.batter_id
+                HAVING COUNT(*) >= 10
+            """, {"season": s})
+            if not ev_fb.empty:
+                df = df.merge(ev_fb, on="batter_id", how="left")
+        except Exception:
+            logger.debug("No avg_ev_fb for %d", s)
+        if "avg_ev_fb" not in df.columns:
+            df["avg_ev_fb"] = np.nan
+
         frames.append(df)
 
     combined = pd.concat(frames, ignore_index=True)
@@ -677,12 +714,13 @@ def build_multi_season_hitter_data(
     combined["age_bucket"] = combined["age_bucket"].astype(int)
 
     # Power composite — single covariate for HR/FB model that combines
-    # ISO + barrel% + hard_hit% + exit_velo into one stable predictor.
-    # Validated: predicts next-year barrel% 54% better than barrel% alone,
-    # next-year ISO 9% better (grade_prior_analysis.py, 2019-2024).
+    # ISO + barrel% + hard_hit% + exit_velo + avg_ev_fb into one stable predictor.
+    # avg_ev_fb (r=0.601 → next-year HR/FB) is the strongest single HR/FB
+    # predictor, adding r=0.203 beyond hard_hit% alone. barrel_pct weight
+    # reduced (r=0.425 YoY, weakest ingredient).
     # Z-scored within the combined data so it's season-normalized.
-    _pow_cols = ["iso", "barrel_pct", "hard_hit_pct", "avg_exit_velo"]
-    _pow_weights = [0.35, 0.25, 0.20, 0.20]
+    _pow_cols = ["iso", "barrel_pct", "hard_hit_pct", "avg_exit_velo", "avg_ev_fb"]
+    _pow_weights = [0.30, 0.15, 0.15, 0.15, 0.25]
     available_pow = [(c, w) for c, w in zip(_pow_cols, _pow_weights) if c in combined.columns]
     if available_pow:
         power_z = np.zeros(len(combined))
@@ -896,6 +934,34 @@ def build_multi_season_pitcher_data(
                 if col not in merged.columns:
                     merged[col] = np.nan
 
+        # Merge called_strike_rate and csw_pct from fact_pitch for K% covariates.
+        # called_strike_rate = called_strikes / total_pitches — captures command
+        # quality independently of swing-and-miss (partial r=+0.187 beyond swstr%).
+        try:
+            from src.data.db import read_sql as _read_sql
+            cs_df = _read_sql("""
+                SELECT fp.pitcher_id,
+                       SUM(fp.is_called_strike::int)::float
+                           / NULLIF(COUNT(*), 0) AS called_strike_rate,
+                       SUM(CASE WHEN fp.is_whiff OR fp.is_called_strike
+                            THEN 1 ELSE 0 END)::float
+                           / NULLIF(COUNT(*), 0) AS csw_pct
+                FROM production.fact_pitch fp
+                JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+                WHERE dg.season = :season AND dg.game_type = 'R'
+                  AND fp.pitch_type IS NOT NULL
+                  AND fp.pitch_type NOT IN ('PO', 'UN')
+                GROUP BY fp.pitcher_id
+                HAVING COUNT(*) >= 200
+            """, {"season": s})
+            if not cs_df.empty:
+                merged = merged.merge(cs_df, on="pitcher_id", how="left")
+        except Exception:
+            logger.debug("No called_strike_rate for %d", s)
+        for col in ["called_strike_rate", "csw_pct"]:
+            if col not in merged.columns:
+                merged[col] = np.nan
+
         # Derive starter/reliever role
         merged["is_starter"] = (
             (merged["ip"] / merged["games"].replace(0, np.nan)) >= 3.0
@@ -916,6 +982,16 @@ def build_multi_season_pitcher_data(
         logger.warning("Dropped %d pitcher rows with missing age", n_dropped)
 
     combined["age_bucket"] = combined["age_bucket"].astype(int)
+
+    # Pitcher model uses 3 age buckets (4 buckets hurt pitcher K% by -3.3%).
+    # Re-cut from raw age using original 3-bucket boundaries, overriding
+    # the 4-bucket assignment from queries.
+    combined["age_bucket"] = pd.cut(
+        combined["age"],
+        bins=[0, 25, 30, 99],
+        labels=[0, 1, 2],
+        right=True,
+    ).astype(int)
 
     combined = assign_skill_tier(combined, player_type="pitcher")
 
@@ -1024,7 +1100,14 @@ def augment_hitters_with_milb_priors(
         # Compute projected age in target season
         years_ahead = projection_season - int(best["season"])
         age_proj = float(best["age_at_level"]) + years_ahead
-        age_bucket = 0 if age_proj <= 25 else (1 if age_proj <= 30 else 2)
+        if age_proj <= 25:
+            age_bucket = 0
+        elif age_proj <= 28:
+            age_bucket = 1
+        elif age_proj <= 32:
+            age_bucket = 2
+        else:
+            age_bucket = 3
 
         # Scale PA by level reliability — fewer effective trials for lower levels
         level_scale = _MILB_LEVEL_PA_SCALE.get(best["level"], 0.25)
@@ -1091,6 +1174,272 @@ def augment_hitters_with_milb_priors(
         len(rookie_df), min_confidence, min_pa,
     )
     return combined
+
+
+def augment_pitchers_with_milb_priors(
+    mlb_df: pd.DataFrame,
+    milb_df: pd.DataFrame | None = None,
+    projection_season: int = 2026,
+    min_confidence: float = 0.40,
+    min_bf: int = 50,
+    max_age: int = 28,
+) -> pd.DataFrame:
+    """Add MiLB rookies as synthetic training rows for pitcher Bayesian projection.
+
+    Mirrors ``augment_hitters_with_milb_priors`` for pitchers.  For each
+    MiLB pitcher NOT in the MLB training data, creates a synthetic season
+    row using translated rates and scaled BF.
+
+    Parameters
+    ----------
+    mlb_df : pd.DataFrame
+        Output of ``build_multi_season_pitcher_data()``.
+    milb_df : pd.DataFrame or None
+        Translated MiLB pitcher data (from ``build_milb_translated_data``).
+        If None, loads from cache.
+    projection_season : int
+        Target season for projections.
+    min_confidence : float
+        Minimum ``translation_confidence`` to include a prospect.
+    min_bf : int
+        Minimum MiLB BF to include a prospect.
+    max_age : int
+        Maximum age at MiLB level.
+
+    Returns
+    -------
+    pd.DataFrame
+        MLB data + synthetic rookie rows, with ``_from_milb`` flag.
+    """
+    if milb_df is None:
+        try:
+            milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_pitchers.parquet")
+        except FileNotFoundError:
+            logger.warning("No MiLB translated pitchers cache found, skipping augmentation")
+            mlb_df["_from_milb"] = False
+            return mlb_df
+
+    mlb_ids = set(mlb_df["pitcher_id"].unique())
+
+    recent_cutoff = projection_season - 2
+    candidates = milb_df[
+        (~milb_df["player_id"].isin(mlb_ids))
+        & (milb_df["translation_confidence"] >= min_confidence)
+        & (milb_df["bf"] >= min_bf)
+        & (milb_df["season"] >= recent_cutoff)
+        & (milb_df["age_at_level"] <= max_age)
+    ].copy()
+
+    if candidates.empty:
+        logger.info("No MiLB rookies meet pitcher augmentation criteria")
+        mlb_df["_from_milb"] = False
+        return mlb_df
+
+    rows: list[dict] = []
+    for pid, grp in candidates.groupby("player_id"):
+        best = _pick_best_milb_row(grp)
+
+        years_ahead = projection_season - int(best["season"])
+        age_proj = float(best["age_at_level"]) + years_ahead
+        # Pitcher model uses 3 age buckets: 0=young(<=25), 1=prime(26-30), 2=vet(31+)
+        if age_proj <= 25:
+            age_bucket = 0
+        elif age_proj <= 30:
+            age_bucket = 1
+        else:
+            age_bucket = 2
+
+        level_scale = _MILB_LEVEL_PA_SCALE.get(best["level"], 0.25)
+        effective_bf = max(int(best["bf"] * level_scale), 10)
+
+        k_rate = float(best["translated_k_pct"])
+        bb_rate = float(best["translated_bb_pct"])
+        hr_bf = float(best.get("translated_hr_bf", 0.03))
+        k_count = int(round(k_rate * effective_bf))
+        bb_count = int(round(bb_rate * effective_bf))
+        hr_count = int(round(hr_bf * effective_bf))
+
+        row = {
+            "pitcher_id": int(pid),
+            "pitcher_name": best.get("player_name", ""),
+            "pitch_hand": None,
+            "season": projection_season - 1,
+            "birth_date": None,
+            "age": int(round(age_proj - 1)),
+            "age_bucket": age_bucket,
+            "games": 1,
+            "ip": effective_bf / 4.0,
+            "k": k_count,
+            "bb": bb_count,
+            "hr": hr_count,
+            "batters_faced": effective_bf,
+            "k_rate": k_rate,
+            "bb_rate": bb_rate,
+            "hr_per_bf": hr_bf,
+            "hr_per_9": hr_bf * 9.0 * 4.0,
+            "is_starter": 1,
+            "whiff_rate": np.nan,
+            "barrel_rate_against": np.nan,
+            "zone_pct": np.nan,
+            "gb_pct": np.nan,
+            "avg_velo": np.nan,
+            "called_strike_rate": np.nan,
+            "csw_pct": np.nan,
+            "skill_tier": 1,
+            "_from_milb": True,
+            "_milb_level": best["level"],
+            "_milb_confidence": float(best["translation_confidence"]),
+        }
+        rows.append(row)
+
+    rookie_df = pd.DataFrame(rows)
+    mlb_df = mlb_df.copy()
+    mlb_df["_from_milb"] = False
+
+    combined = pd.concat([mlb_df, rookie_df], ignore_index=True)
+    logger.info(
+        "Augmented with %d MiLB pitcher rookies (min_conf=%.2f, min_bf=%d)",
+        len(rookie_df), min_confidence, min_bf,
+    )
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# MiLB-informed prior offsets for early-career MLB players
+# ---------------------------------------------------------------------------
+
+def compute_milb_prior_offsets(
+    mlb_df: pd.DataFrame,
+    player_id_col: str = "batter_id",
+    player_type: str = "hitter",
+    milb_df: pd.DataFrame | None = None,
+    max_mlb_pa: int = 200,
+    min_milb_confidence: float = 0.30,
+    projection_season: int = 2026,
+) -> dict[int, dict[str, float]]:
+    """Compute logit-scale MiLB prior offsets for early-career MLB players.
+
+    For players with limited MLB data (<200 total PA/BF across training
+    seasons), looks up their most recent AAA/AA season stats and computes
+    a logit-scale offset from the league average.  This offset is used
+    in the Bayesian model to shift the player intercept (alpha) away
+    from the generic population prior toward their MiLB-informed talent
+    estimate.
+
+    The offset is weighted by level reliability so that AAA data
+    (more predictive) gets stronger influence than A-ball data.
+
+    Parameters
+    ----------
+    mlb_df : pd.DataFrame
+        Multi-season MLB data (output of ``build_multi_season_hitter_data``
+        or ``build_multi_season_pitcher_data``).
+    player_id_col : str
+        Column name for player ID ("batter_id" or "pitcher_id").
+    player_type : str
+        "hitter" or "pitcher".
+    milb_df : pd.DataFrame or None
+        Translated MiLB data.  If None, loads from cache.
+    max_mlb_pa : int
+        Maximum total MLB PA/BF for a player to qualify for MiLB prior.
+    min_milb_confidence : float
+        Minimum translation confidence to use.
+    projection_season : int
+        Target season (for recency filtering).
+
+    Returns
+    -------
+    dict[int, dict[str, float]]
+        ``{player_id: {"k_rate": offset, "bb_rate": offset, ...}}``.
+        Offsets are on the logit scale for binomial stats.
+        Only players who qualify are included.
+    """
+    from src.utils.constants import LEAGUE_AVG_OVERALL
+
+    # Load MiLB translated data
+    if milb_df is None:
+        cache_file = (
+            CACHE_DIR / "milb_translated_batters.parquet"
+            if player_type == "hitter"
+            else CACHE_DIR / "milb_translated_pitchers.parquet"
+        )
+        try:
+            milb_df = pd.read_parquet(cache_file)
+        except FileNotFoundError:
+            logger.warning("No MiLB translated %s cache found", player_type)
+            return {}
+
+    # Identify early-career players: total MLB PA/BF < max_mlb_pa
+    pa_col = "pa" if player_type == "hitter" else "batters_faced"
+    total_pa = mlb_df.groupby(player_id_col)[pa_col].sum()
+    early_career_ids = set(total_pa[total_pa < max_mlb_pa].index)
+
+    if not early_career_ids:
+        logger.info(
+            "No early-career %ss found (all have >= %d PA/BF)",
+            player_type, max_mlb_pa,
+        )
+        return {}
+
+    # Filter MiLB data: recent seasons, meets confidence threshold
+    recent_cutoff = projection_season - 3  # wider window than augmentation
+    milb_candidates = milb_df[
+        (milb_df["player_id"].isin(early_career_ids))
+        & (milb_df["translation_confidence"] >= min_milb_confidence)
+        & (milb_df["season"] >= recent_cutoff)
+    ].copy()
+
+    if milb_candidates.empty:
+        logger.info("No MiLB data found for early-career %ss", player_type)
+        return {}
+
+    # Pick best row per player and compute offsets
+    offsets: dict[int, dict[str, float]] = {}
+
+    for pid, grp in milb_candidates.groupby("player_id"):
+        best = _pick_best_milb_row(grp)
+        level = best["level"]
+        level_weight = _MILB_LEVEL_PA_SCALE.get(level, 0.25)
+        confidence = float(best["translation_confidence"])
+        # Combined reliability: level scale * confidence, capped at 0.85
+        reliability = min(level_weight * confidence / 0.5, 0.85)
+
+        player_offsets: dict[str, float] = {}
+
+        if player_type == "hitter":
+            stat_map = {
+                "k_rate": ("translated_k_pct", LEAGUE_AVG_OVERALL["k_rate"]),
+                "bb_rate": ("translated_bb_pct", LEAGUE_AVG_OVERALL["bb_rate"]),
+            }
+        else:
+            stat_map = {
+                "k_rate": ("translated_k_pct", LEAGUE_AVG_OVERALL["k_rate"]),
+                "bb_rate": ("translated_bb_pct", LEAGUE_AVG_OVERALL["bb_rate"]),
+                "hr_per_bf": ("translated_hr_bf", 0.030),
+            }
+
+        for stat_key, (milb_col, league_avg) in stat_map.items():
+            milb_rate = best.get(milb_col, np.nan)
+            if pd.isna(milb_rate) or milb_rate <= 0 or milb_rate >= 1:
+                continue
+
+            # Logit-scale offset: milb_estimated - league_average
+            milb_logit = np.log(milb_rate / (1 - milb_rate))
+            league_logit = np.log(league_avg / (1 - league_avg))
+            raw_offset = milb_logit - league_logit
+
+            # Scale by reliability — AAA with high confidence gets
+            # near-full weight, A-ball gets heavily discounted
+            player_offsets[stat_key] = float(raw_offset * reliability)
+
+        if player_offsets:
+            offsets[int(pid)] = player_offsets
+
+    logger.info(
+        "Computed MiLB prior offsets for %d early-career %ss (max_pa=%d)",
+        len(offsets), player_type, max_mlb_pa,
+    )
+    return offsets
 
 
 # ---------------------------------------------------------------------------

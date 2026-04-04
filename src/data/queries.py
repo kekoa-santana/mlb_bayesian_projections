@@ -643,8 +643,8 @@ def get_pitcher_season_totals_with_age(season: int) -> pd.DataFrame:
 
     df["age_bucket"] = pd.cut(
         df["age"],
-        bins=[0, 25, 30, 99],
-        labels=[0, 1, 2],
+        bins=[0, 25, 28, 32, 99],
+        labels=[0, 1, 2, 3],
         right=True,
     ).astype("Int64")
 
@@ -972,8 +972,8 @@ def get_season_totals_with_age(season: int) -> pd.DataFrame:
     # Compute age_bucket: 0=young(<=25), 1=prime(26-30), 2=veteran(31+)
     df["age_bucket"] = pd.cut(
         df["age"],
-        bins=[0, 25, 30, 99],
-        labels=[0, 1, 2],
+        bins=[0, 25, 28, 32, 99],
+        labels=[0, 1, 2, 3],
         right=True,
     ).astype("Int64")
 
@@ -1379,8 +1379,8 @@ def get_hitter_season_totals_extended(season: int) -> pd.DataFrame:
     import pandas as _pd
     df["age_bucket"] = _pd.cut(
         df["age"],
-        bins=[0, 25, 30, 99],
-        labels=[0, 1, 2],
+        bins=[0, 25, 28, 32, 99],
+        labels=[0, 1, 2, 3],
         right=True,
     ).astype("Int64")
 
@@ -1450,8 +1450,8 @@ def get_pitcher_season_totals_extended(season: int) -> pd.DataFrame:
     import pandas as _pd
     df["age_bucket"] = _pd.cut(
         df["age"],
-        bins=[0, 25, 30, 99],
-        labels=[0, 1, 2],
+        bins=[0, 25, 28, 32, 99],
+        labels=[0, 1, 2, 3],
         right=True,
     ).astype("Int64")
 

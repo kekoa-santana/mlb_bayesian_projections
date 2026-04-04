@@ -6,9 +6,9 @@ Supports multiple target stats with appropriate likelihoods:
 - HR/BF: Binomial(BF, inv_logit(theta))
 
 All share the same model structure:
-- Age-bucket population priors (young/prime/veteran)
+- Age-bucket population priors (young/prime/veteran) — 3 buckets (4 hurts pitcher K%)
 - Player-level random intercepts (non-centered)
-- AR(1) season process for talent evolution
+- AR(2) season process for talent evolution
 - Starter/reliever role covariate
 - Full posterior distributions per player per season
 
@@ -73,12 +73,21 @@ PITCHER_STAT_CONFIGS: dict[str, PitcherStatConfig] = {
         rate_col="k_rate",
         likelihood="binomial",
         league_avg=LEAGUE_AVG_OVERALL["k_rate"],
+        # called_strike_rate captures command-based Ks independently of
+        # swing-and-miss (partial r=+0.187 beyond swstr%). Prior attempts
+        # to add whiff_rate as covariate failed (ESS collapse due to
+        # collinearity with K% itself). called_strike_rate is less collinear.
+        # Covariates tested and rejected:
+        # - whiff_rate: ESS collapse (r=0.71 collinear with K%)
+        # - called_strike_rate + csw_pct: -8.3% vs Marcel (collinearity)
+        # - called_strike_rate alone: -3.0% vs Marcel (still hurts)
+        # Pitcher K% works best with pure hierarchical AR(1) — no covariates.
         covariates=[],
         season_decay=1.0,  # no decay (tested 0.6, 0.8 — neither improves MAE)
         sigma_season_mu=0.22,
         sigma_season_floor=0.18,
         # K% most persistent pitcher stat
-        rho_alpha=9.0, rho_beta=1.5,  # mean ~0.86
+        rho_alpha=6.0, rho_beta=2.5,  # mean ~0.71
     ),
     "bb_rate": PitcherStatConfig(
         name="bb_rate",
@@ -178,25 +187,37 @@ def prepare_pitcher_data(
             else:
                 cov_arrays[col_name] = (vals - mu) / sd
 
-    # --- Recency weighting via effective sample size ---
-    raw_trials = df[cfg.trials_col].values.astype(float)
-    raw_counts = df[cfg.count_col].values.astype(float)
+    # Recency weighting handled at projection step (extract_rate_samples),
+    # not in the likelihood — see hitter_model.py for rationale.
+    recency_wt = np.ones(len(df), dtype=np.float64)
 
-    if cfg.season_decay < 1.0:
-        max_season_idx = df["season_idx"].max()
-        recency = max_season_idx - df["season_idx"].values
-        weights = cfg.season_decay ** recency
-        eff_trials = np.round(raw_trials * weights).astype(int)
-        eff_counts = np.round(raw_counts * weights).astype(int)
-        # Ensure counts <= trials after rounding
-        eff_counts = np.minimum(eff_counts, eff_trials)
-        logger.info(
-            "Season decay=%.2f: weights range [%.3f, %.3f] over %d seasons",
-            cfg.season_decay, weights.min(), weights.max(), n_seasons,
+    raw_trials = df[cfg.trials_col].values.astype(int)
+    raw_counts = df[cfg.count_col].values.astype(int)
+
+    # --- MiLB-informed prior offsets for early-career pitchers ---
+    milb_prior_offset = np.zeros(n_players, dtype=np.float64)
+    has_milb_prior = np.zeros(n_players, dtype=np.float64)
+    try:
+        from src.data.feature_eng import compute_milb_prior_offsets
+        max_season = int(df["season"].max())
+        offsets = compute_milb_prior_offsets(
+            df, player_id_col="pitcher_id", player_type="pitcher",
+            projection_season=max_season + 1,
         )
-    else:
-        eff_trials = raw_trials.astype(int)
-        eff_counts = raw_counts.astype(int)
+        if offsets:
+            for pid, stat_offsets in offsets.items():
+                if pid in player_map and stat in stat_offsets:
+                    pidx = player_map[pid]
+                    milb_prior_offset[pidx] = stat_offsets[stat]
+                    has_milb_prior[pidx] = 1.0
+            n_with_prior = int(has_milb_prior.sum())
+            if n_with_prior > 0:
+                logger.info(
+                    "MiLB prior offsets: %d/%d pitchers for %s",
+                    n_with_prior, n_players, stat,
+                )
+    except Exception as exc:
+        logger.debug("MiLB prior offsets unavailable: %s", exc)
 
     result: dict[str, Any] = {
         "player_idx": df["player_idx"].values.astype(int),
@@ -209,10 +230,13 @@ def prepare_pitcher_data(
         "player_age_bucket": player_age_bucket,
         "player_skill_tier": player_skill_tier,
         "covariates": cov_arrays,
+        "milb_prior_offset": milb_prior_offset,
+        "has_milb_prior": has_milb_prior,
+        "recency_weight": recency_wt,
         "stat": stat,
         "df": df,
-        "trials": eff_trials,
-        "counts": eff_counts,
+        "trials": raw_trials,
+        "counts": raw_counts,
     }
 
     if "is_starter" in df.columns:
@@ -231,7 +255,7 @@ def build_pitcher_model(
     ---------------
     - Age-bucket population means on logit scale
     - Player-level random intercepts (non-centered)
-    - AR(1) season process for talent evolution
+    - AR(2) season process for talent evolution
     - Starter/reliever role shift (optional)
     - Binomial likelihood: count ~ Binomial(BF, inv_logit(theta))
 
@@ -282,31 +306,56 @@ def build_pitcher_model(
 
         # --- Player-level intercepts (non-centered) ---
         alpha_raw = pm.Normal("alpha_raw", mu=0, sigma=1, shape=n_players)
-        alpha = pm.Deterministic(
-            "alpha",
-            mu_pop[age_bucket, skill_tier] + sigma_player * alpha_raw,
-        )
+        milb_offset = data.get("milb_prior_offset")
+        has_milb = data.get("has_milb_prior")
+        if milb_offset is not None and has_milb is not None and has_milb.sum() > 0:
+            milb_offset_t = pt.as_tensor_variable(milb_offset.astype(np.float64))
+            has_milb_t = pt.as_tensor_variable(has_milb.astype(np.float64))
+            alpha = pm.Deterministic(
+                "alpha",
+                mu_pop[age_bucket, skill_tier]
+                + sigma_player * alpha_raw
+                + milb_offset_t * has_milb_t,
+            )
+        else:
+            alpha = pm.Deterministic(
+                "alpha",
+                mu_pop[age_bucket, skill_tier] + sigma_player * alpha_raw,
+            )
 
-        # --- AR(1) season process ---
+        # --- AR(2) season process ---
         sigma_season = pm.LogNormal(
             "sigma_season",
             mu=np.log(cfg.sigma_season_mu),
             sigma=0.5,
         )
         rho = pm.Beta("rho", alpha=cfg.rho_alpha, beta=cfg.rho_beta)
+        # AR(2) coefficient — two-year-ago signal. BB% benefits most
+        # (rho2~0.33). Beta(3,7) gives mean ~0.30, allows 0.10-0.50 range.
+        rho2 = pm.Beta("rho2", alpha=3, beta=7)
 
         if n_seasons > 1:
             innovation = pm.Normal(
                 "innovation", mu=0, sigma=1,
                 shape=(n_players, n_seasons),
             )
-            # Build AR(1) process iteratively
-            season_0 = (sigma_season * innovation[:, 0]).dimshuffle(0, "x")
-            ar_components = [season_0]
-            for t in range(1, n_seasons):
-                prev = ar_components[-1][:, -1]
-                cur = rho * prev + sigma_season * innovation[:, t]
+            # Season 0: just innovation
+            s0 = (sigma_season * innovation[:, 0]).dimshuffle(0, "x")
+            ar_components = [s0]
+
+            if n_seasons >= 2:
+                # Season 1: AR(1) only (no lag-2 available yet)
+                s1 = rho * s0[:, -1] + sigma_season * innovation[:, 1]
+                ar_components.append(s1.dimshuffle(0, "x"))
+
+            # Seasons 2+: full AR(2)
+            for t in range(2, n_seasons):
+                prev1 = ar_components[-1][:, -1]   # t-1
+                prev2 = ar_components[-2][:, -1]   # t-2
+                cur = (rho * prev1 + rho2 * prev2
+                       + sigma_season * innovation[:, t])
                 ar_components.append(cur.dimshuffle(0, "x"))
+
             season_effect = pm.Deterministic(
                 "season_effect", pt.concatenate(ar_components, axis=1)
             )
@@ -331,12 +380,28 @@ def build_pitcher_model(
 
         # --- Likelihood ---
         rate = pm.Deterministic("rate", pm.math.invlogit(theta))
-        pm.Binomial(
-            "obs",
-            n=data["trials"],
-            p=rate,
-            observed=data["counts"],
-        )
+
+        if cfg.name == "k_rate":
+            # Pitcher K% is overdispersed (factor ~1.25 empirical).
+            # BetaBinomial captures extra-Binomial variance via phi.
+            # phi ~ 50 from method-of-moments on observed overdispersion.
+            phi = pm.HalfNormal("phi", sigma=50)
+            alpha_bb = rate * phi
+            beta_bb = (1.0 - rate) * phi
+            pm.BetaBinomial(
+                "obs",
+                n=data["trials"],
+                alpha=alpha_bb,
+                beta=beta_bb,
+                observed=data["counts"],
+            )
+        else:
+            pm.Binomial(
+                "obs",
+                n=data["trials"],
+                p=rate,
+                observed=data["counts"],
+            )
 
     return model
 
@@ -506,7 +571,7 @@ def extract_rate_samples(
         else:
             sigma_draws = sigma_samples
 
-        # Get rho for AR(1) dampening
+        # Get rho for AR(2) dampening
         if "rho" in trace.posterior:
             rho_samples = trace.posterior["rho"].values.flatten()
             if len(rho_samples) != len(samples):
@@ -515,6 +580,16 @@ def extract_rate_samples(
                 rho_draws = rho_samples
         else:
             rho_draws = np.ones(len(samples))  # fallback: pure random walk
+
+        # Get rho2 (AR(2) lag-2 coefficient) from trace
+        if "rho2" in trace.posterior:
+            rho2_samples = trace.posterior["rho2"].values.flatten()
+            if len(rho2_samples) != len(samples):
+                rho2_draws = rng.choice(rho2_samples, size=len(samples), replace=True)
+            else:
+                rho2_draws = rho2_samples
+        else:
+            rho2_draws = np.zeros(len(samples))  # fallback: AR(1) only
 
         # Age-dependent persistence: young pitchers' improvements persist
         # more (development), aging pitchers' outliers regress harder.
@@ -530,9 +605,7 @@ def extract_rate_samples(
         else:
             effective_rho = rho_draws
 
-        # Project on logit scale with AR(1): next = rho * current_effect + innovation
-        # The season_effect at the last observed season is already in the samples,
-        # so we apply rho dampening + new innovation
+        # Project on logit scale with AR(2): next = rho*dev(t-1) + rho2*dev(t-2) + innov
         eps = np.clip(samples, 1e-6, 1 - 1e-6)
         logit_samples = np.log(eps / (1 - eps))
         innovation = rng.normal(0, sigma_draws)
@@ -545,12 +618,32 @@ def extract_rate_samples(
         if len(alpha_draws) != len(samples):
             alpha_draws = rng.choice(alpha_draws, size=len(samples), replace=True)
 
-        # Treat logit(rate) - alpha as the total deviation (season_effect
-        # + covariate contributions).  Applying rho to the whole deviation
-        # implicitly regresses both the season effect and covariates,
-        # which is correct — covariate values also regress toward the mean.
+        # Age-dependent alpha blending (same as hitter model)
+        if age is not None and age <= 27:
+            blend = min(0.25, (27 - age) * 0.04)
+            alpha_draws = (1 - blend) * alpha_draws + blend * logit_samples
+
         deviation_last = logit_samples - alpha_draws
-        new_deviation = effective_rho * deviation_last + innovation
+
+        # --- Compute deviation_prev (lag-2) for AR(2) forward projection ---
+        # If player has only 1 observed season, deviation_prev = 0.
+        prev_season = season - 1
+        prev_mask = (df["pitcher_id"] == pitcher_id) & (df["season"] == prev_season)
+        prev_positions = df.index[prev_mask].tolist()
+
+        if prev_positions:
+            prev_iloc = df.index.get_loc(prev_positions[0])
+            prev_samples = rate_flat[:, prev_iloc].copy()
+            if len(prev_samples) != len(samples):
+                prev_samples = rng.choice(prev_samples, size=len(samples), replace=True)
+            eps_prev = np.clip(prev_samples, 1e-6, 1 - 1e-6)
+            logit_prev = np.log(eps_prev / (1 - eps_prev))
+            deviation_prev = logit_prev - alpha_draws
+        else:
+            deviation_prev = np.zeros_like(deviation_last)
+
+        new_deviation = (effective_rho * deviation_last
+                         + rho2_draws * deviation_prev + innovation)
         samples = 1.0 / (1.0 + np.exp(-(alpha_draws + new_deviation)))
 
     return samples
@@ -572,6 +665,8 @@ def check_convergence(trace: az.InferenceData, stat: str) -> dict[str, Any]:
     var_names = ["mu_pop", "sigma_player", "sigma_season"]
     if "rho" in trace.posterior:
         var_names.append("rho")
+    if "rho2" in trace.posterior:
+        var_names.append("rho2")
     if cfg.covariates:
         for col_name, _, _, _ in cfg.covariates:
             beta_name = f"beta_{col_name}"

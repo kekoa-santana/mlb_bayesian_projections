@@ -8,7 +8,7 @@ Supports multiple target stats with appropriate likelihoods:
 All share the same model structure:
 - Age-bucket population priors (young/prime/veteran)
 - Player-level random intercepts (non-centered)
-- AR(1) season process for talent evolution
+- AR(2) season process for talent evolution
 - Stat-specific covariates (approach metrics, batted ball metrics)
 - Full posterior distributions per player per season
 
@@ -30,8 +30,13 @@ from src.utils.constants import LEAGUE_AVG_OVERALL
 
 logger = logging.getLogger(__name__)
 
-N_AGE_BUCKETS = 3
-AGE_BUCKET_LABELS = {0: "young (<=25)", 1: "prime (26-30)", 2: "veteran (31+)"}
+N_AGE_BUCKETS = 4
+AGE_BUCKET_LABELS = {
+    0: "young (<=25)",
+    1: "development-peak (26-28)",
+    2: "maintenance (29-32)",
+    3: "veteran (33+)",
+}
 
 
 @dataclass
@@ -78,7 +83,8 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         likelihood="binomial",
         league_avg=LEAGUE_AVG_OVERALL["k_rate"],
         covariates=[
-            ("chase_rate", 0.0, 0.2, "chase% → K%"),
+            # chase_rate removed: r=-0.013 with K% (near zero).
+            # Chase predicts BB% (r=-0.620), not K%.
             ("whiff_rate", 0.0, 0.2, "whiff% → K%"),
         ],
         # empirical logit-scale yr-to-yr SD ≈ 0.24
@@ -166,7 +172,12 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         league_avg=LEAGUE_AVG_OVERALL["woba"],  # 0.315
         covariates=[
             ("hard_hit_pct", 0.0, 0.2, "hard_hit% → wOBA"),
-            ("barrel_pct", 0.0, 0.2, "barrel% → wOBA"),
+            # barrel_pct replaced by xslg: xSLG YoY r=0.765 vs barrel r=0.425,
+            # predicts next-year wOBA better (0.409 vs 0.255).
+            ("xslg", 0.0, 0.2, "xSLG → wOBA"),
+            # xwOBA strips BABIP luck; +2-3% R² beyond hard_hit alone.
+            # Catches lucky/unlucky hitters the model would otherwise miss.
+            ("xwoba_avg", 0.0, 0.15, "xwOBA → wOBA"),
         ],
         # empirical natural-scale yr-to-yr SD ≈ 0.028
         sigma_season_mu=0.025,
@@ -250,6 +261,12 @@ def prepare_hitter_data(
                         "skill_tier", 1,
                     ))
 
+    # Recency weighting is handled at the projection step (extract_rate_samples)
+    # via age-dependent alpha blending, NOT in the likelihood.
+    # Modifying likelihood weights reduces effective sample size and triggers
+    # excess hierarchical shrinkage toward the population mean.
+    recency_weight = np.ones(len(df), dtype=np.float64)
+
     # Z-score covariates
     cov_arrays = {}
     for col_name, _, _, _ in cfg.covariates:
@@ -263,6 +280,33 @@ def prepare_hitter_data(
         else:
             cov_arrays[col_name] = (vals - mu) / sd
 
+    recency_wt = recency_weight
+
+    # --- MiLB-informed prior offsets for early-career players ---
+    milb_prior_offset = np.zeros(n_players, dtype=np.float64)
+    has_milb_prior = np.zeros(n_players, dtype=np.float64)
+    try:
+        from src.data.feature_eng import compute_milb_prior_offsets
+        max_season = int(df["season"].max())
+        offsets = compute_milb_prior_offsets(
+            df, player_id_col="batter_id", player_type="hitter",
+            projection_season=max_season + 1,
+        )
+        if offsets:
+            for pid, stat_offsets in offsets.items():
+                if pid in player_map and stat in stat_offsets:
+                    pidx = player_map[pid]
+                    milb_prior_offset[pidx] = stat_offsets[stat]
+                    has_milb_prior[pidx] = 1.0
+            n_with_prior = int(has_milb_prior.sum())
+            if n_with_prior > 0:
+                logger.info(
+                    "MiLB prior offsets: %d/%d hitters for %s",
+                    n_with_prior, n_players, stat,
+                )
+    except Exception as exc:
+        logger.debug("MiLB prior offsets unavailable: %s", exc)
+
     result: dict[str, Any] = {
         "player_idx": df["player_idx"].values.astype(int),
         "season_idx": df["season_idx"].values.astype(int),
@@ -274,6 +318,9 @@ def prepare_hitter_data(
         "player_age_bucket": player_age_bucket,
         "player_skill_tier": player_skill_tier,
         "covariates": cov_arrays,
+        "milb_prior_offset": milb_prior_offset,
+        "has_milb_prior": has_milb_prior,
+        "recency_weight": recency_wt,
         "stat": stat,
         "df": df,
     }
@@ -299,7 +346,7 @@ def build_hitter_model(
     ---------------
     - Age-bucket population means on logit/natural scale
     - Player-level random intercepts (non-centered)
-    - AR(1) season process for talent evolution
+    - AR(2) season process for talent evolution
     - Statcast covariates shift the linear predictor
     - Binomial or Normal likelihood depending on stat type
 
@@ -350,13 +397,27 @@ def build_hitter_model(
             )
 
         # --- Player-level intercepts (non-centered) ---
+        # For early-career players with MiLB data, shift alpha toward
+        # their translated MiLB rate (weighted by level reliability).
         alpha_raw = pm.Normal("alpha_raw", mu=0, sigma=1, shape=n_players)
-        alpha = pm.Deterministic(
-            "alpha",
-            mu_pop[age_bucket, skill_tier] + sigma_player * alpha_raw,
-        )
+        milb_offset = data.get("milb_prior_offset")
+        has_milb = data.get("has_milb_prior")
+        if milb_offset is not None and has_milb is not None and has_milb.sum() > 0:
+            milb_offset_t = pt.as_tensor_variable(milb_offset.astype(np.float64))
+            has_milb_t = pt.as_tensor_variable(has_milb.astype(np.float64))
+            alpha = pm.Deterministic(
+                "alpha",
+                mu_pop[age_bucket, skill_tier]
+                + sigma_player * alpha_raw
+                + milb_offset_t * has_milb_t,
+            )
+        else:
+            alpha = pm.Deterministic(
+                "alpha",
+                mu_pop[age_bucket, skill_tier] + sigma_player * alpha_raw,
+            )
 
-        # --- AR(1) season process ---
+        # --- AR(2) season process ---
         # LogNormal prior resists collapsing to zero; centered on empirical
         # year-to-year volatility (logit scale for binomial, natural for normal)
         sigma_season = pm.LogNormal(
@@ -365,19 +426,32 @@ def build_hitter_model(
             sigma=0.5,
         )
         rho = pm.Beta("rho", alpha=cfg.rho_alpha, beta=cfg.rho_beta)
+        # AR(2) coefficient — two-year-ago signal. BB% benefits most
+        # (rho2~0.33). Beta(3,7) gives mean ~0.30, allows 0.10-0.50 range.
+        rho2 = pm.Beta("rho2", alpha=3, beta=7)
 
         if n_seasons > 1:
             innovation = pm.Normal(
                 "innovation", mu=0, sigma=1,
                 shape=(n_players, n_seasons),
             )
-            # Build AR(1) process iteratively
-            season_0 = (sigma_season * innovation[:, 0]).dimshuffle(0, "x")
-            ar_components = [season_0]
-            for t in range(1, n_seasons):
-                prev = ar_components[-1][:, -1]
-                cur = rho * prev + sigma_season * innovation[:, t]
+            # Season 0: just innovation
+            s0 = (sigma_season * innovation[:, 0]).dimshuffle(0, "x")
+            ar_components = [s0]
+
+            if n_seasons >= 2:
+                # Season 1: AR(1) only (no lag-2 available yet)
+                s1 = rho * s0[:, -1] + sigma_season * innovation[:, 1]
+                ar_components.append(s1.dimshuffle(0, "x"))
+
+            # Seasons 2+: full AR(2)
+            for t in range(2, n_seasons):
+                prev1 = ar_components[-1][:, -1]   # t-1
+                prev2 = ar_components[-2][:, -1]   # t-2
+                cur = (rho * prev1 + rho2 * prev2
+                       + sigma_season * innovation[:, t])
                 ar_components.append(cur.dimshuffle(0, "x"))
+
             season_effect = pm.Deterministic(
                 "season_effect", pt.concatenate(ar_components, axis=1)
             )
@@ -404,8 +478,7 @@ def build_hitter_model(
                 observed=data["counts"],
             )
         else:
-            # Normal likelihood for xwOBA
-            # theta is on the natural scale (not logit)
+            # Normal likelihood for wOBA
             rate = pm.Deterministic("rate", theta)
             sigma_obs = pm.HalfNormal("sigma_obs", sigma=cfg.sigma_obs_prior)
             pm.Normal(
@@ -586,7 +659,7 @@ def extract_rate_samples(
         else:
             sigma_draws = sigma_samples
 
-        # Get rho for AR(1) dampening
+        # Get rho for AR(2) dampening
         if "rho" in trace.posterior:
             rho_samples = trace.posterior["rho"].values.flatten()
             if len(rho_samples) != len(samples):
@@ -595,6 +668,16 @@ def extract_rate_samples(
                 rho_draws = rho_samples
         else:
             rho_draws = np.ones(len(samples))  # fallback: pure random walk
+
+        # Get rho2 (AR(2) lag-2 coefficient) from trace
+        if "rho2" in trace.posterior:
+            rho2_samples = trace.posterior["rho2"].values.flatten()
+            if len(rho2_samples) != len(samples):
+                rho2_draws = rng.choice(rho2_samples, size=len(samples), replace=True)
+            else:
+                rho2_draws = rho2_samples
+        else:
+            rho2_draws = np.zeros(len(samples))  # fallback: AR(1) only
 
         # Extract alpha (player intercept) to compute season effect
         alpha_post = trace.posterior["alpha"].values
@@ -628,21 +711,69 @@ def extract_rate_samples(
         else:
             effective_rho = rho_draws
 
+        # Age-dependent alpha blending: for young players, shift the
+        # career intercept toward their most recent season's rate.
+        # Alpha pools all career seasons equally, which under-credits
+        # young breakouts.  Blending alpha toward recent performance
+        # lets development carry into the projection without modifying
+        # the likelihood (which triggers excess shrinkage).
+        # Young (<=27): up to 25% shift toward recent rate
+        # Prime (28-32): no shift
+        # Aging (33+): slight shift AWAY from recent (trust career more)
+        if age is not None and age <= 27:
+            blend = min(0.25, (27 - age) * 0.04)  # age 21→0.24, 25→0.08, 27→0
+            if cfg.likelihood == "binomial":
+                eps_s = np.clip(samples, 1e-6, 1 - 1e-6)
+                recent_logit = np.log(eps_s / (1 - eps_s))
+                alpha_draws = (1 - blend) * alpha_draws + blend * recent_logit
+            else:
+                alpha_draws = (1 - blend) * alpha_draws + blend * samples
+        elif age is not None and age >= 33:
+            # Aging: reduce alpha influence of recent spike by blending
+            # TOWARD the original alpha (no change — alpha already is career avg)
+            pass
+
+        # --- Compute deviation_prev (lag-2) for AR(2) forward projection ---
+        # deviation_last = samples(t-1) - alpha  (computed below)
+        # deviation_prev = samples(t-2) - alpha  (second-to-last season)
+        # If player has only 1 observed season, deviation_prev = 0.
+        prev_season = season - 1
+        prev_mask = (df["batter_id"] == batter_id) & (df["season"] == prev_season)
+        prev_positions = df.index[prev_mask].tolist()
+
         if cfg.likelihood == "binomial":
-            # Project on logit scale with AR(1)
-            # Treat logit(rate) - alpha as the total deviation (season_effect
-            # + covariate contributions).  Applying rho to the whole deviation
-            # implicitly regresses both the season effect and covariates,
-            # which is correct — covariate values also regress toward the mean.
             eps = np.clip(samples, 1e-6, 1 - 1e-6)
             logit_samples = np.log(eps / (1 - eps))
             deviation_last = logit_samples - alpha_draws
-            new_deviation = effective_rho * deviation_last + innovation
+
+            if prev_positions:
+                prev_iloc = df.index.get_loc(prev_positions[0])
+                prev_samples = rate_flat[:, prev_iloc].copy()
+                if len(prev_samples) != len(samples):
+                    prev_samples = rng.choice(prev_samples, size=len(samples), replace=True)
+                eps_prev = np.clip(prev_samples, 1e-6, 1 - 1e-6)
+                logit_prev = np.log(eps_prev / (1 - eps_prev))
+                deviation_prev = logit_prev - alpha_draws
+            else:
+                deviation_prev = np.zeros_like(deviation_last)
+
+            new_deviation = (effective_rho * deviation_last
+                             + rho2_draws * deviation_prev + innovation)
             samples = 1.0 / (1.0 + np.exp(-(alpha_draws + new_deviation)))
         else:
-            # Project on natural scale with AR(1)
             deviation_last = samples - alpha_draws
-            new_deviation = effective_rho * deviation_last + innovation
+
+            if prev_positions:
+                prev_iloc = df.index.get_loc(prev_positions[0])
+                prev_samples = rate_flat[:, prev_iloc].copy()
+                if len(prev_samples) != len(samples):
+                    prev_samples = rng.choice(prev_samples, size=len(samples), replace=True)
+                deviation_prev = prev_samples - alpha_draws
+            else:
+                deviation_prev = np.zeros_like(deviation_last)
+
+            new_deviation = (effective_rho * deviation_last
+                             + rho2_draws * deviation_prev + innovation)
             samples = alpha_draws + new_deviation
 
     return samples
@@ -666,6 +797,8 @@ def check_convergence(trace: az.InferenceData, stat: str) -> dict[str, Any]:
     var_names = ["mu_pop", "sigma_player", "sigma_season"]
     if "rho" in trace.posterior:
         var_names.append("rho")
+    if "rho2" in trace.posterior:
+        var_names.append("rho2")
     for col_name, _, _, _ in cfg.covariates:
         var_names.append(f"beta_{col_name}")
     if cfg.likelihood == "normal":
