@@ -1,9 +1,9 @@
 """
 Bayes-Marcel ensemble for season-level projections.
 
-Fits an optimal weight w that blends Bayesian and Marcel point estimates
-to minimize MAE, while shifting Bayesian posteriors to preserve
-calibration advantages (Brier, coverage).
+Fits an optimal weight w that blends Bayesian and Marcel point estimates,
+while shifting Bayesian posteriors to preserve calibration advantages
+(Brier, coverage).
 """
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ def fit_ensemble_weight(
     actual: np.ndarray,
     bayes_pred: np.ndarray,
     marcel_pred: np.ndarray,
-    metric: str = "mae",
 ) -> float:
     """Find optimal ensemble weight via grid search.
 
@@ -32,8 +31,6 @@ def fit_ensemble_weight(
         Bayesian point estimates, shape (n,).
     marcel_pred : np.ndarray
         Marcel point estimates, shape (n,).
-    metric : str
-        Loss to minimize: "mae" or "rmse".
 
     Returns
     -------
@@ -48,14 +45,19 @@ def fit_ensemble_weight(
     best_w = 0.5
     best_loss = np.inf
 
+    # Use Brier score (not MAE) — this system produces distributional
+    # forecasts, so the ensemble weight should optimize the probabilistic
+    # metric we actually evaluate on.
+    league_avg = float(np.median(actual))
+    actual_above = (actual > league_avg).astype(float)
+
     for w in grid:
         blend = w * bayes_pred + (1 - w) * marcel_pred
-        if metric == "mae":
-            loss = float(np.mean(np.abs(actual - blend)))
-        elif metric == "rmse":
-            loss = float(np.sqrt(np.mean((actual - blend) ** 2)))
-        else:
-            raise ValueError(f"Unknown metric: {metric}")
+        # P(above league avg) ≈ fraction of blend > league_avg per player
+        # For point estimates, use a soft sigmoid approximation
+        spread = np.std(actual) if np.std(actual) > 1e-9 else 0.01
+        blend_prob = 1.0 / (1.0 + np.exp(-(blend - league_avg) / (spread * 0.4)))
+        loss = float(brier_score_loss(actual_above, blend_prob))
 
         if loss < best_loss:
             best_loss = loss
@@ -127,14 +129,11 @@ def compute_ensemble_metrics(
     Returns
     -------
     dict
-        ensemble_mae, ensemble_rmse, ensemble_coverage_95, ensemble_brier.
+        ensemble_coverage_95, ensemble_brier.
     """
     actual = comp[f"actual_{stat}"].values
     ensemble = comp[f"ensemble_{stat}"].values
     bayes = comp[f"bayes_{stat}"].values
-
-    mae = float(np.mean(np.abs(actual - ensemble)))
-    rmse = float(np.sqrt(np.mean((actual - ensemble) ** 2)))
 
     lo = comp["ensemble_ci_95_lo"].values
     hi = comp["ensemble_ci_95_hi"].values
@@ -156,8 +155,6 @@ def compute_ensemble_metrics(
     brier = float(brier_score_loss(actual_above, np.array(probs)))
 
     return {
-        "ensemble_mae": mae,
-        "ensemble_rmse": rmse,
         "ensemble_coverage_95": coverage,
         "ensemble_brier": brier,
     }

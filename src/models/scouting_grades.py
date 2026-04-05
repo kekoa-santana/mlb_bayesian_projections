@@ -67,6 +67,8 @@ _RP_DIAMOND_WEIGHTS = {"stuff": 0.60, "command": 0.30, "durability": 0.10}
 
 def _round_to_5(x: float) -> int:
     """Round to nearest 5 for standard scouting increments."""
+    if pd.isna(x):
+        return 50
     return int(5 * round(x / 5))
 
 
@@ -104,15 +106,11 @@ def _z_grade_series(
         z = -z
     raw = 50 + 10 * z
 
-    # Rescale so the actual min → 20 and max → 80. This guarantees the
-    # full 20-80 range is used for every tool — the best player IS 80
-    # and the worst IS 20, with everyone else scaled relative to them.
-    raw_min, raw_max = raw.min(), raw.max()
-    if raw_max - raw_min > 1e-9:
-        rescaled = GRADE_MIN + (raw - raw_min) / (raw_max - raw_min) * (GRADE_MAX - GRADE_MIN)
-    else:
-        rescaled = raw
-    grades = rescaled.apply(lambda x: _round_to_5(np.clip(x, GRADE_MIN, GRADE_MAX)))
+    # Pure z-score grading: grade 50 = league average, each 10 points = 1 SD.
+    # The spread factor (0.70) already widens the distribution so grades
+    # reach 20-80 for typical MLB qualifier pools. We clip rather than
+    # rescale so grade 50 retains its meaning as the league average.
+    grades = raw.apply(lambda x: _round_to_5(np.clip(x, GRADE_MIN, GRADE_MAX)))
     return grades.astype(int)
 
 

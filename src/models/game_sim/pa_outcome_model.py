@@ -49,10 +49,13 @@ _CALIBRATION_K_OFFSET = -0.02   # slight K logit reduction (was -0.06, reduced a
 _CALIBRATION_BB_OFFSET = 0.01   # slight BB logit increase (was 0.03, reduced after exit fix)
 
 # Fatigue adjustment thresholds and slopes (logit scale)
-_FATIGUE_PITCH_THRESHOLD = 85
-_FATIGUE_K_SLOPE = -0.003    # K logit drops per pitch above threshold
-_FATIGUE_BB_SLOPE = 0.00239  # BB logit increases per pitch above threshold
-_FATIGUE_HR_SLOPE = 0.001    # HR logit increases per pitch above threshold
+_FATIGUE_PITCH_THRESHOLD = 90   # Research (Bradbury 2007, Statcast velocity studies): meaningful
+                                # fatigue effects begin ~90-95 pitches, steepest past 100
+_FATIGUE_K_SLOPE = -0.003       # K logit drops per pitch above threshold
+_FATIGUE_BB_SLOPE = 0.00239     # BB logit increases per pitch above threshold
+_FATIGUE_HR_SLOPE = 0.003       # HR logit increases per pitch above threshold (was 0.001;
+                                # Perez & Sherwood 2020: HR rate increases 15-20% relative
+                                # in high-pitch-count regime → ~0.003 logit/pitch)
 
 
 def compute_fatigue_adjustments(

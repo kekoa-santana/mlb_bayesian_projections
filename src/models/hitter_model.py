@@ -71,6 +71,11 @@ class StatConfig:
     # K% most persistent (~0.86), HR/FB least (~0.67).
     rho_alpha: float = 8.0
     rho_beta: float = 2.0
+    # mu_pop prior width: how far age-bucket × skill-tier cell means
+    # can spread from league average.  Default 0.3 works for logit-scale
+    # binomial stats; wOBA (natural scale, SD ~0.04) needs wider to let
+    # cells separate.
+    mu_pop_sigma: float = 0.3
 
 
 # Pre-defined stat configs
@@ -102,7 +107,8 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         league_avg=LEAGUE_AVG_OVERALL["bb_rate"],
         covariates=[
             ("chase_rate", 0.0, 0.2, "chase% → BB%"),
-            ("z_contact_pct", 0.0, 0.2, "z_contact% → BB%"),
+            # z_contact_pct removed: partial r = -0.064 with next-year BB%
+            # after controlling for current BB% — nearly zero, wrong sign.
         ],
         # empirical logit-scale yr-to-yr SD ≈ 0.33
         sigma_season_mu=0.25,
@@ -165,11 +171,11 @@ STAT_CONFIGS: dict[str, StatConfig] = {
     ),
     "woba": StatConfig(
         name="woba",
-        count_col="woba",           # value column for normal likelihood
+        count_col="woba",           # value column (logit-transformed for fitting)
         trials_col="pa",            # PA weight (for career averages)
         rate_col="woba",
-        likelihood="normal",
-        league_avg=LEAGUE_AVG_OVERALL["woba"],  # 0.315
+        likelihood="logit_normal",  # Normal on logit scale → bounded [0,1] projections
+        league_avg=LEAGUE_AVG_OVERALL["woba"],  # 0.315 (stored on natural scale, logit-transformed internally)
         covariates=[
             ("hard_hit_pct", 0.0, 0.2, "hard_hit% → wOBA"),
             # barrel_pct replaced by xslg: xSLG YoY r=0.765 vs barrel r=0.425,
@@ -179,13 +185,16 @@ STAT_CONFIGS: dict[str, StatConfig] = {
             # Catches lucky/unlucky hitters the model would otherwise miss.
             ("xwoba_avg", 0.0, 0.15, "xwOBA → wOBA"),
         ],
-        # empirical natural-scale yr-to-yr SD ≈ 0.028
-        sigma_season_mu=0.025,
-        sigma_season_floor=0.020,
+        # Logit-scale priors (Jacobian at wOBA=0.315 is ~4.63):
+        # Tuned from v1 backtest: mu_pop_sigma=0.45 too wide → ESS collapse,
+        # sigma_season_floor=0.09 too tight → 78% coverage at 95% CI.
+        sigma_season_mu=0.15,
+        sigma_season_floor=0.14,
         sigma_player_prior=0.5,
-        sigma_obs_prior=0.04,       # population SD ≈ 0.038
-        # wOBA is a composite metric — moderate persistence
-        rho_alpha=7.0, rho_beta=2.5,  # mean ~0.74
+        sigma_obs_prior=0.18,       # natural 0.04 → logit ~0.18
+        # wOBA composite metric — high persistence for true talent
+        rho_alpha=8.0, rho_beta=2.0,  # mean ~0.80 (was 0.74 — under-projected young elites)
+        mu_pop_sigma=0.25,  # tighter than binomial stats — helps identification on logit scale
     ),
     "chase_rate": StatConfig(
         name="chase_rate",
@@ -230,8 +239,8 @@ def prepare_hitter_data(
     cfg = STAT_CONFIGS[stat]
     df = df.copy()
 
-    # For xwOBA, drop rows with NaN values
-    if cfg.likelihood == "normal":
+    # For continuous likelihoods, drop rows with NaN values
+    if cfg.likelihood in ("normal", "logit_normal"):
         df = df.dropna(subset=[cfg.rate_col])
 
     # Encode player IDs as contiguous ints
@@ -262,7 +271,7 @@ def prepare_hitter_data(
                     ))
 
     # Recency weighting is handled at the projection step (extract_rate_samples)
-    # via age-dependent alpha blending, NOT in the likelihood.
+    # via age-dependent rho multipliers, NOT in the likelihood.
     # Modifying likelihood weights reduces effective sample size and triggers
     # excess hierarchical shrinkage toward the population mean.
     recency_weight = np.ones(len(df), dtype=np.float64)
@@ -328,6 +337,13 @@ def prepare_hitter_data(
     if cfg.likelihood == "binomial":
         result["trials"] = df[cfg.trials_col].values.astype(int)
         result["counts"] = df[cfg.count_col].values.astype(int)
+    elif cfg.likelihood == "logit_normal":
+        # Logit-transform observations so the model works on unbounded scale
+        # but projections are naturally bounded in [0, 1]
+        raw_vals = df[cfg.rate_col].values.astype(float)
+        clipped = np.clip(raw_vals, 1e-4, 1 - 1e-4)
+        result["y_obs"] = np.log(clipped / (1 - clipped))
+        result["pa_weight"] = df[cfg.trials_col].values.astype(float)
     else:
         result["y_obs"] = df[cfg.rate_col].values.astype(float)
         # PA as precision weight for xwOBA
@@ -373,7 +389,7 @@ def build_hitter_model(
     age_bucket = data["player_age_bucket"]
     skill_tier = data["player_skill_tier"]
 
-    if cfg.likelihood == "binomial":
+    if cfg.likelihood in ("binomial", "logit_normal"):
         league_logit = np.log(cfg.league_avg / (1 - cfg.league_avg))
     else:
         league_logit = cfg.league_avg  # not actually logit for normal
@@ -383,7 +399,7 @@ def build_hitter_model(
         mu_pop = pm.Normal(
             "mu_pop",
             mu=league_logit,
-            sigma=0.3,
+            sigma=cfg.mu_pop_sigma,
             shape=(N_AGE_BUCKETS, N_SKILL_TIERS),
         )
 
@@ -477,8 +493,20 @@ def build_hitter_model(
                 p=rate,
                 observed=data["counts"],
             )
+        elif cfg.likelihood == "logit_normal":
+            # theta is on logit scale; rate is bounded [0,1] via invlogit.
+            # Observations are logit-transformed, so the Normal likelihood
+            # operates on an unbounded scale — no negative rate projections.
+            rate = pm.Deterministic("rate", pm.math.invlogit(theta))
+            sigma_obs = pm.HalfNormal("sigma_obs", sigma=cfg.sigma_obs_prior)
+            pm.Normal(
+                "obs",
+                mu=theta,
+                sigma=sigma_obs,
+                observed=data["y_obs"],
+            )
         else:
-            # Normal likelihood for wOBA
+            # Normal likelihood (unbounded, for stats not in [0,1])
             rate = pm.Deterministic("rate", theta)
             sigma_obs = pm.HalfNormal("sigma_obs", sigma=cfg.sigma_obs_prior)
             pm.Normal(
@@ -693,13 +721,16 @@ def extract_rate_samples(
         # likely real development (higher rho = less regression), while
         # aging players' outlier seasons are more likely to revert.
         # Research: peak age 26-29, accelerating decline after 33.
+        # Stronger multiplier replaces the old post-hoc alpha blending,
+        # keeping everything within the AR(2) framework for consistency
+        # between convergence diagnostics and projections.
         row_data = df.loc[pos]
         age = row_data.get("age", None)
         if age is not None:
             if age <= 27:
                 # Development phase: breakouts persist more.
-                # Scale: age 21 → ×1.24, age 25 → ×1.08, age 27 → ×1.00
-                age_rho_mult = 1.0 + (27 - age) * 0.04
+                # Scale: age 21 → ×1.39, age 25 → ×1.13, age 27 → ×1.00
+                age_rho_mult = 1.0 + (27 - age) * 0.065
             elif age <= 32:
                 # Prime: standard persistence
                 age_rho_mult = 1.0
@@ -711,27 +742,10 @@ def extract_rate_samples(
         else:
             effective_rho = rho_draws
 
-        # Age-dependent alpha blending: for young players, shift the
-        # career intercept toward their most recent season's rate.
-        # Alpha pools all career seasons equally, which under-credits
-        # young breakouts.  Blending alpha toward recent performance
-        # lets development carry into the projection without modifying
-        # the likelihood (which triggers excess shrinkage).
-        # Young (<=27): up to 25% shift toward recent rate
-        # Prime (28-32): no shift
-        # Aging (33+): slight shift AWAY from recent (trust career more)
-        if age is not None and age <= 27:
-            blend = min(0.25, (27 - age) * 0.04)  # age 21→0.24, 25→0.08, 27→0
-            if cfg.likelihood == "binomial":
-                eps_s = np.clip(samples, 1e-6, 1 - 1e-6)
-                recent_logit = np.log(eps_s / (1 - eps_s))
-                alpha_draws = (1 - blend) * alpha_draws + blend * recent_logit
-            else:
-                alpha_draws = (1 - blend) * alpha_draws + blend * samples
-        elif age is not None and age >= 33:
-            # Aging: reduce alpha influence of recent spike by blending
-            # TOWARD the original alpha (no change — alpha already is career avg)
-            pass
+        # Enforce AR(2) stationarity: rho + rho2 < 1 required for
+        # mean-reverting projections. Without this, high-rho elite players
+        # can get diverging forward projections.
+        rho2_draws = np.minimum(rho2_draws, 0.98 - effective_rho)
 
         # --- Compute deviation_prev (lag-2) for AR(2) forward projection ---
         # deviation_last = samples(t-1) - alpha  (computed below)
@@ -741,7 +755,8 @@ def extract_rate_samples(
         prev_mask = (df["batter_id"] == batter_id) & (df["season"] == prev_season)
         prev_positions = df.index[prev_mask].tolist()
 
-        if cfg.likelihood == "binomial":
+        if cfg.likelihood in ("binomial", "logit_normal"):
+            # Both binomial and logit_normal operate on logit scale
             eps = np.clip(samples, 1e-6, 1 - 1e-6)
             logit_samples = np.log(eps / (1 - eps))
             deviation_last = logit_samples - alpha_draws

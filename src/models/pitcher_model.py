@@ -15,7 +15,7 @@ All share the same model structure:
 Age buckets: 0=young(<=25), 1=prime(26-30), 2=veteran(31+)
 
 Covariates tested for K%: whiff_rate (r=0.822), avg_velo (r=0.336),
-and both combined. None improve MAE vs Marcel — partial pooling already
+and both combined. None improve Brier score vs Marcel — partial pooling already
 captures the signal. See docs/failed_hypotheses.md for details.
 """
 from __future__ import annotations
@@ -61,6 +61,7 @@ class PitcherStatConfig:
     # AR(1) rho prior: Beta(alpha, beta). Stat-specific persistence.
     rho_alpha: float = 8.0
     rho_beta: float = 2.0
+    mu_pop_sigma: float = 0.3
 
 
 # Empirical year-to-year volatility (logit scale) from 2018-2025 pitcher data:
@@ -83,7 +84,7 @@ PITCHER_STAT_CONFIGS: dict[str, PitcherStatConfig] = {
         # - called_strike_rate alone: -3.0% vs Marcel (still hurts)
         # Pitcher K% works best with pure hierarchical AR(1) — no covariates.
         covariates=[],
-        season_decay=1.0,  # no decay (tested 0.6, 0.8 — neither improves MAE)
+        season_decay=1.0,  # no decay (tested 0.6, 0.8 — neither improves Brier)
         sigma_season_mu=0.22,
         sigma_season_floor=0.18,
         # K% most persistent pitcher stat
@@ -290,7 +291,7 @@ def build_pitcher_model(
         mu_pop = pm.Normal(
             "mu_pop",
             mu=league_logit,
-            sigma=0.3,
+            sigma=cfg.mu_pop_sigma,
             shape=(N_AGE_BUCKETS, N_SKILL_TIERS),
         )
 
@@ -593,10 +594,14 @@ def extract_rate_samples(
 
         # Age-dependent persistence: young pitchers' improvements persist
         # more (development), aging pitchers' outliers regress harder.
+        # Stronger multiplier replaces the old post-hoc alpha blending,
+        # keeping everything within the AR(2) framework for consistency
+        # between convergence diagnostics and projections.
         age = df.loc[pos, "age"] if "age" in df.columns else None
         if age is not None:
             if age <= 27:
-                age_rho_mult = 1.0 + (27 - age) * 0.04
+                # Scale: age 21 → ×1.39, age 25 → ×1.13, age 27 → ×1.00
+                age_rho_mult = 1.0 + (27 - age) * 0.065
             elif age <= 32:
                 age_rho_mult = 1.0
             else:
@@ -604,6 +609,10 @@ def extract_rate_samples(
             effective_rho = np.clip(rho_draws * age_rho_mult, 0, 0.99)
         else:
             effective_rho = rho_draws
+
+        # Enforce AR(2) stationarity: rho + rho2 < 1 required for
+        # mean-reverting projections.
+        rho2_draws = np.minimum(rho2_draws, 0.98 - effective_rho)
 
         # Project on logit scale with AR(2): next = rho*dev(t-1) + rho2*dev(t-2) + innov
         eps = np.clip(samples, 1e-6, 1 - 1e-6)
@@ -617,11 +626,6 @@ def extract_rate_samples(
         alpha_draws = alpha_flat[:, pidx]
         if len(alpha_draws) != len(samples):
             alpha_draws = rng.choice(alpha_draws, size=len(samples), replace=True)
-
-        # Age-dependent alpha blending (same as hitter model)
-        if age is not None and age <= 27:
-            blend = min(0.25, (27 - age) * 0.04)
-            alpha_draws = (1 - blend) * alpha_draws + blend * logit_samples
 
         deviation_last = logit_samples - alpha_draws
 
