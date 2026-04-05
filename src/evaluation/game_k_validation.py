@@ -5,7 +5,6 @@ Combines Layer 1 (pitcher K% posteriors), Layer 2 (matchup lifts), and
 Step 13 (BF distribution) into a game-level backtest, then evaluates:
 - Calibration: P(over X.5) vs actual over rates
 - Brier scores per K line
-- RMSE/MAE on expected K
 - Coverage of posterior credible intervals
 - Comparison vs Poisson and no-matchup baselines
 """
@@ -525,9 +524,8 @@ def compute_game_k_metrics(
     Returns
     -------
     dict
-        Keys: rmse_expected, mae_expected, brier_scores, avg_brier,
-        calibration_df, coverage_50, coverage_80, coverage_90,
-        log_score, n_games.
+        Keys: brier_scores, avg_brier, calibration_df,
+        coverage_50, coverage_80, coverage_90, log_score, n_games.
     """
     if lines is None:
         lines = [3.5, 4.5, 5.5, 6.5, 7.5]
@@ -535,8 +533,6 @@ def compute_game_k_metrics(
     n_games = len(predictions)
     if n_games == 0:
         return {
-            "rmse_expected": np.nan,
-            "mae_expected": np.nan,
             "brier_scores": {},
             "avg_brier": np.nan,
             "log_losses": {},
@@ -548,11 +544,6 @@ def compute_game_k_metrics(
             "log_score": np.nan,
             "n_games": 0,
         }
-
-    # RMSE and MAE on expected K
-    errors = predictions["expected_k"] - predictions["actual_k"]
-    rmse = float(np.sqrt(np.mean(errors ** 2)))
-    mae = float(np.mean(np.abs(errors)))
 
     # Brier scores and log loss per line
     brier_scores: dict[float, float] = {}
@@ -623,8 +614,6 @@ def compute_game_k_metrics(
         pooled_temperature = np.nan
 
     return {
-        "rmse_expected": rmse,
-        "mae_expected": mae,
         "brier_scores": brier_scores,
         "avg_brier": avg_brier,
         "log_losses": log_losses,
@@ -683,8 +672,6 @@ def compare_to_baselines(
 
     # 1. Naive: k_rate * actual_bf
     naive_expected = k_rate_mean * actual_bf
-    naive_rmse = float(np.sqrt(np.mean((naive_expected - actual) ** 2)))
-    naive_mae = float(np.mean(np.abs(naive_expected - actual)))
     naive_briers = {}
     for line in lines:
         p_over = 1.0 - poisson.cdf(int(line), naive_expected)
@@ -692,15 +679,11 @@ def compare_to_baselines(
         naive_briers[line] = float(brier_score_loss(y_true, np.clip(p_over, 0, 1)))
     results.append({
         "baseline": "naive",
-        "rmse": naive_rmse,
-        "mae": naive_mae,
         "avg_brier": float(np.mean(list(naive_briers.values()))),
     })
 
     # 2. Poisson: k_rate * mean_bf (no actual BF knowledge)
     poisson_expected = k_rate_mean * bf_mu
-    poisson_rmse = float(np.sqrt(np.mean((poisson_expected - actual) ** 2)))
-    poisson_mae = float(np.mean(np.abs(poisson_expected - actual)))
     poisson_briers = {}
     for line in lines:
         p_over = 1.0 - poisson.cdf(int(line), np.clip(poisson_expected, 0.01, None))
@@ -708,15 +691,11 @@ def compare_to_baselines(
         poisson_briers[line] = float(brier_score_loss(y_true, np.clip(p_over, 0, 1)))
     results.append({
         "baseline": "poisson",
-        "rmse": poisson_rmse,
-        "mae": poisson_mae,
         "avg_brier": float(np.mean(list(poisson_briers.values()))),
     })
 
     # 3. Model-no-matchup: posterior K% * estimated BF (no lineup)
     no_matchup_expected = k_rate_mean * bf_mu
-    no_matchup_rmse = float(np.sqrt(np.mean((no_matchup_expected - actual) ** 2)))
-    no_matchup_mae = float(np.mean(np.abs(no_matchup_expected - actual)))
     no_matchup_briers = {}
     for line in lines:
         p_over = 1.0 - poisson.cdf(int(line), np.clip(no_matchup_expected, 0.01, None))
@@ -724,15 +703,10 @@ def compare_to_baselines(
         no_matchup_briers[line] = float(brier_score_loss(y_true, np.clip(p_over, 0, 1)))
     results.append({
         "baseline": "model_no_matchup",
-        "rmse": no_matchup_rmse,
-        "mae": no_matchup_mae,
         "avg_brier": float(np.mean(list(no_matchup_briers.values()))),
     })
 
     # 4. Full model
-    full_expected = predictions["expected_k"].values
-    full_rmse = float(np.sqrt(np.mean((full_expected - actual) ** 2)))
-    full_mae = float(np.mean(np.abs(full_expected - actual)))
     full_briers = {}
     for line in lines:
         col = f"p_over_{line:.1f}".replace(".", "_")
@@ -741,8 +715,6 @@ def compare_to_baselines(
             full_briers[line] = float(brier_score_loss(y_true, predictions[col].values))
     results.append({
         "baseline": "full_model",
-        "rmse": full_rmse,
-        "mae": full_mae,
         "avg_brier": float(np.mean(list(full_briers.values()))) if full_briers else np.nan,
     })
 
@@ -816,8 +788,6 @@ def run_full_game_k_backtest(
         fold_rec = {
             "test_season": test_season,
             "n_games": metrics["n_games"],
-            "rmse": metrics["rmse_expected"],
-            "mae": metrics["mae_expected"],
             "avg_brier": metrics["avg_brier"],
             "avg_log_loss": metrics["avg_log_loss"],
             "coverage_50": metrics["coverage_50"],
@@ -832,7 +802,6 @@ def run_full_game_k_backtest(
         if len(baselines) > 0:
             for _, brow in baselines.iterrows():
                 name = brow["baseline"]
-                fold_rec[f"{name}_rmse"] = brow["rmse"]
                 fold_rec[f"{name}_avg_brier"] = brow["avg_brier"]
 
         fold_results.append(fold_rec)
@@ -840,9 +809,8 @@ def run_full_game_k_backtest(
         all_predictions.append(predictions)
 
         logger.info(
-            "Fold results: RMSE=%.3f, MAE=%.3f, Brier=%.4f, "
-            "LogLoss=%.4f, Coverage(50/80/90)=%.2f/%.2f/%.2f",
-            metrics["rmse_expected"], metrics["mae_expected"],
+            "Fold results: Brier=%.4f, LogLoss=%.4f, "
+            "Coverage(50/80/90)=%.2f/%.2f/%.2f",
             metrics["avg_brier"], metrics["avg_log_loss"],
             metrics["coverage_50"], metrics["coverage_80"],
             metrics["coverage_90"],
@@ -854,8 +822,7 @@ def run_full_game_k_backtest(
         all_pred_df = pd.concat(all_predictions, ignore_index=True)
         overall = compute_game_k_metrics(all_pred_df)
         logger.info(
-            "Overall: RMSE=%.3f, MAE=%.3f, Brier=%.4f, LogLoss=%.4f, n=%d",
-            overall["rmse_expected"], overall["mae_expected"],
+            "Overall: Brier=%.4f, LogLoss=%.4f, n=%d",
             overall["avg_brier"], overall["avg_log_loss"],
             overall["n_games"],
         )
@@ -1034,7 +1001,7 @@ def compute_game_stat_metrics(
     predictions: pd.DataFrame,
     stat_name: str,
 ) -> dict[str, float]:
-    """Compute RMSE, MAE, and correlation for a game-level stat prediction.
+    """Compute correlation for a game-level stat prediction.
 
     Parameters
     ----------
@@ -1046,25 +1013,21 @@ def compute_game_stat_metrics(
     Returns
     -------
     dict
-        rmse, mae, correlation, n_games.
+        correlation, n_games.
     """
     n = len(predictions)
     if n == 0:
-        return {"rmse": np.nan, "mae": np.nan, "correlation": np.nan, "n_games": 0}
+        return {"correlation": np.nan, "n_games": 0}
 
     actual = predictions[f"actual_{stat_name}"].values.astype(float)
     expected = predictions[f"expected_{stat_name}"].values.astype(float)
-
-    errors = expected - actual
-    rmse = float(np.sqrt(np.mean(errors ** 2)))
-    mae = float(np.mean(np.abs(errors)))
 
     if np.std(actual) > 0 and np.std(expected) > 0:
         corr = float(np.corrcoef(actual, expected)[0, 1])
     else:
         corr = 0.0
 
-    return {"rmse": rmse, "mae": mae, "correlation": corr, "n_games": n}
+    return {"correlation": corr, "n_games": n}
 
 
 def run_full_game_backtest(
@@ -1132,8 +1095,6 @@ def run_full_game_backtest(
         fold_rec: dict[str, Any] = {
             "test_season": test_season,
             "n_games": metrics["n_games"],
-            "rmse": metrics["rmse_expected"],
-            "mae": metrics["mae_expected"],
             "avg_brier": metrics["avg_brier"],
             "avg_log_loss": metrics["avg_log_loss"],
             "coverage_50": metrics["coverage_50"],
@@ -1146,7 +1107,6 @@ def run_full_game_backtest(
         if len(baselines) > 0:
             for _, brow in baselines.iterrows():
                 name = brow["baseline"]
-                fold_rec[f"{name}_rmse"] = brow["rmse"]
                 fold_rec[f"{name}_avg_brier"] = brow["avg_brier"]
 
         k_fold_results.append(fold_rec)
@@ -1154,8 +1114,7 @@ def run_full_game_backtest(
         all_k_predictions.append(predictions)
 
         logger.info(
-            "K: RMSE=%.3f, MAE=%.3f, Brier=%.4f, LogLoss=%.4f",
-            metrics["rmse_expected"], metrics["mae_expected"],
+            "K: Brier=%.4f, LogLoss=%.4f",
             metrics["avg_brier"], metrics["avg_log_loss"],
         )
 
@@ -1212,9 +1171,8 @@ def run_full_game_backtest(
                     **stat_metrics,
                 })
                 logger.info(
-                    "%s: RMSE=%.3f, MAE=%.3f, corr=%.3f, n=%d",
+                    "%s: corr=%.3f, n=%d",
                     stat_name.upper(),
-                    stat_metrics["rmse"], stat_metrics["mae"],
                     stat_metrics["correlation"], stat_metrics["n_games"],
                 )
             except Exception as e:
@@ -1222,8 +1180,6 @@ def run_full_game_backtest(
                 stat_fold_results.append({
                     "stat": stat_name,
                     "test_season": test_season,
-                    "rmse": np.nan,
-                    "mae": np.nan,
                     "correlation": np.nan,
                     "n_games": 0,
                 })
@@ -1235,8 +1191,7 @@ def run_full_game_backtest(
         all_pred_df = pd.concat(all_k_predictions, ignore_index=True)
         overall = compute_game_k_metrics(all_pred_df)
         logger.info(
-            "Overall K: RMSE=%.3f, MAE=%.3f, Brier=%.4f, LogLoss=%.4f, n=%d",
-            overall["rmse_expected"], overall["mae_expected"],
+            "Overall K: Brier=%.4f, LogLoss=%.4f, n=%d",
             overall["avg_brier"], overall["avg_log_loss"],
             overall["n_games"],
         )

@@ -96,8 +96,8 @@ def run(
             if bundle.get("model") is not None:
                 xgb_preds[target] = predict_pitcher_priors(bundle, from_season)
                 logger.info(
-                    "XGBoost %s: %d predictions (train RMSE=%.4f)",
-                    target, len(xgb_preds[target]), bundle["train_rmse"],
+                    "XGBoost %s: %d predictions",
+                    target, len(xgb_preds[target]),
                 )
 
         pitcher_proj = project_pitcher_forward(

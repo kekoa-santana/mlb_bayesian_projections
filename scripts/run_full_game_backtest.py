@@ -503,8 +503,6 @@ def compute_metrics(df: pd.DataFrame) -> dict:
 
     # --- Run totals ---
     total_err = df["pred_total_runs"] - df["actual_total_runs"]
-    metrics["total_runs_rmse"] = float(np.sqrt((total_err ** 2).mean()))
-    metrics["total_runs_mae"] = float(total_err.abs().mean())
     metrics["total_runs_bias"] = float(total_err.mean())
     metrics["total_runs_corr"] = float(
         df["pred_total_runs"].corr(df["actual_total_runs"])
@@ -520,8 +518,6 @@ def compute_metrics(df: pd.DataFrame) -> dict:
 
     # --- Margin / run line ---
     margin_err = df["pred_home_margin"] - (df["actual_home_runs"] - df["actual_away_runs"])
-    metrics["margin_rmse"] = float(np.sqrt((margin_err ** 2).mean()))
-    metrics["margin_mae"] = float(margin_err.abs().mean())
     metrics["margin_corr"] = float(
         df["pred_home_margin"].corr(df["actual_home_runs"] - df["actual_away_runs"])
     )
@@ -604,13 +600,9 @@ def _print_results(metrics: pd.DataFrame) -> None:
         print(f"  Win Prob:  Brier={row['win_brier']:.4f}  "
               f"LogLoss={row['win_log_loss']:.4f}  "
               f"Accuracy={row['win_accuracy']:.3f}")
-        print(f"  Runs:      RMSE={row['total_runs_rmse']:.3f}  "
-              f"MAE={row['total_runs_mae']:.3f}  "
-              f"Bias={row['total_runs_bias']:+.3f}  "
+        print(f"  Runs:      Bias={row['total_runs_bias']:+.3f}  "
               f"Corr={row['total_runs_corr']:.3f}")
-        print(f"  Margin:    RMSE={row['margin_rmse']:.3f}  "
-              f"MAE={row['margin_mae']:.3f}  "
-              f"Corr={row['margin_corr']:.3f}")
+        print(f"  Margin:    Corr={row['margin_corr']:.3f}")
 
         for line in [7.5, 8.5, 9.5]:
             pred = row.get(f"ou_{line}_pred_rate", float("nan"))
@@ -631,7 +623,6 @@ def _print_results(metrics: pd.DataFrame) -> None:
     print("\n--- Averages ---")
     print(f"  Win Brier:    {metrics['win_brier'].mean():.4f}")
     print(f"  Win Accuracy: {metrics['win_accuracy'].mean():.3f}")
-    print(f"  Runs RMSE:    {metrics['total_runs_rmse'].mean():.3f}")
     print(f"  Margin Corr:  {metrics['margin_corr'].mean():.3f}")
 
     # Baselines

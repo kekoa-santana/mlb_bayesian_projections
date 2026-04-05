@@ -100,7 +100,7 @@ def assign_confidence_tiers(
     ----------
     backtest_summary : pd.DataFrame
         Output of run_game_prop_backtest.py with columns:
-        prop, side, stat, test_season, n_games, rmse, mae,
+        prop, side, stat, test_season, n_games,
         avg_brier, ece, crps, coverage_80, coverage_90,
         baseline_avg_brier (from comparison).
 

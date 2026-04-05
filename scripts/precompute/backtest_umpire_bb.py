@@ -7,7 +7,7 @@ Runs the same 400 games (2024-2025) through the lineup simulator twice:
   B) Umpire BB: umpire K lift + umpire BB lift
 
 Same seeds, same games, same posteriors. Compares Brier score,
-Brier skill score, 65% confidence hit rate, and MAE.
+Brier skill score and 65% confidence hit rate.
 
 Primary evaluation metric: **Brier score** = mean((p_over - actual_binary)^2)
 
@@ -640,29 +640,7 @@ def compute_comparison(
                   f"{delta:>+10.6f}  {n_batters:>8,}  {hit_rate:>9.3f}{marker}")
 
     # =================================================================
-    # 3. MAE comparison
-    # =================================================================
-    print()
-    print("-" * 78)
-    print("MAE COMPARISON (expected value vs actual)")
-    print("-" * 78)
-    print(f"  {'Stat':>4s}  {'Base MAE':>12s}  {'UmpBB MAE':>12s}  "
-          f"{'Delta':>10s}  {'Improvement':>12s}")
-    print(f"  {'----':>4s}  {'-' * 12:>12s}  {'-' * 12:>12s}  "
-          f"{'-' * 10:>10s}  {'-' * 12:>12s}")
-
-    for stat in ALL_STATS:
-        actual = base[f"actual_{stat}"]
-        mae_b = float(np.mean(np.abs(actual - base[f"pred_{stat}"])))
-        mae_u = float(np.mean(np.abs(actual - ump[f"pred_{stat}"])))
-        delta = mae_u - mae_b
-        pct = 100 * delta / mae_b if mae_b > 0 else 0
-        marker = " <--" if stat == "bb" else ""
-        print(f"  {stat.upper():>4s}  {mae_b:>12.5f}  {mae_u:>12.5f}  "
-              f"{delta:>+10.5f}  {pct:>+11.2f}%{marker}")
-
-    # =================================================================
-    # 4. 65% confidence hit rate
+    # 3. 65% confidence hit rate
     # =================================================================
     print()
     print("-" * 78)

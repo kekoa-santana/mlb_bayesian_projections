@@ -5,7 +5,7 @@ Tests hitter counting stats (K, BB, HR, SB) and pitcher counting stats
 (K, BB, Outs) across walk-forward folds.  Compares Bayesian rate × playing
 time distributions vs Marcel baseline.
 
-Metrics: MAE, RMSE, correlation, MAPE, 80/95% coverage.
+Metrics: correlation, MAPE, 80/95% coverage.
 """
 from __future__ import annotations
 
@@ -63,8 +63,6 @@ def _compute_metrics(
         return {}
 
     residuals = actual - predicted
-    mae = float(np.mean(np.abs(residuals)))
-    rmse = float(np.sqrt(np.mean(residuals ** 2)))
 
     # Correlation
     if np.std(actual) > 0 and np.std(predicted) > 0:
@@ -81,8 +79,6 @@ def _compute_metrics(
 
     metrics = {
         "n": n,
-        "mae": mae,
-        "rmse": rmse,
         "correlation": corr,
         "mape": mape,
     }
@@ -257,20 +253,9 @@ def walk_forward_hitter_counting(
         # Marcel metrics (no coverage — point estimate only)
         marcel_metrics = _compute_metrics(actual_vals, marcel_pred)
 
-        # Improvement
-        mae_imp = 0.0
-        if marcel_metrics.get("mae", 0) > 0:
-            mae_imp = (marcel_metrics["mae"] - bayes_metrics["mae"]) / marcel_metrics["mae"] * 100
-
-        rmse_imp = 0.0
-        if marcel_metrics.get("rmse", 0) > 0:
-            rmse_imp = (marcel_metrics["rmse"] - bayes_metrics["rmse"]) / marcel_metrics["rmse"] * 100
-
         logger.info(
-            "%s: Bayes MAE=%.1f, Marcel MAE=%.1f (improvement: %.1f%%), "
-            "Bayes corr=%.3f, coverage 80/95=%.0f%%/%.0f%%",
+            "%s: Bayes corr=%.3f, coverage 80/95=%.0f%%/%.0f%%",
             stat_name,
-            bayes_metrics.get("mae", 0), marcel_metrics.get("mae", 0), mae_imp,
             bayes_metrics.get("correlation", 0),
             bayes_metrics.get("coverage_80", 0) * 100,
             bayes_metrics.get("coverage_95", 0) * 100,
@@ -279,8 +264,6 @@ def walk_forward_hitter_counting(
         stat_results[stat_name] = {
             "bayes": bayes_metrics,
             "marcel": marcel_metrics,
-            "mae_improvement_pct": mae_imp,
-            "rmse_improvement_pct": rmse_imp,
             "comparison_df": comp,
         }
 
@@ -436,19 +419,9 @@ def walk_forward_pitcher_counting(
         bayes_metrics = _compute_metrics(actual_vals, bayes_pred, lo_80, hi_80, lo_95, hi_95)
         marcel_metrics = _compute_metrics(actual_vals, marcel_pred)
 
-        mae_imp = 0.0
-        if marcel_metrics.get("mae", 0) > 0:
-            mae_imp = (marcel_metrics["mae"] - bayes_metrics["mae"]) / marcel_metrics["mae"] * 100
-
-        rmse_imp = 0.0
-        if marcel_metrics.get("rmse", 0) > 0:
-            rmse_imp = (marcel_metrics["rmse"] - bayes_metrics["rmse"]) / marcel_metrics["rmse"] * 100
-
         logger.info(
-            "%s: Bayes MAE=%.1f, Marcel MAE=%.1f (improvement: %.1f%%), "
-            "Bayes corr=%.3f, coverage 80/95=%.0f%%/%.0f%%",
+            "%s: Bayes corr=%.3f, coverage 80/95=%.0f%%/%.0f%%",
             stat_name,
-            bayes_metrics.get("mae", 0), marcel_metrics.get("mae", 0), mae_imp,
             bayes_metrics.get("correlation", 0),
             bayes_metrics.get("coverage_80", 0) * 100,
             bayes_metrics.get("coverage_95", 0) * 100,
@@ -457,8 +430,6 @@ def walk_forward_pitcher_counting(
         stat_results[stat_name] = {
             "bayes": bayes_metrics,
             "marcel": marcel_metrics,
-            "mae_improvement_pct": mae_imp,
-            "rmse_improvement_pct": rmse_imp,
             "comparison_df": comp,
         }
 
@@ -521,12 +492,6 @@ def run_hitter_counting_backtest(
                 "stat": stat_name,
                 "test_season": result["test_season"],
                 "n_players": sr["bayes"].get("n", 0),
-                "bayes_mae": sr["bayes"].get("mae", float("nan")),
-                "marcel_mae": sr["marcel"].get("mae", float("nan")),
-                "mae_improvement_pct": sr["mae_improvement_pct"],
-                "bayes_rmse": sr["bayes"].get("rmse", float("nan")),
-                "marcel_rmse": sr["marcel"].get("rmse", float("nan")),
-                "rmse_improvement_pct": sr["rmse_improvement_pct"],
                 "bayes_corr": sr["bayes"].get("correlation", float("nan")),
                 "marcel_corr": sr["marcel"].get("correlation", float("nan")),
                 "bayes_mape": sr["bayes"].get("mape", float("nan")),
@@ -580,12 +545,6 @@ def run_pitcher_counting_backtest(
                 "stat": stat_name,
                 "test_season": result["test_season"],
                 "n_players": sr["bayes"].get("n", 0),
-                "bayes_mae": sr["bayes"].get("mae", float("nan")),
-                "marcel_mae": sr["marcel"].get("mae", float("nan")),
-                "mae_improvement_pct": sr["mae_improvement_pct"],
-                "bayes_rmse": sr["bayes"].get("rmse", float("nan")),
-                "marcel_rmse": sr["marcel"].get("rmse", float("nan")),
-                "rmse_improvement_pct": sr["rmse_improvement_pct"],
                 "bayes_corr": sr["bayes"].get("correlation", float("nan")),
                 "marcel_corr": sr["marcel"].get("correlation", float("nan")),
                 "bayes_mape": sr["bayes"].get("mape", float("nan")),

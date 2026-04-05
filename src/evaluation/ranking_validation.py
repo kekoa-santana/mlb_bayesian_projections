@@ -5,7 +5,7 @@ Learns optimal blend weights for hitter and pitcher composite scores
 by training on prior seasons and evaluating against actual next-season
 outcomes (wRC+ for hitters, xwOBA-against for pitchers).
 
-Metrics: RMSE, MAE, Spearman rank correlation, top-N hit rates.
+Metrics: Spearman rank correlation, top-N hit rates.
 Weight optimization via scipy.optimize.minimize (Nelder-Mead).
 
 Default folds:
@@ -481,7 +481,7 @@ def learn_blend_weights(
     min_pa: int = 200,
     random_seed: int = 42,
 ) -> dict[str, Any]:
-    """Optimize composite weights to minimize prediction RMSE.
+    """Optimize composite weights for prediction quality.
 
     Uses Nelder-Mead optimization over the simplex (softmax
     parameterization ensures weights sum to 1.0 and stay positive).
@@ -502,7 +502,7 @@ def learn_blend_weights(
     Returns
     -------
     dict
-        optimal_weights (dict), rmse, mae, spearman_rho.
+        optimal_weights (dict), spearman_rho.
     """
     # Align indices
     common_idx = sub_scores.index.intersection(outcomes.index)
@@ -521,8 +521,6 @@ def learn_blend_weights(
         n = len(score_cols)
         return {
             "optimal_weights": {col: 1.0 / n for col in score_cols},
-            "rmse": np.nan,
-            "mae": np.nan,
             "spearman_rho": np.nan,
         }
 
@@ -542,7 +540,7 @@ def learn_blend_weights(
         return exp / exp.sum()
 
     def _objective(raw: np.ndarray) -> float:
-        """RMSE of weighted composite vs actual outcome."""
+        """Loss of weighted composite vs actual outcome."""
         w = _softmax(raw)
         pred = X @ w
         # Normalize prediction to same scale
@@ -571,29 +569,17 @@ def learn_blend_weights(
 
     # Compute final metrics with optimal weights
     pred = X @ optimal_weights
-    # Scale prediction back to outcome units
-    p_min, p_max = pred.min(), pred.max()
-    p_range = p_max - p_min
-    if p_range > 1e-9:
-        pred_scaled = y_min + (pred - p_min) / p_range * y_range
-    else:
-        pred_scaled = np.full_like(pred, y.mean())
-
-    rmse = float(np.sqrt(np.mean((pred_scaled - y) ** 2)))
-    mae = float(np.mean(np.abs(pred_scaled - y)))
     rho, _ = spearmanr(pred, y)
 
     weight_dict = {col: float(w) for col, w in zip(score_cols, optimal_weights)}
 
     logger.info(
-        "Optimal weights: %s | RMSE=%.3f, MAE=%.3f, rho=%.3f",
-        {k: f"{v:.3f}" for k, v in weight_dict.items()}, rmse, mae, rho,
+        "Optimal weights: %s | rho=%.3f",
+        {k: f"{v:.3f}" for k, v in weight_dict.items()}, rho,
     )
 
     return {
         "optimal_weights": weight_dict,
-        "rmse": rmse,
-        "mae": mae,
         "spearman_rho": float(rho),
         "n_players": len(y),
     }
@@ -718,8 +704,6 @@ def validate_hitter_rankings(
             "test_season": test_season,
             "n_players": len(common),
             "optimal_weights": opt["optimal_weights"],
-            "optimized_rmse": opt["rmse"],
-            "optimized_mae": opt["mae"],
             "optimized_rho": opt["spearman_rho"],
             "baseline_rho": baseline_metrics["spearman_rho"],
             "baseline_top_50": baseline_metrics.get("top_50_hit_rate", np.nan),
@@ -728,9 +712,9 @@ def validate_hitter_rankings(
         }
         per_fold.append(fold_result)
         logger.info(
-            "Fold %s: optimized rho=%.3f (baseline=%.3f), RMSE=%.2f",
+            "Fold %s: optimized rho=%.3f (baseline=%.3f)",
             fold_result["fold"], opt["spearman_rho"],
-            baseline_metrics["spearman_rho"], opt["rmse"],
+            baseline_metrics["spearman_rho"],
         )
 
         # Accumulate for pooled optimization
@@ -758,8 +742,6 @@ def validate_hitter_rankings(
             "optimized_rho": fold["optimized_rho"],
             "baseline_rho": fold["baseline_rho"],
             "rho_improvement": fold["optimized_rho"] - fold["baseline_rho"],
-            "optimized_rmse": fold["optimized_rmse"],
-            "optimized_mae": fold["optimized_mae"],
         }
         # Add top-N hit rates
         for key in ["baseline_top_50", "optimized_top_50"]:
@@ -882,8 +864,6 @@ def validate_pitcher_rankings(
             "test_season": test_season,
             "n_players": len(common),
             "optimal_weights": opt["optimal_weights"],
-            "optimized_rmse": opt["rmse"],
-            "optimized_mae": opt["mae"],
             "optimized_rho": opt["spearman_rho"],
             "baseline_rho": baseline_metrics["spearman_rho"],
             "baseline_top_50": baseline_metrics.get("top_50_hit_rate", np.nan),
@@ -892,9 +872,9 @@ def validate_pitcher_rankings(
         }
         per_fold.append(fold_result)
         logger.info(
-            "Fold %s: optimized rho=%.3f (baseline=%.3f), RMSE=%.3f",
+            "Fold %s: optimized rho=%.3f (baseline=%.3f)",
             fold_result["fold"], opt["spearman_rho"],
-            baseline_metrics["spearman_rho"], opt["rmse"],
+            baseline_metrics["spearman_rho"],
         )
 
         pooled_scores_list.append(scores_fold)
@@ -919,8 +899,6 @@ def validate_pitcher_rankings(
             "optimized_rho": fold["optimized_rho"],
             "baseline_rho": fold["baseline_rho"],
             "rho_improvement": fold["optimized_rho"] - fold["baseline_rho"],
-            "optimized_rmse": fold["optimized_rmse"],
-            "optimized_mae": fold["optimized_mae"],
         }
         for key in ["baseline_top_50", "optimized_top_50"]:
             rec[key] = fold.get(key, np.nan)

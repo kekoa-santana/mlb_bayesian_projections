@@ -110,17 +110,10 @@ def _print_results(
     for _, row in summary.iterrows():
         print(f"\nTest Season {int(row['test_season'])} ({int(row['n_games'])} games):")
         for stat in ("k", "bb", "h", "hr", "outs"):
-            rmse_key = f"{stat}_rmse"
-            mae_key = f"{stat}_mae"
             corr_key = f"{stat}_corr"
-            if rmse_key in row:
+            if corr_key in row and pd.notna(row[corr_key]):
                 label = stat.upper() if stat != "outs" else "OUTS"
-                line = f"  {label:>4s}: RMSE={row[rmse_key]:.3f}"
-                if mae_key in row:
-                    line += f"  MAE={row[mae_key]:.3f}"
-                if corr_key in row and pd.notna(row[corr_key]):
-                    line += f"  corr={row[corr_key]:.3f}"
-                print(line)
+                print(f"  {label:>4s}: corr={row[corr_key]:.3f}")
 
         if "k_avg_brier" in row and pd.notna(row["k_avg_brier"]):
             print(f"  K Brier: {row['k_avg_brier']:.4f}")
@@ -141,11 +134,8 @@ def _print_results(
             if key in row and pd.notna(row[key]):
                 print(f"  Outs Coverage {ci}%: {row[key]:.1%}")
 
-        if "ip_rmse" in row and pd.notna(row["ip_rmse"]):
-            print(f"   IP: RMSE={row['ip_rmse']:.3f}  MAE={row.get('ip_mae', 0):.3f}")
-
-        if "pitches_rmse" in row and pd.notna(row["pitches_rmse"]):
-            print(f"  PIT: RMSE={row['pitches_rmse']:.3f}")
+        if "ip_corr" in row and pd.notna(row.get("ip_corr")):
+            print(f"   IP: corr={row['ip_corr']:.3f}")
 
         # Sharpness
         for prefix, label in [("k", "K"), ("outs", "Outs")]:
@@ -162,11 +152,10 @@ def _print_results(
     # Overall averages
     print("\n--- Overall Averages ---")
     for stat in ("k", "bb", "h", "hr", "outs"):
-        rmse_key = f"{stat}_rmse"
-        if rmse_key in summary.columns:
+        corr_key = f"{stat}_corr"
+        if corr_key in summary.columns:
             label = stat.upper() if stat != "outs" else "OUTS"
-            print(f"  {label:>4s}: RMSE={summary[rmse_key].mean():.3f}  "
-                  f"MAE={summary[f'{stat}_mae'].mean():.3f}")
+            print(f"  {label:>4s}: corr={summary[corr_key].mean():.3f}")
 
     if "k_avg_brier" in summary.columns:
         print(f"  K Avg Brier: {summary['k_avg_brier'].mean():.4f}")
@@ -189,13 +178,10 @@ def _print_results(
 
     # Comparison targets
     print("\n--- vs Current Layer 3 Baseline ---")
-    print("  Layer 3 K RMSE: 2.280  |  K Brier: 0.1872")
-    if "k_rmse" in summary.columns:
-        avg_rmse = summary["k_rmse"].mean()
-        avg_brier = summary["k_avg_brier"].mean() if "k_avg_brier" in summary.columns else float("nan")
-        rmse_delta = avg_rmse - 2.280
+    print("  Layer 3 K Brier: 0.1872")
+    if "k_avg_brier" in summary.columns:
+        avg_brier = summary["k_avg_brier"].mean()
         brier_delta = avg_brier - 0.1872
-        print(f"  Sim K RMSE:    {avg_rmse:.3f}  (delta: {rmse_delta:+.3f})")
         print(f"  Sim K Brier:   {avg_brier:.4f}  (delta: {brier_delta:+.4f})")
 
     print()

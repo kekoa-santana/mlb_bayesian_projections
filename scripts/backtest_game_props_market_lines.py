@@ -298,15 +298,11 @@ def _metrics_block(
     min_n: int,
     line_col: str = "book_line",
 ) -> dict[str, float | int]:
-    """RMSE/MAE on expected vs actual; Brier/ECE/temp on P(over) at book line."""
+    """Brier/ECE/temp on P(over) at book line."""
     sub = sub.dropna(subset=["p_over_market", "actual", line_col])
     n = len(sub)
     if n < min_n:
         return {}
-
-    err = sub["expected"].values - sub["actual"].values
-    rmse = float(np.sqrt(np.mean(err**2)))
-    mae = float(np.mean(np.abs(err)))
 
     y_prob = np.clip(sub["p_over_market"].values.astype(float), 0.0, 1.0)
     y_true = (sub["actual"].values > sub[line_col].values).astype(float)
@@ -316,8 +312,6 @@ def _metrics_block(
 
     return {
         "n": n,
-        "rmse": rmse,
-        "mae": mae,
         "brier": float(brier_score_loss(y_true, y_prob)),
         "ece": float(compute_ece(y_prob, y_true)),
         "temperature": float(compute_temperature(y_prob, y_true)),
@@ -595,14 +589,12 @@ def main() -> None:
             "side",
             "stat",
             "n",
-            "rmse",
-            "mae",
             "brier",
             "ece",
             "temperature",
         ]
         print("\nBy player_type x stat:")
-        float_cols = ["rmse", "mae", "brier", "ece", "temperature"]
+        float_cols = ["brier", "ece", "temperature"]
         formatted = summary[cols].copy()
         formatted["n"] = formatted["n"].astype(int)
         for c in float_cols:
@@ -937,12 +929,10 @@ def _pitcher_detail(pit: pd.DataFrame, min_n: int = 3) -> None:
             yt = (grp["actual"].values > grp["book_line"].values).astype(float)
             if yt.std() == 0:
                 continue
-            err = grp["expected"].values - grp["actual"].values
             pitcher_rows.append({
                 "pitcher": str(pname)[:20],
                 "n": n,
                 "stats": "+".join(sorted(grp["stat"].unique())),
-                "rmse": float(np.sqrt(np.mean(err ** 2))),
                 "brier": float(brier_score_loss(yt, yp)),
                 "over%": float(yt.mean()),
                 "avg_P(o)": float(yp.mean()),
@@ -950,7 +940,6 @@ def _pitcher_detail(pit: pd.DataFrame, min_n: int = 3) -> None:
         if pitcher_rows:
             pf = pd.DataFrame(pitcher_rows).sort_values("brier")
             fmt = pf.copy()
-            fmt["rmse"] = fmt["rmse"].map(lambda x: f"{x:.3f}")
             fmt["brier"] = fmt["brier"].map(lambda x: f"{x:.4f}")
             fmt["over%"] = fmt["over%"].map(lambda x: f"{x:.0%}")
             fmt["avg_P(o)"] = fmt["avg_P(o)"].map(lambda x: f"{x:.3f}")
@@ -1012,7 +1001,7 @@ def _context_split(
     if rows:
         print(f"\n{label} stratification:")
         cdf = pd.DataFrame(rows)
-        for c in ["rmse", "mae", "brier", "ece", "temperature"]:
+        for c in ["brier", "ece", "temperature"]:
             if c in cdf.columns:
                 cdf[c] = cdf[c].map(lambda x: f"{float(x):.4f}")
         print(cdf.to_string(index=False))

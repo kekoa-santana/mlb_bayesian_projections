@@ -6,7 +6,7 @@ Runs the lineup simulator on the same set of historical games twice:
   1. BASELINE: batter_babip_adjs = zeros (current behavior)
   2. LD% ADJ:  batter_babip_adjs derived from regressed LD%
 
-Compares hit rate at >= 65% confidence, MAE, and calibration.
+Compares hit rate at >= 65% confidence and calibration.
 
 Usage
 -----
@@ -342,10 +342,6 @@ def print_results(df: pd.DataFrame) -> None:
     base_p_list = []
     ld_p_list = []
     actual_list = []
-    stat_label_list = []
-    base_exp_list = []
-    ld_exp_list = []
-    actual_val_list = []
 
     for stat in STATS:
         line = PRIMARY_LINE[stat]
@@ -356,46 +352,9 @@ def print_results(df: pd.DataFrame) -> None:
         base_p_list.append(base_p)
         ld_p_list.append(ld_p)
         actual_list.append(actual_over)
-        stat_label_list.append(np.full(len(base_p), stat))
-
-        base_exp_list.append(df_real[f"base_expected_{stat}"].values)
-        ld_exp_list.append(df_real[f"ld_expected_{stat}"].values)
-        actual_val_list.append(df_real[f"actual_{stat}"].values.astype(float))
-
     all_base_p = np.concatenate(base_p_list)
     all_ld_p = np.concatenate(ld_p_list)
     all_actual = np.concatenate(actual_list)
-    all_stat = np.concatenate(stat_label_list)
-    all_base_exp = np.concatenate(base_exp_list)
-    all_ld_exp = np.concatenate(ld_exp_list)
-    all_actual_val = np.concatenate(actual_val_list)
-
-    # ---------------------------------------------------------------
-    # MAE comparison (expected vs actual)
-    # ---------------------------------------------------------------
-    print("-" * 76)
-    print("EXPECTED VALUE MAE (lower is better)")
-    print("-" * 76)
-    print(f"  {'Stat':>4s}  {'Baseline MAE':>13s}  {'LD-adj MAE':>13s}  {'Diff':>10s}  {'Pct chg':>8s}")
-    print(f"  {'----':>4s}  {'-------------':>13s}  {'-------------':>13s}  {'----------':>10s}  {'--------':>8s}")
-
-    for stat in STATS:
-        mask = all_stat == stat
-        base_mae = float(np.mean(np.abs(all_base_exp[mask] - all_actual_val[mask])))
-        ld_mae = float(np.mean(np.abs(all_ld_exp[mask] - all_actual_val[mask])))
-        diff = ld_mae - base_mae
-        pct_chg = 100 * diff / base_mae if base_mae > 0 else 0
-        print(f"  {stat.upper():>4s}  {base_mae:>13.4f}  {ld_mae:>13.4f}  "
-              f"{diff:>+10.4f}  {pct_chg:>+7.2f}%")
-
-    # Overall MAE
-    base_mae_all = float(np.mean(np.abs(all_base_exp - all_actual_val)))
-    ld_mae_all = float(np.mean(np.abs(all_ld_exp - all_actual_val)))
-    diff_all = ld_mae_all - base_mae_all
-    pct_all = 100 * diff_all / base_mae_all if base_mae_all > 0 else 0
-    print(f"  {'ALL':>4s}  {base_mae_all:>13.4f}  {ld_mae_all:>13.4f}  "
-          f"{diff_all:>+10.4f}  {pct_all:>+7.2f}%")
-    print()
 
     # ---------------------------------------------------------------
     # Headline: >= 65% confidence hit rate
@@ -499,32 +458,6 @@ def print_results(df: pd.DataFrame) -> None:
         hr_upgraded = float(h_actual[upgraded_mask].mean())
         print(f"  Hit rate on upgraded picks: {hr_upgraded:.4f} ({hr_upgraded*100:.1f}%)")
 
-    # Compare H > 0.5 MAE for batters with large positive/negative LD adj
-    high_ld = df_real[df_real["babip_adj"] > 0.005].copy()
-    low_ld = df_real[df_real["babip_adj"] < -0.005].copy()
-    neutral_ld = df_real[df_real["babip_adj"].abs() <= 0.005].copy()
-
-    if len(high_ld) > 0:
-        high_base_mae = float(np.mean(np.abs(high_ld["base_expected_h"] - high_ld["actual_h"])))
-        high_ld_mae = float(np.mean(np.abs(high_ld["ld_expected_h"] - high_ld["actual_h"])))
-        print(f"  High-LD batters (adj > +0.005, N={len(high_ld):,}):")
-        print(f"    Baseline H MAE: {high_base_mae:.4f}  LD-adj MAE: {high_ld_mae:.4f}  "
-              f"diff: {high_ld_mae - high_base_mae:+.4f}")
-
-    if len(low_ld) > 0:
-        low_base_mae = float(np.mean(np.abs(low_ld["base_expected_h"] - low_ld["actual_h"])))
-        low_ld_mae = float(np.mean(np.abs(low_ld["ld_expected_h"] - low_ld["actual_h"])))
-        print(f"  Low-LD batters (adj < -0.005, N={len(low_ld):,}):")
-        print(f"    Baseline H MAE: {low_base_mae:.4f}  LD-adj MAE: {low_ld_mae:.4f}  "
-              f"diff: {low_ld_mae - low_base_mae:+.4f}")
-
-    if len(neutral_ld) > 0:
-        neut_base_mae = float(np.mean(np.abs(neutral_ld["base_expected_h"] - neutral_ld["actual_h"])))
-        neut_ld_mae = float(np.mean(np.abs(neutral_ld["ld_expected_h"] - neutral_ld["actual_h"])))
-        print(f"  Neutral-LD batters (|adj| <= 0.005, N={len(neutral_ld):,}):")
-        print(f"    Baseline H MAE: {neut_base_mae:.4f}  LD-adj MAE: {neut_ld_mae:.4f}  "
-              f"diff: {neut_ld_mae - neut_base_mae:+.4f}")
-
     print()
 
     # ---------------------------------------------------------------
@@ -616,13 +549,6 @@ def print_results(df: pd.DataFrame) -> None:
     print("-" * 76)
     print("SUMMARY")
     print("-" * 76)
-
-    # H MAE improvement
-    h_mask = all_stat == "h"
-    h_base_mae = float(np.mean(np.abs(all_base_exp[h_mask] - all_actual_val[h_mask])))
-    h_ld_mae = float(np.mean(np.abs(all_ld_exp[h_mask] - all_actual_val[h_mask])))
-
-    print(f"  H MAE change: {h_base_mae:.4f} -> {h_ld_mae:.4f} ({(h_ld_mae - h_base_mae):+.4f})")
 
     # Overall 65% hit rate change
     for label, p_arr in [("Baseline", all_base_p), ("LD-adj", all_ld_p)]:

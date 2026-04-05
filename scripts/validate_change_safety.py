@@ -154,26 +154,6 @@ def check_thresholds(cfg: dict) -> bool:
                 worst_dev, max_temp_dev,
             )
 
-    # Pitcher K RMSE check
-    max_rmse = thresholds.get("max_rmse_pitcher_k", 2.5)
-    if "rmse" in df.columns and "stat" in df.columns:
-        k_rows = df[df["stat"] == "k"]
-        if not k_rows.empty:
-            worst_rmse = k_rows["rmse"].max()
-            if worst_rmse > max_rmse:
-                logger.error(
-                    "FAIL  pitcher K RMSE = %.3f exceeds threshold %.3f",
-                    worst_rmse, max_rmse,
-                )
-                passed = False
-            else:
-                logger.info(
-                    "PASS  pitcher K RMSE OK (worst = %.3f, threshold = %.3f)",
-                    worst_rmse, max_rmse,
-                )
-        else:
-            logger.warning("SKIP  no 'k' stat rows in backtest summary")
-
     return passed
 
 

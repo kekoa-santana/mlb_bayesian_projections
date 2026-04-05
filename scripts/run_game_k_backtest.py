@@ -91,8 +91,6 @@ def _print_k_results(results: pd.DataFrame) -> None:
     print()
 
     if len(results) > 0:
-        print(f"Average RMSE:  {results['rmse'].mean():.3f}")
-        print(f"Average MAE:   {results['mae'].mean():.3f}")
         print(f"Average Brier: {results['avg_brier'].mean():.4f}")
         if "avg_log_loss" in results.columns:
             print(f"Average Log Loss: {results['avg_log_loss'].mean():.4f}")
@@ -118,12 +116,9 @@ def _print_stat_results(stat_results: pd.DataFrame) -> None:
 
     print("=== PER-STAT AVERAGES ===")
     for stat, group in stat_results.groupby("stat"):
-        avg_rmse = group["rmse"].mean()
-        avg_mae = group["mae"].mean()
         avg_corr = group["correlation"].mean()
         total_games = group["n_games"].sum()
-        print(f"  {stat.upper()}: RMSE={avg_rmse:.3f}, MAE={avg_mae:.3f}, "
-              f"corr={avg_corr:.3f}, total games={total_games}")
+        print(f"  {stat.upper()}: corr={avg_corr:.3f}, total games={total_games}")
 
 
 if __name__ == "__main__":

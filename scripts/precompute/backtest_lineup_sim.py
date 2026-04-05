@@ -6,7 +6,7 @@ Pulls historical game data (lineups, boxscores, opposing starters) from the
 database, runs simulate_lineup_game for each game using pre-computed posterior
 samples, and compares predicted vs actual per-batter stats.
 
-Reports MAE, calibration tables, and P(over) accuracy for H, R, RBI, HRR, K, BB.
+Reports calibration tables and P(over) accuracy for H, R, RBI, HRR, K, BB.
 
 Usage
 -----
@@ -433,19 +433,16 @@ def compute_metrics(df: pd.DataFrame) -> None:
     print(f"  Seasons:                  {sorted(df['season'].unique())}")
     print()
 
-    # --- MAE per stat ---
+    # --- Bias per stat ---
     print("-" * 72)
-    print("MEAN ABSOLUTE ERROR (batters with posteriors only)")
+    print("BIAS (batters with posteriors only)")
     print("-" * 72)
     stats = ["h", "r", "rbi", "hrr", "k", "bb"]
-    mae_results = {}
     for stat in stats:
         actual = df_real[f"actual_{stat}"]
         pred = df_real[f"pred_{stat}"]
-        mae = float(np.mean(np.abs(actual - pred)))
         bias = float(np.mean(pred - actual))
-        mae_results[stat] = mae
-        print(f"  {stat.upper():>4s}:  MAE = {mae:.4f}   Bias = {bias:+.4f}   "
+        print(f"  {stat.upper():>4s}:  Bias = {bias:+.4f}   "
               f"Actual mean = {actual.mean():.3f}   Pred mean = {pred.mean():.3f}")
 
     print()

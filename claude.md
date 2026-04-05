@@ -309,10 +309,13 @@ Complete validation system for game-level props:
 
 Every model must be evaluated with:
 1. **Walk-forward backtesting:** Train on data through season N, predict season N+1, roll forward. Never leak future data.
-2. **Calibration curves:** Do 80% credible intervals contain the truth ~80% of the time?
-3. **Brier score:** For binary outcomes derived from continuous projections.
-4. **Benchmark vs Marcel:** Season projections must beat the Marcel system (weighted 5/4/3 recent seasons, regressed to mean, age-adjusted). If they don't, something is wrong.
-5. **Betting ROI tracking:** Simulated and live bet tracking with Kelly sizing.
+2. **Convergence diagnostics:** r_hat < 1.05, ESS > 400, zero divergences for all PyMC models.
+3. **Calibration / coverage:** Do 80% credible intervals contain the truth ~80% of the time?
+4. **Brier score:** For binary outcomes derived from continuous projections.
+5. **CRPS:** Continuous ranked probability score for full-distribution forecast quality.
+6. **Log loss:** For probabilistic predictions on discrete outcomes.
+7. **Benchmark vs Marcel:** Season projections must beat the Marcel system (weighted 5/4/3 recent seasons, regressed to mean, age-adjusted) on Brier, calibration, and CRPS. If they don't, something is wrong.
+8. **Betting ROI tracking:** Simulated and live bet tracking with Kelly sizing.
 
 ## Common Pitfalls to Avoid
 
@@ -337,7 +340,7 @@ Every model must be evaluated with:
 - Pitch-type + pitch-archetype log-odds scoring with reliability-weighted fallback chains
 
 ### Phase 4: Layer 3 — Game Prediction — COMPLETE
-- Game K posterior (BF distribution + matchup + umpire/weather), backtest: 11,517 games, RMSE=2.280
+- Game K posterior (BF distribution + matchup + umpire/weather), backtest: 11,517 games
 - PA-by-PA game simulator (pitcher + batter), exit model (AUC=0.921), DK/ESPN fantasy scoring
 - Game prop framework (pitcher K/BB/HR/H/Outs, batter K/BB/HR/H) with confidence tiers
 
@@ -391,8 +394,8 @@ Every model must be evaluated with:
 - Hitter K% and BB% are the most stable stats for Bayesian projection (r=0.795, 0.706 YoY). Batted ball decomposition (GB%, FB%, HR/FB) added for hitter model v2.
 - Pitcher HR/BF (r=0.267) too noisy to project — replaced by GB% (r=0.619) as batted-ball indicator.
 - All queries filter `game_type = 'R'` (regular season only) — no spring training/postseason leakage.
-- **Counting stat performance:** Bayes beats Marcel on pitcher K (+13.3% MAE), BB (+6.2%), Outs (+15.4%). SB loses to Marcel (era adjustment too blunt).
-- **Game sim performance:** Pitcher K RMSE=2.305, calibration near-perfect (50.8/81.2/90.9%).
+- **Counting stat performance:** Bayes beats Marcel on pitcher K, BB, and Outs (Brier, calibration, CRPS). SB loses to Marcel (era adjustment too blunt).
+- **Game sim performance:** Pitcher K calibration near-perfect (50.8/81.2/90.9%).
 - **Hitter chase rate** is the most stable count metric (r=0.84 YoY, 87% between-player variance). Aggressiveness is value-neutral (Q4 vs Q1 wOBA = .328 vs .326).
 
 ## AI Assistant Best Practices
@@ -409,12 +412,12 @@ Every model must be evaluated with:
 2. **Explain the "why"** behind each suggestion
 3. **Consider the Bayesian framework** constraints
 4. **Test assumptions** against actual data when possible
-5. **Validate against backtest results** - Bayes should beat Marcel
+5. **Validate against backtest results** - Bayes should beat Marcel on Brier, calibration, and CRPS
 
 ### Common Context Needed
 - Database schema verification (use psql commands)
 - Model convergence diagnostics (r_hat, ESS, divergences)
-- Backtest performance metrics (MAE improvement vs Marcel)
+- Backtest performance metrics (Brier, calibration, CRPS vs Marcel)
 - Current season targets (2026)
 - Counting stat validation results
 - Game prop confidence tier assignments

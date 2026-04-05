@@ -298,7 +298,7 @@ def compute_metrics(
     Returns
     -------
     dict
-        MAE, RMSE, coverage, Brier score for both Bayesian and Marcel.
+        Coverage, Brier score for both Bayesian and Marcel.
     """
     actual = comp["actual_k_rate"].values
     bayes_pred = comp["k_rate_mean"].values
@@ -309,14 +309,6 @@ def compute_metrics(
     else:
         ci_lo = comp["k_rate_2_5"].values
         ci_hi = comp["k_rate_97_5"].values
-
-    # --- MAE ---
-    bayes_mae = np.mean(np.abs(actual - bayes_pred))
-    marcel_mae = np.mean(np.abs(actual - marcel_pred))
-
-    # --- RMSE ---
-    bayes_rmse = np.sqrt(np.mean((actual - bayes_pred) ** 2))
-    marcel_rmse = np.sqrt(np.mean((actual - marcel_pred) ** 2))
 
     # --- 95% credible interval coverage ---
     in_ci = (actual >= ci_lo) & (actual <= ci_hi)
@@ -347,27 +339,17 @@ def compute_metrics(
     calibration = compute_calibration(comp)
 
     results = {
-        "bayes_mae": bayes_mae,
-        "marcel_mae": marcel_mae,
-        "mae_improvement": (marcel_mae - bayes_mae) / marcel_mae * 100,
-        "bayes_rmse": bayes_rmse,
-        "marcel_rmse": marcel_rmse,
-        "rmse_improvement": (marcel_rmse - bayes_rmse) / marcel_rmse * 100,
         "coverage_95": coverage_95,
         "bayes_brier": bayes_brier,
         "marcel_brier": marcel_brier,
         "calibration": calibration,
     }
 
-    logger.info(
-        "Bayes MAE=%.4f, Marcel MAE=%.4f (improvement: %.1f%%)",
-        bayes_mae, marcel_mae, results["mae_improvement"],
-    )
-    logger.info(
-        "Bayes RMSE=%.4f, Marcel RMSE=%.4f (improvement: %.1f%%)",
-        bayes_rmse, marcel_rmse, results["rmse_improvement"],
-    )
     logger.info("95%% CI coverage: %.1f%%", coverage_95 * 100)
+    logger.info(
+        "Bayes Brier=%.4f, Marcel Brier=%.4f",
+        bayes_brier, marcel_brier,
+    )
 
     return results
 
@@ -464,13 +446,9 @@ def run_full_backtest(
         )
         results.append({
             "test_season": fold["test_season"],
-            "bayes_mae": metrics["bayes_mae"],
-            "marcel_mae": metrics["marcel_mae"],
-            "mae_improvement_pct": metrics["mae_improvement"],
-            "bayes_rmse": metrics["bayes_rmse"],
-            "marcel_rmse": metrics["marcel_rmse"],
-            "rmse_improvement_pct": metrics["rmse_improvement"],
             "coverage_95": metrics["coverage_95"],
+            "bayes_brier": metrics["bayes_brier"],
+            "marcel_brier": metrics["marcel_brier"],
             "n_players": metrics["n_players"],
             "converged": metrics["convergence"]["converged"],
         })
@@ -790,12 +768,6 @@ def run_full_pitcher_backtest(
         )
         results.append({
             "test_season": fold["test_season"],
-            "bayes_mae": metrics["bayes_mae"],
-            "marcel_mae": metrics["marcel_mae"],
-            "mae_improvement_pct": metrics["mae_improvement"],
-            "bayes_rmse": metrics["bayes_rmse"],
-            "marcel_rmse": metrics["marcel_rmse"],
-            "rmse_improvement_pct": metrics["rmse_improvement"],
             "coverage_95": metrics["coverage_95"],
             "bayes_brier": metrics["bayes_brier"],
             "marcel_brier": metrics["marcel_brier"],

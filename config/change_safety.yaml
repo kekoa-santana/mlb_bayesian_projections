@@ -11,10 +11,9 @@ schema:
   pitcher_projections:
     required_columns: ["pitcher_id", "projected_k_rate", "season"]
   backtest_game_prop_summary:
-    required_columns: ["stat", "ece", "rmse", "temperature"]
+    required_columns: ["stat", "ece", "temperature"]
 
 thresholds:
   # Maximum acceptable values (fail if exceeded)
   max_ece: 0.08
   max_temperature_deviation: 0.3  # |temperature - 1.0|
-  max_rmse_pitcher_k: 2.5

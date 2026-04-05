@@ -81,17 +81,14 @@ def main() -> None:
 
     print("=== PER-STAT VERDICT (RATE) ===")
     for stat, group in summary.groupby("stat"):
-        avg_mae_imp = group["mae_improvement_pct"].mean()
         avg_cov = group["coverage_95"].mean()
         avg_ens_w = group["ensemble_w"].mean()
-        avg_ens_mae = group["ensemble_mae"].mean()
         avg_bayes_crps = group["bayes_crps"].mean()
         avg_marcel_crps = group["marcel_crps"].mean()
-        beats = avg_mae_imp > 0
-        print(f"  {stat}: Bayes {'BEATS' if beats else 'LOSES TO'} Marcel "
-              f"(MAE improvement: {avg_mae_imp:+.1f}%, "
-              f"95% coverage: {avg_cov:.1%})")
-        print(f"    Ensemble: w={avg_ens_w:.2f}, MAE={avg_ens_mae:.4f}")
+        crps_beats = avg_bayes_crps < avg_marcel_crps
+        print(f"  {stat}: Bayes {'BEATS' if crps_beats else 'LOSES TO'} Marcel on CRPS "
+              f"(95% coverage: {avg_cov:.1%})")
+        print(f"    Ensemble: w={avg_ens_w:.2f}")
         print(f"    CRPS: Bayes={avg_bayes_crps:.4f}, Marcel={avg_marcel_crps:.4f}")
 
     summary.to_csv(out_dir / "pitcher_multi_stat_backtest.csv", index=False)
@@ -116,7 +113,6 @@ def main() -> None:
         print("\n=== PITCHER COUNTING STAT BACKTEST RESULTS ===")
         display_cols = [
             "stat", "test_season", "n_players",
-            "bayes_mae", "marcel_mae", "mae_improvement_pct",
             "bayes_corr", "coverage_80", "coverage_95",
         ]
         available = [c for c in display_cols if c in counting_summary.columns]
@@ -125,14 +121,11 @@ def main() -> None:
 
         print("=== PER-STAT VERDICT (COUNTING) ===")
         for stat, group in counting_summary.groupby("stat"):
-            avg_mae_imp = group["mae_improvement_pct"].mean()
             avg_corr = group["bayes_corr"].mean()
             avg_cov95 = group["coverage_95"].mean()
-            beats = avg_mae_imp > 0
             print(
-                f"  {stat}: Bayes {'BEATS' if beats else 'LOSES TO'} Marcel "
-                f"(MAE improvement: {avg_mae_imp:+.1f}%, "
-                f"corr: {avg_corr:.3f}, 95% cov: {avg_cov95:.0%})"
+                f"  {stat}: "
+                f"corr: {avg_corr:.3f}, 95% cov: {avg_cov95:.0%}"
             )
         print()
 

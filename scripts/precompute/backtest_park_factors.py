@@ -6,7 +6,7 @@ Runs the same 400 games (2024-2025) through the lineup simulator twice:
   A) Baseline: no park factors (current production behavior)
   B) Park factors: K/BB logit lifts + H BABIP adjustment + HR lift per venue
 
-Same seeds, same games, same posteriors. Compares MAE, calibration, and
+Same seeds, same games, same posteriors. Compares calibration and
 65% confidence hit rate for H, K, BB (the three stats park factors
 directly affect).
 
@@ -525,39 +525,7 @@ def compute_comparison(df_base: pd.DataFrame, df_park: pd.DataFrame) -> None:
     print()
 
     # =====================================================================
-    # 1. MAE comparison for park-affected stats
-    # =====================================================================
-    print("-" * 78)
-    print("MAE COMPARISON (H, K, BB -- stats directly affected by park factors)")
-    print("-" * 78)
-    print(f"  {'Stat':>4s}  {'Baseline MAE':>14s}  {'Park MAE':>14s}  "
-          f"{'Delta':>10s}  {'Improvement':>12s}")
-    print(f"  {'----':>4s}  {'-' * 14:>14s}  {'-' * 14:>14s}  "
-          f"{'-' * 10:>10s}  {'-' * 12:>12s}")
-
-    for stat in PARK_STATS:
-        actual = base[f"actual_{stat}"]
-        mae_b = float(np.mean(np.abs(actual - base[f"pred_{stat}"])))
-        mae_p = float(np.mean(np.abs(actual - park[f"pred_{stat}"])))
-        delta = mae_p - mae_b
-        pct = 100 * delta / mae_b if mae_b > 0 else 0
-        print(f"  {stat.upper():>4s}  {mae_b:>14.5f}  {mae_p:>14.5f}  "
-              f"{delta:>+10.5f}  {pct:>+11.2f}%")
-
-    # Also show all stats
-    print()
-    print("  (All stats for reference)")
-    for stat in ALL_STATS:
-        actual = base[f"actual_{stat}"]
-        mae_b = float(np.mean(np.abs(actual - base[f"pred_{stat}"])))
-        mae_p = float(np.mean(np.abs(actual - park[f"pred_{stat}"])))
-        delta = mae_p - mae_b
-        pct = 100 * delta / mae_b if mae_b > 0 else 0
-        print(f"  {stat.upper():>4s}  {mae_b:>14.5f}  {mae_p:>14.5f}  "
-              f"{delta:>+10.5f}  {pct:>+11.2f}%")
-
-    # =====================================================================
-    # 2. 65% confidence hit rate
+    # 1. 65% confidence hit rate
     # =====================================================================
     print()
     print("-" * 78)
@@ -633,45 +601,7 @@ def compute_comparison(df_base: pd.DataFrame, df_park: pd.DataFrame) -> None:
                   f"{delta:>+8.4f}  {n_b:>8,}  {n_p:>8,}")
 
     # =====================================================================
-    # 4. Breakdown by park type
-    # =====================================================================
-    print()
-    print("-" * 78)
-    print("MAE BY PARK TYPE: EXTREME vs NEUTRAL")
-    print("-" * 78)
-
-    base_extreme = base[base["venue_id"].isin(EXTREME_VENUE_IDS)]
-    base_neutral = base[~base["venue_id"].isin(EXTREME_VENUE_IDS)]
-    park_extreme = park[park["venue_id"].isin(EXTREME_VENUE_IDS)]
-    park_neutral = park[~park["venue_id"].isin(EXTREME_VENUE_IDS)]
-
-    print(f"  Extreme parks: {base_extreme['venue_id'].nunique()} venues, "
-          f"{len(base_extreme):,} batter-games")
-    print(f"  Neutral parks: {base_neutral['venue_id'].nunique()} venues, "
-          f"{len(base_neutral):,} batter-games")
-    print()
-
-    for park_type, b_df, p_df in [
-        ("EXTREME", base_extreme, park_extreme),
-        ("NEUTRAL", base_neutral, park_neutral),
-    ]:
-        print(f"  --- {park_type} ---")
-        print(f"    {'Stat':>4s}  {'Base MAE':>10s}  {'Park MAE':>10s}  "
-              f"{'Delta':>10s}  {'Pct':>8s}")
-        for stat in PARK_STATS:
-            if len(b_df) == 0:
-                continue
-            actual = b_df[f"actual_{stat}"]
-            mae_b = float(np.mean(np.abs(actual - b_df[f"pred_{stat}"])))
-            mae_p = float(np.mean(np.abs(actual - p_df[f"pred_{stat}"])))
-            delta = mae_p - mae_b
-            pct = 100 * delta / mae_b if mae_b > 0 else 0
-            print(f"    {stat.upper():>4s}  {mae_b:>10.5f}  {mae_p:>10.5f}  "
-                  f"{delta:>+10.5f}  {pct:>+7.2f}%")
-        print()
-
-    # =====================================================================
-    # 5. Per-venue breakdown for extreme parks
+    # 4. Per-venue breakdown for extreme parks
     # =====================================================================
     print("-" * 78)
     print("PER-VENUE IMPACT (extreme parks)")
@@ -708,13 +638,9 @@ def compute_comparison(df_base: pd.DataFrame, df_park: pd.DataFrame) -> None:
 
         for stat in PARK_STATS:
             actual = b_v[f"actual_{stat}"]
-            mae_b = float(np.mean(np.abs(actual - b_v[f"pred_{stat}"])))
-            mae_p = float(np.mean(np.abs(actual - p_v[f"pred_{stat}"])))
-            delta = mae_p - mae_b
             bias_b = float(np.mean(b_v[f"pred_{stat}"] - actual))
             bias_p = float(np.mean(p_v[f"pred_{stat}"] - actual))
-            print(f"    {stat.upper():>2s}:  MAE {mae_b:.4f} -> {mae_p:.4f} "
-                  f"({delta:+.4f})  Bias {bias_b:+.4f} -> {bias_p:+.4f}")
+            print(f"    {stat.upper():>2s}:  Bias {bias_b:+.4f} -> {bias_p:+.4f}")
 
     print()
     print("=" * 78)

@@ -475,8 +475,6 @@ def compute_batter_sim_metrics(
         actual = predictions[act_col].values.astype(float)
         errors = expected - actual
 
-        metrics[f"{stat}_rmse"] = float(np.sqrt(np.mean(errors ** 2)))
-        metrics[f"{stat}_mae"] = float(np.mean(np.abs(errors)))
         metrics[f"{stat}_bias"] = float(np.mean(errors))
 
         if np.std(actual) > 0 and np.std(expected) > 0:
@@ -616,7 +614,7 @@ def run_full_batter_sim_backtest(
 
         fold_rec = {"test_season": test_season, "n_games": metrics["n_games"]}
         for stat in ("k", "bb", "h", "hr", "double", "triple", "tb"):
-            for m in ("rmse", "mae", "bias", "corr"):
+            for m in ("bias", "corr"):
                 key = f"{stat}_{m}"
                 if key in metrics:
                     fold_rec[key] = metrics[key]
@@ -659,15 +657,9 @@ def run_full_batter_sim_backtest(
         all_predictions.append(predictions)
 
         logger.info(
-            "Batter fold: K RMSE=%.3f, K LogLoss=%.4f, "
-            "H RMSE=%.3f, H LogLoss=%.4f, "
-            "HR RMSE=%.3f, TB RMSE=%.3f, n=%d",
-            fold_rec.get("k_rmse", np.nan),
+            "Batter fold: K LogLoss=%.4f, H LogLoss=%.4f, n=%d",
             fold_rec.get("k_avg_log_loss", np.nan),
-            fold_rec.get("h_rmse", np.nan),
             fold_rec.get("h_avg_log_loss", np.nan),
-            fold_rec.get("hr_rmse", np.nan),
-            fold_rec.get("tb_rmse", np.nan),
             metrics["n_games"],
         )
         logger.info(
@@ -698,15 +690,14 @@ def run_full_batter_sim_backtest(
         logger.info("=" * 60)
         logger.info("OVERALL BATTER RESULTS (%d batter-games)", overall["n_games"])
         for stat in ("k", "bb", "h", "hr", "double", "triple", "tb"):
-            rmse_key = f"{stat}_rmse"
-            if rmse_key in overall:
+            bias_key = f"{stat}_bias"
+            corr_key = f"{stat}_corr"
+            if bias_key in overall or corr_key in overall:
                 logger.info(
-                    "  %s: RMSE=%.3f, MAE=%.3f, bias=%.3f, corr=%.3f",
+                    "  %s: bias=%.3f, corr=%.3f",
                     stat.upper(),
-                    overall[rmse_key],
-                    overall.get(f"{stat}_mae", np.nan),
-                    overall.get(f"{stat}_bias", np.nan),
-                    overall.get(f"{stat}_corr", np.nan),
+                    overall.get(bias_key, np.nan),
+                    overall.get(corr_key, np.nan),
                 )
         if "brier_scores" in overall:
             logger.info("  Brier scores:")

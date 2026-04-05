@@ -230,11 +230,6 @@ def walk_forward_stat_backtest(
     bayes = comp[f"bayes_{stat}"].values
     marcel_pred = comp[f"marcel_{stat}"].values
 
-    bayes_mae = float(np.mean(np.abs(actual - bayes)))
-    marcel_mae = float(np.mean(np.abs(actual - marcel_pred)))
-    bayes_rmse = float(np.sqrt(np.mean((actual - bayes) ** 2)))
-    marcel_rmse = float(np.sqrt(np.mean((actual - marcel_pred) ** 2)))
-
     ci_lo = comp["ci_95_lo"].values
     ci_hi = comp["ci_95_hi"].values
     coverage_95 = float(np.mean((actual >= ci_lo) & (actual <= ci_hi)))
@@ -253,9 +248,6 @@ def walk_forward_stat_backtest(
     # Compute optimal calibration T from 80% coverage
     from src.evaluation.metrics import compute_posterior_calibration_t
     optimal_cal_t = compute_posterior_calibration_t(coverage_80)
-
-    mae_imp = (marcel_mae - bayes_mae) / marcel_mae * 100 if marcel_mae > 0 else 0
-    rmse_imp = (marcel_rmse - bayes_rmse) / marcel_rmse * 100 if marcel_rmse > 0 else 0
 
     # Brier score (above league average?) — reuse stored samples
     league_avg = cfg.league_avg
@@ -330,10 +322,6 @@ def walk_forward_stat_backtest(
         logger.warning("PPC computation failed for %s: %s", stat, e)
 
     logger.info(
-        "%s: Bayes MAE=%.4f, Marcel MAE=%.4f (improvement: %.1f%%)",
-        stat, bayes_mae, marcel_mae, mae_imp,
-    )
-    logger.info(
         "%s: 80%% CI coverage: %.1f%%, 95%% CI coverage: %.1f%% (optimal T=%.3f)",
         stat, coverage_80 * 100, coverage_95 * 100, optimal_cal_t,
     )
@@ -345,12 +333,6 @@ def walk_forward_stat_backtest(
         "stat": stat,
         "test_season": test_season,
         "n_players": len(comp),
-        "bayes_mae": bayes_mae,
-        "marcel_mae": marcel_mae,
-        "mae_improvement_pct": mae_imp,
-        "bayes_rmse": bayes_rmse,
-        "marcel_rmse": marcel_rmse,
-        "rmse_improvement_pct": rmse_imp,
         "coverage_80": coverage_80,
         "coverage_95": coverage_95,
         "calibration_t": optimal_cal_t,
@@ -451,21 +433,15 @@ def run_hitter_backtest(
             )
 
             logger.info(
-                "%s fold %d: ensemble w=%.2f, MAE=%.4f (Bayes=%.4f, Marcel=%.4f)",
-                stat, i + 1, w, ens_metrics["ensemble_mae"],
-                metrics["bayes_mae"], metrics["marcel_mae"],
+                "%s fold %d: ensemble w=%.2f, Brier=%.4f, coverage_95=%.3f",
+                stat, i + 1, w, ens_metrics["ensemble_brier"],
+                ens_metrics["ensemble_coverage_95"],
             )
 
             results.append({
                 "stat": stat,
                 "test_season": metrics["test_season"],
                 "n_players": metrics["n_players"],
-                "bayes_mae": metrics["bayes_mae"],
-                "marcel_mae": metrics["marcel_mae"],
-                "mae_improvement_pct": metrics["mae_improvement_pct"],
-                "bayes_rmse": metrics["bayes_rmse"],
-                "marcel_rmse": metrics["marcel_rmse"],
-                "rmse_improvement_pct": metrics["rmse_improvement_pct"],
                 "coverage_80": metrics["coverage_80"],
                 "coverage_95": metrics["coverage_95"],
                 "calibration_t": metrics["calibration_t"],
@@ -474,8 +450,6 @@ def run_hitter_backtest(
                 "bayes_crps": metrics["bayes_crps"],
                 "marcel_crps": metrics["marcel_crps"],
                 "ensemble_w": w,
-                "ensemble_mae": ens_metrics["ensemble_mae"],
-                "ensemble_rmse": ens_metrics["ensemble_rmse"],
                 "ensemble_brier": ens_metrics["ensemble_brier"],
                 "ensemble_coverage_95": ens_metrics["ensemble_coverage_95"],
                 "converged": metrics["convergence"]["converged"],

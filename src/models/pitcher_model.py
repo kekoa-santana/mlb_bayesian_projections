@@ -61,6 +61,9 @@ class PitcherStatConfig:
     # AR(1) rho prior: Beta(alpha, beta). Stat-specific persistence.
     rho_alpha: float = 8.0
     rho_beta: float = 2.0
+    # AR(2) rho2 prior: stat-specific lag-2 partial autocorrelation
+    rho2_alpha: float = 3.0
+    rho2_beta: float = 7.0
     mu_pop_sigma: float = 0.3
 
 
@@ -86,9 +89,11 @@ PITCHER_STAT_CONFIGS: dict[str, PitcherStatConfig] = {
         covariates=[],
         season_decay=1.0,  # no decay (tested 0.6, 0.8 — neither improves Brier)
         sigma_season_mu=0.22,
-        sigma_season_floor=0.18,
+        sigma_season_floor=0.15,    # was 0.18 — tightened for CRPS (target ~87% cov at 95% CI)
         # K% most persistent pitcher stat
         rho_alpha=6.0, rho_beta=2.5,  # mean ~0.71
+        # Lag-2 partial near zero after rho accounts for lag-1
+        rho2_alpha=2.0, rho2_beta=8.0,  # mean ~0.20
     ),
     "bb_rate": PitcherStatConfig(
         name="bb_rate",
@@ -101,9 +106,11 @@ PITCHER_STAT_CONFIGS: dict[str, PitcherStatConfig] = {
             ("zone_pct", 0.0, 0.2, "zone% → BB%"),
         ],
         sigma_season_mu=0.28,
-        sigma_season_floor=0.22,
+        sigma_season_floor=0.18,    # was 0.22 — tightened for CRPS
         # BB% moderately persistent — keep default
         rho_alpha=8.0, rho_beta=2.0,  # mean ~0.80
+        # BB% has genuine multi-year approach trends — keep default rho2
+        rho2_alpha=3.0, rho2_beta=7.0,  # mean ~0.30
     ),
     "hr_per_bf": PitcherStatConfig(
         name="hr_per_bf",
@@ -117,9 +124,11 @@ PITCHER_STAT_CONFIGS: dict[str, PitcherStatConfig] = {
         ],
         sigma_player_prior=0.8,
         sigma_season_mu=0.40,
-        sigma_season_floor=0.35,
+        sigma_season_floor=0.30,    # was 0.35 — tightened for CRPS
         # HR/BF least persistent pitcher rate (r=0.267 YoY)
         rho_alpha=6.0, rho_beta=3.0,  # mean ~0.67
+        # High noise, low lag-2 signal
+        rho2_alpha=1.5, rho2_beta=8.5,  # mean ~0.15
     ),
 }
 
@@ -328,12 +337,11 @@ def build_pitcher_model(
         sigma_season = pm.LogNormal(
             "sigma_season",
             mu=np.log(cfg.sigma_season_mu),
-            sigma=0.5,
+            sigma=0.35,  # was 0.5 — tighter to reduce right-tail mass on innovation variance
         )
         rho = pm.Beta("rho", alpha=cfg.rho_alpha, beta=cfg.rho_beta)
-        # AR(2) coefficient — two-year-ago signal. BB% benefits most
-        # (rho2~0.33). Beta(3,7) gives mean ~0.30, allows 0.10-0.50 range.
-        rho2 = pm.Beta("rho2", alpha=3, beta=7)
+        # AR(2) coefficient — stat-specific lag-2 persistence.
+        rho2 = pm.Beta("rho2", alpha=cfg.rho2_alpha, beta=cfg.rho2_beta)
 
         if n_seasons > 1:
             innovation = pm.Normal(
@@ -564,39 +572,46 @@ def extract_rate_samples(
 
     if project_forward and "sigma_season" in trace.posterior:
         rng = np.random.default_rng(random_seed)
+
+        # --- Joint posterior sampling ---
+        # All posterior variables must use aligned (chain, draw) indices
+        # to preserve correlations (especially alpha ↔ rate negative
+        # correlation from partial pooling). Independent resampling
+        # artificially inflates deviation_last variance → wider CIs.
+        n_target = len(samples)
         sigma_samples = trace.posterior["sigma_season"].values.flatten()
-        # Apply floor
         sigma_samples = np.maximum(sigma_samples, cfg.sigma_season_floor)
-        if len(sigma_samples) != len(samples):
-            sigma_draws = rng.choice(sigma_samples, size=len(samples), replace=True)
+        n_posterior = len(sigma_samples)
+
+        if n_posterior != n_target:
+            shared_idx = rng.choice(n_posterior, size=n_target, replace=True)
+            sigma_draws = sigma_samples[shared_idx]
         else:
+            shared_idx = None
             sigma_draws = sigma_samples
 
         # Get rho for AR(2) dampening
         if "rho" in trace.posterior:
             rho_samples = trace.posterior["rho"].values.flatten()
-            if len(rho_samples) != len(samples):
-                rho_draws = rng.choice(rho_samples, size=len(samples), replace=True)
-            else:
-                rho_draws = rho_samples
+            rho_draws = rho_samples[shared_idx] if shared_idx is not None else rho_samples
         else:
-            rho_draws = np.ones(len(samples))  # fallback: pure random walk
+            rho_draws = np.ones(n_target)
 
         # Get rho2 (AR(2) lag-2 coefficient) from trace
         if "rho2" in trace.posterior:
             rho2_samples = trace.posterior["rho2"].values.flatten()
-            if len(rho2_samples) != len(samples):
-                rho2_draws = rng.choice(rho2_samples, size=len(samples), replace=True)
-            else:
-                rho2_draws = rho2_samples
+            rho2_draws = rho2_samples[shared_idx] if shared_idx is not None else rho2_samples
         else:
-            rho2_draws = np.zeros(len(samples))  # fallback: AR(1) only
+            rho2_draws = np.zeros(n_target)
 
-        # Age-dependent persistence: young pitchers' improvements persist
-        # more (development), aging pitchers' outliers regress harder.
-        # Stronger multiplier replaces the old post-hoc alpha blending,
-        # keeping everything within the AR(2) framework for consistency
-        # between convergence diagnostics and projections.
+        # Extract alpha (player intercept) — aligned with rate samples
+        alpha_post = trace.posterior["alpha"].values
+        alpha_flat = alpha_post.reshape(-1, alpha_post.shape[-1])
+        pidx = data["player_map"][pitcher_id]
+        alpha_draws = alpha_flat[:, pidx]
+        if shared_idx is not None:
+            alpha_draws = alpha_draws[shared_idx]
+
         age = df.loc[pos, "age"] if "age" in df.columns else None
         if age is not None:
             if age <= 27:
@@ -619,14 +634,6 @@ def extract_rate_samples(
         logit_samples = np.log(eps / (1 - eps))
         innovation = rng.normal(0, sigma_draws)
 
-        # Extract alpha (player intercept) to compute season effect
-        alpha_post = trace.posterior["alpha"].values
-        alpha_flat = alpha_post.reshape(-1, alpha_post.shape[-1])
-        pidx = data["player_map"][pitcher_id]
-        alpha_draws = alpha_flat[:, pidx]
-        if len(alpha_draws) != len(samples):
-            alpha_draws = rng.choice(alpha_draws, size=len(samples), replace=True)
-
         deviation_last = logit_samples - alpha_draws
 
         # --- Compute deviation_prev (lag-2) for AR(2) forward projection ---
@@ -638,13 +645,16 @@ def extract_rate_samples(
         if prev_positions:
             prev_iloc = df.index.get_loc(prev_positions[0])
             prev_samples = rate_flat[:, prev_iloc].copy()
-            if len(prev_samples) != len(samples):
-                prev_samples = rng.choice(prev_samples, size=len(samples), replace=True)
+            if shared_idx is not None:
+                prev_samples = prev_samples[shared_idx]
             eps_prev = np.clip(prev_samples, 1e-6, 1 - 1e-6)
             logit_prev = np.log(eps_prev / (1 - eps_prev))
             deviation_prev = logit_prev - alpha_draws
         else:
+            # No lag-2 data: zero out rho2 so it doesn't constrain
+            # effective_rho via the stationarity clip
             deviation_prev = np.zeros_like(deviation_last)
+            rho2_draws = np.zeros_like(rho2_draws)
 
         new_deviation = (effective_rho * deviation_last
                          + rho2_draws * deviation_prev + innovation)

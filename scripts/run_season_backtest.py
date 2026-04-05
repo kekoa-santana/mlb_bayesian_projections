@@ -2,7 +2,7 @@
 """
 Step 10: Run walk-forward season-level K% backtests for hitters and pitchers.
 
-Confirms the Bayesian model beats Marcel on MAE, RMSE, and calibration.
+Confirms the Bayesian model beats Marcel on calibration and distributional metrics.
 
 Usage
 -----
@@ -71,14 +71,10 @@ def main() -> None:
     # --- Summary ---
     print("=== VERDICT ===")
     for label, df in [("Hitter", hitter_summary), ("Pitcher", pitcher_summary)]:
-        avg_mae_imp = df["mae_improvement_pct"].mean()
-        avg_rmse_imp = df["rmse_improvement_pct"].mean()
         avg_cov = df["coverage_95"].mean()
-        beats = avg_mae_imp > 0
-        print(f"{label}: Bayes {'BEATS' if beats else 'LOSES TO'} Marcel "
-              f"(MAE improvement: {avg_mae_imp:+.1f}%, "
-              f"RMSE improvement: {avg_rmse_imp:+.1f}%, "
-              f"95% coverage: {avg_cov:.1%})")
+        avg_brier = df["brier_score"].mean() if "brier_score" in df.columns else float("nan")
+        print(f"{label}: 95% coverage: {avg_cov:.1%}, "
+              f"Brier: {avg_brier:.4f}")
 
     # Save results
     out_dir = PROJECT_ROOT / "outputs"

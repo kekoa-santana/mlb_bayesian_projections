@@ -29,7 +29,7 @@ Use this checklist after modifying any high-risk modeling, simulation, or calibr
   - `python scripts/run_game_prop_backtest.py`
 - Verify:
   - Expected totals and variance stay realistic:
-    - Pitcher K RMSE not materially worse.
+    - Pitcher K Brier score and CRPS not materially worse.
     - Coverage (50/80/90/95) does not collapse.
   - Tail behavior sanity:
     - `P(over)` curves are smooth/monotonic by line.
@@ -99,7 +99,7 @@ Use this checklist after modifying any high-risk modeling, simulation, or calibr
 - Calibration:
   - No major degradation in `ECE`, `MCE`, temperature, or coverage.
 - Accuracy:
-  - RMSE/MAE not materially worse on core props (at least pitcher K, BB, HR).
+  - Brier score and CRPS not materially worse on core props (at least pitcher K, BB, HR).
 - Stability:
   - Confidence tier assignments do not churn wildly without intentional reason.
 - Operational:

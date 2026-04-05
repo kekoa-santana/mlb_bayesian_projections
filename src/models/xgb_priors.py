@@ -212,8 +212,7 @@ def train_pitcher_prior_model(
     Returns
     -------
     dict
-        Bundle with 'model', 'feature_cols', 'n_train', 'target',
-        'train_rmse'.
+        Bundle with 'model', 'feature_cols', 'n_train', 'target'.
     """
     import xgboost as xgb
 
@@ -223,7 +222,7 @@ def train_pitcher_prior_model(
     if X.empty:
         logger.warning("No training data for %s model", target)
         return {"model": None, "feature_cols": feature_cols, "n_train": 0,
-                "target": target, "train_rmse": float("nan")}
+                "target": target}
 
     # Conservative XGBoost: small trees, heavy regularization
     # ~3000 rows, 9-10 features — overfitting is the main risk
@@ -240,15 +239,12 @@ def train_pitcher_prior_model(
     )
     model.fit(X, y)
 
-    train_pred = model.predict(X)
-    train_rmse = float(np.sqrt(np.mean((y.values - train_pred) ** 2)))
-
     # Feature importances
     importances = dict(zip(X.columns, model.feature_importances_))
     top_features = sorted(importances.items(), key=lambda x: -x[1])[:5]
     logger.info(
-        "Trained %s XGBoost: n=%d, train RMSE=%.4f, top features: %s",
-        target, len(X), train_rmse,
+        "Trained %s XGBoost: n=%d, top features: %s",
+        target, len(X),
         ", ".join(f"{f}={v:.3f}" for f, v in top_features),
     )
 
@@ -257,7 +253,6 @@ def train_pitcher_prior_model(
         "feature_cols": list(X.columns),
         "n_train": len(X),
         "target": target,
-        "train_rmse": train_rmse,
         "feature_importances": importances,
     }
 

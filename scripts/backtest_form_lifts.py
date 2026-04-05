@@ -25,8 +25,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -487,28 +485,24 @@ def run_batter_ab_backtest(
 # Metrics
 # ---------------------------------------------------------------------------
 def compute_ab_metrics(df: pd.DataFrame, stats: list[str], label: str) -> pd.DataFrame:
-    """Compute MAE and RMSE for baseline vs form lift predictions."""
+    """Compute bias and correlation for baseline vs form lift predictions."""
     rows = []
     for stat in stats:
         actual = df[f"actual_{stat}"].values
         pred_base = df[f"pred_{stat}_base"].values
         pred_form = df[f"pred_{stat}_form"].values
 
-        mae_base = mean_absolute_error(actual, pred_base)
-        mae_form = mean_absolute_error(actual, pred_form)
-        rmse_base = np.sqrt(mean_squared_error(actual, pred_base))
-        rmse_form = np.sqrt(mean_squared_error(actual, pred_form))
+        bias_base = float(np.mean(pred_base - actual))
+        bias_form = float(np.mean(pred_form - actual))
+        corr_base = float(np.corrcoef(actual, pred_base)[0, 1]) if len(actual) > 2 else np.nan
+        corr_form = float(np.corrcoef(actual, pred_form)[0, 1]) if len(actual) > 2 else np.nan
 
         rows.append({
             "stat": stat,
-            "mae_baseline": round(mae_base, 4),
-            "mae_form": round(mae_form, 4),
-            "mae_delta": round(mae_form - mae_base, 4),
-            "mae_pct_change": round((mae_form - mae_base) / mae_base * 100, 2),
-            "rmse_baseline": round(rmse_base, 4),
-            "rmse_form": round(rmse_form, 4),
-            "rmse_delta": round(rmse_form - rmse_base, 4),
-            "rmse_pct_change": round((rmse_form - rmse_base) / rmse_base * 100, 2),
+            "bias_baseline": round(bias_base, 4),
+            "bias_form": round(bias_form, 4),
+            "corr_baseline": round(corr_base, 4),
+            "corr_form": round(corr_form, 4),
             "n": len(df),
         })
 
@@ -525,24 +519,22 @@ def analyze_by_lift_magnitude(
     df["abs_lift"] = df[lift_col].abs()
 
     # Split into no-lift vs has-lift
-    no_lift = df[df["abs_lift"] < 0.001]
     has_lift = df[df["abs_lift"] >= 0.001]
 
     if has_lift.empty:
         logger.info("  No games with meaningful %s lift", stat)
         return
 
-    # For games WITH a lift, compare baseline vs form
+    # For games WITH a lift, compare baseline vs form bias
     actual = has_lift[f"actual_{stat}"].values
     pred_b = has_lift[f"pred_{stat}_base"].values
     pred_f = has_lift[f"pred_{stat}_form"].values
 
-    mae_b = mean_absolute_error(actual, pred_b)
-    mae_f = mean_absolute_error(actual, pred_f)
+    bias_b = float(np.mean(pred_b - actual))
+    bias_f = float(np.mean(pred_f - actual))
     logger.info(
-        "  %s | %s lift games (n=%d): MAE base=%.4f, form=%.4f, delta=%+.4f (%.2f%%)",
-        label, stat, len(has_lift), mae_b, mae_f,
-        mae_f - mae_b, (mae_f - mae_b) / mae_b * 100,
+        "  %s | %s lift games (n=%d): bias base=%+.4f, form=%+.4f",
+        label, stat, len(has_lift), bias_b, bias_f,
     )
 
     # Stratify by lift direction
@@ -557,11 +549,10 @@ def analyze_by_lift_magnitude(
         pb = subset[f"pred_{stat}_base"].values
         pf = subset[f"pred_{stat}_form"].values
         logger.info(
-            "    %s lift (n=%d): MAE base=%.4f, form=%.4f, delta=%+.4f",
+            "    %s lift (n=%d): bias base=%+.4f, form=%+.4f",
             direction, len(subset),
-            mean_absolute_error(a, pb),
-            mean_absolute_error(a, pf),
-            mean_absolute_error(a, pf) - mean_absolute_error(a, pb),
+            float(np.mean(pb - a)),
+            float(np.mean(pf - a)),
         )
 
 

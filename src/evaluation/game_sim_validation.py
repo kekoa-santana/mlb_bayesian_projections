@@ -658,7 +658,7 @@ def compute_game_sim_metrics(
     Returns
     -------
     dict
-        Metrics per stat (rmse, mae, correlation) plus K-specific
+        Metrics per stat (bias, correlation) plus K-specific
         (brier, coverage, ECE).
     """
     if k_lines is None:
@@ -670,7 +670,7 @@ def compute_game_sim_metrics(
 
     metrics: dict[str, Any] = {"n_games": n}
 
-    # Per-stat RMSE, MAE, correlation
+    # Per-stat bias, correlation
     for stat in ("k", "bb", "h", "hr", "bf", "pitches", "outs"):
         exp_col = f"expected_{stat}"
         act_col = f"actual_{stat}"
@@ -685,8 +685,6 @@ def compute_game_sim_metrics(
             continue
 
         errors = expected - actual
-        metrics[f"{stat}_rmse"] = float(np.sqrt(np.mean(errors ** 2)))
-        metrics[f"{stat}_mae"] = float(np.mean(np.abs(errors)))
         metrics[f"{stat}_bias"] = float(np.mean(errors))
 
         if np.std(actual) > 0 and np.std(expected) > 0:
@@ -784,14 +782,6 @@ def compute_game_sim_metrics(
                 np.mean((actual_outs_arr >= lo) & (actual_outs_arr <= hi))
             )
 
-    # IP metrics
-    if "expected_ip" in predictions.columns and "actual_ip" in predictions.columns:
-        ip_exp = predictions["expected_ip"].values.astype(float)
-        ip_act = predictions["actual_ip"].values.astype(float)
-        ip_err = ip_exp - ip_act
-        metrics["ip_rmse"] = float(np.sqrt(np.mean(ip_err ** 2)))
-        metrics["ip_mae"] = float(np.mean(np.abs(ip_err)))
-
     return metrics
 
 
@@ -867,7 +857,7 @@ def run_full_game_sim_backtest(
 
         # Add per-stat metrics
         for stat in ("k", "bb", "h", "hr", "bf", "pitches", "outs"):
-            for metric in ("rmse", "mae", "bias", "corr"):
+            for metric in ("bias", "corr"):
                 key = f"{stat}_{metric}"
                 if key in metrics:
                     fold_rec[key] = metrics[key]
@@ -900,31 +890,18 @@ def run_full_game_sim_backtest(
                 if mkey in metrics:
                     fold_rec[mkey] = metrics[mkey]
 
-        # IP
-        for m in ("ip_rmse", "ip_mae"):
-            if m in metrics:
-                fold_rec[m] = metrics[m]
-
         fold_results.append(fold_rec)
         predictions["fold_test_season"] = test_season
         all_predictions.append(predictions)
 
         # Log summary
         logger.info(
-            "Fold results: K RMSE=%.3f, K Brier=%.4f, K LogLoss=%.4f, "
-            "BB RMSE=%.3f, H RMSE=%.3f, HR RMSE=%.3f, "
-            "Outs RMSE=%.3f, Outs Brier=%.4f, Outs LogLoss=%.4f, "
-            "IP RMSE=%.3f, n=%d",
-            fold_rec.get("k_rmse", np.nan),
+            "Fold results: K Brier=%.4f, K LogLoss=%.4f, "
+            "Outs Brier=%.4f, Outs LogLoss=%.4f, n=%d",
             fold_rec.get("k_avg_brier", np.nan),
             fold_rec.get("k_avg_log_loss", np.nan),
-            fold_rec.get("bb_rmse", np.nan),
-            fold_rec.get("h_rmse", np.nan),
-            fold_rec.get("hr_rmse", np.nan),
-            fold_rec.get("outs_rmse", np.nan),
             fold_rec.get("outs_avg_brier", np.nan),
             fold_rec.get("outs_avg_log_loss", np.nan),
-            fold_rec.get("ip_rmse", np.nan),
             metrics["n_games"],
         )
         logger.info(
@@ -950,14 +927,14 @@ def run_full_game_sim_backtest(
         logger.info("=" * 60)
         logger.info("OVERALL RESULTS (%d games)", overall["n_games"])
         for stat in ("k", "bb", "h", "hr", "outs", "bf", "pitches"):
-            rmse_key = f"{stat}_rmse"
-            if rmse_key in overall:
+            corr_key = f"{stat}_corr"
+            bias_key = f"{stat}_bias"
+            if corr_key in overall or bias_key in overall:
                 logger.info(
-                    "  %s: RMSE=%.3f, MAE=%.3f, corr=%.3f",
+                    "  %s: bias=%.3f, corr=%.3f",
                     stat.upper(),
-                    overall[rmse_key],
-                    overall.get(f"{stat}_mae", np.nan),
-                    overall.get(f"{stat}_corr", np.nan),
+                    overall.get(bias_key, np.nan),
+                    overall.get(corr_key, np.nan),
                 )
         if "k_avg_brier" in overall:
             logger.info("  K Avg Brier: %.4f", overall["k_avg_brier"])
@@ -967,8 +944,6 @@ def run_full_game_sim_backtest(
             logger.info("  Outs Avg Brier: %.4f", overall["outs_avg_brier"])
         if "outs_avg_log_loss" in overall:
             logger.info("  Outs Avg Log Loss: %.4f", overall["outs_avg_log_loss"])
-        if "ip_rmse" in overall:
-            logger.info("  IP: RMSE=%.3f", overall["ip_rmse"])
         for prefix, label in [("k", "K"), ("outs", "Outs")]:
             mc_key = f"{prefix}_sharpness_mean_confidence"
             if mc_key in overall:

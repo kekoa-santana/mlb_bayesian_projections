@@ -71,6 +71,11 @@ class StatConfig:
     # K% most persistent (~0.86), HR/FB least (~0.67).
     rho_alpha: float = 8.0
     rho_beta: float = 2.0
+    # AR(2) rho2 prior: Beta(alpha, beta). Stat-specific because lag-2
+    # partial autocorrelation varies. K%/GB% have near-zero partial lag-2
+    # (rho already explains it), while BB% has genuine multi-year trends.
+    rho2_alpha: float = 3.0
+    rho2_beta: float = 7.0
     # mu_pop prior width: how far age-bucket × skill-tier cell means
     # can spread from league average.  Default 0.3 works for logit-scale
     # binomial stats; wOBA (natural scale, SD ~0.04) needs wider to let
@@ -94,9 +99,11 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         ],
         # empirical logit-scale yr-to-yr SD ≈ 0.24
         sigma_season_mu=0.20,
-        sigma_season_floor=0.18,
+        sigma_season_floor=0.15,    # was 0.18 — tightened for CRPS (target ~87% cov at 95% CI)
         # K% is the most persistent hitter stat (r=0.795 YoY)
         rho_alpha=9.0, rho_beta=1.5,  # mean ~0.86
+        # Lag-2 partial autocorrelation near zero after rho accounts for lag-1
+        rho2_alpha=2.0, rho2_beta=8.0,  # mean ~0.20
     ),
     "bb_rate": StatConfig(
         name="bb_rate",
@@ -112,9 +119,11 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         ],
         # empirical logit-scale yr-to-yr SD ≈ 0.33
         sigma_season_mu=0.25,
-        sigma_season_floor=0.20,
+        sigma_season_floor=0.17,    # was 0.20 — tightened for CRPS (target ~85% cov)
         # BB% moderately persistent (r=0.706 YoY) — keep default
         rho_alpha=8.0, rho_beta=2.0,  # mean ~0.80
+        # BB% has genuine multi-year approach trends — keep default rho2
+        rho2_alpha=3.0, rho2_beta=7.0,  # mean ~0.30
     ),
     "gb_rate": StatConfig(
         name="gb_rate",
@@ -128,9 +137,11 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         covariates=[],
         # empirical logit-scale yr-to-yr SD ≈ 0.20
         sigma_season_mu=0.18,
-        sigma_season_floor=0.14,
+        sigma_season_floor=0.12,    # was 0.14 — tightened for CRPS
         # GB% moderately persistent (r=0.73 YoY)
         rho_alpha=7.0, rho_beta=2.5,  # mean ~0.74
+        # Lag-2 partial near zero — rho handles persistence
+        rho2_alpha=2.0, rho2_beta=8.0,  # mean ~0.20
     ),
     "fb_rate": StatConfig(
         name="fb_rate",
@@ -143,9 +154,11 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         covariates=[],
         # empirical logit-scale yr-to-yr SD ≈ 0.22
         sigma_season_mu=0.18,
-        sigma_season_floor=0.14,
+        sigma_season_floor=0.12,    # was 0.14 — tightened for CRPS
         # FB% roughly mirrors GB% stability
         rho_alpha=7.0, rho_beta=2.5,  # mean ~0.74
+        # Mirrors GB% — lag-2 partial near zero
+        rho2_alpha=2.0, rho2_beta=8.0,  # mean ~0.20
     ),
     "hr_per_fb": StatConfig(
         name="hr_per_fb",
@@ -165,9 +178,11 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         sigma_player_prior=0.5,
         # empirical logit-scale yr-to-yr SD ≈ 0.45 — HR/FB is volatile
         sigma_season_mu=0.35,
-        sigma_season_floor=0.28,
+        sigma_season_floor=0.25,    # was 0.28 — tightened for CRPS
         # HR/FB is the least persistent rate stat — needs most regression
         rho_alpha=6.0, rho_beta=3.0,  # mean ~0.67
+        # High noise, low lag-2 signal
+        rho2_alpha=1.5, rho2_beta=8.5,  # mean ~0.15
     ),
     "woba": StatConfig(
         name="woba",
@@ -194,6 +209,7 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         sigma_obs_prior=0.18,       # natural 0.04 → logit ~0.18
         # wOBA composite metric — high persistence for true talent
         rho_alpha=8.0, rho_beta=2.0,  # mean ~0.80 (was 0.74 — under-projected young elites)
+        rho2_alpha=2.0, rho2_beta=8.0,  # mean ~0.20
         mu_pop_sigma=0.25,  # tighter than binomial stats — helps identification on logit scale
     ),
     "chase_rate": StatConfig(
@@ -209,9 +225,11 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         covariates=[],
         # empirical logit-scale yr-to-yr SD ≈ 0.15
         sigma_season_mu=0.13,
-        sigma_season_floor=0.10,
+        sigma_season_floor=0.07,    # was 0.10 — tightened for CRPS
         # Chase rate is the most stable hitter metric (r=0.84 YoY, 87% between-player)
         rho_alpha=9.0, rho_beta=1.0,  # mean ~0.90
+        # Very high rho already; lag-2 partial near zero
+        rho2_alpha=2.0, rho2_beta=8.0,  # mean ~0.20
     ),
 }
 
@@ -439,12 +457,12 @@ def build_hitter_model(
         sigma_season = pm.LogNormal(
             "sigma_season",
             mu=np.log(cfg.sigma_season_mu),
-            sigma=0.5,
+            sigma=0.35,  # was 0.5 — tighter to reduce right-tail mass on innovation variance
         )
         rho = pm.Beta("rho", alpha=cfg.rho_alpha, beta=cfg.rho_beta)
-        # AR(2) coefficient — two-year-ago signal. BB% benefits most
-        # (rho2~0.33). Beta(3,7) gives mean ~0.30, allows 0.10-0.50 range.
-        rho2 = pm.Beta("rho2", alpha=3, beta=7)
+        # AR(2) coefficient — stat-specific lag-2 persistence.
+        # Informed by empirical partial autocorrelations (Yule-Walker).
+        rho2 = pm.Beta("rho2", alpha=cfg.rho2_alpha, beta=cfg.rho2_beta)
 
         if n_seasons > 1:
             innovation = pm.Normal(
@@ -679,41 +697,46 @@ def extract_rate_samples(
 
     if project_forward and "sigma_season" in trace.posterior:
         rng = np.random.default_rng(random_seed)
+
+        # --- Joint posterior sampling ---
+        # All posterior variables must use aligned (chain, draw) indices
+        # to preserve correlations (especially alpha ↔ rate negative
+        # correlation from partial pooling). Independent resampling
+        # artificially inflates deviation_last variance → wider CIs.
+        n_target = len(samples)
         sigma_samples = trace.posterior["sigma_season"].values.flatten()
-        # Apply floor — ensures CIs reflect known empirical volatility
         sigma_samples = np.maximum(sigma_samples, cfg.sigma_season_floor)
-        if len(sigma_samples) != len(samples):
-            sigma_draws = rng.choice(sigma_samples, size=len(samples), replace=True)
+        n_posterior = len(sigma_samples)
+
+        if n_posterior != n_target:
+            # Sizes differ — resample all variables with a SINGLE shared index
+            shared_idx = rng.choice(n_posterior, size=n_target, replace=True)
+            sigma_draws = sigma_samples[shared_idx]
         else:
+            shared_idx = None
             sigma_draws = sigma_samples
 
         # Get rho for AR(2) dampening
         if "rho" in trace.posterior:
             rho_samples = trace.posterior["rho"].values.flatten()
-            if len(rho_samples) != len(samples):
-                rho_draws = rng.choice(rho_samples, size=len(samples), replace=True)
-            else:
-                rho_draws = rho_samples
+            rho_draws = rho_samples[shared_idx] if shared_idx is not None else rho_samples
         else:
-            rho_draws = np.ones(len(samples))  # fallback: pure random walk
+            rho_draws = np.ones(n_target)  # fallback: pure random walk
 
         # Get rho2 (AR(2) lag-2 coefficient) from trace
         if "rho2" in trace.posterior:
             rho2_samples = trace.posterior["rho2"].values.flatten()
-            if len(rho2_samples) != len(samples):
-                rho2_draws = rng.choice(rho2_samples, size=len(samples), replace=True)
-            else:
-                rho2_draws = rho2_samples
+            rho2_draws = rho2_samples[shared_idx] if shared_idx is not None else rho2_samples
         else:
-            rho2_draws = np.zeros(len(samples))  # fallback: AR(1) only
+            rho2_draws = np.zeros(n_target)  # fallback: AR(1) only
 
-        # Extract alpha (player intercept) to compute season effect
+        # Extract alpha (player intercept) — aligned with rate samples
         alpha_post = trace.posterior["alpha"].values
         alpha_flat = alpha_post.reshape(-1, alpha_post.shape[-1])
         pidx = data["player_map"][batter_id]
         alpha_draws = alpha_flat[:, pidx]
-        if len(alpha_draws) != len(samples):
-            alpha_draws = rng.choice(alpha_draws, size=len(samples), replace=True)
+        if shared_idx is not None:
+            alpha_draws = alpha_draws[shared_idx]
 
         innovation = rng.normal(0, sigma_draws)
 
@@ -764,13 +787,16 @@ def extract_rate_samples(
             if prev_positions:
                 prev_iloc = df.index.get_loc(prev_positions[0])
                 prev_samples = rate_flat[:, prev_iloc].copy()
-                if len(prev_samples) != len(samples):
-                    prev_samples = rng.choice(prev_samples, size=len(samples), replace=True)
+                if shared_idx is not None:
+                    prev_samples = prev_samples[shared_idx]
                 eps_prev = np.clip(prev_samples, 1e-6, 1 - 1e-6)
                 logit_prev = np.log(eps_prev / (1 - eps_prev))
                 deviation_prev = logit_prev - alpha_draws
             else:
+                # No lag-2 data: zero out rho2 entirely so it doesn't
+                # constrain effective_rho via the stationarity clip
                 deviation_prev = np.zeros_like(deviation_last)
+                rho2_draws = np.zeros_like(rho2_draws)
 
             new_deviation = (effective_rho * deviation_last
                              + rho2_draws * deviation_prev + innovation)
@@ -781,10 +807,11 @@ def extract_rate_samples(
             if prev_positions:
                 prev_iloc = df.index.get_loc(prev_positions[0])
                 prev_samples = rate_flat[:, prev_iloc].copy()
-                if len(prev_samples) != len(samples):
-                    prev_samples = rng.choice(prev_samples, size=len(samples), replace=True)
+                if shared_idx is not None:
+                    prev_samples = prev_samples[shared_idx]
                 deviation_prev = prev_samples - alpha_draws
             else:
+                rho2_draws = np.zeros_like(rho2_draws)
                 deviation_prev = np.zeros_like(deviation_last)
 
             new_deviation = (effective_rho * deviation_last

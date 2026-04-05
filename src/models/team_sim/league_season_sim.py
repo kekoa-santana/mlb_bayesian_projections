@@ -37,7 +37,7 @@ LG_AVG_RPG = 4.50
 
 # 2H weighting: weight the second half of the season more heavily.
 # Teams that improved at the deadline carry that momentum into next year.
-# Backtested: 40/60 matches full-year MAE while capturing trade-deadline signal.
+# Backtested: 40/60 matches full-year accuracy while capturing trade-deadline signal.
 H1_WEIGHT = 0.35
 H2_WEIGHT = 0.65
 

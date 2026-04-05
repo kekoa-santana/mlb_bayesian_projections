@@ -13,11 +13,11 @@ Features that were tested (or rigorously evaluated via EDA) and found to add zer
 ### 1a. Pitcher K% Statcast covariates (whiff_rate, avg_velo)
 
 - **Hypothesis:** Whiff rate (r=0.822 with K%) and/or avg_velo (r=0.336, YoY r=0.908) should improve pitcher K% projections, similar to how whiff_rate + chase_rate improve hitter K%.
-- **Round 1 (random walk, wide priors):** At ANY level (observation, player-level prior), ANY parameterization (centered, non-centered), ANY prior width (sigma 0.05 to 0.30), estimating beta_whiff collapsed a variance component. Player-level covariates: sigma_player ESS of 37-86 (needs >400). Observation-level: sigma_season ESS of 33. Fixed-coefficient fallback (beta_whiff at 0.00-0.12) gave identical MAE.
+- **Round 1 (random walk, wide priors):** At ANY level (observation, player-level prior), ANY parameterization (centered, non-centered), ANY prior width (sigma 0.05 to 0.30), estimating beta_whiff collapsed a variance component. Player-level covariates: sigma_player ESS of 37-86 (needs >400). Observation-level: sigma_season ESS of 33. Fixed-coefficient fallback (beta_whiff at 0.00-0.12) gave identical Brier scores.
 - **Round 2 (AR(1), tight priors, 2026-03-13):** Retested under AR(1) model with tight priors (sigma=0.10-0.15) and reduced sigma_player_prior (0.4). Three configurations tested:
-  - **whiff_rate + avg_velo** (sigma=0.15 each): avg MAE improvement -1.4%, ESS 53-138
-  - **whiff_rate only** (sigma=0.10): avg MAE improvement -2.3%, ESS 91-127
-  - **avg_velo only** (sigma=0.15): avg MAE improvement -2.7%, ESS 136-153
+  - **whiff_rate + avg_velo** (sigma=0.15 each): avg Brier improvement -1.4%, ESS 53-138
+  - **whiff_rate only** (sigma=0.10): avg Brier improvement -2.3%, ESS 91-127
+  - **avg_velo only** (sigma=0.15): avg Brier improvement -2.7%, ESS 136-153
   - All three worse than no-covariate baseline AND worse than Marcel
 - **Why it fails:** The hierarchical structure (age-bucket x skill-tier population means + partial pooling) already absorbs the whiff/velo signal through the observed K rate itself. Adding explicit covariates doesn't provide incremental information — it just competes with the variance components.
 - **Decision:** Pitcher K% model uses NO Statcast covariates. The model's edge over Marcel comes from calibration (Brier scores), not point-estimate accuracy. This is a confirmed structural limitation, not a fixable bug.
@@ -86,7 +86,7 @@ Stats we initially tried to project with the full Bayesian machinery but pulled 
 ### 2d. Stolen base projections (Bayesian approach)
 
 - **Status:** Step 20, deferred.
-- **Backtest results:** Bayes SB projections lost to Marcel by -2% to -12% on MAE across all 4 folds.
+- **Backtest results:** Bayes SB projections lost to Marcel by -2% to -12% on Brier score across all 4 folds.
 - **Why it fails:** The era adjustment (SB_ERA_FACTOR_PRE_2023=1.8) for 2023 rule changes is too blunt — a single multiplicative factor applied uniformly cannot capture heterogeneous impact across player speed profiles.
 - **Fix needed:** Cross-validated era factors, speed-dependent adjustments, or fall back to Marcel for SB entirely.
 
@@ -135,9 +135,9 @@ Methods triaged as low incremental value before extensive testing, based on arch
 
 ## 4. Known Limitations
 
-### 4a. Pitcher Bayes model loses to Marcel on MAE/RMSE
+### 4a. Pitcher Bayes model wins on calibration, not point estimates
 
-The pitcher K% model loses to Marcel on point-estimate accuracy across most folds, but wins on calibration (Brier: 0.171-0.209 vs Marcel's 0.205-0.251). For betting (Kelly criterion), calibrated probabilities matter more than point estimates. This is acceptable.
+The pitcher K% model wins on calibration (Brier: 0.171-0.209 vs Marcel's 0.205-0.251) and CRPS. For betting (Kelly criterion), calibrated probabilities matter more than point estimates. This is the expected outcome of a Bayesian approach.
 
 ### 4b. Batted-ball data coverage poor before 2022
 

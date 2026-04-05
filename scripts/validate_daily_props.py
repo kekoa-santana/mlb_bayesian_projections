@@ -3,7 +3,7 @@
 
 Reads the accumulated game_props.parquet from the dashboard repo
 (which already contains predictions + backfilled actuals) and
-computes Brier / ECE / RMSE without re-running the full backtest.
+computes Brier / ECE / calibration without re-running the full backtest.
 
 Usage
 -----
@@ -64,14 +64,10 @@ def _compute_prop_metrics(
     df: pd.DataFrame,
     lines: list[float],
 ) -> dict[str, float]:
-    """Compute RMSE, MAE, Brier, ECE, temperature for a single prop group."""
+    """Compute Brier, ECE, temperature for a single prop group."""
     n = len(df)
     if n < 20:
         return {}
-
-    errors = df["expected"].values - df["actual"].values
-    rmse = float(np.sqrt(np.mean(errors ** 2)))
-    mae = float(np.mean(np.abs(errors)))
 
     brier_vals: list[float] = []
     ece_vals: list[float] = []
@@ -96,8 +92,6 @@ def _compute_prop_metrics(
 
     return {
         "n": n,
-        "rmse": rmse,
-        "mae": mae,
         "avg_brier": float(np.mean(brier_vals)) if brier_vals else np.nan,
         "avg_ece": float(np.mean(ece_vals)) if ece_vals else np.nan,
         "avg_temp": float(np.mean(temp_vals)) if temp_vals else np.nan,
@@ -228,7 +222,7 @@ def main() -> None:
         print("\n" + "=" * 75)
         print("DAY-FORWARD PROP VALIDATION")
         print("=" * 75)
-        display = ["side", "stat", "n", "rmse", "mae",
+        display = ["side", "stat", "n",
                     "avg_brier", "avg_ece", "avg_temp"]
         avail = [c for c in display if c in summary.columns]
         print(summary[avail].to_string(index=False))
@@ -253,7 +247,7 @@ def main() -> None:
             print("STRATIFIED METRICS")
             print("=" * 75)
             strat_cols = ["side", "stat", "stratum", "bin", "bin_n",
-                          "rmse", "avg_brier", "avg_ece", "avg_temp"]
+                          "avg_brier", "avg_ece", "avg_temp"]
             avail = [c for c in strat_cols if c in strat_df.columns]
             print(strat_df[avail].to_string(index=False))
         else:

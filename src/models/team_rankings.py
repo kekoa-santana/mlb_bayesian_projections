@@ -321,7 +321,7 @@ def rank_teams(
     # Prior-year WAA doesn't fully repeat, so apply 55% dampening.
     # Cap at ±8 wins to prevent extreme outliers (e.g. COL) from
     # distorting the entire league distribution after normalization.
-    # Backtested 2022-2025: drops MAE from 9.0 to ~7.5 wins.
+    # Backtested 2022-2025: improves projected-win accuracy from 9.0 to ~7.5 win error.
     _WAA_DAMPEN = 0.55
     _WAA_CAP = 8.0
     if waa_deltas is not None and not waa_deltas.empty:

@@ -11,7 +11,7 @@ Whiff/barrel covariates are intentionally excluded from the model:
 whiff_rate correlates r=0.71 with K%, which collapses sigma_player
 regardless of parameterization (observation-level, player-level,
 centered, non-centered, any prior width). The model's edge over
-Marcel comes from calibration (Brier scores), not point-estimate MAE.
+Marcel comes from calibration (Brier scores) and coverage, not point estimates.
 
 - is_starter (role flag from IP/game) → observation-level shift
 

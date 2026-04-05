@@ -53,7 +53,7 @@ Two tables:
 1. **Rate Stats** — K%, BB% for hitter/pitcher vs Marcel (from multi_stat_backtest parquets)
 2. **Counting Stats** — K, BB, HR, SB, Outs vs Marcel (from counting_backtest parquets)
 
-Load from `backtest_*_backtest.parquet` files. Show MAE, RMSE, Brier improvement.
+Load from `backtest_*_backtest.parquet` files. Show Brier score, calibration coverage, and CRPS.
 
 ### Deep Dives (per stat, st.expander)
 For each prop, expandable section with:

@@ -4,7 +4,7 @@ Walk-forward validation for team rankings.
 Learns optimal composite weights for team rankings by comparing
 predicted team strength against actual season wins.
 
-Metrics: RMSE, MAE, Spearman rank correlation, playoff prediction
+Metrics: Spearman rank correlation, playoff prediction
 accuracy, calibration.
 
 Default folds:
@@ -439,7 +439,7 @@ def evaluate_team_predictions(
     Returns
     -------
     dict
-        rmse, mae, spearman_rho, mean_error, max_error.
+        spearman_rho, mean_error, max_error.
     """
     # Align indexes before masking (concat across folds may produce
     # different-length Series sharing the same team_id keys).
@@ -452,20 +452,15 @@ def evaluate_team_predictions(
 
     if len(pred) < 5:
         return {
-            "rmse": np.nan, "mae": np.nan,
             "spearman_rho": np.nan, "n_teams": 0,
         }
 
     errors = pred - actual
-    rmse = float(np.sqrt(np.mean(errors ** 2)))
-    mae = float(np.mean(np.abs(errors)))
     mean_error = float(np.mean(errors))
     max_error = float(np.max(np.abs(errors)))
     rho, pval = spearmanr(pred, actual)
 
     return {
-        "rmse": rmse,
-        "mae": mae,
         "mean_error": mean_error,
         "max_error": max_error,
         "spearman_rho": float(rho),
@@ -540,7 +535,7 @@ def compare_ranking_methods(
     Returns
     -------
     pd.DataFrame
-        One row per method with RMSE, MAE, Spearman rho.
+        One row per method with Spearman rho.
     """
     records = []
     for name, pred in methods.items():
@@ -577,7 +572,7 @@ def learn_team_weights(
     Returns
     -------
     dict
-        optimal_weights, rmse, mae, spearman_rho.
+        optimal_weights, spearman_rho.
     """
     if score_cols is None:
         score_cols = _TEAM_SCORE_COLS
@@ -597,8 +592,6 @@ def learn_team_weights(
         n = len(score_cols)
         return {
             "optimal_weights": {col: 1.0 / n for col in score_cols},
-            "rmse": np.nan,
-            "mae": np.nan,
             "spearman_rho": np.nan,
         }
 
@@ -609,7 +602,7 @@ def learn_team_weights(
         return exp / exp.sum()
 
     def _objective(raw: np.ndarray) -> float:
-        """Predict wins as linear combo of scores, minimize RMSE."""
+        """Predict wins as linear combo of scores, minimize loss."""
         w = _softmax(raw)
         composite = X @ w
         # Linear regression: wins = a * composite + b
@@ -641,21 +634,17 @@ def learn_team_weights(
     coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
     pred_wins = A @ coeffs
 
-    rmse = float(np.sqrt(np.mean((pred_wins - y) ** 2)))
-    mae = float(np.mean(np.abs(pred_wins - y)))
     rho, _ = spearmanr(pred_wins, y)
 
     weight_dict = {col: float(w) for col, w in zip(score_cols, optimal_weights)}
 
     logger.info(
-        "Optimal team weights: %s | RMSE=%.2f, MAE=%.2f, rho=%.3f",
-        {k: f"{v:.3f}" for k, v in weight_dict.items()}, rmse, mae, rho,
+        "Optimal team weights: %s | rho=%.3f",
+        {k: f"{v:.3f}" for k, v in weight_dict.items()}, rho,
     )
 
     return {
         "optimal_weights": weight_dict,
-        "rmse": rmse,
-        "mae": mae,
         "spearman_rho": float(rho),
         "n_teams": len(y),
         "regression_coeffs": {"slope": float(coeffs[0]), "intercept": float(coeffs[1])},
@@ -800,14 +789,9 @@ def validate_team_rankings(
             "test_season": test_season,
             "n_teams": len(common),
             "optimal_weights": opt["optimal_weights"],
-            "optimized_rmse": opt["rmse"],
-            "optimized_mae": opt["mae"],
             "optimized_rho": opt["spearman_rho"],
-            "baseline_rmse": baseline_metrics["rmse"],
             "baseline_rho": baseline_metrics["spearman_rho"],
-            "pythagorean_rmse": pyth_metrics["rmse"],
             "pythagorean_rho": pyth_metrics["spearman_rho"],
-            "prior_wins_rmse": prior_metrics["rmse"],
             "prior_wins_rho": prior_metrics["spearman_rho"],
             "playoff_accuracy": playoff["playoff_accuracy"],
             "component_correlations": component_corrs,
@@ -815,9 +799,10 @@ def validate_team_rankings(
         per_fold.append(fold_result)
 
         logger.info(
-            "Fold %s: optimized RMSE=%.2f (baseline=%.2f, pyth=%.2f, prior=%.2f)",
-            fold_result["fold"], opt["rmse"],
-            baseline_metrics["rmse"], pyth_metrics["rmse"], prior_metrics["rmse"],
+            "Fold %s: optimized rho=%.3f (baseline=%.3f, pyth=%.3f, prior=%.3f)",
+            fold_result["fold"], opt["spearman_rho"],
+            baseline_metrics["spearman_rho"], pyth_metrics["spearman_rho"],
+            prior_metrics["spearman_rho"],
         )
         logger.info(
             "  rho: optimized=%.3f, baseline=%.3f, pyth=%.3f, prior=%.3f",
@@ -868,10 +853,6 @@ def validate_team_rankings(
         summary_records.append({
             "fold": fold["fold"],
             "n_teams": fold["n_teams"],
-            "optimized_rmse": fold["optimized_rmse"],
-            "baseline_rmse": fold["baseline_rmse"],
-            "pythagorean_rmse": fold["pythagorean_rmse"],
-            "prior_wins_rmse": fold["prior_wins_rmse"],
             "optimized_rho": fold["optimized_rho"],
             "baseline_rho": fold["baseline_rho"],
             "pythagorean_rho": fold["pythagorean_rho"],

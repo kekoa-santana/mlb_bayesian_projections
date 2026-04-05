@@ -1547,7 +1547,7 @@ def compute_game_prop_metrics(
     Returns
     -------
     dict
-        Keys: rmse, mae, brier_scores (per line), avg_brier, crps,
+        Keys: brier_scores (per line), avg_brier, crps,
         ece, mce, temperature, coverage_50/80/90/95, n_games.
     """
     sn = config.stat_name.lower()
@@ -1566,11 +1566,6 @@ def compute_game_prop_metrics(
             expected_col, actual_col,
         )
         return _empty_metrics()
-
-    # RMSE and MAE
-    errors = predictions[expected_col].values - predictions[actual_col].values
-    rmse = float(np.sqrt(np.mean(errors ** 2)))
-    mae = float(np.mean(np.abs(errors)))
 
     # Brier scores and log loss per line
     brier_scores: dict[float, float] = {}
@@ -1659,8 +1654,6 @@ def compute_game_prop_metrics(
     return {
         "stat_name": config.stat_name,
         "side": config.side,
-        "rmse": rmse,
-        "mae": mae,
         "brier_scores": brier_scores,
         "avg_brier": avg_brier,
         "log_losses": log_losses,
@@ -1690,8 +1683,6 @@ def _empty_metrics() -> dict[str, Any]:
     return {
         "stat_name": "",
         "side": "",
-        "rmse": np.nan,
-        "mae": np.nan,
         "brier_scores": {},
         "avg_brier": np.nan,
         "log_losses": {},
@@ -1794,8 +1785,6 @@ def run_full_game_prop_backtest(
             "side": config.side,
             "test_season": test_season,
             "n_games": metrics["n_games"],
-            "rmse": metrics["rmse"],
-            "mae": metrics["mae"],
             "avg_brier": metrics["avg_brier"],
             "avg_log_loss": metrics["avg_log_loss"],
             "crps": metrics["crps"],
@@ -1824,10 +1813,10 @@ def run_full_game_prop_backtest(
         all_predictions.append(predictions)
 
         logger.info(
-            "Fold results: RMSE=%.3f, MAE=%.3f, Brier=%.4f, LogLoss=%.4f, "
+            "Fold results: Brier=%.4f, LogLoss=%.4f, "
             "ECE=%.4f, Temp=%.3f, Coverage(50/80/90)=%.2f/%.2f/%.2f, "
             "Sharpness(conf=%.3f, act60=%.1f%%, entropy=%.3f)",
-            metrics["rmse"], metrics["mae"], metrics["avg_brier"],
+            metrics["avg_brier"],
             metrics["avg_log_loss"],
             metrics.get("ece", np.nan), metrics.get("temperature", np.nan),
             metrics["coverage_50"], metrics["coverage_80"],
@@ -1845,10 +1834,8 @@ def run_full_game_prop_backtest(
         # Overall metrics across all folds
         overall = compute_game_prop_metrics(config, all_pred_df)
         logger.info(
-            "Overall [%s %s]: RMSE=%.3f, MAE=%.3f, Brier=%.4f, "
-            "LogLoss=%.4f, n=%d",
+            "Overall [%s %s]: Brier=%.4f, LogLoss=%.4f, n=%d",
             config.side, config.stat_name,
-            overall["rmse"], overall["mae"],
             overall["avg_brier"], overall["avg_log_loss"],
             overall["n_games"],
         )
@@ -1945,7 +1932,7 @@ def compute_stratified_metrics(
     n_bins: int = 3,
     min_group: int = 50,
 ) -> pd.DataFrame:
-    """Compute Brier / ECE / RMSE stratified by context columns.
+    """Compute Brier / ECE stratified by context columns.
 
     Continuous columns are binned into *n_bins* quantile buckets.
     Categorical or low-cardinality columns are used as-is.
@@ -1972,7 +1959,7 @@ def compute_stratified_metrics(
     pd.DataFrame
         One row per (stratum_col, bin_label) with columns:
         stratum, bin, bin_n, bin_min, bin_max, stat_name, side,
-        rmse, mae, avg_brier, ece, temperature, coverage_80, n_games.
+        avg_brier, avg_log_loss, ece, temperature, coverage_80, n_games.
     """
     if strata is None:
         strata = _DEFAULT_STRATA
@@ -2025,8 +2012,6 @@ def compute_stratified_metrics(
                 "bin_max": float(raw_vals.max()) if len(raw_vals) else np.nan,
                 "stat_name": metrics["stat_name"],
                 "side": metrics["side"],
-                "rmse": metrics["rmse"],
-                "mae": metrics["mae"],
                 "avg_brier": metrics["avg_brier"],
                 "avg_log_loss": metrics["avg_log_loss"],
                 "ece": metrics["ece"],

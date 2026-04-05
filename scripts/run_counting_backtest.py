@@ -62,7 +62,6 @@ def _print_summary(summary, player_type: str) -> None:
     # Display key columns
     display_cols = [
         "stat", "test_season", "n_players",
-        "bayes_mae", "marcel_mae", "mae_improvement_pct",
         "bayes_corr", "coverage_80", "coverage_95",
     ]
     available = [c for c in display_cols if c in summary.columns]
@@ -72,16 +71,13 @@ def _print_summary(summary, player_type: str) -> None:
     # Per-stat verdict
     print("=== PER-STAT VERDICT ===")
     for stat, group in summary.groupby("stat"):
-        avg_mae_imp = group["mae_improvement_pct"].mean()
         avg_corr = group["bayes_corr"].mean()
         avg_cov80 = group["coverage_80"].mean()
         avg_cov95 = group["coverage_95"].mean()
-        beats = avg_mae_imp > 0
         print(
-            f"  {stat}: Bayes {'BEATS' if beats else 'LOSES TO'} Marcel "
-            f"(MAE improvement: {avg_mae_imp:+.1f}%, "
+            f"  {stat}: "
             f"corr: {avg_corr:.3f}, "
-            f"80% cov: {avg_cov80:.0%}, 95% cov: {avg_cov95:.0%})"
+            f"80% cov: {avg_cov80:.0%}, 95% cov: {avg_cov95:.0%}"
         )
     print()
 

@@ -125,10 +125,14 @@ def main() -> None:
 
     if args.quick:
         draws, tune, chains = 500, 250, 2
-        logger.info("QUICK mode: draws=%d, tune=%d, chains=%d", draws, tune, chains)
+        sim_seasons = 1_000
+        logger.info("QUICK mode: draws=%d, tune=%d, chains=%d, sim_seasons=%d",
+                     draws, tune, chains, sim_seasons)
     else:
         draws, tune, chains = 2000, 1000, 4
-        logger.info("FULL mode: draws=%d, tune=%d, chains=%d", draws, tune, chains)
+        sim_seasons = 10_000
+        logger.info("FULL mode: draws=%d, tune=%d, chains=%d, sim_seasons=%d",
+                     draws, tune, chains, sim_seasons)
 
     # =================================================================
     # 0. Pre-cache observed profiles (needed by projection enrichment)
@@ -196,6 +200,7 @@ def main() -> None:
             health_df=health_df,
             seasons=SEASONS,
             from_season=FROM_SEASON,
+            n_seasons=sim_seasons,
         )
 
     # =================================================================
@@ -207,6 +212,7 @@ def main() -> None:
             health_df=health_df,
             seasons=SEASONS,
             from_season=FROM_SEASON,
+            n_seasons=sim_seasons,
         )
 
     # =================================================================

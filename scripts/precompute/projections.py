@@ -139,6 +139,7 @@ def run_sim_pitcher(
     health_df: pd.DataFrame | None = None,
     seasons: list[int] = SEASONS,
     from_season: int = FROM_SEASON,
+    n_seasons: int = 10_000,
 ) -> pd.DataFrame | None:
     """Run sim-based pitcher season projections + reliever roles & rankings.
 
@@ -354,7 +355,7 @@ def run_sim_pitcher(
             starter_priors=starter_priors_df,
             health_scores=health_df,
             pitcher_names=pitcher_name_lookup,
-            n_seasons=10_000,
+            n_seasons=n_seasons,
             random_seed=42,
         )
         elapsed = time.time() - t0
@@ -395,6 +396,7 @@ def run_sim_hitter(
     health_df: pd.DataFrame | None = None,
     seasons: list[int] = SEASONS,
     from_season: int = FROM_SEASON,
+    n_seasons: int = 10_000,
 ) -> None:
     """Run sim-based hitter season projections."""
     from src.data.feature_eng import build_multi_season_hitter_extended
@@ -686,7 +688,7 @@ def run_sim_hitter(
             sb_rates=sb_rates,
             health_scores=health_df,
             batter_names=hitter_name_lookup,
-            n_seasons=10_000,
+            n_seasons=n_seasons,
             random_seed=42,
         )
         elapsed_h = time.time() - t0_h

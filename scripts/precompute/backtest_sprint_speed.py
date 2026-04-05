@@ -6,7 +6,7 @@ Runs the lineup simulator on the same set of historical games twice:
   1. LD-ONLY:  batter_babip_adjs from LD% only (current production)
   2. LD+SPEED: batter_babip_adjs from LD% + sprint speed (proposed)
 
-Compares H MAE, 65% confidence hit rate, and breakdown by speed tier
+Compares 65% confidence hit rate and breakdown by speed tier
 (fast / average / slow runners).
 
 Usage
@@ -412,8 +412,6 @@ def print_results(df: pd.DataFrame) -> None:
 
     # Pool all stat predictions
     ld_p_list, comb_p_list, actual_list = [], [], []
-    stat_label_list = []
-    ld_exp_list, comb_exp_list, actual_val_list = [], [], []
 
     for stat in STATS:
         line = PRIMARY_LINE[stat]
@@ -424,47 +422,9 @@ def print_results(df: pd.DataFrame) -> None:
         ld_p_list.append(ld_p)
         comb_p_list.append(comb_p)
         actual_list.append(actual_over)
-        stat_label_list.append(np.full(len(ld_p), stat))
-
-        ld_exp_list.append(df_real[f"ld_expected_{stat}"].values)
-        comb_exp_list.append(df_real[f"comb_expected_{stat}"].values)
-        actual_val_list.append(df_real[f"actual_{stat}"].values.astype(float))
-
     all_ld_p = np.concatenate(ld_p_list)
     all_comb_p = np.concatenate(comb_p_list)
     all_actual = np.concatenate(actual_list)
-    all_stat = np.concatenate(stat_label_list)
-    all_ld_exp = np.concatenate(ld_exp_list)
-    all_comb_exp = np.concatenate(comb_exp_list)
-    all_actual_val = np.concatenate(actual_val_list)
-
-    # ---------------------------------------------------------------
-    # MAE comparison (expected vs actual)
-    # ---------------------------------------------------------------
-    print("-" * 76)
-    print("EXPECTED VALUE MAE (lower is better)")
-    print("-" * 76)
-    print(f"  {'Stat':>4s}  {'LD-only MAE':>13s}  {'LD+Speed MAE':>13s}  "
-          f"{'Diff':>10s}  {'Pct chg':>8s}")
-    print(f"  {'----':>4s}  {'-------------':>13s}  {'-------------':>13s}  "
-          f"{'----------':>10s}  {'--------':>8s}")
-
-    for stat in STATS:
-        mask = all_stat == stat
-        ld_mae = float(np.mean(np.abs(all_ld_exp[mask] - all_actual_val[mask])))
-        comb_mae = float(np.mean(np.abs(all_comb_exp[mask] - all_actual_val[mask])))
-        diff = comb_mae - ld_mae
-        pct_chg = 100 * diff / ld_mae if ld_mae > 0 else 0
-        print(f"  {stat.upper():>4s}  {ld_mae:>13.4f}  {comb_mae:>13.4f}  "
-              f"{diff:>+10.4f}  {pct_chg:>+7.2f}%")
-
-    ld_mae_all = float(np.mean(np.abs(all_ld_exp - all_actual_val)))
-    comb_mae_all = float(np.mean(np.abs(all_comb_exp - all_actual_val)))
-    diff_all = comb_mae_all - ld_mae_all
-    pct_all = 100 * diff_all / ld_mae_all if ld_mae_all > 0 else 0
-    print(f"  {'ALL':>4s}  {ld_mae_all:>13.4f}  {comb_mae_all:>13.4f}  "
-          f"{diff_all:>+10.4f}  {pct_all:>+7.2f}%")
-    print()
 
     # ---------------------------------------------------------------
     # Headline: >= 65% confidence hit rate
@@ -580,7 +540,7 @@ def print_results(df: pd.DataFrame) -> None:
     # SPEED TIER ANALYSIS -- the core question
     # ---------------------------------------------------------------
     print("-" * 76)
-    print("SPEED TIER ANALYSIS (H MAE by runner speed)")
+    print("SPEED TIER ANALYSIS (H bias by runner speed)")
     print("-" * 76)
 
     has_speed = df_real["sprint_speed"].notna()
@@ -607,14 +567,12 @@ def print_results(df: pd.DataFrame) -> None:
             print(f"  {tier_label}: no data")
             continue
 
-        ld_h_mae = float(np.mean(np.abs(
+        ld_h_bias = float(np.mean(
             tier_df["ld_expected_h"] - tier_df["actual_h"]
-        )))
-        comb_h_mae = float(np.mean(np.abs(
+        ))
+        comb_h_bias = float(np.mean(
             tier_df["comb_expected_h"] - tier_df["actual_h"]
-        )))
-        diff = comb_h_mae - ld_h_mae
-        pct = 100 * diff / ld_h_mae if ld_h_mae > 0 else 0
+        ))
 
         # Mean speed adj in this tier
         mean_adj = tier_df["speed_babip_adj"].mean()
@@ -623,8 +581,7 @@ def print_results(df: pd.DataFrame) -> None:
         mean_h = tier_df["actual_h"].mean()
 
         print(f"  {tier_label} (N={len(tier_df):,}, avg actual H={mean_h:.2f}):")
-        print(f"    LD-only H MAE: {ld_h_mae:.4f}  LD+Speed H MAE: {comb_h_mae:.4f}  "
-              f"diff: {diff:+.4f} ({pct:+.2f}%)")
+        print(f"    LD-only H bias: {ld_h_bias:+.4f}  LD+Speed H bias: {comb_h_bias:+.4f}")
         print(f"    Mean speed adj: {mean_adj:+.4f}")
 
         # 65% confidence hit rate for H in this tier
@@ -692,13 +649,6 @@ def print_results(df: pd.DataFrame) -> None:
     print("-" * 76)
     print("SUMMARY")
     print("-" * 76)
-
-    # H MAE improvement
-    h_mask = all_stat == "h"
-    h_ld_mae = float(np.mean(np.abs(all_ld_exp[h_mask] - all_actual_val[h_mask])))
-    h_comb_mae = float(np.mean(np.abs(all_comb_exp[h_mask] - all_actual_val[h_mask])))
-    print(f"  H MAE change: {h_ld_mae:.4f} -> {h_comb_mae:.4f} "
-          f"({(h_comb_mae - h_ld_mae):+.4f})")
 
     # Overall 65% hit rate change
     for label, p_arr in [("LD-only", all_ld_p), ("LD+Speed", all_comb_p)]:

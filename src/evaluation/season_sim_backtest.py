@@ -71,12 +71,10 @@ def _compute_metrics(
         return {"n": 0}
 
     residuals = a - p
-    mae = float(np.mean(np.abs(residuals)))
-    rmse = float(np.sqrt(np.mean(residuals ** 2)))
     bias = float(np.mean(p - a))
     corr = float(np.corrcoef(a, p)[0, 1]) if np.std(a) > 0 and np.std(p) > 0 else 0.0
 
-    metrics = {"n": n, "mae": mae, "rmse": rmse, "bias": bias, "correlation": corr}
+    metrics = {"n": n, "bias": bias, "correlation": corr}
 
     if lo_80 is not None and hi_80 is not None:
         lo, hi = lo_80[valid], hi_80[valid]
@@ -539,23 +537,13 @@ def walk_forward_season_sim(
                 ).values.astype(float)
                 marcel_m = _compute_metrics(actual_vals, marcel_vals)
 
-        # Overall row
-        mae_vs_marcel = 0.0
-        if marcel_m.get("mae", 0) > 0:
-            mae_vs_marcel = (marcel_m["mae"] - sim_m.get("mae", 0)) / marcel_m["mae"] * 100
-        mae_vs_old = 0.0
-        if old_m.get("mae", 0) > 0:
-            mae_vs_old = (old_m["mae"] - sim_m.get("mae", 0)) / old_m["mae"] * 100
-
         summary_rows.append({
             "stat": stat_prefix, "role": "ALL", "test_season": test_season,
             "n": sim_m.get("n", 0),
-            "sim_mae": sim_m.get("mae"), "sim_rmse": sim_m.get("rmse"),
             "sim_bias": sim_m.get("bias"), "sim_corr": sim_m.get("correlation"),
             "sim_cov80": sim_m.get("coverage_80"), "sim_cov95": sim_m.get("coverage_95"),
-            "old_mae": old_m.get("mae"), "old_corr": old_m.get("correlation"),
-            "marcel_mae": marcel_m.get("mae"), "marcel_corr": marcel_m.get("correlation"),
-            "mae_vs_marcel_pct": mae_vs_marcel, "mae_vs_old_pct": mae_vs_old,
+            "old_corr": old_m.get("correlation"),
+            "marcel_corr": marcel_m.get("correlation"),
         })
 
         # SP / RP split
@@ -579,19 +567,13 @@ def walk_forward_season_sim(
             if has_marcel and marcel_m:
                 split_marcel = _compute_metrics(actual_vals[mask], marcel_vals[mask])
 
-            mae_vs_m = 0.0
-            if split_marcel.get("mae", 0) > 0:
-                mae_vs_m = (split_marcel["mae"] - split_sim.get("mae", 0)) / split_marcel["mae"] * 100
-
             summary_rows.append({
                 "stat": stat_prefix, "role": role_label, "test_season": test_season,
                 "n": split_sim.get("n", 0),
-                "sim_mae": split_sim.get("mae"), "sim_rmse": split_sim.get("rmse"),
                 "sim_bias": split_sim.get("bias"), "sim_corr": split_sim.get("correlation"),
                 "sim_cov80": split_sim.get("coverage_80"), "sim_cov95": split_sim.get("coverage_95"),
-                "old_mae": None, "old_corr": None,
-                "marcel_mae": split_marcel.get("mae"), "marcel_corr": split_marcel.get("correlation"),
-                "mae_vs_marcel_pct": mae_vs_m, "mae_vs_old_pct": None,
+                "old_corr": None,
+                "marcel_corr": split_marcel.get("correlation"),
             })
 
     # ERA / WHIP (sim only, derived stats)
@@ -609,13 +591,10 @@ def walk_forward_season_sim(
         )
         summary_rows.append({
             "stat": "ERA", "role": "ALL", "test_season": test_season,
-            "n": era_m.get("n"), "sim_mae": era_m.get("mae"),
-            "sim_rmse": era_m.get("rmse"), "sim_bias": era_m.get("bias"),
-            "sim_corr": era_m.get("correlation"),
+            "n": era_m.get("n"),
+            "sim_bias": era_m.get("bias"), "sim_corr": era_m.get("correlation"),
             "sim_cov80": era_m.get("coverage_80"), "sim_cov95": era_m.get("coverage_95"),
-            "old_mae": None, "old_corr": None,
-            "marcel_mae": None, "marcel_corr": None,
-            "mae_vs_marcel_pct": None, "mae_vs_old_pct": None,
+            "old_corr": None, "marcel_corr": None,
         })
 
     # FIP-derived ERA (should be more predictive than run-based ERA)
@@ -633,13 +612,10 @@ def walk_forward_season_sim(
         )
         summary_rows.append({
             "stat": "FIP-ERA", "role": "ALL", "test_season": test_season,
-            "n": fip_era_m.get("n"), "sim_mae": fip_era_m.get("mae"),
-            "sim_rmse": fip_era_m.get("rmse"), "sim_bias": fip_era_m.get("bias"),
-            "sim_corr": fip_era_m.get("correlation"),
+            "n": fip_era_m.get("n"),
+            "sim_bias": fip_era_m.get("bias"), "sim_corr": fip_era_m.get("correlation"),
             "sim_cov80": fip_era_m.get("coverage_80"), "sim_cov95": fip_era_m.get("coverage_95"),
-            "old_mae": None, "old_corr": None,
-            "marcel_mae": None, "marcel_corr": None,
-            "mae_vs_marcel_pct": None, "mae_vs_old_pct": None,
+            "old_corr": None, "marcel_corr": None,
         })
 
     if "projected_whip_mean" in sim_sub.columns:
@@ -650,13 +626,10 @@ def walk_forward_season_sim(
         whip_m = _compute_metrics(test_whip, sim_whip)
         summary_rows.append({
             "stat": "WHIP", "role": "ALL", "test_season": test_season,
-            "n": whip_m.get("n"), "sim_mae": whip_m.get("mae"),
-            "sim_rmse": whip_m.get("rmse"), "sim_bias": whip_m.get("bias"),
-            "sim_corr": whip_m.get("correlation"),
+            "n": whip_m.get("n"),
+            "sim_bias": whip_m.get("bias"), "sim_corr": whip_m.get("correlation"),
             "sim_cov80": None, "sim_cov95": None,
-            "old_mae": None, "old_corr": None,
-            "marcel_mae": None, "marcel_corr": None,
-            "mae_vs_marcel_pct": None, "mae_vs_old_pct": None,
+            "old_corr": None, "marcel_corr": None,
         })
 
     # FIP- and Runs Saved (need actual FIP from DB for comparison)
@@ -675,13 +648,10 @@ def walk_forward_season_sim(
             summary_rows.append({
                 "stat": stat_label, "role": "ALL", "test_season": test_season,
                 "n": len(sim_vals),
-                "sim_mae": None, "sim_rmse": None,
                 "sim_bias": float(np.nanmean(sim_vals)),  # store mean as reference
                 "sim_corr": None,
                 "sim_cov80": None, "sim_cov95": None,
-                "old_mae": None, "old_corr": None,
-                "marcel_mae": None, "marcel_corr": None,
-                "mae_vs_marcel_pct": None, "mae_vs_old_pct": None,
+                "old_corr": None, "marcel_corr": None,
             })
 
     summary = pd.DataFrame(summary_rows)
@@ -959,20 +929,13 @@ def walk_forward_hitter_sim(
                 ).values.astype(float)
                 old_m = _compute_metrics(actual_vals, o_vals)
 
-        mae_vs_marcel = 0.0
-        if marcel_m.get("mae", 0) > 0:
-            mae_vs_marcel = (marcel_m["mae"] - sim_m.get("mae", 0)) / marcel_m["mae"] * 100
-
         summary_rows.append({
             "stat": stat_prefix, "role": "ALL", "test_season": test_season,
             "n": sim_m.get("n", 0),
-            "sim_mae": sim_m.get("mae"), "sim_rmse": sim_m.get("rmse"),
             "sim_bias": sim_m.get("bias"), "sim_corr": sim_m.get("correlation"),
             "sim_cov80": sim_m.get("coverage_80"), "sim_cov95": sim_m.get("coverage_95"),
-            "old_mae": old_m.get("mae"), "old_corr": old_m.get("correlation"),
-            "marcel_mae": marcel_m.get("mae"), "marcel_corr": marcel_m.get("correlation"),
-            "mae_vs_marcel_pct": mae_vs_marcel,
-            "mae_vs_old_pct": (old_m["mae"] - sim_m.get("mae", 0)) / old_m["mae"] * 100 if old_m.get("mae", 0) > 0 else None,
+            "old_corr": old_m.get("correlation"),
+            "marcel_corr": marcel_m.get("correlation"),
         })
 
     # ---- wOBA / wRC+ / wRAA validation ----
@@ -1010,12 +973,9 @@ def walk_forward_hitter_sim(
             summary_rows.append({
                 "stat": stat_label, "role": "ALL", "test_season": test_season,
                 "n": m.get("n", 0),
-                "sim_mae": m.get("mae"), "sim_rmse": m.get("rmse"),
                 "sim_bias": m.get("bias"), "sim_corr": m.get("correlation"),
                 "sim_cov80": m.get("coverage_80"), "sim_cov95": m.get("coverage_95"),
-                "old_mae": None, "old_corr": None,
-                "marcel_mae": None, "marcel_corr": None,
-                "mae_vs_marcel_pct": None, "mae_vs_old_pct": None,
+                "old_corr": None, "marcel_corr": None,
             })
 
     # wRAA (no direct actual — record distribution for reference)
@@ -1023,13 +983,10 @@ def walk_forward_hitter_sim(
         summary_rows.append({
             "stat": "wRAA", "role": "ALL", "test_season": test_season,
             "n": len(sim_sub),
-            "sim_mae": None, "sim_rmse": None,
             "sim_bias": float(sim_sub["projected_wraa_mean"].mean()),
             "sim_corr": None,
             "sim_cov80": None, "sim_cov95": None,
-            "old_mae": None, "old_corr": None,
-            "marcel_mae": None, "marcel_corr": None,
-            "mae_vs_marcel_pct": None, "mae_vs_old_pct": None,
+            "old_corr": None, "marcel_corr": None,
         })
 
     summary = pd.DataFrame(summary_rows)

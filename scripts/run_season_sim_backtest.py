@@ -49,17 +49,10 @@ def _print_summary(summary: pd.DataFrame) -> None:
         print("\n--- OVERALL ---")
         for _, r in overall.iterrows():
             stat = r["stat"]
-            mae = f"MAE={r['sim_mae']:5.1f}" if pd.notna(r.get("sim_mae")) else ""
             bias = f"bias={r['sim_bias']:+5.1f}" if pd.notna(r.get("sim_bias")) else ""
             corr = f"r={r['sim_corr']:.3f}" if pd.notna(r.get("sim_corr")) else ""
             cov80 = f"80%CI={r['sim_cov80']:.0%}" if pd.notna(r.get("sim_cov80")) else ""
-            vs_m = ""
-            if pd.notna(r.get("mae_vs_marcel_pct")) and r["mae_vs_marcel_pct"] != 0:
-                vs_m = f"vs Marcel: {r['mae_vs_marcel_pct']:+.1f}%"
-            vs_o = ""
-            if pd.notna(r.get("mae_vs_old_pct")) and r["mae_vs_old_pct"] != 0:
-                vs_o = f"vs old: {r['mae_vs_old_pct']:+.1f}%"
-            parts = [p for p in [mae, bias, corr, cov80, vs_m, vs_o] if p]
+            parts = [p for p in [bias, corr, cov80] if p]
             print(f"  {stat:15s}  {r['n']:3.0f}p  {'  '.join(parts)}")
 
     # SP/RP split
@@ -70,14 +63,10 @@ def _print_summary(summary: pd.DataFrame) -> None:
         print(f"\n--- {role} ---")
         for _, r in split.iterrows():
             stat = r["stat"]
-            mae = f"MAE={r['sim_mae']:5.1f}" if pd.notna(r.get("sim_mae")) else ""
             bias = f"bias={r['sim_bias']:+5.1f}" if pd.notna(r.get("sim_bias")) else ""
             corr = f"r={r['sim_corr']:.3f}" if pd.notna(r.get("sim_corr")) else ""
             cov80 = f"80%CI={r['sim_cov80']:.0%}" if pd.notna(r.get("sim_cov80")) else ""
-            vs_m = ""
-            if pd.notna(r.get("mae_vs_marcel_pct")) and r["mae_vs_marcel_pct"] != 0:
-                vs_m = f"vs Marcel: {r['mae_vs_marcel_pct']:+.1f}%"
-            parts = [p for p in [mae, bias, corr, cov80, vs_m] if p]
+            parts = [p for p in [bias, corr, cov80] if p]
             print(f"  {stat:15s}  {r['n']:3.0f}p  {'  '.join(parts)}")
 
     # Verdict
@@ -87,25 +76,15 @@ def _print_summary(summary: pd.DataFrame) -> None:
     k_all = summary[(summary["stat"] == "total_k") & (summary["role"] == "ALL")]
     if not k_all.empty:
         r = k_all.iloc[0]
-        beats_marcel = r.get("mae_vs_marcel_pct", 0) > 0
-        beats_old = r.get("mae_vs_old_pct", 0) > 0
-        print(f"  K:  Sim {'BEATS' if beats_marcel else 'LOSES TO'} Marcel "
-              f"({r.get('mae_vs_marcel_pct', 0):+.1f}%), "
-              f"{'BEATS' if beats_old else 'LOSES TO'} old counting "
-              f"({r.get('mae_vs_old_pct', 0):+.1f}%)")
+        cov80 = r.get("sim_cov80", 0)
+        corr = r.get("sim_corr", float("nan"))
+        print(f"  K:  corr={corr:.3f}, 80%CI={cov80:.0%}")
 
     ip_all = summary[(summary["stat"] == "projected_ip") & (summary["role"] == "ALL")]
     if not ip_all.empty:
         r = ip_all.iloc[0]
-        print(f"  IP: Sim MAE={r['sim_mae']:.1f}, bias={r['sim_bias']:+.1f}, "
+        print(f"  IP: bias={r['sim_bias']:+.1f}, "
               f"80%CI={r.get('sim_cov80', 0):.0%}")
-
-    k_sp = summary[(summary["stat"] == "total_k") & (summary["role"] == "SP")]
-    k_rp = summary[(summary["stat"] == "total_k") & (summary["role"] == "RP")]
-    if not k_sp.empty and not k_rp.empty:
-        sp_v = k_sp.iloc[0].get("mae_vs_marcel_pct", 0)
-        rp_v = k_rp.iloc[0].get("mae_vs_marcel_pct", 0)
-        print(f"  K split: SP {sp_v:+.1f}% vs Marcel, RP {rp_v:+.1f}% vs Marcel")
 
     print()
 
@@ -183,14 +162,10 @@ def main() -> None:
 
     for _, r in h_summary.iterrows():
         stat = r["stat"]
-        mae = f"MAE={r['sim_mae']:5.1f}" if pd.notna(r.get("sim_mae")) else ""
         bias = f"bias={r['sim_bias']:+5.1f}" if pd.notna(r.get("sim_bias")) else ""
         corr = f"r={r['sim_corr']:.3f}" if pd.notna(r.get("sim_corr")) else ""
         cov80 = f"80%CI={r['sim_cov80']:.0%}" if pd.notna(r.get("sim_cov80")) else ""
-        vs_m = ""
-        if pd.notna(r.get("mae_vs_marcel_pct")) and r["mae_vs_marcel_pct"] != 0:
-            vs_m = f"vs Marcel: {r['mae_vs_marcel_pct']:+.1f}%"
-        parts = [p for p in [mae, bias, corr, cov80, vs_m] if p]
+        parts = [p for p in [bias, corr, cov80] if p]
         print(f"  {stat:15s}  {r['n']:3.0f}p  {'  '.join(parts)}")
 
     h_summary.to_csv(out_dir / "hitter_sim_backtest_summary.csv", index=False)

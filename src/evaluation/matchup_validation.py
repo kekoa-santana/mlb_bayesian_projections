@@ -147,23 +147,15 @@ def compute_validation_metrics(predictions: pd.DataFrame) -> dict[str, float]:
     Returns
     -------
     dict[str, float]
-        Keys: rmse_baseline, rmse_matchup, mae_baseline, mae_matchup,
-        lift_residual_corr, lift_residual_pvalue, paired_t_stat,
+        Keys: lift_residual_corr, lift_residual_pvalue, paired_t_stat,
         paired_t_pvalue, n_games, pct_matched.
     """
     actual = predictions["actual_k"].values
     baseline = predictions["predicted_k_baseline"].values
     matchup = predictions["predicted_k_matchup"].values
 
-    # RMSE
     resid_baseline = actual - baseline
     resid_matchup = actual - matchup
-    rmse_baseline = float(np.sqrt(np.mean(resid_baseline ** 2)))
-    rmse_matchup = float(np.sqrt(np.mean(resid_matchup ** 2)))
-
-    # MAE
-    mae_baseline = float(np.mean(np.abs(resid_baseline)))
-    mae_matchup = float(np.mean(np.abs(resid_matchup)))
 
     # Lift-residual correlation: does the matchup adjustment correlate with
     # where the baseline under/over-predicts?
@@ -186,10 +178,6 @@ def compute_validation_metrics(predictions: pd.DataFrame) -> dict[str, float]:
     ) if predictions["n_total"].sum() > 0 else 0.0
 
     return {
-        "rmse_baseline": rmse_baseline,
-        "rmse_matchup": rmse_matchup,
-        "mae_baseline": mae_baseline,
-        "mae_matchup": mae_matchup,
         "lift_residual_corr": lift_residual_corr,
         "lift_residual_pvalue": lift_residual_pvalue,
         "paired_t_stat": paired_t_stat,
@@ -236,20 +224,19 @@ def run_matchup_validation(
         rows.append(metrics)
 
         logger.info(
-            "Season %d: RMSE baseline=%.3f matchup=%.3f, "
-            "lift-residual r=%.4f (p=%.4f), n=%d",
+            "Season %d: lift-residual r=%.4f (p=%.4f), "
+            "paired_t=%.4f (p=%.4f), n=%d",
             season,
-            metrics["rmse_baseline"],
-            metrics["rmse_matchup"],
             metrics["lift_residual_corr"],
             metrics["lift_residual_pvalue"],
+            metrics["paired_t_stat"],
+            metrics["paired_t_pvalue"],
             metrics["n_games"],
         )
 
     df = pd.DataFrame(rows)
     col_order = [
         "season", "n_games", "pct_matched",
-        "rmse_baseline", "rmse_matchup", "mae_baseline", "mae_matchup",
         "lift_residual_corr", "lift_residual_pvalue",
         "paired_t_stat", "paired_t_pvalue",
     ]

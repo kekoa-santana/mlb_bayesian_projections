@@ -106,9 +106,9 @@ def _exposure_conditioned_scouting_weight(
 # Hitter sub-component weights (sum to 1.0)
 # ---------------------------------------------------------------------------
 _HITTER_WEIGHTS = {
-    "offense": 0.65,
+    "offense": 0.63,
     "fielding": 0.13,
-    "baserunning": 0.06,
+    "baserunning": 0.08,
     "trajectory": 0.08,
     "positional_adj": 0.05,
     "role": 0.02,
@@ -1129,22 +1129,32 @@ def _build_hitter_offense_score(
 
     # =================================================================
     # Combine buckets into offense_score
-    # Production anchor (35%) ensures actual run output dominates.
-    # Contact + decisions (25%) reward projectable skills but can't
-    # carry a player whose results don't follow.
+    # Two-layer blend:
+    #   70% — projected wOBA percentile (total production truth).
+    #          Prevents the bucket decomposition from creating artificial
+    #          spread between players with similar total output (e.g. a
+    #          low-walk contact hitter vs a high-walk power hitter).
+    #   30% — skill-bucket composite (profile differentiation).
+    #          Rewards/penalizes specific skill profiles on top of the
+    #          production anchor.  Decision skill reduced to 5% — walk
+    #          rate is already captured in projected wOBA; higher weight
+    #          double-penalizes aggressive hitters whose results are fine.
     # =================================================================
-    merged["offense_score"] = (
-        0.15 * merged["contact_skill"]
-        + 0.10 * merged["decision_skill"]
-        + 0.40 * merged["damage_skill"]
+    woba_anchor = _pctl(merged["projected_woba"].fillna(0.310))
+
+    bucket_composite = (
+        0.175 * merged["contact_skill"]
+        + 0.05 * merged["decision_skill"]
+        + 0.425 * merged["damage_skill"]
         + 0.35 * merged["production_skill"]
     )
 
+    merged["offense_score"] = 0.70 * woba_anchor + 0.30 * bucket_composite
+
     # Small-sample dampening toward league average.  Only kicks in once PA
-    # reaches the contact-trust floor (100) — below that, all trust ramps
+    # reaches the contact-trust floor (60) — below that, all trust ramps
     # give 0% observed weight so the score is already projection-based and
-    # dampening would just compress differentiation (harmful early-season
-    # when everyone has <100 PA).
+    # dampening would just compress differentiation.
     pa_confidence = ((pa - 150) / (400 - 150)).clip(0, 1)
     dampening = 0.50 * (1.0 - pa_confidence)
     damped = merged["offense_score"] * (1 - dampening) + 0.50 * dampening
@@ -1997,20 +2007,6 @@ def rank_hitters(
     base["baserunning_score"] = base["baserunning_score"].fillna(0.50)
     base["platoon_score"] = base["platoon_score"].fillna(0.50)
 
-    # Discipline modifier: low chase + low 2-strike whiff = more valuable
-    if "chase_rate" in base.columns:
-        chase_pctl = _inv_pctl(base["chase_rate"].fillna(base["chase_rate"].median()))
-        whiff_2s_pctl = _inv_pctl(base["two_strike_whiff_rate"].fillna(base["two_strike_whiff_rate"].median()))
-        discipline_score = 0.60 * chase_pctl + 0.40 * whiff_2s_pctl
-        discipline_modifier = 0.95 + 0.10 * discipline_score  # scales ±5%
-        base["offense_score"] = (base["offense_score"] * discipline_modifier).clip(0, 1)
-
-    # Apply platoon modifier to offense: balanced hitters get a boost,
-    # extreme-split hitters get penalized. Scales offense by ±10%
-    # (widened from ±5% — industry research shows extreme splits = 1+ WAR penalty).
-    platoon_modifier = 0.90 + 0.20 * base["platoon_score"]  # 0.90 to 1.10
-    base["offense_score"] = (base["offense_score"] * platoon_modifier).clip(0, 1)
-
     # --- Postseason performance boost (player-specific) ---
     # Apply individual postseason performance as an additive adjustment
     # to offense_score.  Elite October performers get up to +5%, poor
@@ -2247,7 +2243,7 @@ def rank_hitters(
             # Regress diamond rating by PA reliability (same for both scores)
             dr_norm = (base["tools_rating"] / 10.0).clip(0, 1)
 
-            pa_col = base["pa"] if "pa" in base.columns else base.get("total_pa", 400)
+            pa_col = base["pa"].fillna(0) if "pa" in base.columns else base.get("total_pa", 400)
             cfg = _RANK_CFG["hitter"]
             reliability = ((pa_col - cfg["pa_ramp_min"]) / (cfg["pa_ramp_max"] - cfg["pa_ramp_min"])).clip(0, 1)
 

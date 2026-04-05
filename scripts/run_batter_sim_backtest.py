@@ -100,16 +100,9 @@ def _print_results(
         print(f"\nTest Season {int(row['test_season'])} ({int(row['n_games'])} games):")
         for stat, label in [("k", "K"), ("bb", "BB"), ("h", "H"), ("hr", "HR"),
                             ("double", "2B"), ("triple", "3B"), ("tb", "TB")]:
-            rmse_key = f"{stat}_rmse"
-            if rmse_key in row and not pd.isna(row[rmse_key]):
-                line = f"  {label:>3s}: RMSE={row[rmse_key]:.3f}"
-                mae_key = f"{stat}_mae"
-                if mae_key in row:
-                    line += f"  MAE={row[mae_key]:.3f}"
-                corr_key = f"{stat}_corr"
-                if corr_key in row and not pd.isna(row[corr_key]):
-                    line += f"  corr={row[corr_key]:.3f}"
-                print(line)
+            corr_key = f"{stat}_corr"
+            if corr_key in row and not pd.isna(row.get(corr_key)):
+                print(f"  {label:>3s}: corr={row[corr_key]:.3f}")
 
         # Brier scores
         brier_labels = [
@@ -176,10 +169,9 @@ def _print_results(
     print("\n--- Overall Averages ---")
     for stat, label in [("k", "K"), ("bb", "BB"), ("h", "H"), ("hr", "HR"),
                         ("double", "2B"), ("triple", "3B"), ("tb", "TB")]:
-        rmse_key = f"{stat}_rmse"
-        if rmse_key in summary.columns:
-            print(f"  {label:>3s}: RMSE={summary[rmse_key].mean():.3f}  "
-                  f"MAE={summary[f'{stat}_mae'].mean():.3f}")
+        corr_key = f"{stat}_corr"
+        if corr_key in summary.columns:
+            print(f"  {label:>3s}: corr={summary[corr_key].mean():.3f}")
 
     # Avg Brier and log loss per stat
     for stat, label in [("k", "K"), ("h", "H"), ("hr", "HR"), ("tb", "TB")]:
