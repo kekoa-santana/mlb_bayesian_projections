@@ -3534,6 +3534,63 @@ def get_team_reliever_roster(
     return read_sql(query)
 
 
+def get_bullpen_trailing_workload(
+    seasons: list[int],
+    trailing_days: int = 3,
+) -> pd.DataFrame:
+    """Per-team-game trailing bullpen IP over the last N days.
+
+    Used to detect bullpen fatigue: high trailing IP → manager stretches
+    the starter deeper.
+
+    Parameters
+    ----------
+    seasons : list[int]
+        Seasons to include.
+    trailing_days : int
+        Number of trailing calendar days to sum bullpen IP (default 3).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: team_id, game_pk, game_date, bullpen_trailing_ip.
+    """
+    season_list = ", ".join(str(s) for s in seasons)
+    query = f"""
+    WITH reliever_ip AS (
+        SELECT
+            fpg.team_id,
+            dg.game_pk,
+            dg.game_date,
+            SUM(fpg.pit_ip) AS bullpen_ip
+        FROM production.fact_player_game_mlb fpg
+        JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+        WHERE fpg.pit_is_starter = FALSE
+          AND dg.game_type = 'R'
+          AND fpg.pit_bf >= 1
+          AND fpg.season IN ({season_list})
+        GROUP BY fpg.team_id, dg.game_pk, dg.game_date
+    )
+    SELECT
+        r.team_id,
+        r.game_pk,
+        r.game_date,
+        COALESCE(SUM(prev.bullpen_ip), 0.0) AS bullpen_trailing_ip
+    FROM reliever_ip r
+    LEFT JOIN reliever_ip prev
+        ON prev.team_id = r.team_id
+       AND prev.game_date >= r.game_date - INTERVAL '{trailing_days} days'
+       AND prev.game_date < r.game_date
+    GROUP BY r.team_id, r.game_pk, r.game_date
+    ORDER BY r.team_id, r.game_date
+    """
+    logger.info(
+        "Fetching bullpen trailing workload (%d-day) for seasons %s",
+        trailing_days, seasons,
+    )
+    return read_sql(query)
+
+
 def get_reliever_role_history(
     seasons: list[int],
     min_games: int = 10,

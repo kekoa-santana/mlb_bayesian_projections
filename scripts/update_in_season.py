@@ -320,7 +320,12 @@ def simulate_todays_games(
     comprehensive stat distributions (K, BB, H, HR, IP, pitches).
     """
     from src.models.game_sim.exit_model import ExitModel
-    from src.models.game_sim.simulator import simulate_game, compute_stamina_offset
+    from src.models.game_sim.pa_outcome_model import GameContext
+    from src.models.game_sim.simulator import (
+        simulate_game,
+        compute_stamina_offset,
+        compute_exit_offset,
+    )
     from src.models.game_sim.pitch_count_model import build_pitch_count_features
     from src.models.game_sim.tto_model import build_all_tto_lifts
     from src.models.game_sim.form_model import (
@@ -353,6 +358,46 @@ def simulate_todays_games(
     hr_npz_path = DASHBOARD_DIR / "pitcher_hr_samples.npz"
     bb_npz = dict(np.load(bb_npz_path)) if bb_npz_path.exists() else {}
     hr_npz = dict(np.load(hr_npz_path)) if hr_npz_path.exists() else {}
+
+    # Load game-level BB adjustment model
+    import pickle
+    from src.models.game_bb_adj import predict_game_bb_adjustment
+    bb_adj_bundle = None
+    bb_adj_path = DASHBOARD_DIR / "game_bb_adj_model.pkl"
+    if bb_adj_path.exists():
+        try:
+            with open(bb_adj_path, "rb") as f:
+                bb_adj_bundle = pickle.load(f)
+            logger.info(
+                "Loaded game BB adjustment model (n_train=%d)",
+                bb_adj_bundle.get("n_train", 0),
+            )
+        except Exception as e:
+            logger.warning("Failed to load BB adjustment model: %s", e)
+
+    # Pitcher zone% for BB adjustment features
+    obs_path = DASHBOARD_DIR / "pitcher_observed.parquet"
+    pitcher_obs = pd.read_parquet(obs_path) if obs_path.exists() else pd.DataFrame()
+    pitcher_zone_lookup: dict[int, float] = {}
+    if not pitcher_obs.empty and "zone_pct" in pitcher_obs.columns:
+        for _, r in pitcher_obs[["pitcher_id", "zone_pct"]].drop_duplicates("pitcher_id").iterrows():
+            pitcher_zone_lookup[int(r["pitcher_id"])] = float(r["zone_pct"])
+
+    # Umpire BB lifts for BB adjustment
+    ump_bb_lift_map: dict[str, float] = {}
+    try:
+        from src.data.queries import get_umpire_tendencies
+        ump_df = get_umpire_tendencies(seasons=list(range(2021, SEASON)), min_games=30)
+        if not ump_df.empty:
+            ump_bb_lift_map = dict(zip(ump_df["hp_umpire_name"], ump_df["bb_logit_lift"]))
+    except Exception:
+        pass
+
+    # Hitter BB samples for lineup BB rate computation
+    hitter_bb_npz: dict[str, np.ndarray] = {}
+    _hbb_path = DASHBOARD_DIR / "hitter_bb_samples.npz"
+    if _hbb_path.exists():
+        hitter_bb_npz = dict(np.load(_hbb_path))
 
     # Load exit tendencies, pitch count features, TTO profiles
     tend_path = DASHBOARD_DIR / "pitcher_exit_tendencies.parquet"
@@ -516,10 +561,53 @@ def simulate_todays_games(
                     avg_pitches = float(tr.get("avg_pitches", 88.0))
                     avg_ip = float(tr.get("avg_ip", 5.28)) if pd.notna(tr.get("avg_ip")) else 5.28
                     team_avg_p = float(tr.get("team_avg_pitches", 88.0)) if pd.notna(tr.get("team_avg_pitches")) else 88.0
-            stamina_offset = compute_stamina_offset(avg_ip)
+            # BF prior for unified exit offset
+            mu_bf_val = None
+            if bf_priors is not None and not bf_priors.empty:
+                bf_row = bf_priors[bf_priors["pitcher_id"] == pid]
+                if len(bf_row) > 0:
+                    mu_bf_val = float(
+                        bf_row.sort_values("season").iloc[-1]["mu_bf"]
+                    )
+
+            # Lineup patience aggregate
+            lineup_ppa_agg = float(np.mean(batter_adjs))
+
+            exit_offset = compute_exit_offset(
+                mu_bf=mu_bf_val,
+                pitcher_avg_ip=avg_ip,
+                lineup_ppa_aggregate=lineup_ppa_agg,
+            )
 
             # Pitcher form lift (BB% only — K% form near-zero for pitchers)
             pit_form = pitcher_form_lifts.get(pid, PitcherFormLifts())
+
+            # XGBoost game-level BB adjustment
+            xgb_bb_delta = 0.0
+            if bb_adj_bundle is not None and bb_adj_bundle.get("model") is not None:
+                pitcher_bb_mean = float(np.mean(bb_samp))
+                zone_pct = pitcher_zone_lookup.get(pid, 0.45)
+                # Umpire: look up from schedule if available
+                ump_name = game.get("hp_umpire_name", "")
+                ump_bb = ump_bb_lift_map.get(ump_name, 0.0) if ump_name else 0.0
+                # Lineup avg BB rate from hitter BB posteriors
+                lineup_avg_bb = 0.085
+                if has_lineup and hitter_bb_npz:
+                    lu_bbs = [
+                        float(np.mean(hitter_bb_npz[str(bid)]))
+                        for bid in lineup_ids if str(bid) in hitter_bb_npz
+                    ]
+                    if lu_bbs:
+                        lineup_avg_bb = float(np.mean(lu_bbs))
+                xgb_bb_delta = predict_game_bb_adjustment(
+                    bb_adj_bundle,
+                    pitcher_bb_rate=pitcher_bb_mean,
+                    pitcher_zone_pct=zone_pct,
+                    umpire_bb_lift=ump_bb,
+                    lineup_avg_bb_rate=lineup_avg_bb,
+                    is_home=int(side == "home"),
+                    days_rest=5,
+                )
 
             # Run PA-by-PA simulation
             try:
@@ -533,8 +621,11 @@ def simulate_todays_games(
                     batter_ppa_adjs=batter_adjs,
                     exit_model=exit_model,
                     pitcher_avg_pitches=avg_pitches,
-                    form_bb_lift=pit_form.bb_lift,
-                    exit_calibration_offset=stamina_offset,
+                    game_context=GameContext(
+                        form_bb_lift=pit_form.bb_lift,
+                        xgb_bb_lift=xgb_bb_delta,
+                    ),
+                    exit_calibration_offset=exit_offset,
                     manager_pull_tendency=team_avg_p,
                     n_sims=10000,
                     random_seed=42 + gpk,

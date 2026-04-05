@@ -37,7 +37,12 @@ from src.data.queries import (
     get_weather_effects,
 )
 from src.models.game_sim.exit_model import ExitModel
-from src.models.game_sim.simulator import simulate_game, compute_stamina_offset
+from src.models.game_sim.pa_outcome_model import GameContext
+from src.models.game_sim.simulator import (
+    simulate_game,
+    compute_stamina_offset,
+    compute_exit_offset,
+)
 from src.models.game_sim.tto_model import build_all_tto_lifts
 from src.models.matchup import score_matchup_for_stat
 from src.models.pitcher_k_rate_model import (
@@ -49,7 +54,7 @@ from src.models.pitcher_model import (
     fit_pitcher_model,
     prepare_pitcher_data,
 )
-from src.models.game_k_model import extract_pitcher_k_rate_samples
+from src.models.posterior_utils import extract_pitcher_k_rate_samples
 
 logger = logging.getLogger(__name__)
 
@@ -162,15 +167,21 @@ def _compute_lineup_matchup_lifts(
     pitcher_arsenal: pd.DataFrame,
     hitter_vuln: pd.DataFrame,
     baselines_pt: dict[str, dict[str, float]],
-) -> dict[str, np.ndarray]:
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """Score matchups for a 9-batter lineup across K, BB, HR.
 
     Returns
     -------
-    dict[str, np.ndarray]
-        Keys: 'k', 'bb', 'hr'. Values: shape (9,) logit lifts.
+    tuple[dict[str, np.ndarray], dict[str, np.ndarray]]
+        (lifts, reliabilities). Each dict has keys 'k', 'bb', 'hr'
+        with shape (9,) arrays. Reliability ranges [0, 1].
     """
     lifts: dict[str, np.ndarray] = {
+        "k": np.zeros(9),
+        "bb": np.zeros(9),
+        "hr": np.zeros(9),
+    }
+    reliabilities: dict[str, np.ndarray] = {
         "k": np.zeros(9),
         "bb": np.zeros(9),
         "hr": np.zeros(9),
@@ -191,8 +202,9 @@ def _compute_lineup_matchup_lifts(
             if np.isnan(lift) if isinstance(lift, float) else False:
                 lift = 0.0
             lifts[stat][i] = lift
+            reliabilities[stat][i] = result.get("avg_reliability", 0.0)
 
-    return lifts
+    return lifts, reliabilities
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +387,32 @@ def build_game_sim_predictions(
         .reset_index()
     )
 
+    # BF priors from bf_model (empirical Bayes)
+    from src.models.bf_model import compute_pitcher_bf_priors
+    bf_game_logs = get_cached_pitcher_game_logs(last_train)
+    for s in train_seasons[:-1]:
+        bf_game_logs = pd.concat(
+            [bf_game_logs, get_cached_pitcher_game_logs(s)],
+            ignore_index=True,
+        )
+    bf_priors = compute_pitcher_bf_priors(bf_game_logs)
+    bf_priors_latest = (
+        bf_priors.sort_values("season")
+        .groupby("pitcher_id").last().reset_index()
+    )
+    logger.info("BF priors: %d pitchers", len(bf_priors_latest))
+
+    # Bullpen trailing workload for test season
+    from src.data.queries import get_bullpen_trailing_workload
+    bullpen_workload = get_bullpen_trailing_workload([test_season])
+    # Build (team_id, game_pk) → bullpen_trailing_ip lookup
+    bullpen_wl_lookup: dict[tuple[int, int], float] = {}
+    if not bullpen_workload.empty:
+        for _, bw_row in bullpen_workload.iterrows():
+            key = (int(bw_row["team_id"]), int(bw_row["game_pk"]))
+            bullpen_wl_lookup[key] = float(bw_row["bullpen_trailing_ip"])
+        logger.info("Bullpen workload: %d team-games", len(bullpen_wl_lookup))
+
     # ---------------------------------------------------------------
     # 7. Load test season data — actuals + lineups
     # ---------------------------------------------------------------
@@ -393,7 +431,7 @@ def build_game_sim_predictions(
 
     # Load actuals from fact_player_game_mlb
     actuals = read_sql(f"""
-        SELECT player_id AS pitcher_id, game_pk,
+        SELECT player_id AS pitcher_id, game_pk, team_id,
                pit_k, pit_bb, pit_h, pit_hr, pit_bf,
                pit_pitches, pit_ip, pit_er
         FROM production.fact_player_game_mlb
@@ -477,8 +515,8 @@ def build_game_sim_predictions(
             n_skipped += 1
             continue
 
-        # Compute matchup lifts
-        matchup_lifts = _compute_lineup_matchup_lifts(
+        # Compute matchup lifts + reliability
+        matchup_lifts, matchup_reliabilities = _compute_lineup_matchup_lifts(
             pitcher_id, batter_ids,
             pitcher_arsenal, hitter_vuln, baselines_pt,
         )
@@ -508,7 +546,29 @@ def build_game_sim_predictions(
             avg_pitches = 88.0
             avg_ip = 5.2
             team_avg_p = 88.0
-        stamina_offset = compute_stamina_offset(avg_ip)
+
+        # BF prior for this pitcher (bf_model empirical Bayes)
+        bf_row = bf_priors_latest[
+            bf_priors_latest["pitcher_id"] == pitcher_id
+        ]
+        mu_bf = (
+            float(bf_row.iloc[0]["mu_bf"])
+            if len(bf_row) > 0 else None
+        )
+
+        # Bullpen workload: look up pitcher's team for this game
+        actual_row_team = actuals[
+            (actuals["pitcher_id"] == pitcher_id)
+            & (actuals["game_pk"] == game_pk)
+        ]
+        pitcher_team_id_for_bp = (
+            int(actual_row_team.iloc[0]["team_id"])
+            if len(actual_row_team) > 0 else None
+        )
+        bullpen_ip = (
+            bullpen_wl_lookup.get((pitcher_team_id_for_bp, game_pk))
+            if pitcher_team_id_for_bp is not None else None
+        )
 
         # Context lifts
         ump_k = umpire_lifts["k"].get(game_pk, 0.0)
@@ -526,6 +586,17 @@ def build_game_sim_predictions(
             season=last_train,
         )
 
+        # Lineup patience: mean of batter P/PA adjustments
+        lineup_ppa_agg = float(np.mean(batter_adjs))
+
+        # Unified exit offset with all three signals
+        exit_offset = compute_exit_offset(
+            mu_bf=mu_bf,
+            pitcher_avg_ip=avg_ip,
+            bullpen_trailing_ip=bullpen_ip,
+            lineup_ppa_aggregate=lineup_ppa_agg,
+        )
+
         # Run simulation
         try:
             sim_result = simulate_game(
@@ -538,11 +609,14 @@ def build_game_sim_predictions(
                 batter_ppa_adjs=batter_adjs,
                 exit_model=exit_model,
                 pitcher_avg_pitches=avg_pitches,
-                exit_calibration_offset=stamina_offset,
-                umpire_k_lift=ump_k,
-                umpire_bb_lift=ump_bb,
-                park_hr_lift=park_hr,
-                weather_k_lift=wx_k,
+                exit_calibration_offset=exit_offset,
+                game_context=GameContext(
+                    umpire_k_lift=ump_k,
+                    umpire_bb_lift=ump_bb,
+                    park_hr_lift=park_hr,
+                    weather_k_lift=wx_k,
+                ),
+                lineup_matchup_reliabilities=matchup_reliabilities,
                 manager_pull_tendency=team_avg_p,
                 n_sims=n_sims,
                 random_seed=random_seed + game_pk % 10000,

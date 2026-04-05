@@ -49,7 +49,12 @@ def run(
     """
     from src.data.schedule import fetch_todays_schedule
     from src.models.game_sim.exit_model import ExitModel
-    from src.models.game_sim.simulator import simulate_game, compute_stamina_offset
+    from src.models.game_sim.pa_outcome_model import GameContext
+    from src.models.game_sim.simulator import (
+        simulate_game,
+        compute_stamina_offset,
+        compute_exit_offset,
+    )
     from src.models.game_sim.lineup_simulator import simulate_lineup_game
     from src.models.game_sim.batter_simulator import simulate_batter_game
     from src.models.game_sim.tto_model import build_all_tto_lifts
@@ -350,6 +355,9 @@ def run(
     # --- Run sims per game ---
     pitcher_picks = []
     batter_picks = []
+    # Raw posterior distributions per player-game for Layer 4 market edge.
+    # Keyed by (game_pk, player_id) → {stat: np.ndarray of MC draws}
+    player_posteriors: dict[tuple[int, int], dict[str, np.ndarray]] = {}
 
     for _, game in schedule.iterrows():
         game_pk = int(game["game_pk"])
@@ -474,11 +482,32 @@ def run(
                 and pd.notna(tend_row.iloc[0].get("team_avg_pitches"))
                 else 88.0
             )
-            stamina_offset = compute_stamina_offset(avg_ip)
+            # Pitcher team ID (needed for bullpen + catcher lookups)
+            pitcher_team_id = int(game.get(team_col, 0)) if pd.notna(game.get(team_col)) else 0
+
+            # BF prior for this pitcher
+            bf_row = bf_priors[bf_priors["pitcher_id"] == pitcher_id]
+            mu_bf_val = (
+                float(bf_row.sort_values("season").iloc[-1]["mu_bf"])
+                if len(bf_row) > 0 else None
+            )
+
+            # Bullpen trailing workload (approximate from bullpen_rates total_bf)
+            bp_ip = None
+
+            # Lineup patience aggregate
+            lineup_ppa_agg = float(np.mean(batter_adjs))
+
+            # Unified exit offset with BF prior + bullpen + lineup patience
+            exit_offset = compute_exit_offset(
+                mu_bf=mu_bf_val,
+                pitcher_avg_ip=avg_ip,
+                bullpen_trailing_ip=bp_ip,
+                lineup_ppa_aggregate=lineup_ppa_agg,
+            )
 
             # Catcher framing lift (pitcher's own team's catcher)
             catcher_k_lift = 0.0
-            pitcher_team_id = int(game.get(team_col, 0)) if pd.notna(game.get(team_col)) else 0
             if catcher_framing_lookup and pitcher_team_id and not roster.empty:
                 id_col_r = "org_id" if "org_id" in roster.columns else "team_id"
                 _has_pos = "primary_position" in roster.columns
@@ -505,11 +534,14 @@ def run(
                     batter_ppa_adjs=batter_adjs,
                     exit_model=exit_model,
                     pitcher_avg_pitches=avg_pitches,
-                    form_bb_lift=pit_form.bb_lift,
-                    exit_calibration_offset=stamina_offset,
-                    umpire_k_lift=ump_k_lift + catcher_k_lift + platoon_k_lift,
-                    umpire_bb_lift=ump_bb_lift + platoon_bb_lift,
-                    weather_k_lift=wx_k_lift,
+                    game_context=GameContext(
+                        umpire_k_lift=ump_k_lift + platoon_k_lift,
+                        umpire_bb_lift=ump_bb_lift + platoon_bb_lift,
+                        weather_k_lift=wx_k_lift,
+                        catcher_k_lift=catcher_k_lift,
+                        form_bb_lift=pit_form.bb_lift,
+                    ),
+                    exit_calibration_offset=exit_offset,
                     manager_pull_tendency=team_avg_p,
                     n_sims=n_sims,
                     random_seed=42 + game_pk % 10000,
@@ -522,6 +554,16 @@ def run(
                 continue
 
             summary = sim.summary()
+
+            # Stash posteriors for Layer 4 edge analysis
+            player_posteriors[(game_pk, pitcher_id)] = {
+                "k": sim.k_samples,
+                "bb": sim.bb_samples,
+                "hr": sim.hr_samples,
+                "h": sim.h_samples,
+                "outs": sim.outs_samples,
+            }
+
             pitcher_name = game.get(pname_col, "")
             opp_abbr = game.get(opp_abbr_col, "")
             team_abbr = game.get(f"{side}_abbr", "")
@@ -738,6 +780,19 @@ def run(
                 lineup_summary = lineup_sim.batter_summary(slot_idx)
                 batter_name = _lookup_name(roster, batter_id)
 
+                # Stash batter posteriors for Layer 4 edge analysis
+                batter_arrays = lineup_sim.batter_result(slot_idx)
+                player_posteriors[(game_pk, batter_id)] = {
+                    "h": batter_arrays["h_samples"],
+                    "k": batter_arrays["k_samples"],
+                    "bb": batter_arrays["bb_samples"],
+                    "hr": batter_arrays["hr_samples"],
+                    "r": batter_arrays["r_samples"],
+                    "rbi": batter_arrays["rbi_samples"],
+                    "tb": batter_arrays["tb_samples"],
+                    "hrr": batter_arrays["hrr_samples"],
+                }
+
                 # Per-batter sim for TB (uses calibrated PA model,
                 # avoids the lineup sim's PA inflation that biases TB)
                 bid_str = str(batter_id)
@@ -858,6 +913,8 @@ def run(
             dk_cols = ["player_id", "stat", "line"]
             if "over_odds" in dk_resolved.columns:
                 dk_cols.append("over_odds")
+            if "under_odds" in dk_resolved.columns:
+                dk_cols.append("under_odds")
             if "over_implied" in dk_resolved.columns:
                 dk_cols.append("over_implied")
             dk_lines = (
@@ -866,6 +923,7 @@ def run(
                 .rename(columns={
                     "line": "vegas_line",
                     "over_odds": "vegas_odds",
+                    "under_odds": "vegas_under_odds",
                     "over_implied": "vegas_implied",
                 })
             )
@@ -873,17 +931,23 @@ def run(
                 dk_lines, on=["player_id", "stat"], how="left",
                 suffixes=("", "_dk"),
             )
-            for col in ("vegas_line", "vegas_odds", "vegas_implied"):
+            for col in ("vegas_line", "vegas_odds", "vegas_under_odds", "vegas_implied"):
                 dk_col = f"{col}_dk"
                 if dk_col in all_props.columns:
                     all_props[col] = all_props[col].fillna(all_props[dk_col])
                     all_props.drop(columns=[dk_col], inplace=True)
 
-        for col in ("vegas_line", "vegas_odds", "vegas_implied"):
+        for col in ("vegas_line", "vegas_odds", "vegas_under_odds", "vegas_implied"):
             if col not in all_props.columns:
                 all_props[col] = None
 
         # PP standard lines fill remaining gaps (HRR, etc.)
+        # PP is no-vig: standard lines are even money (decimal 2.0, implied 0.50).
+        if "line_source" not in all_props.columns:
+            all_props["line_source"] = None
+        # Tag rows that already have DK odds
+        all_props.loc[all_props["vegas_odds"].notna(), "line_source"] = "draftkings"
+
         if not pp_resolved.empty and "player_id" in pp_resolved.columns:
             pp_std = pp_resolved[
                 pp_resolved["odds_type"] == "standard"
@@ -897,9 +961,19 @@ def run(
                 all_props = all_props.merge(
                     pp_lines, on=["player_id", "stat"], how="left",
                 )
-                all_props["vegas_line"] = all_props["vegas_line"].fillna(
-                    all_props["vegas_line_pp"]
+                # Fill vegas_line from PP where DK didn't have one
+                pp_fill = (
+                    all_props["vegas_line"].isna()
+                    & all_props["vegas_line_pp"].notna()
                 )
+                all_props.loc[pp_fill, "vegas_line"] = all_props.loc[
+                    pp_fill, "vegas_line_pp"
+                ]
+                # PP standard = no vig, even money
+                all_props.loc[pp_fill, "vegas_odds"] = "-100"
+                all_props.loc[pp_fill, "vegas_under_odds"] = "-100"
+                all_props.loc[pp_fill, "vegas_implied"] = 0.50
+                all_props.loc[pp_fill, "line_source"] = "prizepicks"
                 all_props.drop(columns=["vegas_line_pp"], inplace=True)
 
         # --- Compute model edge at book line ---
@@ -940,6 +1014,9 @@ def run(
             "Vegas merge: %d / %d with lines, %d with edge",
             n_with_line, len(all_props), n_with_edge,
         )
+
+    # --- Layer 4: Market edge analysis ---
+    _run_market_edge(all_props, player_posteriors)
 
     # --- Merge with history: freeze started/finished, update pre-game ---
     # Props for games that have started or finished are never overwritten.
@@ -1023,6 +1100,117 @@ def run(
                     row["player_name"], row["opponent"], row["expected"],
                     row["line"], row["p_over"] * 100,
                 )
+
+
+# ---------------------------------------------------------------------------
+# Layer 4: Market edge integration
+# ---------------------------------------------------------------------------
+
+# Stat label in game_props → lowercase key in player_posteriors
+_STAT_MAP = {
+    "K": "k", "BB": "bb", "HR": "hr", "H": "h", "Outs": "outs",
+    "R": "r", "RBI": "rbi", "TB": "tb", "HRR": "hrr",
+}
+
+
+def _run_market_edge(
+    all_props: pd.DataFrame,
+    player_posteriors: dict[tuple[int, int], dict[str, np.ndarray]],
+) -> None:
+    """Build Layer 4 market edge analysis and save to dashboard.
+
+    Reads vegas_line/vegas_odds from the already-merged all_props,
+    constructs PropLine objects, evaluates edges against raw sim samples,
+    and writes market_edge.parquet.
+    """
+    from src.models.market_edge import (
+        PropLine, american_to_decimal, evaluate_props,
+        build_portfolio, portfolio_to_dataframe, edges_to_dataframe,
+    )
+
+    if all_props.empty or not player_posteriors:
+        return
+
+    # Any row with a line (DK or PP) can be evaluated
+    has_line = all_props["vegas_line"].notna()
+    eligible = all_props[has_line].copy()
+    if eligible.empty:
+        logger.info("Market edge: no rows with book lines, skipping")
+        return
+
+    all_edges = []
+    all_positions = []
+
+    # Group by game_pk + player_id so we can do correlated portfolio per game
+    for (gpk, pid), group in eligible.groupby(["game_pk", "player_id"]):
+        samples = player_posteriors.get((int(gpk), int(pid)))
+        if samples is None:
+            continue
+
+        # Build PropLine for each stat row with a book line
+        props = []
+        for _, row in group.iterrows():
+            stat_lower = _STAT_MAP.get(row["stat"])
+            if stat_lower is None or stat_lower not in samples:
+                continue
+
+            source = str(row.get("line_source", "")) or "unknown"
+
+            if pd.notna(row.get("vegas_odds")):
+                over_dec = american_to_decimal(row["vegas_odds"])
+                under_raw = row.get("vegas_under_odds")
+                under_dec = (
+                    american_to_decimal(under_raw)
+                    if pd.notna(under_raw) else over_dec
+                )
+            else:
+                # PP standard or missing odds → even money (no vig)
+                over_dec = 2.0
+                under_dec = 2.0
+
+            props.append(PropLine(
+                player_id=int(pid),
+                game_pk=int(gpk),
+                stat=stat_lower,
+                line=float(row["vegas_line"]),
+                over_odds=over_dec,
+                under_odds=under_dec,
+                source=source,
+                player_type=str(row["player_type"]),
+            ))
+
+        if not props:
+            continue
+
+        edges = evaluate_props(samples, props, min_edge=0.02)
+        all_edges.extend(edges)
+
+        positions = build_portfolio(edges, samples)
+        all_positions.extend(positions)
+
+    # Save edge analysis
+    edge_df = edges_to_dataframe(all_edges)
+    if not edge_df.empty:
+        # Add player names for readability
+        name_map = dict(zip(all_props["player_id"], all_props["player_name"]))
+        edge_df["player_name"] = edge_df["player_id"].map(name_map)
+        edge_df.to_parquet(DASHBOARD_DIR / "market_edge.parquet", index=False)
+        logger.info(
+            "Market edge: %d props evaluated, %d with edge > 2%%",
+            len(edge_df),
+            len(edge_df[edge_df["edge_over"].abs().gt(0.02) | edge_df["edge_under"].abs().gt(0.02)]),
+        )
+
+    # Save portfolio positions
+    portfolio_df = portfolio_to_dataframe(all_positions)
+    if not portfolio_df.empty:
+        portfolio_df["player_name"] = portfolio_df["player_id"].map(name_map)
+        portfolio_df.to_parquet(DASHBOARD_DIR / "market_portfolio.parquet", index=False)
+        logger.info(
+            "Market portfolio: %d positions, total exposure %.1f%%",
+            len(portfolio_df),
+            portfolio_df["stake_pct"].sum() * 100,
+        )
 
 
 def _fetch_book_props(

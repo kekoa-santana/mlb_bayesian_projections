@@ -29,6 +29,7 @@ from src.models.game_sim.pa_outcome_model import (
     PA_STRIKEOUT,
     PA_TRIPLE,
     PA_WALK,
+    GameContext,
     PAOutcomeModel,
     compute_fatigue_adjustments,
 )
@@ -55,6 +56,20 @@ _STAMINA_POP_MEAN_IP = 5.28  # 2025 population mean IP for starters (10+ starts)
 _STAMINA_POP_STD_IP = 0.47   # 2025 population std
 _STAMINA_LOGIT_SCALE = 0.45  # logit shift per z-score of avg IP
 
+# BF prior bridge: population BF mean for z-scoring
+_POP_BF_MU = 22.0
+_POP_BF_STD = 2.2   # Between-pitcher std of mean BF (not within-game)
+_BF_LOGIT_SCALE = 0.25  # logit shift per z-score of pitcher BF mean (tuned from 0.35 to recenter BF bias)
+
+# Bullpen state adjustment parameters
+_BULLPEN_WORKLOAD_POP_MEAN = 5.0   # Mean relief IP over trailing 3 days
+_BULLPEN_WORKLOAD_POP_STD = 2.5    # Std of trailing 3-day bullpen IP
+_BULLPEN_LOGIT_SCALE = -0.12       # Negative → taxed bullpen keeps starter in longer
+
+# Lineup patience adjustment parameters
+_LINEUP_PPA_POP_MEAN = 0.0   # Population mean lineup aggregate P/PA adj
+_LINEUP_PPA_SENSITIVITY = 0.10  # Exit offset per unit of lineup P/PA aggregate
+
 
 def compute_stamina_offset(
     pitcher_avg_ip: float,
@@ -80,6 +95,133 @@ def compute_stamina_offset(
     z = (pitcher_avg_ip - _STAMINA_POP_MEAN_IP) / _STAMINA_POP_STD_IP
     # Negative direction: higher avg IP → more negative offset → stays longer
     return base_offset - _STAMINA_LOGIT_SCALE * z
+
+
+def compute_bf_calibration_offset(
+    mu_bf: float,
+    base_offset: float = _DEFAULT_EXIT_CALIBRATION_OFFSET,
+) -> float:
+    """Compute exit offset anchored to pitcher's known BF distribution.
+
+    Uses the bf_model prior (empirical Bayes from historical starts) to
+    set the exit calibration so the simulator targets the correct BF mean.
+    Replaces compute_stamina_offset when bf_model priors are available.
+
+    Parameters
+    ----------
+    mu_bf : float
+        Pitcher's shrinkage-estimated mean BF per start (from bf_model).
+    base_offset : float
+        Population-level calibration offset (logit scale).
+
+    Returns
+    -------
+    float
+        Per-pitcher exit calibration offset (logit scale).
+    """
+    z = (mu_bf - _POP_BF_MU) / _POP_BF_STD
+    # Higher BF mean → more negative offset → stays longer
+    return base_offset - _BF_LOGIT_SCALE * z
+
+
+def compute_bullpen_workload_offset(
+    bullpen_trailing_ip: float,
+) -> float:
+    """Compute exit offset adjustment for bullpen fatigue state.
+
+    When the bullpen is taxed (high recent IP), managers let starters
+    go deeper. When the bullpen is fresh, managers pull starters earlier.
+
+    Parameters
+    ----------
+    bullpen_trailing_ip : float
+        Team's total bullpen IP over the trailing 3 days.
+
+    Returns
+    -------
+    float
+        Additive exit calibration offset (logit scale).
+        Negative values reduce exit probability (starter stays longer).
+    """
+    z = (bullpen_trailing_ip - _BULLPEN_WORKLOAD_POP_MEAN) / _BULLPEN_WORKLOAD_POP_STD
+    # Positive z = taxed bullpen → negative offset → starter stays longer
+    return _BULLPEN_LOGIT_SCALE * z
+
+
+def compute_lineup_patience_offset(
+    lineup_ppa_aggregate: float,
+) -> float:
+    """Compute exit offset for opposing lineup patience.
+
+    Patient lineups (high aggregate P/PA adjustment) drive up pitch counts
+    faster, leading to earlier pitcher exits independent of outcome rates.
+
+    Parameters
+    ----------
+    lineup_ppa_aggregate : float
+        Mean of the 9 batter P/PA adjustments for the opposing lineup.
+
+    Returns
+    -------
+    float
+        Additive exit calibration offset (logit scale).
+        Positive values increase exit probability (pitcher pulled earlier).
+    """
+    return _LINEUP_PPA_SENSITIVITY * lineup_ppa_aggregate
+
+
+def compute_exit_offset(
+    *,
+    mu_bf: float | None = None,
+    pitcher_avg_ip: float | None = None,
+    bullpen_trailing_ip: float | None = None,
+    lineup_ppa_aggregate: float | None = None,
+    base_offset: float = _DEFAULT_EXIT_CALIBRATION_OFFSET,
+) -> float:
+    """Unified exit calibration offset combining all BF-related signals.
+
+    Priority for pitcher stamina:
+    1. mu_bf from bf_model prior (if available) — best signal
+    2. pitcher_avg_ip stamina offset (fallback)
+
+    Additional additive adjustments:
+    - Bullpen workload state
+    - Opposing lineup patience
+
+    Parameters
+    ----------
+    mu_bf : float, optional
+        Pitcher's shrinkage BF mean from bf_model.
+    pitcher_avg_ip : float, optional
+        Pitcher's avg IP per start (fallback for stamina).
+    bullpen_trailing_ip : float, optional
+        Team bullpen IP over trailing 3 days.
+    lineup_ppa_aggregate : float, optional
+        Mean lineup P/PA adjustment for opposing batters.
+    base_offset : float
+        Population-level calibration offset.
+
+    Returns
+    -------
+    float
+        Combined exit calibration offset (logit scale).
+    """
+    # Core pitcher-specific offset: prefer BF prior, fall back to avg IP
+    if mu_bf is not None:
+        offset = compute_bf_calibration_offset(mu_bf, base_offset)
+    elif pitcher_avg_ip is not None:
+        offset = compute_stamina_offset(pitcher_avg_ip, base_offset)
+    else:
+        offset = base_offset
+
+    # Additive adjustments
+    if bullpen_trailing_ip is not None:
+        offset += compute_bullpen_workload_offset(bullpen_trailing_ip)
+
+    if lineup_ppa_aggregate is not None:
+        offset += compute_lineup_patience_offset(lineup_ppa_aggregate)
+
+    return offset
 
 
 @dataclass
@@ -179,15 +321,10 @@ def simulate_game(
     exit_model: ExitModel,
     pitcher_avg_pitches: float = 88.0,
     babip_adj: float = 0.0,
-    umpire_k_lift: float = 0.0,
-    umpire_bb_lift: float = 0.0,
-    park_k_lift: float = 0.0,
-    park_bb_lift: float = 0.0,
-    park_hr_lift: float = 0.0,
-    weather_k_lift: float = 0.0,
-    form_bb_lift: float = 0.0,
+    game_context: GameContext | None = None,
     exit_calibration_offset: float = _DEFAULT_EXIT_CALIBRATION_OFFSET,
     manager_pull_tendency: float = 88.0,
+    lineup_matchup_reliabilities: dict[str, np.ndarray] | None = None,
     n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> SimulationResult:
@@ -220,23 +357,18 @@ def simulate_game(
         Pitcher's historical average exit pitch count.
     babip_adj : float
         Pitcher BABIP adjustment for BIP outcomes.
-    umpire_k_lift : float
-        Umpire K-rate logit lift.
-    umpire_bb_lift : float
-        Umpire BB-rate logit lift.
-    park_k_lift, park_bb_lift : float
-        Park factor logit lifts for K and BB.
-    park_hr_lift : float
-        Park HR logit lift.
-    weather_k_lift : float
-        Weather K logit lift.
-    form_bb_lift : float
-        Pitcher rolling form BB% logit lift (from form_model).
+    game_context : GameContext, optional
+        Per-game environmental lifts (umpire, park, weather, catcher
+        framing, pitcher form). Defaults to zero lifts.
     exit_calibration_offset : float
         Logit-scale offset for exit model probabilities. Negative values
         reduce exit probability (pitcher stays in longer).
     manager_pull_tendency : float
         Team's avg starter exit pitch count (manager proxy).
+    lineup_matchup_reliabilities : dict[str, np.ndarray], optional
+        Per-stat reliability per batter slot. Keys: 'k', 'bb', 'hr'.
+        Each value shape (9,), range [0, 1]. When provided, adds per-sim
+        noise to matchup lifts: high reliability → tight, low → wide.
     n_sims : int
         Number of Monte Carlo simulations.
     random_seed : int
@@ -274,9 +406,30 @@ def simulate_game(
     # Dampen matchup lifts — empirical calibration from 11,517 game
     # walk-forward backtest (2023-2025). Raw pitch-type matchup scoring
     # over-applies lifts by ~2x for K/BB. HR signal is near-zero.
-    lineup_matchup_lifts["k"] = lineup_matchup_lifts["k"] * 0.55
-    lineup_matchup_lifts["bb"] = lineup_matchup_lifts["bb"] * 0.40
-    lineup_matchup_lifts["hr"] = lineup_matchup_lifts["hr"] * 0.20
+    _MATCHUP_DAMPEN = {"k": 0.55, "bb": 0.40, "hr": 0.20}
+    for stat, damp in _MATCHUP_DAMPEN.items():
+        lineup_matchup_lifts[stat] = lineup_matchup_lifts[stat] * damp
+
+    # Reliability-based per-sim noise: when reliability is low the true
+    # matchup effect is uncertain, so we draw per-sim perturbations.
+    # At reliability=1.0 sigma→0 (point mass at computed lift);
+    # at reliability=0.0 sigma→full spread (essentially random).
+    # Drawn once per simulation path (not per PA) — this represents
+    # epistemic uncertainty about the matchup, not within-game noise.
+    # Shape: (n_sims, 9) per stat — indexed by batter slot in the PA loop.
+    _MATCHUP_NOISE_SIGMA = {"k": 0.30, "bb": 0.25, "hr": 0.15}
+    matchup_noise: dict[str, np.ndarray] = {}
+    if lineup_matchup_reliabilities is not None:
+        for stat in ("k", "bb", "hr"):
+            rel = lineup_matchup_reliabilities.get(stat, np.ones(9))
+            sigma_per_slot = _MATCHUP_NOISE_SIGMA[stat] * (1.0 - rel)  # (9,)
+            # Draw (n_sims, 9) noise, then add to base lifts per sim
+            matchup_noise[stat] = rng.normal(
+                loc=0.0, scale=sigma_per_slot[np.newaxis, :], size=(n_sims, 9),
+            )
+    else:
+        for stat in ("k", "bb", "hr"):
+            matchup_noise[stat] = np.zeros((n_sims, 9))
 
     # --- Game state arrays (all shape n_sims) ---
     pitches = np.zeros(n_sims, dtype=np.int32)
@@ -334,10 +487,14 @@ def simulate_game(
         # --- 2. Compute PA outcome probabilities ---
         fatigue = compute_fatigue_adjustments(pitches[active])
 
-        # Gather per-batter matchup lifts
-        k_matchup = np.array([lineup_matchup_lifts["k"][s] for s in slot])
-        bb_matchup = np.array([lineup_matchup_lifts["bb"][s] for s in slot])
-        hr_matchup = np.array([lineup_matchup_lifts["hr"][s] for s in slot])
+        # Gather per-batter matchup lifts + per-sim reliability noise
+        active_idx = np.where(active)[0]
+        k_matchup = np.array([lineup_matchup_lifts["k"][s] for s in slot]) + \
+            matchup_noise["k"][active_idx, slot]
+        bb_matchup = np.array([lineup_matchup_lifts["bb"][s] for s in slot]) + \
+            matchup_noise["bb"][active_idx, slot]
+        hr_matchup = np.array([lineup_matchup_lifts["hr"][s] for s in slot]) + \
+            matchup_noise["hr"][active_idx, slot]
 
         # Gather TTO lifts
         k_tto = np.array([tto_lifts["k"][t] for t in tto])
@@ -357,13 +514,7 @@ def simulate_game(
             fatigue_k_lift=fatigue["k"],
             fatigue_bb_lift=fatigue["bb"],
             fatigue_hr_lift=fatigue["hr"],
-            umpire_k_lift=umpire_k_lift,
-            umpire_bb_lift=umpire_bb_lift,
-            park_k_lift=park_k_lift,
-            park_bb_lift=park_bb_lift,
-            park_hr_lift=park_hr_lift,
-            weather_k_lift=weather_k_lift,
-            form_bb_lift=form_bb_lift,
+            ctx=game_context,
         )
 
         # --- 3. Draw PA outcomes ---
@@ -519,13 +670,7 @@ def predict_game(
     exit_model: ExitModel,
     pitcher_avg_pitches: float = 88.0,
     babip_adj: float = 0.0,
-    umpire_k_lift: float = 0.0,
-    umpire_bb_lift: float = 0.0,
-    park_hr_lift: float = 0.0,
-    park_k_lift: float = 0.0,
-    park_bb_lift: float = 0.0,
-    catcher_k_lift: float = 0.0,
-    weather_k_lift: float = 0.0,
+    game_context: GameContext | None = None,
     manager_pull_tendency: float = 88.0,
     n_sims: int = 50_000,
     random_seed: int = 42,
@@ -563,8 +708,9 @@ def predict_game(
         Average exit pitch count.
     babip_adj : float
         Pitcher BABIP adjustment.
-    umpire_k_lift, umpire_bb_lift, park_hr_lift, weather_k_lift : float
-        Context adjustments.
+    game_context : GameContext, optional
+        Per-game environmental lifts (umpire, park, weather, catcher
+        framing, pitcher form).
     n_sims : int
         Number of simulations.
     random_seed : int
@@ -587,10 +733,6 @@ def predict_game(
         season=season,
     )
 
-    # Run simulation — combine park + catcher + umpire + weather lifts
-    total_k_lift = umpire_k_lift + park_k_lift + catcher_k_lift + weather_k_lift
-    total_bb_lift = umpire_bb_lift + park_bb_lift
-
     result = simulate_game(
         pitcher_k_rate_samples=pitcher_k_rate_samples,
         pitcher_bb_rate_samples=pitcher_bb_rate_samples,
@@ -602,10 +744,7 @@ def predict_game(
         exit_model=exit_model,
         pitcher_avg_pitches=pitcher_avg_pitches,
         babip_adj=babip_adj,
-        umpire_k_lift=total_k_lift,
-        umpire_bb_lift=total_bb_lift,
-        park_hr_lift=park_hr_lift,
-        weather_k_lift=0.0,  # already folded into total_k_lift
+        game_context=game_context,
         manager_pull_tendency=manager_pull_tendency,
         n_sims=n_sims,
         random_seed=random_seed,
