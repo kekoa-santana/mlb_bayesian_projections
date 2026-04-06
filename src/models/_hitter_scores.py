@@ -344,13 +344,18 @@ def _build_hitter_offense_score(
     merged["offense_score"] = 0.70 * woba_anchor + 0.30 * bucket_composite
 
     # Small-sample dampening toward league average.  Applied universally --
-    # players with 0 or NULL PA get maximum dampening (50% pull toward 0.50),
+    # players with 0 or NULL PA get maximum dampening (35% pull toward 0.50),
     # ramping to zero dampening at 400+ PA.  Previously skipped for pa < 60
     # which let bench players with NULL observed stats keep inflated
     # projection-only offense scores.
+    # Strength reduced from 50% to 35%: at 50 PA the old dampening cut the
+    # Judge-vs-average gap from 0.27 to 0.15 (44% compression), making it
+    # impossible for elite bats to separate from average ones.  At 35%, the
+    # same gap goes to 0.19 (30% compression) — still dampened but signal
+    # is preserved.
     pa_safe = pa.fillna(0)
     pa_confidence = (pa_safe / 400).clip(0, 1)
-    dampening = 0.50 * (1.0 - pa_confidence)
+    dampening = 0.35 * (1.0 - pa_confidence)
     merged["offense_score"] = merged["offense_score"] * (1 - dampening) + 0.50 * dampening
 
     return merged[["batter_id", "offense_score", "contact_skill",

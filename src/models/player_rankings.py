@@ -448,13 +448,18 @@ def rank_hitters(
         + 0.50 * base.loc[is_catcher, "framing_score"]
     )
 
-    # Percentile-rank fielding and baserunning so their effective spread
-    # matches offense.  Raw fielding has IQR ~0.66 vs offense ~0.20 -- at
-    # 16% weight the raw scale gives fielding equal influence to 52% offense.
-    # Percentile-ranking compresses both to a uniform 0-1 distribution so
-    # the weights mean what they say.
+    # Percentile-rank fielding and baserunning, then compress toward 0.50
+    # so their effective spread matches offense.  After early-season PA
+    # dampening, offense IQR ≈ 0.14 while raw percentile IQR ≈ 0.47.
+    # Without compression, 13% fielding weight has ~44% effective impact.
+    # Sigmoid compression: preserves rank order but pulls extremes toward
+    # center.  A 0.067 fielder → ~0.25 (not devastated), a 0.95 → ~0.80
+    # (still rewarded, not dominant).
     base["fielding_combined"] = _pctl(base["fielding_combined"])
     base["baserunning_score"] = _pctl(base["baserunning_score"])
+    # Compress: blend 60% percentile + 40% center (0.50)
+    base["fielding_combined"] = 0.60 * base["fielding_combined"] + 0.40 * 0.50
+    base["baserunning_score"] = 0.60 * base["baserunning_score"] + 0.40 * 0.50
 
     # Positional adjustment (FanGraphs-standard run values, 0-1 scale)
     base["positional_adj"] = base["position"].map(_POSITIONAL_OFFENSE_ADJ).fillna(0.333)
@@ -469,10 +474,13 @@ def rank_hitters(
     # If you're so good with the bat, teams will hide you at DH/1B/corner OF.
     # Worst fielder costs ~-15 runs; best hitter adds ~+50 runs -- fielding
     # range is ~30% of offense range, so elite bats should have reduced
-    # fielding penalty.  Kicks in above 0.70 offense, halves fielding
-    # weight at 1.00 offense.  Redistributed weight goes to offense.
-    offense_excess = (base["offense_score"] - 0.70).clip(0) / 0.30
-    fielding_dampening = 0.50 * offense_excess
+    # fielding penalty.  Kicks in above 0.65 offense, reduces fielding
+    # weight by up to 75% at 1.00 offense.  Redistributed weight goes to
+    # offense.  Threshold lowered from 0.70 and ceiling raised from 0.50
+    # because early-season dampening compresses offense (IQR ~0.14),
+    # making 0.70 harder to reach while fielding spread stays wide.
+    offense_excess = (base["offense_score"] - 0.65).clip(0) / 0.35
+    fielding_dampening = 0.75 * offense_excess
     eff_fielding_wt = _HITTER_WEIGHTS["fielding"] * (1 - fielding_dampening)
     eff_offense_boost = _HITTER_WEIGHTS["fielding"] * fielding_dampening
 
@@ -681,15 +689,11 @@ def rank_hitters(
     # age 21: 1.10, age 24: 1.04, age 26: 1.00, age 30: 0.92, age 33: 0.86, age 38: 0.76
     base["talent_upside_score"] = base["talent_upside_score"] * upside_age_mult
 
-    # DH penalty: DHs don't field, which is a real value gap (~1.75 WAR/season).
-    # Applied after all other scoring so it's the final adjustment, not a
-    # compounding factor.  Two-way players (Ohtani) exempt -- they DH because
-    # they pitch, not because they can't field.
-    is_pure_dh = (base["position"] == "DH") & (~base["is_two_way"])
-    if is_pure_dh.any():
-        base.loc[is_pure_dh, "current_value_score"] *= 0.90
-        logger.info("DH penalty (10%%): %d pure DHs, %d two-way exempt",
-                     is_pure_dh.sum(), (base["is_two_way"] & (base["position"] == "DH")).sum())
+    # DH penalty removed: the DH composite already handles the value gap by
+    # excluding fielding weight (redistributed to offense/baserunning) and
+    # positional_adj = 0.0 (5% zero contribution).  The old 10% penalty on
+    # top was double-penalizing, dropping elite DH bats (Alvarez, Schwarber)
+    # 100+ ranks below consensus.
 
     # tdd_value_score = current_value_score (backward compat for team consumption)
     base["tdd_value_score"] = base["current_value_score"]
@@ -1287,6 +1291,59 @@ def rank_all(
         min_bf=min_bf,
         health_df=health_df, pitcher_roles_df=pitcher_roles_df,
     )
+    # --- Filter to rostered players only (active + IL) ---
+    roster_path = DASHBOARD_DIR / "roster.parquet"
+    if roster_path.exists():
+        roster = pd.read_parquet(roster_path)
+        valid_statuses = {"active", "il_7", "il_10", "il_15", "il_60"}
+        rostered_ids = set(
+            roster.loc[roster["roster_status"].isin(valid_statuses), "player_id"]
+        )
+
+        h_before = len(hitters)
+        hitters = hitters[hitters["batter_id"].isin(rostered_ids)].copy()
+        if len(hitters) < h_before:
+            logger.info(
+                "Roster filter: %d -> %d hitters (%d removed)",
+                h_before, len(hitters), h_before - len(hitters),
+            )
+            hitters = hitters.sort_values("current_value_score", ascending=False)
+            hitters["pos_rank"] = hitters.groupby("position").cumcount() + 1
+            hitters["overall_rank"] = (
+                hitters["current_value_score"]
+                .rank(ascending=False, method="min")
+                .astype(int)
+            )
+            hitters["talent_rank"] = (
+                hitters["talent_upside_score"]
+                .rank(ascending=False, method="min")
+                .astype(int)
+            )
+            hitters = hitters.sort_values(["position", "pos_rank"])
+
+        p_before = len(pitchers)
+        pitchers = pitchers[pitchers["pitcher_id"].isin(rostered_ids)].copy()
+        if len(pitchers) < p_before:
+            logger.info(
+                "Roster filter: %d -> %d pitchers (%d removed)",
+                p_before, len(pitchers), p_before - len(pitchers),
+            )
+            pitchers = pitchers.sort_values("current_value_score", ascending=False)
+            pitchers["role_rank"] = pitchers.groupby("role").cumcount() + 1
+            pitchers["overall_rank"] = (
+                pitchers["current_value_score"]
+                .rank(ascending=False, method="min")
+                .astype(int)
+            )
+            pitchers["talent_rank"] = (
+                pitchers["talent_upside_score"]
+                .rank(ascending=False, method="min")
+                .astype(int)
+            )
+            pitchers = pitchers.sort_values(["role", "role_rank"])
+    else:
+        logger.warning("roster.parquet not found -- skipping roster filter")
+
     logger.info(
         "Rankings complete: %d hitters, %d pitchers",
         len(hitters), len(pitchers),
