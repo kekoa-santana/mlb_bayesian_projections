@@ -26,10 +26,6 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from precompute import DASHBOARD_DIR
 from src.data.db import read_sql
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 # League average LD% (2022-2025 Statcast data)
@@ -112,6 +108,10 @@ def compute_ld_rates() -> pd.DataFrame:
 
 def run() -> None:
     """Compute and save per-batter LD% data."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     df = compute_ld_rates()
 
     if df.empty:

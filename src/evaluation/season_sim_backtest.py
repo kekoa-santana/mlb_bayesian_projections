@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.evaluation.metrics import compute_regression_metrics
 from src.data.feature_eng import (
     build_multi_season_pitcher_extended,
 )
@@ -64,26 +65,12 @@ def _compute_metrics(
     hi_95: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Compute regression metrics."""
-    valid = ~(np.isnan(actual) | np.isnan(predicted))
-    a, p = actual[valid], predicted[valid]
-    n = len(a)
-    if n == 0:
-        return {"n": 0}
-
-    residuals = a - p
-    bias = float(np.mean(p - a))
-    corr = float(np.corrcoef(a, p)[0, 1]) if np.std(a) > 0 and np.std(p) > 0 else 0.0
-
-    metrics = {"n": n, "bias": bias, "correlation": corr}
-
-    if lo_80 is not None and hi_80 is not None:
-        lo, hi = lo_80[valid], hi_80[valid]
-        metrics["coverage_80"] = float(np.mean((a >= lo) & (a <= hi)))
-    if lo_95 is not None and hi_95 is not None:
-        lo, hi = lo_95[valid], hi_95[valid]
-        metrics["coverage_95"] = float(np.mean((a >= lo) & (a <= hi)))
-
-    return metrics
+    return compute_regression_metrics(
+        actual, predicted,
+        lo_80=lo_80, hi_80=hi_80,
+        lo_95=lo_95, hi_95=hi_95,
+        include_mape=False,
+    )
 
 
 def _build_posteriors(

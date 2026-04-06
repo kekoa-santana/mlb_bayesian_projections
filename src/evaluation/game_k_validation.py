@@ -33,9 +33,9 @@ from src.data.feature_eng import (
     get_hitter_vulnerability,
     get_pitcher_arsenal,
 )
-from src.data.queries import (
-    get_umpire_k_tendencies,
-    get_weather_effects,
+from src.evaluation.context_lifts import (
+    build_umpire_logit_lifts,
+    build_weather_logit_lifts,
 )
 from src.models.bf_model import compute_pitcher_bf_priors
 from src.models.game_k_model import (
@@ -57,257 +57,6 @@ from src.models.pitcher_model import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _build_umpire_lift_lookup(
-    train_seasons: list[int],
-    test_season: int,
-) -> dict[int, float]:
-    """Build game_pk → umpire K logit lift for the test season.
-
-    Computes umpire tendencies from training seasons, then maps each
-    test-season game to its HP umpire's logit lift.
-
-    Returns
-    -------
-    dict[int, float]
-        {game_pk: umpire_k_logit_lift}.
-    """
-    from src.data.db import read_sql
-
-    ump_tendencies = get_umpire_k_tendencies(
-        seasons=train_seasons, min_games=30,
-    )
-    if ump_tendencies.empty:
-        return {}
-
-    # Build name → lift lookup
-    ump_lift_map = dict(zip(
-        ump_tendencies["hp_umpire_name"],
-        ump_tendencies["k_logit_lift"],
-    ))
-
-    # Get umpire assignments for test season
-    ump_assignments = read_sql(f"""
-        SELECT du.game_pk, du.hp_umpire_name
-        FROM production.dim_umpire du
-        JOIN production.dim_game dg ON du.game_pk = dg.game_pk
-        WHERE dg.season = {int(test_season)}
-          AND dg.game_type = 'R'
-    """, {})
-
-    result: dict[int, float] = {}
-    for _, row in ump_assignments.iterrows():
-        gpk = int(row["game_pk"])
-        name = row["hp_umpire_name"]
-        lift = ump_lift_map.get(name, 0.0)
-        if pd.notna(lift):
-            result[gpk] = float(lift)
-    logger.info("Umpire lifts: %d games mapped (%.1f%% non-zero)",
-                len(result),
-                100 * sum(1 for v in result.values() if abs(v) > 0.001) / max(len(result), 1))
-    return result
-
-
-def _build_weather_lift_lookup(
-    train_seasons: list[int],
-    test_season: int,
-) -> dict[int, float]:
-    """Build game_pk → weather K logit lift for the test season.
-
-    Computes weather multipliers from training seasons, converts to logit
-    lifts, then maps each test-season outdoor game to its weather lift.
-
-    Returns
-    -------
-    dict[int, float]
-        {game_pk: weather_k_logit_lift}.
-    """
-    from scipy.special import logit as _logit_fn
-    from src.data.db import read_sql
-
-    wx_effects = get_weather_effects(seasons=train_seasons)
-    if wx_effects.empty:
-        return {}
-
-    # Build (temp_bucket, wind_category) → k_multiplier lookup
-    overall_k = float(wx_effects.iloc[0]["overall_k_rate"])
-    wx_map: dict[tuple[str, str], float] = {}
-    for _, row in wx_effects.iterrows():
-        k_mult = float(row["k_multiplier"])
-        adj_k = overall_k * k_mult
-        lift = float(
-            _logit_fn(np.clip(adj_k, 1e-6, 1 - 1e-6))
-            - _logit_fn(np.clip(overall_k, 1e-6, 1 - 1e-6))
-        )
-        wx_map[(row["temp_bucket"], row["wind_category"])] = lift
-
-    # Get weather for test season games (temp_bucket derived from temperature)
-    weather_data = read_sql(f"""
-        SELECT dw.game_pk, dw.is_dome, dw.wind_category,
-            CASE
-                WHEN dw.temperature < 55 THEN 'cold'
-                WHEN dw.temperature BETWEEN 55 AND 69 THEN 'cool'
-                WHEN dw.temperature BETWEEN 70 AND 84 THEN 'warm'
-                ELSE 'hot'
-            END AS temp_bucket
-        FROM production.dim_weather dw
-        JOIN production.dim_game dg ON dw.game_pk = dg.game_pk
-        WHERE dg.season = {int(test_season)}
-          AND dg.game_type = 'R'
-    """, {})
-
-    result: dict[int, float] = {}
-    for _, row in weather_data.iterrows():
-        gpk = int(row["game_pk"])
-        if row.get("is_dome"):
-            result[gpk] = 0.0
-        else:
-            key = (row.get("temp_bucket", ""), row.get("wind_category", ""))
-            result[gpk] = wx_map.get(key, 0.0)
-    logger.info("Weather lifts: %d games mapped (%.1f%% non-zero)",
-                len(result),
-                100 * sum(1 for v in result.values() if abs(v) > 0.001) / max(len(result), 1))
-    return result
-
-
-def _build_umpire_lift_lookup_multi(
-    train_seasons: list[int],
-    test_season: int,
-) -> dict[str, dict[int, float]]:
-    """Build game_pk -> logit lift for K, BB, and HR per umpire.
-
-    Uses ``get_umpire_tendencies()`` (extended version) to compute lifts
-    for all three stats, then maps each test-season game to its HP
-    umpire's stat-specific logit lifts.
-
-    Returns
-    -------
-    dict[str, dict[int, float]]
-        ``{"k": {game_pk: lift}, "bb": {game_pk: lift}, "hr": {game_pk: lift}}``.
-    """
-    from src.data.db import read_sql
-    from src.data.queries import get_umpire_tendencies
-
-    ump_tendencies = get_umpire_tendencies(
-        seasons=train_seasons, min_games=30,
-    )
-    if ump_tendencies.empty:
-        return {"k": {}, "bb": {}, "hr": {}}
-
-    # Build name -> lift lookups for each stat
-    stat_cols = {"k": "k_logit_lift", "bb": "bb_logit_lift", "hr": "hr_logit_lift"}
-    ump_lift_maps: dict[str, dict[str, float]] = {}
-    for stat, col in stat_cols.items():
-        ump_lift_maps[stat] = dict(zip(
-            ump_tendencies["hp_umpire_name"],
-            ump_tendencies[col],
-        ))
-
-    # Get umpire assignments for test season
-    ump_assignments = read_sql(f"""
-        SELECT du.game_pk, du.hp_umpire_name
-        FROM production.dim_umpire du
-        JOIN production.dim_game dg ON du.game_pk = dg.game_pk
-        WHERE dg.season = {int(test_season)}
-          AND dg.game_type = 'R'
-    """, {})
-
-    result: dict[str, dict[int, float]] = {"k": {}, "bb": {}, "hr": {}}
-    for _, row in ump_assignments.iterrows():
-        gpk = int(row["game_pk"])
-        name = row["hp_umpire_name"]
-        for stat in ("k", "bb", "hr"):
-            lift = ump_lift_maps[stat].get(name, 0.0)
-            if pd.notna(lift):
-                result[stat][gpk] = float(lift)
-    logger.info(
-        "Umpire lifts (multi): %d games, K non-zero=%.1f%%, BB non-zero=%.1f%%, "
-        "HR non-zero=%.1f%%",
-        len(ump_assignments),
-        100 * sum(1 for v in result["k"].values() if abs(v) > 0.001) / max(len(result["k"]), 1),
-        100 * sum(1 for v in result["bb"].values() if abs(v) > 0.001) / max(len(result["bb"]), 1),
-        100 * sum(1 for v in result["hr"].values() if abs(v) > 0.001) / max(len(result["hr"]), 1),
-    )
-    return result
-
-
-def _build_weather_lift_lookup_multi(
-    train_seasons: list[int],
-    test_season: int,
-) -> dict[str, dict[int, float]]:
-    """Build game_pk -> logit lift for K and HR from weather conditions.
-
-    Returns
-    -------
-    dict[str, dict[int, float]]
-        ``{"k": {game_pk: lift}, "hr": {game_pk: lift}}``.
-        BB is not included because weather has negligible effect on BB rates.
-    """
-    from scipy.special import logit as _logit_fn
-    from src.data.db import read_sql
-
-    wx_effects = get_weather_effects(seasons=train_seasons)
-    if wx_effects.empty:
-        return {"k": {}, "hr": {}}
-
-    overall_k = float(wx_effects.iloc[0]["overall_k_rate"])
-    overall_hr = float(wx_effects.iloc[0]["overall_hr_rate"])
-
-    # Build (temp_bucket, wind_category) -> logit lift for K and HR
-    wx_map_k: dict[tuple[str, str], float] = {}
-    wx_map_hr: dict[tuple[str, str], float] = {}
-    for _, row in wx_effects.iterrows():
-        key = (row["temp_bucket"], row["wind_category"])
-        # K lift
-        k_mult = float(row["k_multiplier"])
-        adj_k = overall_k * k_mult
-        wx_map_k[key] = float(
-            _logit_fn(np.clip(adj_k, 1e-6, 1 - 1e-6))
-            - _logit_fn(np.clip(overall_k, 1e-6, 1 - 1e-6))
-        )
-        # HR lift: log(hr_multiplier) on logit scale
-        hr_mult = float(row["hr_multiplier"])
-        adj_hr = overall_hr * hr_mult
-        wx_map_hr[key] = float(
-            _logit_fn(np.clip(adj_hr, 1e-6, 1 - 1e-6))
-            - _logit_fn(np.clip(overall_hr, 1e-6, 1 - 1e-6))
-        )
-
-    # Get weather for test season games
-    weather_data = read_sql(f"""
-        SELECT dw.game_pk, dw.is_dome, dw.wind_category,
-            CASE
-                WHEN dw.temperature < 55 THEN 'cold'
-                WHEN dw.temperature BETWEEN 55 AND 69 THEN 'cool'
-                WHEN dw.temperature BETWEEN 70 AND 84 THEN 'warm'
-                ELSE 'hot'
-            END AS temp_bucket
-        FROM production.dim_weather dw
-        JOIN production.dim_game dg ON dw.game_pk = dg.game_pk
-        WHERE dg.season = {int(test_season)}
-          AND dg.game_type = 'R'
-    """, {})
-
-    result_k: dict[int, float] = {}
-    result_hr: dict[int, float] = {}
-    for _, row in weather_data.iterrows():
-        gpk = int(row["game_pk"])
-        if row.get("is_dome"):
-            result_k[gpk] = 0.0
-            result_hr[gpk] = 0.0
-        else:
-            key = (row.get("temp_bucket", ""), row.get("wind_category", ""))
-            result_k[gpk] = wx_map_k.get(key, 0.0)
-            result_hr[gpk] = wx_map_hr.get(key, 0.0)
-    logger.info(
-        "Weather lifts (multi): %d games, K non-zero=%.1f%%, HR non-zero=%.1f%%",
-        len(weather_data),
-        100 * sum(1 for v in result_k.values() if abs(v) > 0.001) / max(len(result_k), 1),
-        100 * sum(1 for v in result_hr.values() if abs(v) > 0.001) / max(len(result_hr), 1),
-    )
-    return {"k": result_k, "hr": result_hr}
-
 
 
 def build_game_k_predictions(
@@ -418,8 +167,8 @@ def build_game_k_predictions(
                 len(game_lineups), test_season)
 
     # 5c. Umpire and weather lifts (trained on training seasons only)
-    umpire_lifts = _build_umpire_lift_lookup(train_seasons, test_season)
-    weather_lifts = _build_weather_lift_lookup(train_seasons, test_season)
+    umpire_lifts = build_umpire_logit_lifts(train_seasons, test_season, stats=("k",))["k"]
+    weather_lifts = build_weather_logit_lifts(train_seasons, test_season, stats=("k",))["k"]
 
     # 6. Batch predict
     predictions = predict_game_batch(
@@ -1140,8 +889,8 @@ def run_full_game_backtest(
         baselines_pt = get_baselines_dict(seasons=train_seasons, recency_weights="equal")
         game_batter_ks = get_cached_game_batter_ks(test_season)
         game_lineups = get_cached_game_lineups(test_season)
-        umpire_lifts = _build_umpire_lift_lookup(train_seasons, test_season)
-        weather_lifts = _build_weather_lift_lookup(train_seasons, test_season)
+        umpire_lifts = build_umpire_logit_lifts(train_seasons, test_season, stats=("k",))["k"]
+        weather_lifts = build_weather_logit_lifts(train_seasons, test_season, stats=("k",))["k"]
 
         for stat_name in additional_stats:
             try:

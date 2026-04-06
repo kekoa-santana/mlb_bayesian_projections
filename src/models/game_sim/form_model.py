@@ -21,9 +21,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from scipy.special import logit
 
-from src.utils.constants import CLIP_LO, CLIP_HI
+from src.models.game_sim._sim_utils import safe_logit
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +55,7 @@ LEAGUE_HH_PCT = 0.395
 
 def _safe_logit(p: float | np.ndarray) -> float | np.ndarray:
     """Logit with clipping to avoid infinities."""
-    return logit(np.clip(p, CLIP_LO, CLIP_HI))
+    return safe_logit(p)
 
 
 @dataclass

@@ -33,8 +33,10 @@ from src.data.queries import (
     get_pitcher_exit_tendencies,
     get_pitcher_pitch_count_features,
     get_tto_adjustment_profiles,
-    get_umpire_tendencies,
-    get_weather_effects,
+)
+from src.evaluation.context_lifts import (
+    build_umpire_logit_lifts,
+    build_weather_logit_lifts,
 )
 from src.models.game_sim.exit_model import ExitModel
 from src.models.game_sim.pa_outcome_model import GameContext
@@ -56,109 +58,310 @@ from src.models.pitcher_model import (
 )
 from src.models.posterior_utils import extract_pitcher_k_rate_samples
 
+from src.data.league_baselines import get_baselines_dict
+from src.models.bf_model import compute_pitcher_bf_priors
+from src.models.game_sim.pitch_count_model import build_pitch_count_features
+from src.data.queries import get_bullpen_trailing_workload
+
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Context lift lookups (reused from game_k_validation.py pattern)
+# Private helpers — extracted from build_game_sim_predictions for readability
 # ---------------------------------------------------------------------------
 
-def _build_umpire_lifts(
+
+def _fit_pitcher_posteriors(
     train_seasons: list[int],
-    test_season: int,
-) -> dict[str, dict[int, float]]:
-    """Build game_pk → logit lift for K, BB, HR per umpire."""
-    ump_tendencies = get_umpire_tendencies(
-        seasons=train_seasons, min_games=30,
+    draws: int,
+    tune: int,
+    chains: int,
+    random_seed: int,
+) -> dict[str, dict[int, np.ndarray]]:
+    """Fit K%, BB%, HR% models and extract forward-projected posteriors.
+
+    Returns
+    -------
+    dict[str, dict[int, np.ndarray]]
+        ``{"k": {pid: samples}, "bb": ..., "hr": ...}``
+    """
+    last_train = max(train_seasons)
+
+    # -- K% dedicated model --
+    logger.info("Fitting pitcher K%% model...")
+    df_k = build_multi_season_pitcher_k_data(train_seasons, min_bf=10)
+    data_k = prepare_pitcher_model_data(df_k)
+    _, trace_k = fit_pitcher_k_rate_model(
+        data_k, draws=draws, tune=tune, chains=chains,
+        random_seed=random_seed,
     )
-    if ump_tendencies.empty:
-        return {"k": {}, "bb": {}, "hr": {}}
 
-    stat_cols = {"k": "k_logit_lift", "bb": "bb_logit_lift", "hr": "hr_logit_lift"}
-    ump_lift_maps: dict[str, dict[str, float]] = {}
-    for stat, col in stat_cols.items():
-        ump_lift_maps[stat] = dict(zip(
-            ump_tendencies["hp_umpire_name"],
-            ump_tendencies[col],
-        ))
+    df_k_df = data_k["df"]
+    pids_k = df_k_df[df_k_df["season"] == last_train]["pitcher_id"].unique()
+    k_posteriors: dict[int, np.ndarray] = {}
+    for pid in pids_k:
+        try:
+            samples = extract_pitcher_k_rate_samples(
+                trace_k, data_k, pid, last_train,
+                project_forward=True, random_seed=random_seed,
+            )
+            k_posteriors[pid] = samples
+        except ValueError:
+            continue
+    logger.info("K posteriors: %d pitchers", len(k_posteriors))
 
-    ump_assignments = read_sql(f"""
-        SELECT du.game_pk, du.hp_umpire_name
-        FROM production.dim_umpire du
-        JOIN production.dim_game dg ON du.game_pk = dg.game_pk
-        WHERE dg.season = {int(test_season)}
-          AND dg.game_type = 'R'
-    """, {})
+    # -- BB model --
+    logger.info("Fitting pitcher BB model...")
+    df_bb = build_multi_season_pitcher_data(train_seasons, min_bf=10)
+    data_bb = prepare_pitcher_data(df_bb, "bb_rate")
+    _, trace_bb = fit_pitcher_model(
+        data_bb, draws=draws, tune=tune, chains=chains,
+        random_seed=random_seed + 1,
+    )
 
-    result: dict[str, dict[int, float]] = {"k": {}, "bb": {}, "hr": {}}
-    for _, row in ump_assignments.iterrows():
-        gpk = int(row["game_pk"])
-        name = row["hp_umpire_name"]
-        for stat in ("k", "bb", "hr"):
-            lift = ump_lift_maps[stat].get(name, 0.0)
-            if pd.notna(lift):
-                result[stat][gpk] = float(lift)
-    return result
+    df_bb_df = data_bb["df"]
+    pids_bb = df_bb_df[df_bb_df["season"] == last_train]["pitcher_id"].unique()
+    bb_posteriors: dict[int, np.ndarray] = {}
+    for pid in pids_bb:
+        try:
+            samples = extract_generalized_rate_samples(
+                trace_bb, data_bb, pid, last_train,
+                project_forward=True, random_seed=random_seed + 1,
+            )
+            bb_posteriors[pid] = samples
+        except ValueError:
+            continue
+    logger.info("BB posteriors: %d pitchers", len(bb_posteriors))
+
+    # -- HR model (reuses df_bb data) --
+    logger.info("Fitting pitcher HR model...")
+    data_hr = prepare_pitcher_data(df_bb, "hr_per_bf")
+    _, trace_hr = fit_pitcher_model(
+        data_hr, draws=draws, tune=tune, chains=chains,
+        random_seed=random_seed + 2,
+    )
+
+    df_hr_df = data_hr["df"]
+    pids_hr = df_hr_df[df_hr_df["season"] == last_train]["pitcher_id"].unique()
+    hr_posteriors: dict[int, np.ndarray] = {}
+    for pid in pids_hr:
+        try:
+            samples = extract_generalized_rate_samples(
+                trace_hr, data_hr, pid, last_train,
+                project_forward=True, random_seed=random_seed + 2,
+            )
+            hr_posteriors[pid] = samples
+        except ValueError:
+            continue
+    logger.info("HR posteriors: %d pitchers", len(hr_posteriors))
+
+    return {"k": k_posteriors, "bb": bb_posteriors, "hr": hr_posteriors}
 
 
-def _build_weather_lifts(
+def _load_game_context(
     train_seasons: list[int],
     test_season: int,
-) -> dict[str, dict[int, float]]:
-    """Build game_pk → weather logit lifts for K and HR."""
-    from scipy.special import logit as _logit_fn
+) -> dict[str, Any]:
+    """Load all per-game context data needed by the simulation loop.
 
-    wx_effects = get_weather_effects(seasons=train_seasons)
-    if wx_effects.empty:
-        return {"k": {}, "hr": {}}
+    Returns a dict with keys:
+        exit_model, pitcher_pc_latest, batter_pc_latest, tto_profiles,
+        pitcher_arsenal, hitter_vuln, baselines_pt, umpire_lifts,
+        weather_lifts, pitcher_tend_latest, bf_priors_latest,
+        bullpen_wl_lookup
+    """
+    last_train = max(train_seasons)
 
-    overall_k = float(wx_effects.iloc[0]["overall_k_rate"])
-    overall_hr = float(wx_effects.iloc[0]["overall_hr_rate"])
+    # Exit model
+    logger.info("Training exit model...")
+    exit_train_data = get_exit_model_training_data(train_seasons)
+    exit_tendencies = get_pitcher_exit_tendencies(train_seasons)
+    exit_model = ExitModel()
+    exit_metrics = exit_model.train(exit_train_data, exit_tendencies)
+    logger.info("Exit model AUC: %.4f", exit_metrics["auc"])
 
-    wx_map_k: dict[tuple[str, str], float] = {}
-    wx_map_hr: dict[tuple[str, str], float] = {}
-    for _, row in wx_effects.iterrows():
-        key = (row["temp_bucket"], row["wind_category"])
-        k_mult = float(row["k_multiplier"])
-        adj_k = overall_k * k_mult
-        wx_map_k[key] = float(
-            _logit_fn(np.clip(adj_k, 1e-6, 1 - 1e-6))
-            - _logit_fn(np.clip(overall_k, 1e-6, 1 - 1e-6))
+    # Pitch count features — use most recent season per player
+    logger.info("Loading pitch count features...")
+    pitcher_pc_features = get_pitcher_pitch_count_features(train_seasons)
+    batter_pc_features = get_batter_pitch_count_features(train_seasons)
+
+    pitcher_pc_latest = (
+        pitcher_pc_features
+        .sort_values("season")
+        .groupby("pitcher_id")
+        .last()
+        .reset_index()
+    )
+    pitcher_pc_latest["season"] = last_train
+
+    batter_pc_latest = (
+        batter_pc_features
+        .sort_values("season")
+        .groupby("batter_id")
+        .last()
+        .reset_index()
+    )
+    batter_pc_latest["season"] = last_train
+
+    # TTO, matchup, and context lifts
+    logger.info("Loading matchup and context data...")
+    tto_profiles = get_tto_adjustment_profiles(train_seasons)
+
+    pitcher_arsenal = get_pitcher_arsenal(last_train)
+    hitter_vuln = get_hitter_vulnerability(last_train)
+    baselines_pt = get_baselines_dict(seasons=train_seasons, recency_weights="equal")
+
+    umpire_lifts = build_umpire_logit_lifts(train_seasons, test_season)
+    weather_lifts = build_weather_logit_lifts(train_seasons, test_season)
+
+    # Pitcher exit tendencies (latest per pitcher)
+    pitcher_tend_latest = (
+        exit_tendencies.copy()
+        .sort_values("season")
+        .groupby("pitcher_id")
+        .last()
+        .reset_index()
+    )
+
+    # BF priors (empirical Bayes)
+    bf_game_logs = get_cached_pitcher_game_logs(last_train)
+    for s in train_seasons[:-1]:
+        bf_game_logs = pd.concat(
+            [bf_game_logs, get_cached_pitcher_game_logs(s)],
+            ignore_index=True,
         )
-        hr_mult = float(row["hr_multiplier"])
-        adj_hr = overall_hr * hr_mult
-        wx_map_hr[key] = float(
-            _logit_fn(np.clip(adj_hr, 1e-6, 1 - 1e-6))
-            - _logit_fn(np.clip(overall_hr, 1e-6, 1 - 1e-6))
-        )
+    bf_priors = compute_pitcher_bf_priors(bf_game_logs)
+    bf_priors_latest = (
+        bf_priors.sort_values("season")
+        .groupby("pitcher_id").last().reset_index()
+    )
+    logger.info("BF priors: %d pitchers", len(bf_priors_latest))
 
-    weather_data = read_sql(f"""
-        SELECT dw.game_pk, dw.is_dome, dw.wind_category,
-            CASE
-                WHEN dw.temperature < 55 THEN 'cold'
-                WHEN dw.temperature BETWEEN 55 AND 69 THEN 'cool'
-                WHEN dw.temperature BETWEEN 70 AND 84 THEN 'warm'
-                ELSE 'hot'
-            END AS temp_bucket
-        FROM production.dim_weather dw
-        JOIN production.dim_game dg ON dw.game_pk = dg.game_pk
-        WHERE dg.season = {int(test_season)}
-          AND dg.game_type = 'R'
-    """, {})
+    # Bullpen trailing workload for test season
+    bullpen_workload = get_bullpen_trailing_workload([test_season])
+    bullpen_wl_lookup: dict[tuple[int, int], float] = {}
+    if not bullpen_workload.empty:
+        for _, bw_row in bullpen_workload.iterrows():
+            key = (int(bw_row["team_id"]), int(bw_row["game_pk"]))
+            bullpen_wl_lookup[key] = float(bw_row["bullpen_trailing_ip"])
+        logger.info("Bullpen workload: %d team-games", len(bullpen_wl_lookup))
 
-    result_k: dict[int, float] = {}
-    result_hr: dict[int, float] = {}
-    for _, row in weather_data.iterrows():
-        gpk = int(row["game_pk"])
-        if row.get("is_dome"):
-            result_k[gpk] = 0.0
-            result_hr[gpk] = 0.0
-        else:
-            key = (row.get("temp_bucket", ""), row.get("wind_category", ""))
-            result_k[gpk] = wx_map_k.get(key, 0.0)
-            result_hr[gpk] = wx_map_hr.get(key, 0.0)
-    return {"k": result_k, "hr": result_hr}
+    return {
+        "exit_model": exit_model,
+        "pitcher_pc_latest": pitcher_pc_latest,
+        "batter_pc_latest": batter_pc_latest,
+        "tto_profiles": tto_profiles,
+        "pitcher_arsenal": pitcher_arsenal,
+        "hitter_vuln": hitter_vuln,
+        "baselines_pt": baselines_pt,
+        "umpire_lifts": umpire_lifts,
+        "weather_lifts": weather_lifts,
+        "pitcher_tend_latest": pitcher_tend_latest,
+        "bf_priors_latest": bf_priors_latest,
+        "bullpen_wl_lookup": bullpen_wl_lookup,
+    }
 
+
+def _resolve_opposing_lineup(
+    game_pk: int,
+    pitcher_id: int,
+    game_lineups: pd.DataFrame,
+    actuals: pd.DataFrame,
+) -> list[int] | None:
+    """Resolve the opposing 9-batter lineup for a pitcher in a game.
+
+    Returns
+    -------
+    list[int] | None
+        Nine batter IDs in batting-order, or ``None`` if unresolvable.
+    """
+    game_lu = game_lineups[game_lineups["game_pk"] == game_pk]
+
+    if len(game_lu) == 0:
+        return None
+
+    # Find pitcher's team, then get the OTHER team's batters
+    pitcher_team = game_lu[game_lu["player_id"] == pitcher_id]["team_id"]
+    if len(pitcher_team) == 0:
+        # Pitcher not in lineup data — fallback: pick team pitcher is NOT on
+        team_counts = game_lu["team_id"].value_counts()
+        if len(team_counts) < 2:
+            return None
+        teams = game_lu["team_id"].unique()
+        opposing_team = None
+        for t in teams:
+            team_players = game_lu[game_lu["team_id"] == t]["player_id"].values
+            if pitcher_id not in team_players:
+                opposing_team = t
+                break
+        if opposing_team is None:
+            return None
+    else:
+        pitcher_team_id = int(pitcher_team.iloc[0])
+        opp_rows = game_lu[game_lu["team_id"] != pitcher_team_id]
+        if len(opp_rows) == 0:
+            return None
+        opposing_team = opp_rows["team_id"].iloc[0]
+
+    opposing_lu = game_lu[game_lu["team_id"] == opposing_team].sort_values(
+        "batting_order"
+    )
+    batter_ids = opposing_lu["player_id"].tolist()[:9]
+
+    if len(batter_ids) < 9:
+        return None
+
+    return batter_ids
+
+
+def _extract_game_actuals(
+    pitcher_id: int,
+    game_pk: int,
+    game_row: pd.Series,
+    actuals: pd.DataFrame,
+) -> dict[str, int | float]:
+    """Extract actual stat line for one pitcher game.
+
+    Returns
+    -------
+    dict
+        Keys: actual_k, actual_bb, actual_h, actual_hr, actual_bf,
+        actual_pitches, actual_ip, actual_outs
+    """
+    actual_row = actuals[
+        (actuals["pitcher_id"] == pitcher_id)
+        & (actuals["game_pk"] == game_pk)
+    ]
+    if len(actual_row) == 0:
+        actual_k = int(game_row.get("strike_outs", 0))
+        actual_bb = int(game_row.get("walks", 0))
+        actual_h = int(game_row.get("hits", 0))
+        actual_hr = int(game_row.get("home_runs", 0))
+        actual_bf = int(game_row.get("batters_faced", 0))
+        actual_pitches = 0
+        actual_ip = float(game_row.get("innings_pitched", 0))
+    else:
+        ar = actual_row.iloc[0]
+        actual_k = int(ar.get("pit_k", 0))
+        actual_bb = int(ar.get("pit_bb", 0))
+        actual_h = int(ar.get("pit_h", 0))
+        actual_hr = int(ar.get("pit_hr", 0))
+        actual_bf = int(ar.get("pit_bf", 0))
+        actual_pitches = int(ar.get("pit_pitches", 0))
+        actual_ip = float(ar.get("pit_ip", 0))
+
+    actual_outs = int(actual_ip) * 3 + round((actual_ip % 1) * 10)
+
+    return {
+        "actual_k": actual_k,
+        "actual_bb": actual_bb,
+        "actual_h": actual_h,
+        "actual_hr": actual_hr,
+        "actual_bf": actual_bf,
+        "actual_pitches": actual_pitches,
+        "actual_ip": actual_ip,
+        "actual_outs": actual_outs,
+    }
 
 
 def _compute_lineup_matchup_lifts(
@@ -253,165 +456,31 @@ def build_game_sim_predictions(
     )
 
     # ---------------------------------------------------------------
-    # 1. Fit pitcher K% model (dedicated model for best K posteriors)
+    # 1-3. Fit pitcher K%, BB%, HR% models and extract posteriors
     # ---------------------------------------------------------------
-    logger.info("Fitting pitcher K%% model...")
-    df_k = build_multi_season_pitcher_k_data(train_seasons, min_bf=10)
-    data_k = prepare_pitcher_model_data(df_k)
-    _, trace_k = fit_pitcher_k_rate_model(
-        data_k, draws=draws, tune=tune, chains=chains,
-        random_seed=random_seed,
+    posteriors = _fit_pitcher_posteriors(
+        train_seasons, draws, tune, chains, random_seed,
     )
-
-    # Extract K posteriors
-    df_k_df = data_k["df"]
-    pids_k = df_k_df[df_k_df["season"] == last_train]["pitcher_id"].unique()
-    k_posteriors: dict[int, np.ndarray] = {}
-    for pid in pids_k:
-        try:
-            samples = extract_pitcher_k_rate_samples(
-                trace_k, data_k, pid, last_train,
-                project_forward=True, random_seed=random_seed,
-            )
-            k_posteriors[pid] = samples
-        except ValueError:
-            continue
-    logger.info("K posteriors: %d pitchers", len(k_posteriors))
+    k_posteriors = posteriors["k"]
+    bb_posteriors = posteriors["bb"]
+    hr_posteriors = posteriors["hr"]
 
     # ---------------------------------------------------------------
-    # 2. Fit pitcher BB model
+    # 4-6. Load exit model, pitch count, matchup, and context data
     # ---------------------------------------------------------------
-    logger.info("Fitting pitcher BB model...")
-    df_bb = build_multi_season_pitcher_data(train_seasons, min_bf=10)
-    data_bb = prepare_pitcher_data(df_bb, "bb_rate")
-    _, trace_bb = fit_pitcher_model(
-        data_bb, draws=draws, tune=tune, chains=chains,
-        random_seed=random_seed + 1,
-    )
-
-    df_bb_df = data_bb["df"]
-    pids_bb = df_bb_df[df_bb_df["season"] == last_train]["pitcher_id"].unique()
-    bb_posteriors: dict[int, np.ndarray] = {}
-    for pid in pids_bb:
-        try:
-            samples = extract_generalized_rate_samples(
-                trace_bb, data_bb, pid, last_train,
-                project_forward=True, random_seed=random_seed + 1,
-            )
-            bb_posteriors[pid] = samples
-        except ValueError:
-            continue
-    logger.info("BB posteriors: %d pitchers", len(bb_posteriors))
-
-    # ---------------------------------------------------------------
-    # 3. Fit pitcher HR model
-    # ---------------------------------------------------------------
-    logger.info("Fitting pitcher HR model...")
-    data_hr = prepare_pitcher_data(df_bb, "hr_per_bf")
-    _, trace_hr = fit_pitcher_model(
-        data_hr, draws=draws, tune=tune, chains=chains,
-        random_seed=random_seed + 2,
-    )
-
-    df_hr_df = data_hr["df"]
-    pids_hr = df_hr_df[df_hr_df["season"] == last_train]["pitcher_id"].unique()
-    hr_posteriors: dict[int, np.ndarray] = {}
-    for pid in pids_hr:
-        try:
-            samples = extract_generalized_rate_samples(
-                trace_hr, data_hr, pid, last_train,
-                project_forward=True, random_seed=random_seed + 2,
-            )
-            hr_posteriors[pid] = samples
-        except ValueError:
-            continue
-    logger.info("HR posteriors: %d pitchers", len(hr_posteriors))
-
-    # ---------------------------------------------------------------
-    # 4. Train exit model on training seasons
-    # ---------------------------------------------------------------
-    logger.info("Training exit model...")
-    exit_train_data = get_exit_model_training_data(train_seasons)
-    exit_tendencies = get_pitcher_exit_tendencies(train_seasons)
-    exit_model = ExitModel()
-    exit_metrics = exit_model.train(exit_train_data, exit_tendencies)
-    logger.info("Exit model AUC: %.4f", exit_metrics["auc"])
-
-    # ---------------------------------------------------------------
-    # 5. Load pitch count features from training data
-    # ---------------------------------------------------------------
-    logger.info("Loading pitch count features...")
-    pitcher_pc_features = get_pitcher_pitch_count_features(train_seasons)
-    batter_pc_features = get_batter_pitch_count_features(train_seasons)
-
-    # Use most recent season's features for each player
-    pitcher_pc_latest = (
-        pitcher_pc_features
-        .sort_values("season")
-        .groupby("pitcher_id")
-        .last()
-        .reset_index()
-    )
-    pitcher_pc_latest["season"] = last_train
-
-    batter_pc_latest = (
-        batter_pc_features
-        .sort_values("season")
-        .groupby("batter_id")
-        .last()
-        .reset_index()
-    )
-    batter_pc_latest["season"] = last_train
-
-    # ---------------------------------------------------------------
-    # 6. Load TTO profiles, matchup data, context lifts
-    # ---------------------------------------------------------------
-    logger.info("Loading matchup and context data...")
-    tto_profiles = get_tto_adjustment_profiles(train_seasons)
-
-    pitcher_arsenal = get_pitcher_arsenal(last_train)
-    hitter_vuln = get_hitter_vulnerability(last_train)
-    from src.data.league_baselines import get_baselines_dict
-    baselines_pt = get_baselines_dict(seasons=train_seasons, recency_weights="equal")
-
-    umpire_lifts = _build_umpire_lifts(train_seasons, test_season)
-    weather_lifts = _build_weather_lifts(train_seasons, test_season)
-
-    # Pitcher exit tendencies for pitcher_avg_pitches lookup
-    pitcher_tend = exit_tendencies.copy()
-    pitcher_tend_latest = (
-        pitcher_tend
-        .sort_values("season")
-        .groupby("pitcher_id")
-        .last()
-        .reset_index()
-    )
-
-    # BF priors from bf_model (empirical Bayes)
-    from src.models.bf_model import compute_pitcher_bf_priors
-    bf_game_logs = get_cached_pitcher_game_logs(last_train)
-    for s in train_seasons[:-1]:
-        bf_game_logs = pd.concat(
-            [bf_game_logs, get_cached_pitcher_game_logs(s)],
-            ignore_index=True,
-        )
-    bf_priors = compute_pitcher_bf_priors(bf_game_logs)
-    bf_priors_latest = (
-        bf_priors.sort_values("season")
-        .groupby("pitcher_id").last().reset_index()
-    )
-    logger.info("BF priors: %d pitchers", len(bf_priors_latest))
-
-    # Bullpen trailing workload for test season
-    from src.data.queries import get_bullpen_trailing_workload
-    bullpen_workload = get_bullpen_trailing_workload([test_season])
-    # Build (team_id, game_pk) → bullpen_trailing_ip lookup
-    bullpen_wl_lookup: dict[tuple[int, int], float] = {}
-    if not bullpen_workload.empty:
-        for _, bw_row in bullpen_workload.iterrows():
-            key = (int(bw_row["team_id"]), int(bw_row["game_pk"]))
-            bullpen_wl_lookup[key] = float(bw_row["bullpen_trailing_ip"])
-        logger.info("Bullpen workload: %d team-games", len(bullpen_wl_lookup))
+    ctx = _load_game_context(train_seasons, test_season)
+    exit_model = ctx["exit_model"]
+    pitcher_pc_latest = ctx["pitcher_pc_latest"]
+    batter_pc_latest = ctx["batter_pc_latest"]
+    tto_profiles = ctx["tto_profiles"]
+    pitcher_arsenal = ctx["pitcher_arsenal"]
+    hitter_vuln = ctx["hitter_vuln"]
+    baselines_pt = ctx["baselines_pt"]
+    umpire_lifts = ctx["umpire_lifts"]
+    weather_lifts = ctx["weather_lifts"]
+    pitcher_tend_latest = ctx["pitcher_tend_latest"]
+    bf_priors_latest = ctx["bf_priors_latest"]
+    bullpen_wl_lookup = ctx["bullpen_wl_lookup"]
 
     # ---------------------------------------------------------------
     # 7. Load test season data — actuals + lineups
@@ -449,7 +518,11 @@ def build_game_sim_predictions(
     n_skipped = 0
 
     # Set of pitchers that have all three posteriors
-    valid_pids = set(k_posteriors.keys()) & set(bb_posteriors.keys()) & set(hr_posteriors.keys())
+    valid_pids = (
+        set(k_posteriors.keys())
+        & set(bb_posteriors.keys())
+        & set(hr_posteriors.keys())
+    )
     logger.info("Pitchers with all 3 posteriors: %d", len(valid_pids))
 
     for _, game_row in test_game_logs.iterrows():
@@ -461,57 +534,11 @@ def build_game_sim_predictions(
             n_skipped += 1
             continue
 
-        # Get opposing lineup for this game
-        # game_lineups has player_id, team_id, batting_order per game
-        game_lu = game_lineups[game_lineups["game_pk"] == game_pk]
-
-        if len(game_lu) == 0:
-            n_skipped += 1
-            continue
-
-        # Find pitcher's team, then get the OTHER team's batters
-        pitcher_team = game_lu[game_lu["player_id"] == pitcher_id]["team_id"]
-        if len(pitcher_team) == 0:
-            # Pitcher not in lineup data — get team from actuals
-            actual_row_team = actuals[
-                (actuals["pitcher_id"] == pitcher_id)
-                & (actuals["game_pk"] == game_pk)
-            ]
-            if len(actual_row_team) > 0:
-                # Use team_id from fact_player_game_mlb if available
-                # For now, just take opposing team batters (the majority)
-                pass
-
-            # Fallback: take the team with more batters as "opposing"
-            team_counts = game_lu["team_id"].value_counts()
-            if len(team_counts) < 2:
-                n_skipped += 1
-                continue
-            # Pick the team the pitcher is NOT on — use the one where
-            # pitcher_id doesn't appear
-            teams = game_lu["team_id"].unique()
-            opposing_team = None
-            for t in teams:
-                team_players = game_lu[game_lu["team_id"] == t]["player_id"].values
-                if pitcher_id not in team_players:
-                    opposing_team = t
-                    break
-            if opposing_team is None:
-                n_skipped += 1
-                continue
-        else:
-            pitcher_team_id = int(pitcher_team.iloc[0])
-            opposing_team = game_lu[
-                game_lu["team_id"] != pitcher_team_id
-            ]["team_id"].iloc[0] if len(game_lu[game_lu["team_id"] != pitcher_team_id]) > 0 else None
-            if opposing_team is None:
-                n_skipped += 1
-                continue
-
-        opposing_lu = game_lu[game_lu["team_id"] == opposing_team].sort_values("batting_order")
-        batter_ids = opposing_lu["player_id"].tolist()[:9]
-
-        if len(batter_ids) < 9:
+        # Resolve opposing lineup
+        batter_ids = _resolve_opposing_lineup(
+            game_pk, pitcher_id, game_lineups, actuals,
+        )
+        if batter_ids is None:
             n_skipped += 1
             continue
 
@@ -577,7 +604,6 @@ def build_game_sim_predictions(
         park_hr = weather_lifts.get("hr", {}).get(game_pk, 0.0)
 
         # Build pitch count features
-        from src.models.game_sim.pitch_count_model import build_pitch_count_features
         pitcher_adj, batter_adjs = build_pitch_count_features(
             pitcher_features=pitcher_pc_latest,
             batter_features=batter_pc_latest,
@@ -628,33 +654,11 @@ def build_game_sim_predictions(
             continue
 
         # Get actuals
-        actual_row = actuals[
-            (actuals["pitcher_id"] == pitcher_id)
-            & (actuals["game_pk"] == game_pk)
-        ]
-        if len(actual_row) == 0:
-            # Fall back to game_logs
-            actual_k = int(game_row.get("strike_outs", 0))
-            actual_bb = int(game_row.get("walks", 0))
-            actual_h = int(game_row.get("hits", 0))
-            actual_hr = int(game_row.get("home_runs", 0))
-            actual_bf = int(game_row.get("batters_faced", 0))
-            actual_pitches = 0
-            actual_ip = float(game_row.get("innings_pitched", 0))
-        else:
-            ar = actual_row.iloc[0]
-            actual_k = int(ar.get("pit_k", 0))
-            actual_bb = int(ar.get("pit_bb", 0))
-            actual_h = int(ar.get("pit_h", 0))
-            actual_hr = int(ar.get("pit_hr", 0))
-            actual_bf = int(ar.get("pit_bf", 0))
-            actual_pitches = int(ar.get("pit_pitches", 0))
-            actual_ip = float(ar.get("pit_ip", 0))
+        game_actuals = _extract_game_actuals(
+            pitcher_id, game_pk, game_row, actuals,
+        )
 
         summary = sim_result.summary()
-
-        # Derive actual outs from IP (baseball notation: 6.1 = 19 outs)
-        actual_outs = int(actual_ip) * 3 + round((actual_ip % 1) * 10)
 
         # Build K over-prob columns
         k_over = sim_result.over_probs("k", [3.5, 4.5, 5.5, 6.5, 7.5])
@@ -682,15 +686,7 @@ def build_game_sim_predictions(
             "std_outs": summary["outs"]["std"],
             "expected_ip": float(np.mean(sim_result.outs_samples)) / 3.0,
             "expected_runs": summary["runs"]["mean"],
-            # Actuals
-            "actual_k": actual_k,
-            "actual_bb": actual_bb,
-            "actual_h": actual_h,
-            "actual_hr": actual_hr,
-            "actual_bf": actual_bf,
-            "actual_pitches": actual_pitches,
-            "actual_ip": actual_ip,
-            "actual_outs": actual_outs,
+            **game_actuals,
         }
 
         # K prop line probabilities

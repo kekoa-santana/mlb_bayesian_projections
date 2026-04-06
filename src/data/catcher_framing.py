@@ -95,37 +95,24 @@ def build_catcher_framing_lookup(
     dict[str, dict[tuple[int, int], float]]
         ``{"k": {(game_pk, pitcher_id): lift}, "bb": {(game_pk, pitcher_id): lift}}``.
     """
-    from src.data.db import read_sql
-    from src.data.queries import get_catcher_framing_effects
+    from src.data.queries import (
+        get_catcher_framing_effects,
+        get_catcher_game_assignments,
+        get_game_starter_teams,
+    )
 
     framing_data = get_catcher_framing_effects(seasons=train_seasons)
     if framing_data.empty:
         logger.warning("No catcher framing data for seasons %s", train_seasons)
         return {"k": {}, "bb": {}}
 
-    catcher_assignments = read_sql(f"""
-        SELECT fl.game_pk, fl.player_id AS catcher_id,
-               fl.team_id
-        FROM production.fact_lineup fl
-        JOIN production.dim_game dg ON fl.game_pk = dg.game_pk
-        WHERE fl.position = 'C'
-          AND fl.is_starter = true
-          AND dg.season = {int(test_season)}
-          AND dg.game_type = 'R'
-    """, {})
+    catcher_assignments = get_catcher_game_assignments(int(test_season))
 
     if catcher_assignments.empty:
         logger.warning("No catcher lineup data for season %d", test_season)
         return {"k": {}, "bb": {}}
 
-    pitcher_teams = read_sql(f"""
-        SELECT fpg.game_pk, fpg.player_id AS pitcher_id, fpg.team_id
-        FROM production.fact_player_game_mlb fpg
-        JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
-        WHERE fpg.pit_is_starter = true
-          AND dg.season = {int(test_season)}
-          AND dg.game_type = 'R'
-    """, {})
+    pitcher_teams = get_game_starter_teams(int(test_season))
 
     if pitcher_teams.empty:
         logger.warning("No starter data for season %d", test_season)

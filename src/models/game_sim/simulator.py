@@ -35,6 +35,7 @@ from src.models.game_sim.pa_outcome_model import (
 )
 from src.models.game_sim.pitch_count_model import PitchCountModel
 from src.models.game_sim.tto_model import BF_PER_TTO, get_tto_for_bf
+from src.models.game_sim._sim_utils import resample_posterior, MATCHUP_DAMPEN
 from src.utils.constants import CLIP_LO, CLIP_HI
 
 logger = logging.getLogger(__name__)
@@ -387,15 +388,9 @@ def simulate_game(
     pa_outcome_model = PAOutcomeModel()
 
     # Resample posterior draws to n_sims
-    def _resample(arr: np.ndarray) -> np.ndarray:
-        if len(arr) == n_sims:
-            return arr.copy()
-        idx = rng.choice(len(arr), size=n_sims, replace=True)
-        return arr[idx]
-
-    k_rates = _resample(pitcher_k_rate_samples)
-    bb_rates = _resample(pitcher_bb_rate_samples)
-    hr_rates = _resample(pitcher_hr_rate_samples)
+    k_rates = resample_posterior(pitcher_k_rate_samples, n_sims, rng)
+    bb_rates = resample_posterior(pitcher_bb_rate_samples, n_sims, rng)
+    hr_rates = resample_posterior(pitcher_hr_rate_samples, n_sims, rng)
 
     # Default matchup lifts to zeros if missing stat keys
     for stat in ("k", "bb", "hr"):
@@ -407,8 +402,7 @@ def simulate_game(
     # Dampen matchup lifts — empirical calibration from 11,517 game
     # walk-forward backtest (2023-2025). Raw pitch-type matchup scoring
     # over-applies lifts by ~2x for K/BB. HR signal is near-zero.
-    _MATCHUP_DAMPEN = {"k": 0.55, "bb": 0.40, "hr": 0.20}
-    for stat, damp in _MATCHUP_DAMPEN.items():
+    for stat, damp in MATCHUP_DAMPEN.items():
         lineup_matchup_lifts[stat] = lineup_matchup_lifts[stat] * damp
 
     # Reliability-based per-sim noise: when reliability is low the true

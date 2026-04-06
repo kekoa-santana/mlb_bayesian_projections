@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.evaluation.metrics import compute_regression_metrics
 from src.data.feature_eng import (
     build_multi_season_hitter_data,
     build_multi_season_hitter_extended,
@@ -58,40 +59,12 @@ def _compute_metrics(
     hi_95: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Compute regression metrics for counting stat predictions."""
-    n = len(actual)
-    if n == 0:
-        return {}
-
-    residuals = actual - predicted
-
-    # Correlation
-    if np.std(actual) > 0 and np.std(predicted) > 0:
-        corr = float(np.corrcoef(actual, predicted)[0, 1])
-    else:
-        corr = 0.0
-
-    # MAPE (avoid div/0 for players with 0 actuals)
-    nonzero = actual > 0
-    if nonzero.sum() > 0:
-        mape = float(np.mean(np.abs(residuals[nonzero]) / actual[nonzero]))
-    else:
-        mape = float("nan")
-
-    metrics = {
-        "n": n,
-        "correlation": corr,
-        "mape": mape,
-    }
-
-    # Coverage
-    if lo_80 is not None and hi_80 is not None:
-        cov_80 = float(np.mean((actual >= lo_80) & (actual <= hi_80)))
-        metrics["coverage_80"] = cov_80
-    if lo_95 is not None and hi_95 is not None:
-        cov_95 = float(np.mean((actual >= lo_95) & (actual <= hi_95)))
-        metrics["coverage_95"] = cov_95
-
-    return metrics
+    return compute_regression_metrics(
+        actual, predicted,
+        lo_80=lo_80, hi_80=hi_80,
+        lo_95=lo_95, hi_95=hi_95,
+        include_mape=True,
+    )
 
 
 # ---------------------------------------------------------------------------

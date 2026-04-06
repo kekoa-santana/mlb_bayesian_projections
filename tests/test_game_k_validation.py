@@ -74,21 +74,20 @@ class TestComputeGameKMetricsKeys:
         """Returns all expected metric keys."""
         result = compute_game_k_metrics(predictions)
         expected_keys = {
-            "rmse_expected", "mae_expected", "brier_scores",
-            "avg_brier", "calibration_df", "coverage_50",
-            "coverage_80", "coverage_90", "log_score", "n_games",
+            "brier_scores", "avg_brier", "calibration_df",
+            "coverage_50", "coverage_80", "coverage_90",
+            "log_score", "n_games",
         }
         assert expected_keys.issubset(set(result.keys()))
         assert result["n_games"] == 200
-        assert result["rmse_expected"] > 0
-        assert result["mae_expected"] > 0
+        assert result["avg_brier"] > 0
 
     def test_empty_predictions(self) -> None:
         """Empty predictions return NaN metrics."""
         empty = pd.DataFrame()
         result = compute_game_k_metrics(empty)
         assert result["n_games"] == 0
-        assert np.isnan(result["rmse_expected"])
+        assert np.isnan(result["avg_brier"])
 
 
 class TestCompareToBaselinesShape:
@@ -99,12 +98,9 @@ class TestCompareToBaselinesShape:
         assert set(result["baseline"]) == {
             "naive", "poisson", "model_no_matchup", "full_model",
         }
-        assert "rmse" in result.columns
-        assert "mae" in result.columns
         assert "avg_brier" in result.columns
 
     def test_all_metrics_finite(self, predictions: pd.DataFrame) -> None:
         """All baseline metrics should be finite."""
         result = compare_to_baselines(predictions)
-        assert result["rmse"].notna().all()
-        assert result["mae"].notna().all()
+        assert result["avg_brier"].notna().all()

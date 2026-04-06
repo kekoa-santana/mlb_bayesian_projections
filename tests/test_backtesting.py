@@ -132,5 +132,5 @@ def test_walk_forward_backtest_mocked_pipeline(monkeypatch) -> None:
 
     assert metrics["n_players"] == 2
     assert metrics["convergence"]["converged"] is True
-    assert "bayes_mae" in metrics
+    assert "bayes_brier" in metrics
     assert "calibration" in metrics

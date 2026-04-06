@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.data.db import load_or_build_parquet, read_sql
 from src.data.queries import (
     get_batter_game_logs,
     get_game_batter_ks,
@@ -57,6 +58,11 @@ def _load_or_build(
 ) -> pd.DataFrame:
     """Load from Parquet cache if available, otherwise build and cache.
 
+    Thin wrapper around :func:`~src.data.db.load_or_build_parquet` that
+    constructs the cache path from *name* and *season* and adapts the
+    ``builder(season)`` signature to the zero-argument callable expected
+    by the shared helper.
+
     Parameters
     ----------
     name : str
@@ -73,16 +79,7 @@ def _load_or_build(
     pd.DataFrame
     """
     path = _cache_path(name, season)
-    if path.exists() and not force_rebuild:
-        logger.info("Loading cached %s for %d", name, season)
-        return pd.read_parquet(path)
-
-    logger.info("Building %s for %d (no cache or force_rebuild)", name, season)
-    df = builder(season)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, index=False)
-    logger.info("Cached %s to %s (%d rows)", name, path, len(df))
-    return df
+    return load_or_build_parquet(path, lambda: builder(season), force_rebuild)
 
 
 # ---------------------------------------------------------------------------
@@ -666,8 +663,7 @@ def build_multi_season_hitter_data(
         # Merge advanced batting stats (xSLG, avg_ev_fb) from fact_batting_advanced
         # and sat_batted_balls for model covariates.
         try:
-            from src.data.db import read_sql as _read_sql
-            adv = _read_sql(
+            adv = read_sql(
                 "SELECT batter_id, xslg FROM production.fact_batting_advanced"
                 " WHERE season = :season",
                 {"season": s},
@@ -680,8 +676,7 @@ def build_multi_season_hitter_data(
             df["xslg"] = np.nan
 
         try:
-            from src.data.db import read_sql as _read_sql
-            ev_fb = _read_sql("""
+            ev_fb = read_sql("""
                 SELECT fpa.batter_id,
                        AVG(sbb.launch_speed) AS avg_ev_fb
                 FROM production.fact_pa fpa
@@ -938,8 +933,7 @@ def build_multi_season_pitcher_data(
         # called_strike_rate = called_strikes / total_pitches — captures command
         # quality independently of swing-and-miss (partial r=+0.187 beyond swstr%).
         try:
-            from src.data.db import read_sql as _read_sql
-            cs_df = _read_sql("""
+            cs_df = read_sql("""
                 SELECT fp.pitcher_id,
                        SUM(fp.is_called_strike::int)::float
                            / NULLIF(COUNT(*), 0) AS called_strike_rate,

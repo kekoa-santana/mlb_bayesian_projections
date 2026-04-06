@@ -20,6 +20,7 @@ from src.data.feature_eng import (
     build_multi_season_k_data,
     build_multi_season_pitcher_k_data,
 )
+from src.evaluation.baselines import marcel_rate_projection
 from src.models.k_rate_model import (
     check_convergence,
     extract_player_posteriors,
@@ -100,6 +101,24 @@ def _summarize_posterior_for_season(
 # ---------------------------------------------------------------------------
 # Marcel baseline projection
 # ---------------------------------------------------------------------------
+class _SimpleStatConfig:
+    """Lightweight stat config for legacy K%-only Marcel wrappers."""
+
+    def __init__(
+        self,
+        count_col: str,
+        trials_col: str,
+        rate_col: str,
+        league_avg: float,
+        likelihood: str = "binomial",
+    ) -> None:
+        self.count_col = count_col
+        self.trials_col = trials_col
+        self.rate_col = rate_col
+        self.league_avg = league_avg
+        self.likelihood = likelihood
+
+
 def marcel_k_rate(
     df_history: pd.DataFrame,
     target_season: int,
@@ -124,48 +143,18 @@ def marcel_k_rate(
     pd.DataFrame
         Columns: batter_id, marcel_k_rate, reliability.
     """
-    weights = {0: 5, 1: 4, 2: 3}  # season offset → weight (0 = most recent)
-    available_seasons = sorted(df_history["season"].unique(), reverse=True)
-
-    if league_k_rate is None:
-        total_k = df_history["k"].sum()
-        total_pa = df_history["pa"].sum()
-        league_k_rate = total_k / total_pa if total_pa > 0 else 0.22
-
-    records = []
-    for batter_id, group in df_history.groupby("batter_id"):
-        weighted_k = 0.0
-        weighted_pa = 0.0
-
-        for offset, season in enumerate(available_seasons):
-            if offset > 2:
-                break
-            w = weights.get(offset, 0)
-            row = group[group["season"] == season]
-            if len(row) == 0:
-                continue
-            r = row.iloc[0]
-            weighted_k += w * r["k"]
-            weighted_pa += w * r["pa"]
-
-        if weighted_pa == 0:
-            continue
-
-        raw_rate = weighted_k / weighted_pa
-
-        # Regression toward mean: reliability = weighted_pa / (weighted_pa + 1200)
-        # 1200 is a common Marcel regression PA constant for K%
-        reliability = weighted_pa / (weighted_pa + 1200)
-        marcel_rate = reliability * raw_rate + (1 - reliability) * league_k_rate
-
-        records.append({
-            "batter_id": batter_id,
-            "marcel_k_rate": marcel_rate,
-            "reliability": reliability,
-            "weighted_pa": weighted_pa,
-        })
-
-    return pd.DataFrame(records)
+    cfg = _SimpleStatConfig(
+        count_col="k", trials_col="pa", rate_col="k_rate",
+        league_avg=league_k_rate if league_k_rate is not None else 0.22,
+    )
+    result = marcel_rate_projection(
+        df_history,
+        id_col="batter_id",
+        trials_col="pa",
+        stat_configs={"k_rate": cfg},
+        regression_constants={"k_rate": 1200},
+    )
+    return result["k_rate"].rename(columns={"marcel_k_rate": "marcel_k_rate"})
 
 
 # ---------------------------------------------------------------------------
@@ -491,47 +480,22 @@ def marcel_pitcher_k_rate(
     pd.DataFrame
         Columns: pitcher_id, marcel_k_rate, reliability, weighted_bf.
     """
-    weights = {0: 5, 1: 4, 2: 3}
-    available_seasons = sorted(df_history["season"].unique(), reverse=True)
-
-    if league_k_rate is None:
-        total_k = df_history["k"].sum()
-        total_bf = df_history["batters_faced"].sum()
-        league_k_rate = total_k / total_bf if total_bf > 0 else 0.224
-
-    records = []
-    for pitcher_id, group in df_history.groupby("pitcher_id"):
-        weighted_k = 0.0
-        weighted_bf = 0.0
-
-        for offset, season in enumerate(available_seasons):
-            if offset > 2:
-                break
-            w = weights.get(offset, 0)
-            row = group[group["season"] == season]
-            if len(row) == 0:
-                continue
-            r = row.iloc[0]
-            weighted_k += w * r["k"]
-            weighted_bf += w * r["batters_faced"]
-
-        if weighted_bf == 0:
-            continue
-
-        raw_rate = weighted_k / weighted_bf
-
-        # Regression: BF constant ~800 for pitchers (less stable than hitters)
-        reliability = weighted_bf / (weighted_bf + 800)
-        marcel_rate = reliability * raw_rate + (1 - reliability) * league_k_rate
-
-        records.append({
-            "pitcher_id": pitcher_id,
-            "marcel_k_rate": marcel_rate,
-            "reliability": reliability,
-            "weighted_bf": weighted_bf,
-        })
-
-    return pd.DataFrame(records)
+    cfg = _SimpleStatConfig(
+        count_col="k", trials_col="batters_faced", rate_col="k_rate",
+        league_avg=league_k_rate if league_k_rate is not None else 0.224,
+    )
+    result = marcel_rate_projection(
+        df_history,
+        id_col="pitcher_id",
+        trials_col="batters_faced",
+        stat_configs={"k_rate": cfg},
+        regression_constants={"k_rate": 800},
+    )
+    df_out = result["k_rate"].rename(columns={"marcel_k_rate": "marcel_k_rate"})
+    # Rename weighted_batters_faced -> weighted_bf for backward compat
+    if "weighted_batters_faced" in df_out.columns:
+        df_out = df_out.rename(columns={"weighted_batters_faced": "weighted_bf"})
+    return df_out
 
 
 # ---------------------------------------------------------------------------

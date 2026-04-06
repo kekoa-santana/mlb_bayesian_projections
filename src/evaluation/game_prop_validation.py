@@ -965,12 +965,12 @@ def _build_pitcher_prop_predictions(
     game_batter_stats = get_cached_game_batter_stats(test_season)
 
     # 5. Context lifts (umpire + weather, stat-specific)
-    from src.evaluation.game_k_validation import (
-        _build_umpire_lift_lookup_multi,
-        _build_weather_lift_lookup_multi,
+    from src.evaluation.context_lifts import (
+        build_umpire_logit_lifts,
+        build_weather_logit_lifts,
     )
-    umpire_lifts_multi = _build_umpire_lift_lookup_multi(train_seasons, test_season)
-    weather_lifts_multi = _build_weather_lift_lookup_multi(train_seasons, test_season)
+    umpire_lifts_multi = build_umpire_logit_lifts(train_seasons, test_season)
+    weather_lifts_multi = build_weather_logit_lifts(train_seasons, test_season)
 
     # Combine stat-specific context lifts for the current prop
     sn_key = config.stat_name.lower()
@@ -1318,12 +1318,12 @@ def _build_batter_prop_predictions(
                 batter_pitcher_lookup[key] = int(row["pitcher_id"])
 
     # 6. Context lifts (stat-specific)
-    from src.evaluation.game_k_validation import (
-        _build_umpire_lift_lookup_multi,
-        _build_weather_lift_lookup_multi,
+    from src.evaluation.context_lifts import (
+        build_umpire_logit_lifts,
+        build_weather_logit_lifts,
     )
-    umpire_lifts_multi = _build_umpire_lift_lookup_multi(train_seasons, test_season)
-    weather_lifts_multi = _build_weather_lift_lookup_multi(train_seasons, test_season)
+    umpire_lifts_multi = build_umpire_logit_lifts(train_seasons, test_season)
+    weather_lifts_multi = build_weather_logit_lifts(train_seasons, test_season)
 
     # Stat-specific umpire + weather lifts for this prop
     sn = config.stat_name.lower()

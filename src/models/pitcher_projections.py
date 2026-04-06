@@ -14,7 +14,6 @@ Dimensions
 """
 from __future__ import annotations
 
-import gc
 import logging
 from typing import Any
 
@@ -33,6 +32,11 @@ from src.models.pitcher_model import (
     extract_rate_samples,
     fit_pitcher_model,
     prepare_pitcher_data,
+)
+from src.models.projection_utils import (
+    compute_composite,
+    find_breakouts_and_regressions as _find_breakouts_and_regressions,
+    fit_all_models_generic,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,76 +104,23 @@ def fit_all_models(
     if stats is None:
         stats = ALL_STATS
 
-    df = build_multi_season_pitcher_data(seasons, min_bf=min_bf)
-    logger.info("Loaded %d pitcher-seasons for projection", len(df))
-
-    results: dict[str, dict[str, Any]] = {}
-
-    for stat in stats:
-        logger.info("=" * 50)
-        logger.info("Fitting pitcher %s model", stat)
-
-        data = prepare_pitcher_data(df, stat)
-        model, trace = fit_pitcher_model(
-            data,
-            draws=draws,
-            tune=tune,
-            chains=chains,
-            random_seed=random_seed,
-        )
-        conv = check_convergence(trace, stat)
-        posteriors = extract_posteriors(trace, data)
-
-        # Pre-extract rate samples so we can free the trace entirely
-        rate_samples: dict[int, np.ndarray] | None = None
-        if extract_season is not None:
-            rate_samples = {}
-            stat_df = data["df"]
-            active_pids = stat_df[
-                stat_df["season"] == extract_season
-            ]["pitcher_id"].unique()
-            for pid in active_pids:
-                try:
-                    rate_samples[int(pid)] = extract_rate_samples(
-                        trace, data,
-                        pitcher_id=int(pid),
-                        season=extract_season,
-                        project_forward=True,
-                        random_seed=random_seed,
-                    )
-                except ValueError:
-                    continue
-            logger.info(
-                "Pre-extracted %s samples for %d pitchers",
-                stat, len(rate_samples),
-            )
-
-        results[stat] = {
-            "data": data,
-            "convergence": conv,
-            "posteriors": posteriors,
-        }
-        if rate_samples is not None:
-            results[stat]["rate_samples"] = rate_samples
-        else:
-            # Keep stripped trace for backward compat (backtests etc.)
-            for group in ("posterior_predictive", "sample_stats", "observed_data"):
-                if hasattr(trace, group):
-                    delattr(trace, group)
-            results[stat]["trace"] = trace
-
-        # Free model + trace (if pre-extracted) to reclaim memory
-        del model
-        if rate_samples is not None:
-            del trace
-        gc.collect()
-
-        logger.info(
-            "pitcher %s: converged=%s, r_hat=%.4f",
-            stat, conv["converged"], conv["max_rhat"],
-        )
-
-    return results
+    return fit_all_models_generic(
+        stats=stats,
+        data_builder_fn=build_multi_season_pitcher_data,
+        data_builder_kwargs={"seasons": seasons, "min_bf": min_bf},
+        prepare_data_fn=prepare_pitcher_data,
+        model_fitter_fn=fit_pitcher_model,
+        check_convergence_fn=check_convergence,
+        extract_posteriors_fn=extract_posteriors,
+        extract_samples_fn=extract_rate_samples,
+        id_col="pitcher_id",
+        player_type="pitcher",
+        draws=draws,
+        tune=tune,
+        chains=chains,
+        random_seed=random_seed,
+        extract_season=extract_season,
+    )
 
 
 def _enrich_with_observed(
@@ -199,40 +150,7 @@ def _enrich_with_observed(
 
 def _compute_composite(base: pd.DataFrame) -> pd.DataFrame:
     """Compute 4-dimension composite score using z-score normalization."""
-    base["composite_score"] = 0.0
-    base["_total_weight"] = 0.0
-
-    for dim_name, (weight, components) in COMPOSITE_DIMENSIONS.items():
-        dim_z_scores = []
-
-        for col, sign, source in components:
-            if col not in base.columns:
-                continue
-            vals = base[col].astype(float)
-            mu, sd = vals.mean(), vals.std()
-            if pd.isna(sd) or np.isclose(sd, 0.0):
-                continue
-            z = (vals - mu) / sd * sign
-            dim_z_scores.append(z)
-
-        if not dim_z_scores:
-            continue
-
-        dim_df = pd.concat(dim_z_scores, axis=1)
-        dim_avg = dim_df.mean(axis=1)
-
-        has_value = dim_avg.notna()
-        base["composite_score"] += weight * dim_avg.fillna(0)
-        base["_total_weight"] += has_value.astype(float) * weight
-
-    base["composite_score"] = np.where(
-        base["_total_weight"] > 0,
-        base["composite_score"] / base["_total_weight"],
-        0.0,
-    )
-    base.drop(columns=["_total_weight"], inplace=True)
-
-    return base
+    return compute_composite(base, COMPOSITE_DIMENSIONS)
 
 
 def _derive_fip_era(
@@ -500,7 +418,4 @@ def find_breakouts_and_regressions(
     tuple[pd.DataFrame, pd.DataFrame]
         (breakouts, regressions) sorted by |composite_score|.
     """
-    breakouts = projections.head(n_top).copy()
-    regressions = projections.tail(n_top).iloc[::-1].copy()
-
-    return breakouts.reset_index(drop=True), regressions.reset_index(drop=True)
+    return _find_breakouts_and_regressions(projections, n_top=n_top)

@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -27,14 +26,17 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models.game_sim.lineup_simulator import simulate_lineup_game
-from scripts.precompute.backtest_lineup_sim import (
-    load_posteriors,
+from scripts.precompute import DASHBOARD_DIR
+from scripts.precompute.backtest_harness import (
+    DEFAULT_BP_K_RATE as DEFAULT_BP_K,
+    DEFAULT_BP_BB_RATE as DEFAULT_BP_BB,
+    DEFAULT_BP_HR_RATE as DEFAULT_BP_HR,
+    N_SIMS,
     fetch_backtest_games,
-    DEFAULT_BP_K,
-    DEFAULT_BP_BB,
-    DEFAULT_BP_HR,
+    run_sides_loop,
 )
+from scripts.precompute.backtest_lineup_sim import load_posteriors
+from src.models.game_sim.lineup_simulator import simulate_lineup_game
 from scripts.precompute.precompute_ld_rate import LEAGUE_LD_RATE
 
 logging.basicConfig(
@@ -42,11 +44,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-DASHBOARD_DIR = Path(r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard")
-
-N_SIMS = 10_000
-BATCH_SIZE = 25
 
 # Stats to compare (H is the primary target since LD% affects BABIP -> hits)
 STATS = ["h", "k", "bb", "r", "rbi"]
@@ -272,39 +269,17 @@ def run_backtest(
         return pd.DataFrame()
 
     sides = list(games_df.groupby(["game_pk", "team_id"]))
-    n_sides = len(sides)
     logger.info(
         "Running LD%% BABIP backtest on %d team-game sides (%d sims each)...",
-        n_sides, n_sims,
+        len(sides), n_sims,
     )
 
-    all_records: list[dict] = []
-    n_skipped = 0
-    t0 = time.perf_counter()
-
-    for idx, ((game_pk, team_id), side_df) in enumerate(sides):
-        recs = simulate_one_side(side_df, posteriors, ld_lookup, n_sims=n_sims)
-        if recs is None:
-            n_skipped += 1
-        else:
-            all_records.extend(recs)
-
-        if (idx + 1) % BATCH_SIZE == 0 or idx == n_sides - 1:
-            elapsed = time.perf_counter() - t0
-            pct = 100 * (idx + 1) / n_sides
-            rate = (idx + 1) / elapsed if elapsed > 0 else 0
-            logger.info(
-                "Progress: %d/%d (%.1f%%) | %.1f sides/sec | "
-                "%d skipped | %d batter-games",
-                idx + 1, n_sides, pct, rate, n_skipped, len(all_records),
-            )
-
-    elapsed = time.perf_counter() - t0
-    logger.info(
-        "Done: %d batter-games in %.1fs. Skipped %d sides.",
-        len(all_records), elapsed, n_skipped,
+    df, _skipped = run_sides_loop(
+        label="LD-BABIP",
+        sides=sides,
+        simulate_fn=lambda sdf: simulate_one_side(sdf, posteriors, ld_lookup, n_sims=n_sims),
     )
-    return pd.DataFrame(all_records)
+    return df
 
 
 def print_results(df: pd.DataFrame) -> None:

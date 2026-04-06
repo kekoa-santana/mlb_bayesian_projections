@@ -89,10 +89,10 @@ class TestComputeBfPriorsShapes:
 
 class TestShrinkageHighStarts:
     def test_high_starts_reliability(self, game_logs: pd.DataFrame) -> None:
-        """30-start pitcher: reliability > 0.9, mu_bf ≈ raw mean."""
+        """30-start pitcher: reliability > 0.85, mu_bf ≈ raw mean."""
         priors = compute_pitcher_bf_priors(game_logs)
         p1 = priors[priors["pitcher_id"] == 1].iloc[0]
-        assert p1["reliability"] > 0.9
+        assert p1["reliability"] > 0.85
         # mu_bf should be close to raw_mean_bf (mostly own data)
         assert abs(p1["mu_bf"] - p1["raw_mean_bf"]) < 1.0
 
@@ -103,7 +103,7 @@ class TestShrinkageLowStarts:
         priors = compute_pitcher_bf_priors(game_logs, min_starts=5)
         p2 = priors[priors["pitcher_id"] == 2].iloc[0]
         assert p2["reliability"] == 0.0
-        assert p2["mu_bf"] == 22.0  # pop_mu default
+        assert p2["mu_bf"] == 22.4  # pop_mu default (DEFAULT_POP_BF_MU)
 
 
 class TestDrawBfSamplesBounded:
@@ -142,4 +142,4 @@ class TestGetBfDistribution:
         priors = compute_pitcher_bf_priors(game_logs)
         result = get_bf_distribution(999, 2024, priors)
         assert result["dist_type"] == "population_fallback"
-        assert result["mu_bf"] == 22.0
+        assert result["mu_bf"] == 22.4

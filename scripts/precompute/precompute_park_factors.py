@@ -24,13 +24,10 @@ from scipy.special import logit as _logit
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.precompute import DASHBOARD_DIR
 from src.data.db import read_sql
 
 logger = logging.getLogger("precompute.park_factors")
-
-DASHBOARD_DIR = Path(
-    r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard"
-)
 
 # Seasons to use for park factor computation
 PF_SEASONS = [2022, 2023, 2024, 2025]

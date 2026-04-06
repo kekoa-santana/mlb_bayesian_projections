@@ -31,10 +31,6 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from precompute import DASHBOARD_DIR
 from src.data.feature_eng import get_cached_sprint_speed
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 # League average sprint speed (2022-2025 Statcast data, ~27.0-27.3)
@@ -129,6 +125,10 @@ def compute_sprint_speeds() -> pd.DataFrame:
 
 def run() -> None:
     """Compute and save per-batter sprint speed data."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     df = compute_sprint_speeds()
 
     if df.empty:

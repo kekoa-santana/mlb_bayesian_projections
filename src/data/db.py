@@ -118,6 +118,38 @@ def get_engine() -> Engine:
     return engine
 
 
+def load_or_build_parquet(
+    cache_path: Path,
+    builder: callable,
+    force_rebuild: bool = False,
+) -> pd.DataFrame:
+    """Load a DataFrame from Parquet cache, or build and cache it.
+
+    Parameters
+    ----------
+    cache_path : Path
+        Full path to the ``.parquet`` cache file.
+    builder : callable
+        Zero-argument callable that returns the DataFrame to cache.
+    force_rebuild : bool
+        If True, ignore existing cache and rebuild.
+
+    Returns
+    -------
+    pd.DataFrame
+    """
+    if cache_path.exists() and not force_rebuild:
+        logger.info("Loading cached %s", cache_path.name)
+        return pd.read_parquet(cache_path)
+
+    logger.info("Building %s", cache_path.name)
+    df = builder()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path, index=False)
+    logger.info("Cached %s (%d rows)", cache_path.name, len(df))
+    return df
+
+
 def read_sql(query: str, params: dict[str, Any] | None = None) -> pd.DataFrame:
     """Execute a SQL query and return results as a DataFrame.
 

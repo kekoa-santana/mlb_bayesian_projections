@@ -30,9 +30,20 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.db import read_sql
+from scripts.precompute import DASHBOARD_DIR
+from scripts.precompute.backtest_harness import (
+    ALL_STATS,
+    N_SIMS,
+    PROP_LINES,
+    PRIMARY_LINE,
+    fetch_backtest_games as _harness_fetch,
+    run_sides_loop,
+    simulate_one_side as _harness_simulate_one_side,
+)
+from scripts.precompute.backtest_lineup_sim import (
+    load_posteriors as _load_base_posteriors,
+)
 from src.data.queries import get_umpire_tendencies
-from src.models.game_sim.lineup_simulator import simulate_lineup_game
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,87 +51,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DASHBOARD_DIR = Path(
-    r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard"
-)
-
-ALL_STATS = ["h", "k", "bb", "r", "rbi", "hrr"]
-
-PROP_LINES = {
-    "h": [0.5, 1.5, 2.5],
-    "k": [0.5, 1.5],
-    "bb": [0.5],
-    "r": [0.5, 1.5],
-    "rbi": [0.5, 1.5],
-    "hrr": [0.5, 1.5, 2.5, 3.5],
-}
-
-PRIMARY_LINE = {
-    "h": 0.5,
-    "k": 0.5,
-    "bb": 0.5,
-    "r": 0.5,
-    "rbi": 0.5,
-    "hrr": 1.5,
-}
-
-N_SIMS = 10_000
-BATCH_SIZE = 25
-
-DEFAULT_BP_K = 0.253
-DEFAULT_BP_BB = 0.084
-DEFAULT_BP_HR = 0.024
-
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
 def load_posteriors() -> dict:
-    """Load pre-computed posterior samples and supporting data."""
-    logger.info("Loading posteriors...")
-    data = {}
-    data["hitter_k"] = np.load(DASHBOARD_DIR / "hitter_k_samples.npz")
-    data["hitter_bb"] = np.load(DASHBOARD_DIR / "hitter_bb_samples.npz")
-    data["hitter_hr"] = np.load(DASHBOARD_DIR / "hitter_hr_samples.npz")
-    data["pitcher_k"] = np.load(DASHBOARD_DIR / "pitcher_k_samples.npz")
-    data["pitcher_bb"] = np.load(DASHBOARD_DIR / "pitcher_bb_samples.npz")
-    data["pitcher_hr"] = np.load(DASHBOARD_DIR / "pitcher_hr_samples.npz")
-    data["bf_priors"] = pd.read_parquet(DASHBOARD_DIR / "bf_priors.parquet")
-    data["bullpen_rates"] = pd.read_parquet(
-        DASHBOARD_DIR / "team_bullpen_rates.parquet"
-    )
-
-    # Index bullpen rates
-    bp = (
-        data["bullpen_rates"]
-        .sort_values("season")
-        .groupby("team_id").last()
-        .reset_index()
-    )
-    data["bp_lookup"] = {
-        int(row["team_id"]): {
-            "k_rate": float(row["k_rate"]),
-            "bb_rate": float(row["bb_rate"]),
-            "hr_rate": float(row["hr_rate"]),
-        }
-        for _, row in bp.iterrows()
-    }
-
-    # Index BF priors
-    bf = (
-        data["bf_priors"]
-        .sort_values("season")
-        .groupby("pitcher_id").last()
-        .reset_index()
-    )
-    data["bf_lookup"] = {
-        int(row["pitcher_id"]): {
-            "mu_bf": float(row["mu_bf"]),
-            "sigma_bf": float(row["sigma_bf"]),
-        }
-        for _, row in bf.iterrows()
-    }
+    """Load base posteriors and add LD% / sprint-speed BABIP lookups."""
+    data = _load_base_posteriors()
 
     # LD% BABIP adjustments
     data["ld_babip_lookup"] = {}
@@ -161,12 +99,7 @@ def load_posteriors() -> dict:
         pass
 
     logger.info(
-        "Loaded: %d hitters, %d pitchers, %d BF priors, %d bullpen, "
-        "%d LD BABIP, %d speed BABIP",
-        len(set(data["hitter_k"].files)),
-        len(set(data["pitcher_k"].files)),
-        len(data["bf_lookup"]),
-        len(data["bp_lookup"]),
+        "  + LD BABIP: %d, speed BABIP: %d",
         len(data["ld_babip_lookup"]),
         len(data["speed_babip_lookup"]),
     )
@@ -209,85 +142,35 @@ def fetch_backtest_games(
     seasons: list[int],
     max_games: int | None = None,
 ) -> pd.DataFrame:
-    """Fetch games with umpire info, full lineups, boxscores, and starters."""
-    season_list = ", ".join(str(s) for s in seasons)
-    query = f"""
-    WITH starters AS (
-        SELECT
-            pb.pitcher_id,
-            pb.game_pk,
-            pb.team_id AS pitcher_team_id
-        FROM staging.pitching_boxscores pb
-        WHERE pb.is_starter = TRUE
-          AND pb.batters_faced >= 9
-    ),
-    game_season AS (
-        SELECT game_pk, season, home_team_id, away_team_id, venue_id
-        FROM production.dim_game
-        WHERE game_type = 'R' AND season IN ({season_list})
-    )
-    SELECT
-        fl.game_pk,
-        gs.season,
-        gs.venue_id,
-        du.hp_umpire_name,
-        fl.player_id AS batter_id,
-        fl.batting_order,
-        fl.team_id,
-        bb.hits AS actual_h,
-        bb.runs AS actual_r,
-        bb.rbi AS actual_rbi,
-        bb.strikeouts AS actual_k,
-        bb.walks AS actual_bb,
-        bb.home_runs AS actual_hr,
-        bb.total_bases AS actual_tb,
-        bb.plate_appearances AS actual_pa,
-        st.pitcher_id AS opp_starter_id,
-        st.pitcher_team_id AS opp_team_id
-    FROM production.fact_lineup fl
-    JOIN game_season gs ON fl.game_pk = gs.game_pk
-    JOIN staging.batting_boxscores bb
-      ON fl.player_id = bb.batter_id AND fl.game_pk = bb.game_pk
-    LEFT JOIN starters st
-      ON fl.game_pk = st.game_pk AND st.pitcher_team_id != fl.team_id
-    LEFT JOIN production.dim_umpire du
-      ON fl.game_pk = du.game_pk
-    WHERE fl.is_starter = TRUE
-      AND fl.batting_order BETWEEN 1 AND 9
-      AND bb.plate_appearances >= 1
-    ORDER BY fl.game_pk, fl.team_id, fl.batting_order
+    """Fetch games with umpire info via harness ``fetch_backtest_games``.
+
+    The umpire backtest needs special sampling logic (prefer games with
+    umpire data), so we fetch more than ``max_games`` and post-filter.
     """
-    logger.info("Fetching backtest games for seasons %s with umpire info...", seasons)
-    df = read_sql(query)
-    logger.info("Raw rows: %d", len(df))
+    # Fetch without sampling first so we can apply umpire-aware sampling
+    df = _harness_fetch(
+        seasons,
+        max_games=None,
+        extra_select=["gs.venue_id", "du.hp_umpire_name"],
+        extra_joins=[
+            "LEFT JOIN production.dim_umpire du ON fl.game_pk = du.game_pk",
+        ],
+    )
 
     if df.empty:
         return df
 
-    # Filter to full 9-man lineups
-    counts = df.groupby(["game_pk", "team_id"]).size().reset_index(name="n_batters")
-    full_sides = counts[counts["n_batters"] == 9][["game_pk", "team_id"]]
-    df = df.merge(full_sides, on=["game_pk", "team_id"])
-
-    # Filter to sides with opposing starter
-    df = df[df["opp_starter_id"].notna()].copy()
-    df["opp_starter_id"] = df["opp_starter_id"].astype(int)
-    df["actual_hrr"] = df["actual_h"] + df["actual_r"] + df["actual_rbi"]
-
     n_sides = df.groupby(["game_pk", "team_id"]).ngroups
     n_with_ump = df[df["hp_umpire_name"].notna()]["game_pk"].nunique()
     logger.info(
-        "After filtering: %d rows (%d team-game sides), %d games with umpire data",
-        len(df), n_sides, n_with_ump,
+        "Umpire games: %d of %d total sides", n_with_ump, n_sides,
     )
 
     if max_games is not None and n_sides > max_games:
-        # Prefer games that have umpire data (otherwise we cannot test the feature)
+        # Prefer games that have umpire data
         side_keys = df[["game_pk", "team_id"]].drop_duplicates()
-        # Mark sides with umpire data
         ump_games = set(df[df["hp_umpire_name"].notna()]["game_pk"].unique())
         side_keys["has_ump"] = side_keys["game_pk"].isin(ump_games)
-        # Take all umpire sides first, sample the rest from non-umpire
         ump_sides = side_keys[side_keys["has_ump"]]
         if len(ump_sides) > max_games:
             ump_sides = ump_sides.sample(n=max_games, random_state=42)
@@ -325,67 +208,7 @@ def simulate_one_side(
     If use_umpire_bb is True, passes both umpire K and BB lifts.
     If False, passes only umpire K lift (BB lift = 0).
     """
-    side_df = side_df.sort_values("batting_order")
-    batter_ids = side_df["batter_id"].astype(int).tolist()
-    opp_starter_id = int(side_df.iloc[0]["opp_starter_id"])
-    opp_team_id = int(side_df.iloc[0]["opp_team_id"])
-    pid_str = str(opp_starter_id)
-
-    # Check pitcher posteriors
-    if pid_str not in posteriors["pitcher_k"].files:
-        return None
-    if pid_str not in posteriors["pitcher_bb"].files:
-        return None
-    if pid_str not in posteriors["pitcher_hr"].files:
-        return None
-
-    # Build batter samples
-    batter_k_samples = []
-    batter_bb_samples = []
-    batter_hr_samples = []
-    valid_count = 0
-
-    for bid in batter_ids:
-        bid_str = str(bid)
-        has_k = bid_str in posteriors["hitter_k"].files
-        has_bb = bid_str in posteriors["hitter_bb"].files
-        has_hr = bid_str in posteriors["hitter_hr"].files
-
-        if has_k and has_bb and has_hr:
-            batter_k_samples.append(posteriors["hitter_k"][bid_str])
-            batter_bb_samples.append(posteriors["hitter_bb"][bid_str])
-            batter_hr_samples.append(posteriors["hitter_hr"][bid_str])
-            valid_count += 1
-        else:
-            rng = np.random.default_rng(bid % 100000)
-            batter_k_samples.append(
-                np.clip(rng.normal(0.226, 0.03, 2000), 0.05, 0.50)
-            )
-            batter_bb_samples.append(
-                np.clip(rng.normal(0.082, 0.02, 2000), 0.02, 0.25)
-            )
-            batter_hr_samples.append(
-                np.clip(rng.normal(0.031, 0.01, 2000), 0.005, 0.10)
-            )
-
-    if valid_count < 5:
-        return None
-
-    # Pitcher rates
-    starter_k = float(np.mean(posteriors["pitcher_k"][pid_str]))
-    starter_bb = float(np.mean(posteriors["pitcher_bb"][pid_str]))
-    starter_hr = float(np.mean(posteriors["pitcher_hr"][pid_str]))
-
-    # BF priors
-    bf_info = posteriors["bf_lookup"].get(opp_starter_id)
-    mu_bf = bf_info["mu_bf"] if bf_info else 22.0
-    sigma_bf = bf_info["sigma_bf"] if bf_info else 3.4
-
-    # Bullpen rates
-    bp_info = posteriors["bp_lookup"].get(opp_team_id)
-    bp_k = bp_info["k_rate"] if bp_info else DEFAULT_BP_K
-    bp_bb = bp_info["bb_rate"] if bp_info else DEFAULT_BP_BB
-    bp_hr = bp_info["hr_rate"] if bp_info else DEFAULT_BP_HR
+    batter_ids = side_df.sort_values("batting_order")["batter_id"].astype(int).tolist()
 
     # Per-batter BABIP adjustments (LD% + sprint speed)
     babip_adjs = np.array([
@@ -400,85 +223,27 @@ def simulate_one_side(
     ump_k = ump_info.get("k_lift", 0.0)
     ump_bb = ump_info.get("bb_lift", 0.0) if use_umpire_bb else 0.0
 
-    game_pk = int(side_df.iloc[0]["game_pk"])
-    result = simulate_lineup_game(
-        batter_k_rate_samples=batter_k_samples,
-        batter_bb_rate_samples=batter_bb_samples,
-        batter_hr_rate_samples=batter_hr_samples,
-        starter_k_rate=starter_k,
-        starter_bb_rate=starter_bb,
-        starter_hr_rate=starter_hr,
-        starter_bf_mu=mu_bf,
-        starter_bf_sigma=sigma_bf,
-        bullpen_k_rate=bp_k,
-        bullpen_bb_rate=bp_bb,
-        bullpen_hr_rate=bp_hr,
+    ctx = dict(
         batter_babip_adjs=babip_adjs,
         umpire_k_lift=ump_k,
         umpire_bb_lift=ump_bb,
-        n_sims=n_sims,
-        random_seed=game_pk % (2**31),
     )
 
-    # Extract per-batter predictions
-    records = []
-    for i, (_, row) in enumerate(side_df.iterrows()):
-        bid = int(row["batter_id"])
-        bid_str = str(bid)
-        has_posterior = (
-            bid_str in posteriors["hitter_k"].files
-            and bid_str in posteriors["hitter_bb"].files
-            and bid_str in posteriors["hitter_hr"].files
-        )
+    extra = {
+        "hp_umpire_name": hp_ump if pd.notna(hp_ump) else "",
+        "has_umpire": bool(pd.notna(hp_ump) and hp_ump and hp_ump in ump_lifts),
+        "ump_k_lift": ump_k,
+        "ump_bb_lift": ump_bb if use_umpire_bb else 0.0,
+    }
 
-        br = result.batter_result(i)
-        h_samples = br["h_samples"]
-        r_samples = br["r_samples"]
-        rbi_samples = br["rbi_samples"]
-        k_samples = br["k_samples"]
-        bb_samples = br["bb_samples"]
-        hrr_samples = h_samples + r_samples + rbi_samples
-
-        rec = {
-            "game_pk": int(row["game_pk"]),
-            "season": int(row["season"]),
-            "batter_id": bid,
-            "batting_order": int(row["batting_order"]),
-            "team_id": int(row["team_id"]),
-            "opp_starter_id": int(row["opp_starter_id"]),
-            "hp_umpire_name": row.get("hp_umpire_name", ""),
-            "has_posterior": has_posterior,
-            "has_umpire": bool(pd.notna(hp_ump) and hp_ump and hp_ump in ump_lifts),
-            "ump_k_lift": ump_k,
-            "ump_bb_lift": ump_bb if use_umpire_bb else 0.0,
-            "actual_h": int(row["actual_h"]),
-            "actual_r": int(row["actual_r"]),
-            "actual_rbi": int(row["actual_rbi"]),
-            "actual_hrr": int(row["actual_hrr"]),
-            "actual_k": int(row["actual_k"]),
-            "actual_bb": int(row["actual_bb"]),
-            "actual_pa": int(row["actual_pa"]),
-            "pred_h": float(np.mean(h_samples)),
-            "pred_r": float(np.mean(r_samples)),
-            "pred_rbi": float(np.mean(rbi_samples)),
-            "pred_hrr": float(np.mean(hrr_samples)),
-            "pred_k": float(np.mean(k_samples)),
-            "pred_bb": float(np.mean(bb_samples)),
-        }
-
-        # P(over) at each prop line
-        for stat, lines in PROP_LINES.items():
-            if stat == "hrr":
-                samples = hrr_samples
-            else:
-                samples = br[f"{stat}_samples"]
-            for line in lines:
-                p_over = float(np.mean(samples > line))
-                rec[f"p_over_{stat}_{line}"] = p_over
-
-        records.append(rec)
-
-    return records
+    return _harness_simulate_one_side(
+        side_df,
+        posteriors,
+        prop_lines=PROP_LINES,
+        n_sims=n_sims,
+        context_kwargs=ctx,
+        extra_record_fields=extra,
+    )
 
 
 def run_one_variant(
@@ -490,35 +255,14 @@ def run_one_variant(
     n_sims: int,
 ) -> pd.DataFrame:
     """Run all sides for one variant."""
-    all_records: list[dict] = []
-    n_skipped = 0
-    t0 = time.perf_counter()
-    n_sides = len(sides)
-
-    for idx, ((game_pk, team_id), side_df) in enumerate(sides):
-        recs = simulate_one_side(
-            side_df, posteriors, ump_lifts, use_umpire_bb, n_sims=n_sims,
-        )
-        if recs is None:
-            n_skipped += 1
-        else:
-            all_records.extend(recs)
-
-        if (idx + 1) % BATCH_SIZE == 0 or idx == n_sides - 1:
-            elapsed = time.perf_counter() - t0
-            pct = 100 * (idx + 1) / n_sides
-            rate = (idx + 1) / elapsed if elapsed > 0 else 0
-            logger.info(
-                "[%s] %d/%d (%.0f%%) | %.1f sides/sec | %d skipped | %d batters",
-                label, idx + 1, n_sides, pct, rate, n_skipped, len(all_records),
-            )
-
-    elapsed = time.perf_counter() - t0
-    logger.info(
-        "[%s] Done: %d batter-games in %.1fs. Skipped %d.",
-        label, len(all_records), elapsed, n_skipped,
+    df, _skipped = run_sides_loop(
+        label=label,
+        sides=sides,
+        simulate_fn=lambda sdf: simulate_one_side(
+            sdf, posteriors, ump_lifts, use_umpire_bb, n_sims=n_sims,
+        ),
     )
-    return pd.DataFrame(all_records)
+    return df
 
 
 # ---------------------------------------------------------------------------

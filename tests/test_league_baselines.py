@@ -249,9 +249,10 @@ class TestPooledBaselinesWeightsByVolume:
         )
         row = result.iloc[0]
 
-        # Volume-weighted: (150+5) / (500+50) = 155/550 ≈ 0.2818
+        # Marcel-weighted (default): 2021 (most recent) gets weight 5, 2020 gets weight 4
+        # whiffs: 150*5 + 5*4 = 770, swings: 500*5 + 50*4 = 2700
         # NOT simple average: (0.30 + 0.10) / 2 = 0.20
-        expected_whiff = (150 + 5) / (500 + 50)
+        expected_whiff = (150 * 5 + 5 * 4) / (500 * 5 + 50 * 4)
         assert row["whiff_rate"] == pytest.approx(expected_whiff)
         # Verify it's NOT the simple average
         assert row["whiff_rate"] != pytest.approx(0.20, abs=0.01)

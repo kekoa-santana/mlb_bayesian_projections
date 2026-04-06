@@ -3,12 +3,17 @@ Enhanced evaluation metrics for game-level prop predictions.
 
 Provides log loss, CRPS, ECE, MCE, and temperature scaling diagnostics
 that go beyond Brier score for full-distribution evaluation.
+
+Also includes shared coverage, PPC extraction, and CRPS comparison
+utilities used by hitter/pitcher/counting/season-sim backtests.
 """
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import numpy as np
+import pandas as pd
 from scipy.optimize import minimize_scalar
 from scipy.special import expit, logit
 from scipy.stats import kstest
@@ -413,3 +418,271 @@ def summarize_ppc_calibration(
         "pct_outliers": float(pct),
         "uniform_consistent": bool(ks_result.pvalue >= alpha),
     }
+
+
+# ---------------------------------------------------------------------------
+# Shared coverage utilities
+# ---------------------------------------------------------------------------
+
+
+def compute_coverage(
+    actual: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+) -> float:
+    """Fraction of actuals within [lo, hi] interval.
+
+    Parameters
+    ----------
+    actual : np.ndarray
+        Observed values.
+    lo : np.ndarray
+        Lower bounds of credible/confidence interval.
+    hi : np.ndarray
+        Upper bounds of credible/confidence interval.
+
+    Returns
+    -------
+    float
+        Empirical coverage fraction in [0, 1].
+    """
+    return float(np.mean((actual >= lo) & (actual <= hi)))
+
+
+def compute_coverage_from_sd(
+    actual: np.ndarray,
+    mean: np.ndarray,
+    sd: np.ndarray,
+    level: float = 0.80,
+) -> float:
+    """Coverage using normal approximation at given confidence level.
+
+    Parameters
+    ----------
+    actual : np.ndarray
+        Observed values.
+    mean : np.ndarray
+        Predicted means.
+    sd : np.ndarray
+        Predicted standard deviations.
+    level : float
+        Confidence level (e.g. 0.80 for 80% CI).
+
+    Returns
+    -------
+    float
+        Empirical coverage fraction in [0, 1].
+    """
+    from scipy.stats import norm
+
+    z = norm.ppf(0.5 + level / 2)
+    lo = mean - z * sd
+    hi = mean + z * sd
+    return compute_coverage(actual, lo, hi)
+
+
+# ---------------------------------------------------------------------------
+# PPC extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_ppc_summary(
+    trace: Any,
+    data: dict[str, Any],
+    cfg: Any,
+    label: str = "",
+) -> dict[str, Any] | None:
+    """Extract and summarize posterior predictive checks from a fitted trace.
+
+    Parameters
+    ----------
+    trace : InferenceData
+        Fitted ArviZ trace with optional ``posterior_predictive`` group.
+    data : dict
+        Model data dict. Must contain ``"counts"`` (binomial) or
+        ``"y_obs"`` (normal) for comparison.
+    cfg : object
+        Stat config with a ``likelihood`` attribute (``"binomial"`` or
+        ``"normal"``).
+    label : str
+        Descriptive label for log messages.
+
+    Returns
+    -------
+    dict | None
+        PPC calibration summary, or None if PPC is unavailable.
+    """
+    try:
+        if not (hasattr(trace, "posterior_predictive")
+                and "obs" in trace.posterior_predictive):
+            return None
+
+        ppc_obs = trace.posterior_predictive["obs"].values  # (chains, draws, n_obs)
+        n_chains, n_draws_per, n_obs = ppc_obs.shape
+        ppc_flat = ppc_obs.reshape(n_chains * n_draws_per, n_obs)
+
+        if cfg.likelihood == "binomial":
+            observed_for_ppc = data["counts"]
+        else:
+            observed_for_ppc = data["y_obs"]
+
+        pvalues = compute_ppc_pvalues(ppc_flat, observed_for_ppc)
+        summary = summarize_ppc_calibration(pvalues)
+        if label:
+            logger.info(
+                "%s PPC: KS stat=%.3f (p=%.3f), outliers=%.1f%%",
+                label, summary["ks_stat"], summary["ks_pvalue"],
+                summary["pct_outliers"],
+            )
+        return summary
+    except Exception as e:
+        logger.warning("PPC computation failed for %s: %s", label, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CRPS comparison (Bayes vs Marcel)
+# ---------------------------------------------------------------------------
+
+
+def compute_bayes_vs_marcel_crps(
+    comp: pd.DataFrame,
+    stat: str,
+    proj_samples: dict[int, np.ndarray],
+    id_col: str,
+    weight_col: str,
+    rng: np.random.Generator,
+    compute_crps_single_fn: Any,
+    likelihood: str = "binomial",
+) -> tuple[float, float]:
+    """Compute Bayes and Marcel CRPS for a comparison DataFrame.
+
+    Parameters
+    ----------
+    comp : pd.DataFrame
+        Comparison DataFrame with ``actual_{stat}``, ``marcel_{stat}``,
+        ``{weight_col}``, and ``{id_col}`` columns.
+    stat : str
+        Stat key (e.g. ``"k_rate"``).
+    proj_samples : dict[int, np.ndarray]
+        Mapping of player ID -> posterior samples.
+    id_col : str
+        Player ID column name (e.g. ``"batter_id"``).
+    weight_col : str
+        Weight column name (e.g. ``"weighted_pa"`` or ``"weighted_bf"``).
+    rng : np.random.Generator
+        Random number generator for Marcel draws.
+    compute_crps_single_fn : callable
+        Function ``(observed, samples) -> float``.
+    likelihood : str
+        ``"binomial"`` uses Beta draws for Marcel; ``"normal"`` uses
+        Normal draws.
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(bayes_crps, marcel_crps)`` mean values.
+    """
+    bayes_crps_vals: list[float] = []
+    marcel_crps_vals: list[float] = []
+
+    for _, row in comp.iterrows():
+        pid = int(row[id_col])
+        act = float(row[f"actual_{stat}"])
+
+        # Bayes CRPS
+        if pid in proj_samples:
+            bayes_crps_vals.append(compute_crps_single_fn(act, proj_samples[pid]))
+
+        # Marcel CRPS via Beta or Normal draws
+        m_rate = float(row[f"marcel_{stat}"])
+        w = float(row[weight_col])
+        if likelihood == "binomial":
+            a = 1.0 + m_rate * max(w, 1.0)
+            b = 1.0 + (1.0 - m_rate) * max(w, 1.0)
+            marcel_draws = rng.beta(a, b, size=4000)
+        else:
+            marcel_draws = rng.normal(m_rate, max(0.01, abs(m_rate) * 0.1), size=4000)
+        marcel_crps_vals.append(compute_crps_single_fn(act, marcel_draws))
+
+    bayes_crps = float(np.mean(bayes_crps_vals)) if bayes_crps_vals else np.nan
+    marcel_crps = float(np.mean(marcel_crps_vals)) if marcel_crps_vals else np.nan
+    return bayes_crps, marcel_crps
+
+
+# ---------------------------------------------------------------------------
+# Regression metrics for counting stat backtests
+# ---------------------------------------------------------------------------
+
+
+def compute_regression_metrics(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    lo_80: np.ndarray | None = None,
+    hi_80: np.ndarray | None = None,
+    lo_95: np.ndarray | None = None,
+    hi_95: np.ndarray | None = None,
+    include_mape: bool = False,
+) -> dict[str, float]:
+    """Compute regression metrics for counting stat predictions.
+
+    Shared implementation for ``counting_backtest._compute_metrics``
+    (with ``include_mape=True``) and ``season_sim_backtest._compute_metrics``
+    (with ``include_mape=False``, computes bias instead).
+
+    Parameters
+    ----------
+    actual : np.ndarray
+        Observed values.
+    predicted : np.ndarray
+        Predicted values.
+    lo_80, hi_80 : np.ndarray | None
+        Optional 80% interval bounds.
+    lo_95, hi_95 : np.ndarray | None
+        Optional 95% interval bounds.
+    include_mape : bool
+        If True, compute MAPE. If False, compute bias.
+
+    Returns
+    -------
+    dict[str, float]
+        Keys always include ``n`` and ``correlation``.
+        If ``include_mape``, includes ``mape``.
+        Otherwise includes ``bias``.
+        Optionally includes ``coverage_80`` and ``coverage_95``.
+    """
+    actual = np.asarray(actual, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+
+    valid = ~(np.isnan(actual) | np.isnan(predicted))
+    a, p = actual[valid], predicted[valid]
+    n = len(a)
+    if n == 0:
+        return {"n": 0} if not include_mape else {}
+
+    # Correlation
+    if np.std(a) > 0 and np.std(p) > 0:
+        corr = float(np.corrcoef(a, p)[0, 1])
+    else:
+        corr = 0.0
+
+    metrics: dict[str, float] = {"n": n, "correlation": corr}
+
+    if include_mape:
+        nonzero = a > 0
+        if nonzero.sum() > 0:
+            metrics["mape"] = float(np.mean(np.abs((a - p)[nonzero]) / a[nonzero]))
+        else:
+            metrics["mape"] = float("nan")
+    else:
+        metrics["bias"] = float(np.mean(p - a))
+
+    # Coverage
+    if lo_80 is not None and hi_80 is not None:
+        lo_v, hi_v = np.asarray(lo_80)[valid], np.asarray(hi_80)[valid]
+        metrics["coverage_80"] = compute_coverage(a, lo_v, hi_v)
+    if lo_95 is not None and hi_95 is not None:
+        lo_v, hi_v = np.asarray(lo_95)[valid], np.asarray(hi_95)[valid]
+        metrics["coverage_95"] = compute_coverage(a, lo_v, hi_v)
+
+    return metrics

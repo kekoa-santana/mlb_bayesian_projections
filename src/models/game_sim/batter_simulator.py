@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.special import expit, logit
+from scipy.special import expit
 
 from src.models.game_sim.bip_model import (
     BIP_DOUBLE,
@@ -33,6 +33,7 @@ from src.models.game_sim.pa_outcome_model import (
     PA_STRIKEOUT,
     PA_TRIPLE,
     PA_WALK,
+    GameContext,
     PAOutcomeModel,
 )
 from src.models.game_sim.batter_pa_model import (
@@ -40,9 +41,12 @@ from src.models.game_sim.batter_pa_model import (
     split_pa_starter_reliever,
 )
 from src.models.bf_model import draw_bf_samples
+from src.models.game_sim._sim_utils import (
+    safe_logit,
+    resample_posterior,
+    compute_pitcher_quality_lifts,
+)
 from src.utils.constants import (
-    CLIP_LO,
-    CLIP_HI,
     SIM_LEAGUE_K_RATE,
     SIM_LEAGUE_BB_RATE,
     SIM_LEAGUE_HR_RATE,
@@ -55,10 +59,6 @@ logger = logging.getLogger(__name__)
 
 # Max PAs a batter can get in a game
 MAX_BATTER_PA = 7
-
-
-def _safe_logit(p: float | np.ndarray) -> float | np.ndarray:
-    return logit(np.clip(p, CLIP_LO, CLIP_HI))
 
 
 @dataclass
@@ -163,6 +163,7 @@ def simulate_batter_game(
     form_k_lift: float = 0.0,
     form_bb_lift: float = 0.0,
     form_hr_lift: float = 0.0,
+    game_context: GameContext | None = None,
     n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> BatterSimulationResult:
@@ -216,6 +217,10 @@ def simulate_batter_game(
         Batter rolling form BB% logit lift.
     form_hr_lift : float
         Batter rolling form HR logit lift (includes HR/PA accel + hard-hit).
+    game_context : GameContext, optional
+        Per-game environmental lifts. When provided, its fields supply
+        defaults for any environmental lift parameter left at 0.0.
+        Explicit keyword arguments always take priority over the context.
     n_sims : int
         Number of simulations.
     random_seed : int
@@ -226,19 +231,30 @@ def simulate_batter_game(
     BatterSimulationResult
         Joint distributions over batter counting stats.
     """
+    # Resolve environmental lifts: explicit kwargs beat GameContext
+    if game_context is not None:
+        if umpire_k_lift == 0.0:
+            umpire_k_lift = game_context.umpire_k_lift
+        if umpire_bb_lift == 0.0:
+            umpire_bb_lift = game_context.umpire_bb_lift
+        if park_k_lift == 0.0:
+            park_k_lift = game_context.park_k_lift
+        if park_bb_lift == 0.0:
+            park_bb_lift = game_context.park_bb_lift
+        if park_hr_lift == 0.0:
+            park_hr_lift = game_context.park_hr_lift
+        if park_h_babip_adj == 0.0:
+            park_h_babip_adj = game_context.park_h_babip_adj
+        if weather_k_lift == 0.0:
+            weather_k_lift = game_context.weather_k_lift
+
     rng = np.random.default_rng(random_seed)
     pa_model = PAOutcomeModel()
 
     # Resample batter posteriors to n_sims
-    def _resample(arr: np.ndarray) -> np.ndarray:
-        if len(arr) == n_sims:
-            return arr.copy()
-        idx = rng.choice(len(arr), size=n_sims, replace=True)
-        return arr[idx]
-
-    batter_k = _resample(batter_k_rate_samples)
-    batter_bb = _resample(batter_bb_rate_samples)
-    batter_hr = _resample(batter_hr_rate_samples)
+    batter_k = resample_posterior(batter_k_rate_samples, n_sims, rng)
+    batter_bb = resample_posterior(batter_bb_rate_samples, n_sims, rng)
+    batter_hr = resample_posterior(batter_hr_rate_samples, n_sims, rng)
 
     # --- 1. Draw total PAs and starter BF ---
     total_pa = draw_total_pa(batting_order, rng, n_sims)
@@ -259,13 +275,15 @@ def simulate_batter_game(
 
     # --- 2. Compute per-PA rates ---
     # Pitcher quality lift: how far is the starter/reliever from league avg?
-    starter_k_lift = _safe_logit(starter_k_rate) - _safe_logit(SIM_LEAGUE_K_RATE)
-    starter_bb_lift = _safe_logit(starter_bb_rate) - _safe_logit(SIM_LEAGUE_BB_RATE)
-    starter_hr_lift = _safe_logit(starter_hr_rate) - _safe_logit(SIM_LEAGUE_HR_RATE)
+    starter_k_lift, starter_bb_lift, starter_hr_lift = compute_pitcher_quality_lifts(
+        starter_k_rate, starter_bb_rate, starter_hr_rate,
+        SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE,
+    )
 
-    bullpen_k_lift = _safe_logit(bullpen_k_rate) - _safe_logit(SIM_LEAGUE_K_RATE)
-    bullpen_bb_lift = _safe_logit(bullpen_bb_rate) - _safe_logit(SIM_LEAGUE_BB_RATE)
-    bullpen_hr_lift = _safe_logit(bullpen_hr_rate) - _safe_logit(SIM_LEAGUE_HR_RATE)
+    bullpen_k_lift, bullpen_bb_lift, bullpen_hr_lift = compute_pitcher_quality_lifts(
+        bullpen_k_rate, bullpen_bb_rate, bullpen_hr_rate,
+        SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE,
+    )
 
     # --- 3. Accumulators ---
     k_total = np.zeros(n_sims, dtype=np.int32)
@@ -293,9 +311,9 @@ def simulate_batter_game(
 
         # Build rates: use batter posteriors as base,
         # add pitcher quality lift + matchup lift
-        k_logit_base = _safe_logit(batter_k[active])
-        bb_logit_base = _safe_logit(batter_bb[active])
-        hr_logit_base = _safe_logit(batter_hr[active])
+        k_logit_base = safe_logit(batter_k[active])
+        bb_logit_base = safe_logit(batter_bb[active])
+        hr_logit_base = safe_logit(batter_hr[active])
 
         # Pitcher quality + matchup lifts
         vs_starter_active = vs_starter[active]

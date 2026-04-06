@@ -16,15 +16,19 @@ from scipy.stats import beta as beta_dist
 from sklearn.metrics import brier_score_loss
 
 from src.data.feature_eng import build_multi_season_hitter_data
+from src.evaluation.baselines import marcel_rate_projection
 from src.evaluation.ensemble import (
     apply_ensemble,
     compute_ensemble_metrics,
     fit_ensemble_weight,
 )
 from src.evaluation.metrics import (
+    compute_bayes_vs_marcel_crps,
+    compute_coverage,
+    compute_coverage_from_sd,
     compute_crps_single,
-    compute_ppc_pvalues,
-    summarize_ppc_calibration,
+    compute_posterior_calibration_t,
+    extract_ppc_summary,
 )
 from src.models.hitter_model import (
     STAT_CONFIGS,
@@ -65,61 +69,13 @@ def marcel_hitter(
     pd.DataFrame
         Columns: batter_id, marcel_{stat}, reliability, weighted_pa.
     """
-    cfg = STAT_CONFIGS[stat]
-    weights = {0: 5, 1: 4, 2: 3}
-    available_seasons = sorted(df_history["season"].unique(), reverse=True)
-
-    if league_avg is None:
-        if cfg.likelihood == "binomial":
-            total_count = df_history[cfg.count_col].sum()
-            total_pa = df_history[cfg.trials_col].sum()
-            league_avg = total_count / total_pa if total_pa > 0 else cfg.league_avg
-        else:
-            league_avg = df_history[cfg.rate_col].mean()
-
-    # Regression PA constant — more stable stats need less regression
-    regression_pa = {
-        "k_rate": 1200, "bb_rate": 1200,
-        "gb_rate": 800, "fb_rate": 800, "hr_per_fb": 1500,
-    }
-    reg_pa = regression_pa.get(stat, 1200)
-
-    records = []
-    for batter_id, group in df_history.groupby("batter_id"):
-        weighted_val = 0.0
-        weighted_pa = 0.0
-
-        for offset, season in enumerate(available_seasons):
-            if offset > 2:
-                break
-            w = weights.get(offset, 0)
-            row = group[group["season"] == season]
-            if len(row) == 0:
-                continue
-            r = row.iloc[0]
-            pa = float(r[cfg.trials_col])
-
-            if cfg.likelihood == "binomial":
-                weighted_val += w * float(r[cfg.count_col])
-            else:
-                weighted_val += w * float(r[cfg.rate_col]) * pa
-            weighted_pa += w * pa
-
-        if weighted_pa == 0:
-            continue
-
-        raw_rate = weighted_val / weighted_pa
-        reliability = weighted_pa / (weighted_pa + reg_pa)
-        marcel_rate = reliability * raw_rate + (1 - reliability) * league_avg
-
-        records.append({
-            "batter_id": batter_id,
-            f"marcel_{stat}": marcel_rate,
-            "reliability": reliability,
-            "weighted_pa": weighted_pa,
-        })
-
-    return pd.DataFrame(records)
+    result = marcel_rate_projection(
+        df_history,
+        id_col="batter_id",
+        trials_col="pa",
+        stat_configs={stat: STAT_CONFIGS[stat]},
+    )
+    return result[stat]
 
 
 # ---------------------------------------------------------------------------
@@ -232,21 +188,16 @@ def walk_forward_stat_backtest(
 
     ci_lo = comp["ci_95_lo"].values
     ci_hi = comp["ci_95_hi"].values
-    coverage_95 = float(np.mean((actual >= ci_lo) & (actual <= ci_hi)))
+    coverage_95 = compute_coverage(actual, ci_lo, ci_hi)
 
     # 80% CI coverage (approximate from mean ± 1.282 * SD)
-    from scipy.stats import norm as _norm
-    z80 = _norm.ppf(0.90)
     bayes_sd = comp[f"bayes_{stat}_sd"].values if f"bayes_{stat}_sd" in comp.columns else None
     if bayes_sd is not None:
-        ci80_lo = bayes - z80 * bayes_sd
-        ci80_hi = bayes + z80 * bayes_sd
-        coverage_80 = float(np.mean((actual >= ci80_lo) & (actual <= ci80_hi)))
+        coverage_80 = compute_coverage_from_sd(actual, bayes, bayes_sd, level=0.80)
     else:
         coverage_80 = float("nan")
 
     # Compute optimal calibration T from 80% coverage
-    from src.evaluation.metrics import compute_posterior_calibration_t
     optimal_cal_t = compute_posterior_calibration_t(coverage_80)
 
     # Brier score (above league average?) — reuse stored samples
@@ -272,54 +223,15 @@ def walk_forward_stat_backtest(
 
     # CRPS: Bayes via stored samples, Marcel via Beta sampling
     rng = np.random.default_rng(random_seed + 1)
-    bayes_crps_vals = []
-    marcel_crps_vals = []
-    for _, row in comp.iterrows():
-        bid = int(row["batter_id"])
-        act = float(row[f"actual_{stat}"])
-
-        # Bayes CRPS
-        if bid in proj_samples:
-            bayes_crps_vals.append(compute_crps_single(act, proj_samples[bid]))
-
-        # Marcel CRPS via Beta(alpha, beta) draws
-        m_rate = float(row[f"marcel_{stat}"])
-        w_pa = float(row["weighted_pa"])
-        if cfg.likelihood == "binomial":
-            a = 1.0 + m_rate * max(w_pa, 1.0)
-            b = 1.0 + (1.0 - m_rate) * max(w_pa, 1.0)
-            marcel_draws = rng.beta(a, b, size=4000)
-        else:
-            # Normal approximation for continuous stats
-            marcel_draws = rng.normal(m_rate, max(0.01, abs(m_rate) * 0.1), size=4000)
-        marcel_crps_vals.append(compute_crps_single(act, marcel_draws))
-
-    bayes_crps = float(np.mean(bayes_crps_vals)) if bayes_crps_vals else np.nan
-    marcel_crps = float(np.mean(marcel_crps_vals)) if marcel_crps_vals else np.nan
+    bayes_crps, marcel_crps = compute_bayes_vs_marcel_crps(
+        comp, stat, proj_samples,
+        id_col="batter_id", weight_col="weighted_pa",
+        rng=rng, compute_crps_single_fn=compute_crps_single,
+        likelihood=cfg.likelihood,
+    )
 
     # PPC: posterior predictive check
-    ppc_summary: dict[str, Any] = {}
-    try:
-        if hasattr(trace, "posterior_predictive") and "obs" in trace.posterior_predictive:
-            ppc_obs = trace.posterior_predictive["obs"].values  # (chains, draws, n_obs)
-            n_chains, n_draws_per, n_obs = ppc_obs.shape
-            ppc_flat = ppc_obs.reshape(n_chains * n_draws_per, n_obs)
-
-            # Observed data for PPC comparison
-            if cfg.likelihood == "binomial":
-                observed_for_ppc = data["counts"]
-            else:
-                observed_for_ppc = data["y_obs"]
-
-            pvalues = compute_ppc_pvalues(ppc_flat, observed_for_ppc)
-            ppc_summary = summarize_ppc_calibration(pvalues)
-            logger.info(
-                "%s PPC: KS stat=%.3f (p=%.3f), outliers=%.1f%%",
-                stat, ppc_summary["ks_stat"], ppc_summary["ks_pvalue"],
-                ppc_summary["pct_outliers"],
-            )
-    except Exception as e:
-        logger.warning("PPC computation failed for %s: %s", stat, e)
+    ppc_summary = extract_ppc_summary(trace, data, cfg, label=stat) or {}
 
     logger.info(
         "%s: 80%% CI coverage: %.1f%%, 95%% CI coverage: %.1f%% (optimal T=%.3f)",

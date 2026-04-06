@@ -58,11 +58,8 @@ class TestComputeValidationMetrics:
         metrics = compute_validation_metrics(predictions)
 
         expected_keys = {
-            "rmse_baseline", "rmse_matchup", "mae_baseline", "mae_matchup",
             "lift_residual_corr", "lift_residual_pvalue",
             "paired_t_stat", "paired_t_pvalue", "n_games", "pct_matched",
         }
         assert set(metrics.keys()) == expected_keys
-        assert metrics["rmse_baseline"] >= 0
-        assert metrics["rmse_matchup"] >= 0
         assert metrics["n_games"] == 5

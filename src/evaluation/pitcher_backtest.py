@@ -16,15 +16,19 @@ from scipy.stats import beta as beta_dist
 from sklearn.metrics import brier_score_loss
 
 from src.data.feature_eng import build_multi_season_pitcher_data
+from src.evaluation.baselines import marcel_rate_projection
 from src.evaluation.ensemble import (
     apply_ensemble,
     compute_ensemble_metrics,
     fit_ensemble_weight,
 )
 from src.evaluation.metrics import (
+    compute_bayes_vs_marcel_crps,
+    compute_coverage,
+    compute_coverage_from_sd,
     compute_crps_single,
-    compute_ppc_pvalues,
-    summarize_ppc_calibration,
+    compute_posterior_calibration_t,
+    extract_ppc_summary,
 )
 from src.models.pitcher_model import (
     PITCHER_STAT_CONFIGS,
@@ -64,50 +68,20 @@ def marcel_pitcher(
     pd.DataFrame
         Columns: pitcher_id, marcel_{stat}, reliability, weighted_bf.
     """
-    cfg = PITCHER_STAT_CONFIGS[stat]
-    weights = {0: 5, 1: 4, 2: 3}
-    available_seasons = sorted(df_history["season"].unique(), reverse=True)
-
-    if league_avg is None:
-        total_count = df_history[cfg.count_col].sum()
-        total_bf = df_history[cfg.trials_col].sum()
-        league_avg = total_count / total_bf if total_bf > 0 else cfg.league_avg
-
-    # Pitchers are less stable — smaller regression constant
-    reg_bf = {"k_rate": 800, "bb_rate": 800, "hr_per_bf": 1200}
-    reg = reg_bf.get(stat, 800)
-
-    records = []
-    for pitcher_id, group in df_history.groupby("pitcher_id"):
-        weighted_count = 0.0
-        weighted_bf = 0.0
-
-        for offset, season in enumerate(available_seasons):
-            if offset > 2:
-                break
-            w = weights.get(offset, 0)
-            row = group[group["season"] == season]
-            if len(row) == 0:
-                continue
-            r = row.iloc[0]
-            weighted_count += w * float(r[cfg.count_col])
-            weighted_bf += w * float(r[cfg.trials_col])
-
-        if weighted_bf == 0:
-            continue
-
-        raw_rate = weighted_count / weighted_bf
-        reliability = weighted_bf / (weighted_bf + reg)
-        marcel_rate = reliability * raw_rate + (1 - reliability) * league_avg
-
-        records.append({
-            "pitcher_id": pitcher_id,
-            f"marcel_{stat}": marcel_rate,
-            "reliability": reliability,
-            "weighted_bf": weighted_bf,
-        })
-
-    return pd.DataFrame(records)
+    # Pitchers are less stable -- smaller regression constant
+    pitcher_regression = {"k_rate": 800, "bb_rate": 800, "hr_per_bf": 1200}
+    result = marcel_rate_projection(
+        df_history,
+        id_col="pitcher_id",
+        trials_col="batters_faced",
+        stat_configs={stat: PITCHER_STAT_CONFIGS[stat]},
+        regression_constants={stat: pitcher_regression.get(stat, 800)},
+    )
+    # Rename weighted_batters_faced -> weighted_bf for backward compat
+    df_out = result[stat]
+    if "weighted_batters_faced" in df_out.columns:
+        df_out = df_out.rename(columns={"weighted_batters_faced": "weighted_bf"})
+    return df_out
 
 
 # ---------------------------------------------------------------------------
@@ -220,21 +194,16 @@ def walk_forward_pitcher_stat_backtest(
 
     ci_lo = comp["ci_95_lo"].values
     ci_hi = comp["ci_95_hi"].values
-    coverage_95 = float(np.mean((actual >= ci_lo) & (actual <= ci_hi)))
+    coverage_95 = compute_coverage(actual, ci_lo, ci_hi)
 
     # 80% CI coverage (approximate from mean ± 1.282 * SD)
-    from scipy.stats import norm as _norm
-    z80 = _norm.ppf(0.90)
     bayes_sd = comp[f"bayes_{stat}_sd"].values if f"bayes_{stat}_sd" in comp.columns else None
     if bayes_sd is not None:
-        ci80_lo = bayes - z80 * bayes_sd
-        ci80_hi = bayes + z80 * bayes_sd
-        coverage_80 = float(np.mean((actual >= ci80_lo) & (actual <= ci80_hi)))
+        coverage_80 = compute_coverage_from_sd(actual, bayes, bayes_sd, level=0.80)
     else:
         coverage_80 = float("nan")
 
     # Compute optimal calibration T from 80% coverage
-    from src.evaluation.metrics import compute_posterior_calibration_t
     optimal_cal_t = compute_posterior_calibration_t(coverage_80)
 
     # Brier score — reuse stored samples
@@ -256,43 +225,15 @@ def walk_forward_pitcher_stat_backtest(
 
     # CRPS: Bayes via stored samples, Marcel via Beta sampling
     rng = np.random.default_rng(random_seed + 1)
-    bayes_crps_vals = []
-    marcel_crps_vals = []
-    for _, row in comp.iterrows():
-        pid = int(row["pitcher_id"])
-        act = float(row[f"actual_{stat}"])
-
-        if pid in proj_samples:
-            bayes_crps_vals.append(compute_crps_single(act, proj_samples[pid]))
-
-        m_rate = float(row[f"marcel_{stat}"])
-        w_bf = float(row["weighted_bf"])
-        a = 1.0 + m_rate * max(w_bf, 1.0)
-        b = 1.0 + (1.0 - m_rate) * max(w_bf, 1.0)
-        marcel_draws = rng.beta(a, b, size=4000)
-        marcel_crps_vals.append(compute_crps_single(act, marcel_draws))
-
-    bayes_crps = float(np.mean(bayes_crps_vals)) if bayes_crps_vals else np.nan
-    marcel_crps = float(np.mean(marcel_crps_vals)) if marcel_crps_vals else np.nan
+    bayes_crps, marcel_crps = compute_bayes_vs_marcel_crps(
+        comp, stat, proj_samples,
+        id_col="pitcher_id", weight_col="weighted_bf",
+        rng=rng, compute_crps_single_fn=compute_crps_single,
+        likelihood="binomial",
+    )
 
     # PPC: posterior predictive check
-    ppc_summary: dict[str, Any] = {}
-    try:
-        if hasattr(trace, "posterior_predictive") and "obs" in trace.posterior_predictive:
-            ppc_obs = trace.posterior_predictive["obs"].values
-            n_chains, n_draws_per, n_obs = ppc_obs.shape
-            ppc_flat = ppc_obs.reshape(n_chains * n_draws_per, n_obs)
-
-            observed_for_ppc = data["counts"]
-            pvalues = compute_ppc_pvalues(ppc_flat, observed_for_ppc)
-            ppc_summary = summarize_ppc_calibration(pvalues)
-            logger.info(
-                "pitcher %s PPC: KS stat=%.3f (p=%.3f), outliers=%.1f%%",
-                stat, ppc_summary["ks_stat"], ppc_summary["ks_pvalue"],
-                ppc_summary["pct_outliers"],
-            )
-    except Exception as e:
-        logger.warning("PPC computation failed for pitcher %s: %s", stat, e)
+    ppc_summary = extract_ppc_summary(trace, data, cfg, label=f"pitcher {stat}") or {}
 
     logger.info(
         "pitcher %s: 80%% CI coverage: %.1f%%, 95%% CI coverage: %.1f%% (optimal T=%.3f)",

@@ -18,7 +18,7 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.special import expit, logit
+from scipy.special import expit
 
 from src.models.game_sim.bip_model import (
     BIP_DOUBLE,
@@ -27,7 +27,8 @@ from src.models.game_sim.bip_model import (
     BIP_TRIPLE,
     BIPOutcomeModel,
 )
-from src.utils.constants import CLIP_LO, CLIP_HI, LEAGUE_HBP_RATE
+from src.models.game_sim._sim_utils import safe_logit
+from src.utils.constants import LEAGUE_HBP_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,7 @@ class GameContext:
     park_k_lift: float = 0.0
     park_bb_lift: float = 0.0
     park_hr_lift: float = 0.0
+    park_h_babip_adj: float = 0.0
     weather_k_lift: float = 0.0
     form_bb_lift: float = 0.0
     catcher_k_lift: float = 0.0
@@ -127,7 +129,7 @@ class PAOutcomeModel:
     @staticmethod
     def _safe_logit(p: np.ndarray | float) -> np.ndarray | float:
         """Logit with clipping."""
-        return logit(np.clip(p, CLIP_LO, CLIP_HI))
+        return safe_logit(p)
 
     def compute_pa_probs(
         self,

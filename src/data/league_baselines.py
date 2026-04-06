@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from src.data.db import load_or_build_parquet
 from src.data.pitch_archetypes import get_pitch_archetype_offerings
 from src.data.queries import get_pitcher_outcomes_by_stand
 
@@ -65,22 +66,9 @@ def _get_train_seasons() -> list[int]:
 # ---------------------------------------------------------------------------
 # Cache helpers
 # ---------------------------------------------------------------------------
-def _load_or_build(
-    cache_path: Path,
-    builder: callable,
-    force_rebuild: bool = False,
-) -> pd.DataFrame:
-    """Load from Parquet cache if available, otherwise build and cache."""
-    if cache_path.exists() and not force_rebuild:
-        logger.info("Loading cached %s", cache_path.name)
-        return pd.read_parquet(cache_path)
-
-    logger.info("Building %s", cache_path.name)
-    df = builder()
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(cache_path, index=False)
-    logger.info("Cached %s (%d rows)", cache_path.name, len(df))
-    return df
+# _load_or_build is now provided by src.data.db.load_or_build_parquet.
+# Kept as a thin alias so existing call sites remain unchanged.
+_load_or_build = load_or_build_parquet
 
 
 # ---------------------------------------------------------------------------

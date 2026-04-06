@@ -1,0 +1,391 @@
+============================= test session starts =============================
+platform win32 -- Python 3.11.8, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\kekoa\AppData\Local\Programs\Python\Python311\python.exe
+cachedir: .pytest_cache
+rootdir: C:\users\kekoa\documents\data_analytics\player_profiles
+configfile: pyproject.toml
+plugins: zarr-3.1.6
+collecting ... collected 252 items
+
+tests/test_backtesting.py::test_compute_metrics_uses_posterior_probability_columns PASSED [  0%]
+tests/test_backtesting.py::test_walk_forward_backtest_mocked_pipeline FAILED [  0%]
+tests/test_bf_model.py::TestComputeBfPriorsShapes::test_output_columns PASSED [  1%]
+tests/test_bf_model.py::TestComputeBfPriorsShapes::test_no_relievers PASSED [  1%]
+tests/test_bf_model.py::TestShrinkageHighStarts::test_high_starts_reliability FAILED [  1%]
+tests/test_bf_model.py::TestShrinkageLowStarts::test_low_starts_pure_population FAILED [  2%]
+tests/test_bf_model.py::TestDrawBfSamplesBounded::test_samples_in_range PASSED [  2%]
+tests/test_bf_model.py::TestDrawBfSamplesMean::test_mean_near_mu PASSED  [  3%]
+tests/test_bf_model.py::TestGetBfDistribution::test_found_pitcher PASSED [  3%]
+tests/test_bf_model.py::TestGetBfDistribution::test_missing_pitcher FAILED [  3%]
+tests/test_counting_projections.py::TestCountingStatConfig::test_hitter_stats_keys PASSED [  4%]
+tests/test_counting_projections.py::TestCountingStatConfig::test_pitcher_stats_keys PASSED [  4%]
+tests/test_counting_projections.py::TestCountingStatConfig::test_bayesian_flags PASSED [  5%]
+tests/test_counting_projections.py::TestCountingStatConfig::test_opportunity_columns PASSED [  5%]
+tests/test_counting_projections.py::TestSbEraFactor::test_era_factor_positive PASSED [  5%]
+tests/test_counting_projections.py::TestSbEraFactor::test_era_factor_reasonable PASSED [  6%]
+tests/test_counting_projections.py::TestComputeStatSummary::test_keys PASSED [  6%]
+tests/test_counting_projections.py::TestComputeStatSummary::test_mean_correct PASSED [  7%]
+tests/test_counting_projections.py::TestComputeStatSummary::test_percentiles_ordered PASSED [  7%]
+tests/test_counting_projections.py::TestShrinkageRate::test_empty_returns_pop_mean PASSED [  7%]
+tests/test_counting_projections.py::TestShrinkageRate::test_single_season_regresses PASSED [  8%]
+tests/test_counting_projections.py::TestShrinkageRate::test_multi_season_less_regression PASSED [  8%]
+tests/test_counting_projections.py::TestShrinkageRate::test_std_positive PASSED [  9%]
+tests/test_counting_projections.py::TestMarcelCountingHitter::test_output_columns PASSED [  9%]
+tests/test_counting_projections.py::TestMarcelCountingHitter::test_returns_eligible_players PASSED [  9%]
+tests/test_counting_projections.py::TestMarcelCountingHitter::test_marcel_pa_positive PASSED [ 10%]
+tests/test_counting_projections.py::TestMarcelCountingHitter::test_marcel_k_reasonable PASSED [ 10%]
+tests/test_counting_projections.py::TestMarcelCountingHitter::test_sb_era_adjustment_applied PASSED [ 11%]
+tests/test_counting_projections.py::TestMarcelCountingPitcher::test_output_columns PASSED [ 11%]
+tests/test_counting_projections.py::TestMarcelCountingPitcher::test_returns_eligible_pitchers PASSED [ 11%]
+tests/test_counting_projections.py::TestMarcelCountingPitcher::test_marcel_bf_positive PASSED [ 12%]
+tests/test_counting_projections.py::TestMarcelCountingPitcher::test_starter_more_ks_than_reliever PASSED [ 12%]
+tests/test_counting_projections.py::TestMarcelCountingPitcher::test_outs_reasonable PASSED [ 13%]
+tests/test_counting_projections.py::TestParkFactorIntegration::test_coors_boosts_hr PASSED [ 13%]
+tests/test_counting_projections.py::TestParkFactorIntegration::test_oracle_suppresses_hr PASSED [ 13%]
+tests/test_counting_projections.py::TestParkFactorIntegration::test_switch_hitter_averages_lr PASSED [ 14%]
+tests/test_counting_projections.py::TestParkFactorIntegration::test_hr_park_factor_in_output PASSED [ 14%]
+tests/test_db_config.py::test_load_db_config_from_dotenv_whitespace PASSED [ 15%]
+tests/test_db_config.py::test_env_vars_override_dotenv_values PASSED     [ 15%]
+tests/test_era_projection.py::TestDerivePitcherFip::test_known_inputs PASSED [ 15%]
+tests/test_era_projection.py::TestDerivePitcherFip::test_high_k_lowers_fip PASSED [ 16%]
+tests/test_era_projection.py::TestDerivePitcherFip::test_high_hr_raises_fip PASSED [ 16%]
+tests/test_era_projection.py::TestDerivePitcherFip::test_clipped_to_range PASSED [ 17%]
+tests/test_era_projection.py::TestDerivePitcherFip::test_output_shape PASSED [ 17%]
+tests/test_era_projection.py::TestDerivePitcherFip::test_no_nan_output PASSED [ 17%]
+tests/test_era_projection.py::TestShrinkEraFipGap::test_no_data_returns_near_zero PASSED [ 18%]
+tests/test_era_projection.py::TestShrinkEraFipGap::test_nan_gap_returns_prior PASSED [ 18%]
+tests/test_era_projection.py::TestShrinkEraFipGap::test_low_ip_more_shrinkage PASSED [ 19%]
+tests/test_era_projection.py::TestShrinkEraFipGap::test_gb_pitcher_negative_prior PASSED [ 19%]
+tests/test_era_projection.py::TestShrinkEraFipGap::test_fb_pitcher_positive_prior PASSED [ 19%]
+tests/test_era_projection.py::TestShrinkEraFipGap::test_sd_decreases_with_ip PASSED [ 20%]
+tests/test_era_projection.py::TestShrinkEraFipGap::test_gb_coefficient_direction PASSED [ 20%]
+tests/test_era_projection.py::TestDerivePitcherEra::test_equals_fip_when_no_gap_data PASSED [ 21%]
+tests/test_era_projection.py::TestDerivePitcherEra::test_positive_gap_raises_era PASSED [ 21%]
+tests/test_era_projection.py::TestDerivePitcherEra::test_negative_gap_lowers_era PASSED [ 21%]
+tests/test_era_projection.py::TestDerivePitcherEra::test_bounded PASSED  [ 22%]
+tests/test_era_projection.py::TestDerivePitcherEra::test_no_nan PASSED   [ 22%]
+tests/test_era_projection.py::TestDerivePitcherEra::test_reasonable_range_for_starter PASSED [ 23%]
+tests/test_era_projection.py::TestFipBatch::test_basic_batch PASSED      [ 23%]
+tests/test_era_projection.py::TestFipBatch::test_missing_posteriors_returns_empty PASSED [ 23%]
+tests/test_era_projection.py::TestFipBatch::test_partial_overlap PASSED  [ 24%]
+tests/test_era_projection.py::TestFipBatch::test_no_nan_leakage PASSED   [ 24%]
+tests/test_era_projection.py::TestEraBatch::test_basic_batch PASSED      [ 25%]
+tests/test_era_projection.py::TestEraBatch::test_missing_era_data_uses_prior PASSED [ 25%]
+tests/test_era_projection.py::TestEraBatch::test_no_nan_leakage PASSED   [ 25%]
+tests/test_era_projection.py::TestEraBatch::test_all_bounded PASSED      [ 26%]
+tests/test_feature_eng.py::test_build_hitter_vulnerability_computes_rates_and_excludes_pitches PASSED [ 26%]
+tests/test_game_k_model.py::TestSimulateGameKsOutputShape::test_returns_correct_shape PASSED [ 26%]
+tests/test_game_k_model.py::TestSimulateGameKsExpectedValue::test_expected_k_reasonable PASSED [ 27%]
+tests/test_game_k_model.py::TestSimulateGameKsNoMatchup::test_no_matchup_works PASSED [ 27%]
+tests/test_game_k_model.py::TestSimulateGameKsPositiveLiftIncreasesKs::test_positive_lifts PASSED [ 28%]
+tests/test_game_k_model.py::TestComputeKOverProbsMonotonic::test_p_over_decreases PASSED [ 28%]
+tests/test_game_k_model.py::TestComputeKOverProbsMonotonic::test_columns PASSED [ 28%]
+tests/test_game_k_model.py::TestComputeKOverProbsMonotonic::test_custom_lines PASSED [ 29%]
+tests/test_game_k_model.py::TestUmpireKLogitLift::test_positive_umpire_lift_increases_ks PASSED [ 29%]
+tests/test_game_k_model.py::TestUmpireKLogitLift::test_negative_umpire_lift_decreases_ks PASSED [ 30%]
+tests/test_game_k_model.py::TestUmpireKLogitLift::test_zero_lift_matches_baseline PASSED [ 30%]
+tests/test_game_k_model.py::TestUmpireKLogitLift::test_umpire_combines_with_matchup PASSED [ 30%]
+tests/test_game_k_model.py::TestWeatherKLogitLift::test_cold_weather_increases_ks PASSED [ 31%]
+tests/test_game_k_model.py::TestWeatherKLogitLift::test_hot_weather_decreases_ks PASSED [ 31%]
+tests/test_game_k_model.py::TestWeatherKLogitLift::test_all_adjustments_stack PASSED [ 32%]
+tests/test_game_k_model.py::TestWeatherKLogitLift::test_dome_neutral PASSED [ 32%]
+tests/test_game_k_model.py::TestTTOLogitLiftsConstants::test_league_tto_k_lifts_direction PASSED [ 32%]
+tests/test_game_k_model.py::TestTTOLogitLiftsConstants::test_league_tto_hr_lifts_direction PASSED [ 33%]
+tests/test_game_k_model.py::TestBuildTTOLogitLifts::test_none_profiles_returns_league_avg PASSED [ 33%]
+tests/test_game_k_model.py::TestBuildTTOLogitLifts::test_empty_df_returns_league_avg PASSED [ 34%]
+tests/test_game_k_model.py::TestBuildTTOLogitLifts::test_pitcher_specific_profile PASSED [ 34%]
+tests/test_game_k_model.py::TestBuildTTOLogitLifts::test_unknown_stat_returns_zeros PASSED [ 34%]
+tests/test_game_k_model.py::TestSimulateGameKsWithTTO::test_tto_none_backward_compatible PASSED [ 35%]
+tests/test_game_k_model.py::TestSimulateGameKsWithTTO::test_tto_changes_expected_ks PASSED [ 35%]
+tests/test_game_k_model.py::TestSimulateGameKsWithTTO::test_tto_stacks_with_other_lifts PASSED [ 36%]
+tests/test_game_k_model.py::TestSimulateGameKsWithTTO::test_extreme_tto_penalty_lowers_ks PASSED [ 36%]
+tests/test_game_k_model.py::TestSimulateGameStatWithTTO::test_tto_none_backward_compatible PASSED [ 36%]
+tests/test_game_k_model.py::TestSimulateGameStatWithTTO::test_batter_mode_ignores_tto PASSED [ 37%]
+tests/test_game_k_validation.py::TestComputeCalibrationShape::test_output_columns PASSED [ 37%]
+tests/test_game_k_validation.py::TestComputeCalibrationShape::test_calibration_error_nonneg PASSED [ 38%]
+tests/test_game_k_validation.py::TestComputeGameKMetricsKeys::test_all_keys_present FAILED [ 38%]
+tests/test_game_k_validation.py::TestComputeGameKMetricsKeys::test_empty_predictions FAILED [ 38%]
+tests/test_game_k_validation.py::TestCompareToBaselinesShape::test_four_baselines FAILED [ 39%]
+tests/test_game_k_validation.py::TestCompareToBaselinesShape::test_all_metrics_finite FAILED [ 39%]
+tests/test_hitter_model.py::TestPrepareData::test_prepare_binomial_stat PASSED [ 40%]
+tests/test_hitter_model.py::TestPrepareData::test_prepare_gb_rate PASSED [ 40%]
+tests/test_hitter_model.py::TestPrepareData::test_prepare_all_stats PASSED [ 40%]
+tests/test_hitter_model.py::TestBuildModel::test_build_binomial FAILED   [ 41%]
+tests/test_hitter_model.py::TestFitAndExtract::test_k_rate_posteriors PASSED [ 41%]
+tests/test_hitter_model.py::TestFitAndExtract::test_bb_rate_posteriors PASSED [ 42%]
+tests/test_hitter_model.py::TestFitAndExtract::test_gb_rate_posteriors PASSED [ 42%]
+tests/test_hitter_model.py::TestFitAndExtract::test_extract_samples PASSED [ 42%]
+tests/test_hitter_model.py::TestFitAndExtract::test_extract_samples_forward PASSED [ 43%]
+tests/test_hitter_model.py::TestFitAndExtract::test_convergence PASSED   [ 43%]
+tests/test_hitter_model.py::TestFitAndExtract::test_age_bucket_mu_pop FAILED [ 44%]
+tests/test_hitter_projections.py::TestCompositeDimensions::test_weights_sum_to_one PASSED [ 44%]
+tests/test_hitter_projections.py::TestCompositeDimensions::test_all_projected_stats_have_models PASSED [ 44%]
+tests/test_hitter_projections.py::TestCompositeDimensions::test_six_dimensions PASSED [ 45%]
+tests/test_hitter_projections.py::TestProjectForward::test_empty_season_returns_empty PASSED [ 45%]
+tests/test_hitter_projections.py::TestFindBreakoutsAndRegressions::test_split_sizes PASSED [ 46%]
+tests/test_hitter_projections.py::TestFindBreakoutsAndRegressions::test_breakouts_have_higher_scores PASSED [ 46%]
+tests/test_hitter_projections.py::TestFindBreakoutsAndRegressions::test_n_top_larger_than_df PASSED [ 46%]
+tests/test_k_rate_model.py::test_prepare_model_data_handles_constant_covariates PASSED [ 47%]
+tests/test_k_rate_model.py::test_prepare_model_data_observation_level_z_scores PASSED [ 47%]
+tests/test_k_rate_model.py::test_prepare_model_data_platoon_basic PASSED [ 48%]
+tests/test_k_rate_model.py::test_prepare_model_data_platoon_false_is_default PASSED [ 48%]
+tests/test_k_rate_model.py::test_prepare_model_data_platoon_missing_column_raises PASSED [ 48%]
+tests/test_k_rate_model.py::test_build_k_rate_model_platoon_has_gamma_variables PASSED [ 49%]
+tests/test_k_rate_model.py::test_build_k_rate_model_no_platoon_no_gamma PASSED [ 49%]
+tests/test_k_rate_model.py::test_build_k_rate_model_always_has_covariates PASSED [ 50%]
+tests/test_league_baselines.py::TestAggregateBaselinesComputesRates::test_rate_math PASSED [ 50%]
+tests/test_league_baselines.py::TestAggregateBaselinesHandlesZeroDenominator::test_zero_swings_gives_nan PASSED [ 50%]
+tests/test_league_baselines.py::TestArchetypeJoinLeftJoinPreservesUnmatched::test_unmatched_rows_have_nan_archetype PASSED [ 51%]
+tests/test_league_baselines.py::TestBaselinesByPitchTypeStandShape::test_correct_row_count_and_columns PASSED [ 51%]
+tests/test_league_baselines.py::TestBaselinesByArchetypeStandShape::test_correct_row_count_and_columns PASSED [ 51%]
+tests/test_league_baselines.py::TestPooledBaselinesWeightsByVolume::test_short_season_doesnt_get_equal_weight FAILED [ 52%]
+tests/test_league_baselines.py::TestPriorBaselinesFallbackChain::test_falls_back_from_archetype_stand_to_pitch_type_to_overall PASSED [ 52%]
+tests/test_lineup_adjustments.py::TestComputeLineupProneness::test_high_k_lineup_positive_lift PASSED [ 53%]
+tests/test_lineup_adjustments.py::TestComputeLineupProneness::test_low_k_lineup_negative_lift PASSED [ 53%]
+tests/test_lineup_adjustments.py::TestComputeLineupProneness::test_weight_zero_returns_zero PASSED [ 53%]
+tests/test_lineup_adjustments.py::TestComputeLineupProneness::test_weight_scales_lift PASSED [ 54%]
+tests/test_lineup_adjustments.py::TestComputeLineupProneness::test_missing_batters_use_league_avg PASSED [ 54%]
+tests/test_lineup_adjustments.py::TestComputeLineupProneness::test_no_matching_batters_returns_zero PASSED [ 55%]
+tests/test_lineup_adjustments.py::TestComputeLineupProneness::test_wrong_lineup_size_returns_zero PASSED [ 55%]
+tests/test_lineup_adjustments.py::TestComputeLineupProneness::test_pa_weights_shape PASSED [ 55%]
+tests/test_lineup_adjustments.py::TestComputeLineupPronenessBatch::test_batch PASSED [ 56%]
+tests/test_lineup_adjustments.py::TestComputeOpposingPitcherLift::test_high_k_pitcher_positive_lift PASSED [ 56%]
+tests/test_lineup_adjustments.py::TestComputeOpposingPitcherLift::test_low_k_pitcher_negative_lift PASSED [ 57%]
+tests/test_lineup_adjustments.py::TestComputeOpposingPitcherLift::test_league_avg_pitcher_near_zero PASSED [ 57%]
+tests/test_lineup_adjustments.py::TestComputeOpposingPitcherLift::test_weight_zero PASSED [ 57%]
+tests/test_lineup_adjustments.py::TestComputeOpposingPitcherLift::test_nan_returns_zero PASSED [ 58%]
+tests/test_lineup_adjustments.py::TestComputeOpposingPitcherLiftBatch::test_batch PASSED [ 58%]
+tests/test_lineup_adjustments.py::TestExtractOpposingLineup::test_extracts_opposing_team PASSED [ 59%]
+tests/test_lineup_adjustments.py::TestExtractOpposingLineup::test_returns_none_if_no_game PASSED [ 59%]
+tests/test_lineup_adjustments.py::TestBuildGameLineupMap::test_builds_map PASSED [ 59%]
+tests/test_matchup.py::TestLogitInvLogit::test_roundtrip PASSED          [ 60%]
+tests/test_matchup.py::TestLogitInvLogit::test_clipping PASSED           [ 60%]
+tests/test_matchup.py::TestHitterWhiffFallback::test_direct_match PASSED [ 61%]
+tests/test_matchup.py::TestHitterWhiffFallback::test_low_sample_blends PASSED [ 61%]
+tests/test_matchup.py::TestHitterWhiffFallback::test_family_fallback PASSED [ 61%]
+tests/test_matchup.py::TestHitterWhiffFallback::test_league_fallback PASSED [ 62%]
+tests/test_matchup.py::TestScoreMatchup::test_average_hitter_near_zero_lift PASSED [ 62%]
+tests/test_matchup.py::TestScoreMatchup::test_vulnerable_hitter_positive_lift PASSED [ 63%]
+tests/test_matchup_archetype.py::TestArchetypeFallback::test_direct_archetype_match PASSED [ 63%]
+tests/test_matchup_archetype.py::TestArchetypeFallback::test_low_sample_blends PASSED [ 63%]
+tests/test_matchup_archetype.py::TestArchetypeFallback::test_primary_pt_fallback PASSED [ 64%]
+tests/test_matchup_archetype.py::TestArchetypeFallback::test_league_fallback PASSED [ 64%]
+tests/test_matchup_archetype.py::TestScoreMatchupByArchetype::test_average_hitter_near_zero_lift PASSED [ 65%]
+tests/test_matchup_archetype.py::TestScoreMatchupByArchetype::test_vulnerable_hitter_positive_lift PASSED [ 65%]
+tests/test_matchup_archetype.py::TestScoreMatchupByArchetype::test_empty_arsenal_returns_nan PASSED [ 65%]
+tests/test_matchup_archetype.py::TestScoreMatchupByArchetype::test_output_schema PASSED [ 66%]
+tests/test_matchup_archetype.py::TestBatchArchetype::test_batch_matches_individual PASSED [ 66%]
+tests/test_matchup_validation.py::TestComputeGameMatchupKRate::test_basic PASSED [ 67%]
+tests/test_matchup_validation.py::TestComputeGameMatchupKRate::test_no_matches PASSED [ 67%]
+tests/test_matchup_validation.py::TestComputeValidationMetrics::test_shape FAILED [ 67%]
+tests/test_model_integration.py::TestHitterModelRecovery::test_no_errors PASSED [ 68%]
+tests/test_model_integration.py::TestHitterModelRecovery::test_posterior_means_reasonable PASSED [ 68%]
+tests/test_model_integration.py::TestHitterModelRecovery::test_credible_interval_coverage PASSED [ 69%]
+tests/test_model_integration.py::TestHitterModelRecovery::test_covariates_in_model PASSED [ 69%]
+tests/test_model_integration.py::TestPitcherModelRecovery::test_no_errors PASSED [ 69%]
+tests/test_model_integration.py::TestPitcherModelRecovery::test_posterior_means_reasonable PASSED [ 70%]
+tests/test_model_integration.py::TestPitcherModelRecovery::test_credible_interval_coverage PASSED [ 70%]
+tests/test_model_integration.py::TestPitcherModelRecovery::test_no_covariate_betas PASSED [ 71%]
+tests/test_model_integration.py::TestPitcherModelRecovery::test_starter_role_present PASSED [ 71%]
+tests/test_model_integration.py::TestHitterPlatoonIntegration::test_platoon_model_compiles_and_samples PASSED [ 71%]
+tests/test_model_integration.py::TestMatchupEndToEnd::test_batch_scoring_produces_valid_output PASSED [ 72%]
+tests/test_model_integration.py::TestMatchupEndToEnd::test_game_level_matchup_adjustment PASSED [ 72%]
+tests/test_model_integration.py::TestProjectionWider::test_projected_wider_than_insample PASSED [ 73%]
+tests/test_pa_model.py::TestComputePaPriorsOutput::test_output_columns PASSED [ 73%]
+tests/test_pa_model.py::TestComputePaPriorsOutput::test_returns_all_eligible_players PASSED [ 73%]
+tests/test_pa_model.py::TestComputePaPriorsOutput::test_min_pa_filters PASSED [ 74%]
+tests/test_pa_model.py::TestShrinkageWithHistory::test_multi_season_higher_reliability PASSED [ 74%]
+tests/test_pa_model.py::TestShrinkageWithHistory::test_multi_season_less_shrinkage PASSED [ 75%]
+tests/test_pa_model.py::TestAgeRegression::test_veteran_age_penalty PASSED [ 75%]
+tests/test_pa_model.py::TestAgeRegression::test_projected_pa_positive PASSED [ 75%]
+tests/test_pa_model.py::TestSeason2020Adjustment::test_2020_games_scaled_up PASSED [ 76%]
+tests/test_pa_model.py::TestPaPriorsCap::test_games_capped_at_162 PASSED [ 76%]
+tests/test_pa_model.py::TestDrawPaSamplesBounds::test_samples_bounded PASSED [ 76%]
+tests/test_pa_model.py::TestDrawPaSamplesBounds::test_mean_near_expected PASSED [ 77%]
+tests/test_pa_model.py::TestDrawPaSamplesBounds::test_zero_sigma_deterministic PASSED [ 77%]
+tests/test_pa_model.py::TestDrawPaSamplesShape::test_correct_count PASSED [ 78%]
+tests/test_pa_model.py::TestConstants::test_age_buckets_present PASSED   [ 78%]
+tests/test_pa_model.py::TestConstants::test_pop_pa_per_game_reasonable PASSED [ 78%]
+tests/test_pa_model.py::TestConstants::test_season_weights_length PASSED [ 79%]
+tests/test_pitch_archetypes.py::TestNormalizeHandedness::test_flips_lhp_pfx_x PASSED [ 79%]
+tests/test_pitch_archetypes.py::TestShapeFeatures::test_has_five_elements PASSED [ 80%]
+tests/test_pitch_archetypes.py::TestShapeFeatures::test_no_release_pos PASSED [ 80%]
+tests/test_pitch_archetypes.py::TestFitDeterministic::test_same_input_same_centroids PASSED [ 80%]
+tests/test_pitch_archetypes.py::TestLhpRhpMirror::test_mirror_pitches_cluster_together PASSED [ 81%]
+tests/test_pitch_archetypes.py::TestCrossSeasonStability::test_same_pitch_different_seasons_same_label PASSED [ 81%]
+tests/test_pitch_archetypes.py::TestFullPipeline::test_fit_assign_correct_shapes_and_columns PASSED [ 82%]
+tests/test_pitch_archetypes.py::TestEvaluateClusterCounts::test_output_columns_and_row_count PASSED [ 82%]
+tests/test_pitch_archetypes.py::TestValidation::test_fit_rejects_n_clusters_below_2 PASSED [ 82%]
+tests/test_pitcher_k_rate_model.py::test_prepare_pitcher_model_data_basic PASSED [ 83%]
+tests/test_pitcher_k_rate_model.py::test_prepare_pitcher_model_data_player_level_z_scores PASSED [ 83%]
+tests/test_pitcher_k_rate_model.py::test_prepare_pitcher_model_data_constant_covariates PASSED [ 84%]
+tests/test_pitcher_k_rate_model.py::test_build_pitcher_k_rate_model_has_expected_variables PASSED [ 84%]
+tests/test_pitcher_k_rate_model.py::test_build_pitcher_k_rate_model_uses_bf_not_pa PASSED [ 84%]
+tests/test_pitcher_k_rate_model.py::test_build_pitcher_k_rate_model_no_role_no_beta_starter PASSED [ 85%]
+tests/test_pitcher_k_rate_model.py::test_prepare_pitcher_model_data_missing_covariates_fills_zeros PASSED [ 85%]
+tests/test_pitcher_model.py::TestPrepareData::test_prepare_k_rate PASSED [ 86%]
+tests/test_pitcher_model.py::TestPrepareData::test_prepare_all_stats PASSED [ 86%]
+tests/test_pitcher_model.py::TestPrepareData::test_age_buckets PASSED    [ 86%]
+tests/test_pitcher_model.py::TestBuildModel::test_build_model PASSED     [ 87%]
+tests/test_pitcher_model.py::TestFitAndExtract::test_k_rate_posteriors PASSED [ 87%]
+tests/test_pitcher_model.py::TestFitAndExtract::test_bb_rate_posteriors PASSED [ 88%]
+tests/test_pitcher_model.py::TestFitAndExtract::test_extract_samples PASSED [ 88%]
+tests/test_pitcher_model.py::TestFitAndExtract::test_extract_samples_forward PASSED [ 88%]
+tests/test_pitcher_model.py::TestFitAndExtract::test_convergence PASSED  [ 89%]
+tests/test_pitcher_model.py::TestFitAndExtract::test_age_bucket_mu_pop PASSED [ 89%]
+tests/test_pitcher_projections.py::TestCompositeDimensions::test_weights_sum_to_one PASSED [ 90%]
+tests/test_pitcher_projections.py::TestCompositeDimensions::test_all_projected_stats_have_models PASSED [ 90%]
+tests/test_pitcher_projections.py::TestCompositeDimensions::test_four_dimensions PASSED [ 90%]
+tests/test_pitcher_projections.py::TestProjectForward::test_empty_season_returns_empty PASSED [ 91%]
+tests/test_pitcher_projections.py::TestFindBreakoutsAndRegressions::test_split_sizes PASSED [ 91%]
+tests/test_pitcher_projections.py::TestFindBreakoutsAndRegressions::test_breakouts_have_higher_scores PASSED [ 92%]
+tests/test_pitcher_projections.py::TestFindBreakoutsAndRegressions::test_n_top_larger_than_df PASSED [ 92%]
+tests/test_rest_adjustment.py::TestClassifyRestBucket::test_short_rest PASSED [ 92%]
+tests/test_rest_adjustment.py::TestClassifyRestBucket::test_normal_rest PASSED [ 93%]
+tests/test_rest_adjustment.py::TestClassifyRestBucket::test_extended_rest PASSED [ 93%]
+tests/test_rest_adjustment.py::TestClassifyRestBucket::test_none_returns_normal PASSED [ 94%]
+tests/test_rest_adjustment.py::TestClassifyRestBucket::test_negative_returns_normal PASSED [ 94%]
+tests/test_rest_adjustment.py::TestGetRestAdjustment::test_short_rest_negative_k_lift PASSED [ 94%]
+tests/test_rest_adjustment.py::TestGetRestAdjustment::test_normal_rest_zero_lifts PASSED [ 95%]
+tests/test_rest_adjustment.py::TestGetRestAdjustment::test_extended_rest PASSED [ 95%]
+tests/test_rest_adjustment.py::TestGetRestAdjustment::test_none_returns_neutral PASSED [ 96%]
+tests/test_rest_adjustment.py::TestGetRestBfModifier::test_short_rest_lower_bf PASSED [ 96%]
+tests/test_rest_adjustment.py::TestGetRestBfModifier::test_normal_rest_no_change PASSED [ 96%]
+tests/test_rest_adjustment.py::TestGetRestBfModifier::test_extended_rest PASSED [ 97%]
+tests/test_rest_adjustment.py::TestApplyRestToBf::test_short_rest_reduces_mu PASSED [ 97%]
+tests/test_rest_adjustment.py::TestApplyRestToBf::test_normal_rest_unchanged PASSED [ 98%]
+tests/test_rest_adjustment.py::TestApplyRestToBf::test_none_rest_unchanged PASSED [ 98%]
+tests/test_rest_adjustment.py::TestComputeRestForGame::test_found PASSED [ 98%]
+tests/test_rest_adjustment.py::TestComputeRestForGame::test_not_found PASSED [ 99%]
+tests/test_rest_adjustment.py::TestComputeRestForGame::test_none_df PASSED [ 99%]
+tests/test_rest_adjustment.py::TestComputeRestForGame::test_empty_df PASSED [100%]
+
+================================== FAILURES ===================================
+_________________ test_walk_forward_backtest_mocked_pipeline __________________
+E:\data_analytics\player_profiles\tests\test_backtesting.py:135: in test_walk_forward_backtest_mocked_pipeline
+    assert "bayes_mae" in metrics
+E   AssertionError: assert 'bayes_mae' in {'bayes_brier': 0.23125000000000004, 'calibration':    nominal_level  empirical_coverage  n\n0           0.50                 1.0  2\n1           0.80                 1.0  2\n2           0.90                 1.0  2\n3           0.95                 1.0  2, 'comparison_df':    batter_id batter_name  ...  post_ci_95_lo  post_ci_95_hi\n0          1           A  ...           0.17           0.27\n1          2           B  ...           0.18           0.28\n\n[2 rows x 20 columns], 'convergence': {'converged': True}, ...}
+------------------------------ Captured log call ------------------------------
+WARNING  src.evaluation.backtesting:backtesting.py:209 Very few common batters — results may be unreliable
+____________ TestShrinkageHighStarts.test_high_starts_reliability _____________
+E:\data_analytics\player_profiles\tests\test_bf_model.py:95: in test_high_starts_reliability
+    assert p1["reliability"] > 0.9
+E   assert np.float64(0.8982035928143713) > 0.9
+___________ TestShrinkageLowStarts.test_low_starts_pure_population ____________
+E:\data_analytics\player_profiles\tests\test_bf_model.py:106: in test_low_starts_pure_population
+    assert p2["mu_bf"] == 22.0  # pop_mu default
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   assert np.float64(22.4) == 22.0
+_________________ TestGetBfDistribution.test_missing_pitcher __________________
+E:\data_analytics\player_profiles\tests\test_bf_model.py:145: in test_missing_pitcher
+    assert result["mu_bf"] == 22.0
+E   assert 22.4 == 22.0
+______________ TestComputeGameKMetricsKeys.test_all_keys_present ______________
+E:\data_analytics\player_profiles\tests\test_game_k_validation.py:81: in test_all_keys_present
+    assert expected_keys.issubset(set(result.keys()))
+E   AssertionError: assert False
+E    +  where False = <built-in method issubset of set object at 0x000001CF9DB0A340>({'avg_brier', 'avg_log_loss', 'brier_scores', 'calibration_df', 'coverage_50', 'coverage_80', ...})
+E    +    where <built-in method issubset of set object at 0x000001CF9DB0A340> = {'avg_brier', 'brier_scores', 'calibration_df', 'coverage_50', 'coverage_80', 'coverage_90', ...}.issubset
+E    +    and   {'avg_brier', 'avg_log_loss', 'brier_scores', 'calibration_df', 'coverage_50', 'coverage_80', ...} = set(dict_keys(['brier_scores', 'avg_brier', 'log_losses', 'avg_log_loss', 'calibration_df', 'coverage_50', 'coverage_80', 'coverage_90', 'log_score', 'n_games', 'ece_per_line', 'temperature_per_line', 'pooled_ece', 'pooled_temperature']))
+E    +      where dict_keys(['brier_scores', 'avg_brier', 'log_losses', 'avg_log_loss', 'calibration_df', 'coverage_50', 'coverage_80', 'coverage_90', 'log_score', 'n_games', 'ece_per_line', 'temperature_per_line', 'pooled_ece', 'pooled_temperature']) = <built-in method keys of dict object at 0x000001CF9DB92900>()
+E    +        where <built-in method keys of dict object at 0x000001CF9DB92900> = {'avg_brier': 0.12436899839954116, 'avg_log_loss': 0.39659849389177027, 'brier_scores': {3.5: 0.120016068617075, 4.5: 0.12477749762576568, 5.5: 0.1306047686003998, 6.5: 0.12531345866018423, ...}, 'calibration_df':     line  bin_center  predicted_prob  actual_freq  n_games  calibration_error\n0    3.5        0.15        0.163092     0.222222        9           0.059131\n1    3.5        0.25        0.248442     0.222222        9           0.026220\n2    3.5        0.35        0.347061     0.384615       13           0.037555\n3    3.5        0.45        0.447712     0.411765       17           0.035947\n4    3.5        0.55        0.559788     0.833333       24           0.273546\n5    3.5        0.65        0.655725     0.733333       30           0.077608\n6    3.5        0.75        0.759154     1.000000       23           0.240846\n7    3.5        0.85        0.849162     0.960000       25           0.110838\n8    3.5        0.95        0.950206     1.000000       50           0.049794\n9    4.5        0.05        0.080911     0.000000        4           0.080911\n10   4.5        0.15        0.157021     0.000000       14           0.157021\n11   4.5        0.25        0.240400     0.06666...  14           0.225096\n34   6.5        0.55        0.545825     0.520000       25           0.025825\n35   6.5        0.65        0.662057     0.736842       19           0.074785\n36   6.5        0.75        0.748347     0.909091       11           0.160743\n37   6.5        0.85        0.858118     1.000000       13           0.141882\n38   6.5        0.95        0.934586     1.000000       11           0.065414\n39   7.5        0.05        0.051980     0.000000       44           0.051980\n40   7.5        0.15        0.150650     0.055556       36           0.095094\n41   7.5        0.25        0.241893     0.074074       27           0.167819\n42   7.5        0.35        0.344120     0.200000       20           0.144120\n43   7.5        0.45        0.444668     0.173913       23           0.270755\n44   7.5        0.55        0.551754     0.470588       17           0.081165\n45   7.5        0.65        0.645789     0.636364       11           0.009425\n46   7.5        0.75        0.751602     0.900000       10           0.148398\n47   7.5        0.85        0.848862     0.666667        9           0.182195\n48   7.5        0.95        0.935535     1.000000        3           0.064465, ...}.keys
+_____________ TestComputeGameKMetricsKeys.test_empty_predictions ______________
+E:\data_analytics\player_profiles\tests\test_game_k_validation.py:91: in test_empty_predictions
+    assert np.isnan(result["rmse_expected"])
+                    ^^^^^^^^^^^^^^^^^^^^^^^
+E   KeyError: 'rmse_expected'
+_______________ TestCompareToBaselinesShape.test_four_baselines _______________
+E:\data_analytics\player_profiles\tests\test_game_k_validation.py:102: in test_four_baselines
+    assert "rmse" in result.columns
+E   AssertionError: assert 'rmse' in Index(['baseline', 'avg_brier'], dtype='object')
+E    +  where Index(['baseline', 'avg_brier'], dtype='object') =            baseline  avg_brier\n0             naive   0.243451\n1           poisson   0.237141\n2  model_no_matchup   0.237141\n3        full_model   0.124369.columns
+_____________ TestCompareToBaselinesShape.test_all_metrics_finite _____________
+..\..\..\AppData\Local\Programs\Python\Python311\Lib\site-packages\pandas\core\indexes\base.py:3812: in get_loc
+    return self._engine.get_loc(casted_key)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+pandas/_libs/index.pyx:167: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/index.pyx:196: in pandas._libs.index.IndexEngine.get_loc
+    ???
+pandas/_libs/hashtable_class_helper.pxi:7088: in pandas._libs.hashtable.PyObjectHashTable.get_item
+    ???
+pandas/_libs/hashtable_class_helper.pxi:7096: in pandas._libs.hashtable.PyObjectHashTable.get_item
+    ???
+E   KeyError: 'rmse'
+
+The above exception was the direct cause of the following exception:
+E:\data_analytics\player_profiles\tests\test_game_k_validation.py:109: in test_all_metrics_finite
+    assert result["rmse"].notna().all()
+           ^^^^^^^^^^^^^^
+..\..\..\AppData\Local\Programs\Python\Python311\Lib\site-packages\pandas\core\frame.py:4113: in __getitem__
+    indexer = self.columns.get_loc(key)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\..\AppData\Local\Programs\Python\Python311\Lib\site-packages\pandas\core\indexes\base.py:3819: in get_loc
+    raise KeyError(key) from err
+E   KeyError: 'rmse'
+_____________________ TestBuildModel.test_build_binomial ______________________
+tests\test_hitter_model.py:131: in test_build_binomial
+    assert model.named_vars["mu_pop"].eval().shape == (3, 4)
+E   AssertionError: assert (4, 4) == (3, 4)
+E     
+E     At index 0 diff: 4 != 3
+E     
+E     Full diff:
+E       (
+E     -     3,
+E     ?     ^...
+E     
+E     ...Full output truncated (4 lines hidden), use '-vv' to show
+__________________ TestFitAndExtract.test_age_bucket_mu_pop ___________________
+tests\test_hitter_model.py:217: in test_age_bucket_mu_pop
+    assert mu_pop.shape[-2:] == (3, 4)
+E   AssertionError: assert (4, 4) == (3, 4)
+E     
+E     At index 0 diff: 4 != 3
+E     
+E     Full diff:
+E       (
+E     -     3,
+E     ?     ^...
+E     
+E     ...Full output truncated (4 lines hidden), use '-vv' to show
+_ TestPooledBaselinesWeightsByVolume.test_short_season_doesnt_get_equal_weight _
+E:\data_analytics\player_profiles\tests\test_league_baselines.py:255: in test_short_season_doesnt_get_equal_weight
+    assert row["whiff_rate"] == pytest.approx(expected_whiff)
+E   assert np.float64(0.2851851851851852) == 0.2818181818181818 ± 2.8e-07
+E     
+E     comparison failed
+E     Obtained: 0.2851851851851852
+E     Expected: 0.2818181818181818 ± 2.8e-07
+___________________ TestComputeValidationMetrics.test_shape ___________________
+E:\data_analytics\player_profiles\tests\test_matchup_validation.py:65: in test_shape
+    assert set(metrics.keys()) == expected_keys
+E   AssertionError: assert {'lift_residu...'pct_matched'} == {'lift_residu..._pvalue', ...}
+E     
+E     Extra items in the right set:
+E     'rmse_matchup'
+E     'rmse_baseline'
+E     'mae_baseline'
+E     'mae_matchup'
+E     ...
+E     
+E     ...Full output truncated (13 lines hidden), use '-vv' to show
+============================== warnings summary ===============================
+tests/test_matchup_validation.py::TestComputeGameMatchupKRate::test_no_matches
+  C:\users\kekoa\documents\data_analytics\player_profiles\src\models\matchup.py:330: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+    merged["matchup_k_logit_lift"] = merged["matchup_k_logit_lift"].fillna(0.0)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_backtesting.py::test_walk_forward_backtest_mocked_pipeline
+FAILED tests/test_bf_model.py::TestShrinkageHighStarts::test_high_starts_reliability
+FAILED tests/test_bf_model.py::TestShrinkageLowStarts::test_low_starts_pure_population
+FAILED tests/test_bf_model.py::TestGetBfDistribution::test_missing_pitcher - ...
+FAILED tests/test_game_k_validation.py::TestComputeGameKMetricsKeys::test_all_keys_present
+FAILED tests/test_game_k_validation.py::TestComputeGameKMetricsKeys::test_empty_predictions
+FAILED tests/test_game_k_validation.py::TestCompareToBaselinesShape::test_four_baselines
+FAILED tests/test_game_k_validation.py::TestCompareToBaselinesShape::test_all_metrics_finite
+FAILED tests/test_hitter_model.py::TestBuildModel::test_build_binomial - Asse...
+FAILED tests/test_hitter_model.py::TestFitAndExtract::test_age_bucket_mu_pop
+FAILED tests/test_league_baselines.py::TestPooledBaselinesWeightsByVolume::test_short_season_doesnt_get_equal_weight
+FAILED tests/test_matchup_validation.py::TestComputeValidationMetrics::test_shape
+============ 12 failed, 240 passed, 1 warning in 171.22s (0:02:51) ============
