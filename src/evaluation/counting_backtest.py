@@ -325,7 +325,7 @@ def walk_forward_pitcher_counting(
     )
 
     # Build extended pitcher data
-    pitcher_ext = build_multi_season_pitcher_extended(all_seasons, min_bf=1)
+    pitcher_ext = build_multi_season_pitcher_extended(all_seasons, min_bf=9)
 
     # Fit Bayesian rate models on train data only
     rate_results = fit_pitcher_models(

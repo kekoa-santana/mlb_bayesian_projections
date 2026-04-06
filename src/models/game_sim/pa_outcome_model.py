@@ -10,11 +10,12 @@ Integrates:
 - Matchup logit lifts (Layer 2)
 - TTO adjustments
 - Fatigue adjustments (pitch count)
-- Umpire/park/weather context
+- Game context (umpire/park/weather/catcher framing)
 """
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.special import expit, logit
@@ -56,6 +57,29 @@ _FATIGUE_BB_SLOPE = 0.00239     # BB logit increases per pitch above threshold
 _FATIGUE_HR_SLOPE = 0.003       # HR logit increases per pitch above threshold (was 0.001;
                                 # Perez & Sherwood 2020: HR rate increases 15-20% relative
                                 # in high-pitch-count regime → ~0.003 logit/pitch)
+
+
+@dataclass(frozen=True)
+class GameContext:
+    """Per-game environmental logit lifts (constant throughout game).
+
+    Bundles all context signals that are known at lineup lock and do not
+    change PA-to-PA. New environmental signals (e.g., platoon) should be
+    added here rather than as new parameters to compute_pa_probs.
+    """
+
+    umpire_k_lift: float = 0.0
+    umpire_bb_lift: float = 0.0
+    park_k_lift: float = 0.0
+    park_bb_lift: float = 0.0
+    park_hr_lift: float = 0.0
+    weather_k_lift: float = 0.0
+    form_bb_lift: float = 0.0
+    catcher_k_lift: float = 0.0
+    xgb_bb_lift: float = 0.0
+
+
+_EMPTY_CONTEXT = GameContext()
 
 
 def compute_fatigue_adjustments(
@@ -119,13 +143,7 @@ class PAOutcomeModel:
         fatigue_k_lift: float = 0.0,
         fatigue_bb_lift: float = 0.0,
         fatigue_hr_lift: float = 0.0,
-        umpire_k_lift: float = 0.0,
-        umpire_bb_lift: float = 0.0,
-        park_k_lift: float = 0.0,
-        park_bb_lift: float = 0.0,
-        park_hr_lift: float = 0.0,
-        weather_k_lift: float = 0.0,
-        form_bb_lift: float = 0.0,
+        ctx: GameContext | None = None,
     ) -> dict[str, float | np.ndarray]:
         """Compute adjusted PA outcome probabilities.
 
@@ -147,35 +165,33 @@ class PAOutcomeModel:
             Through-the-order logit lifts.
         fatigue_*_lift : float
             Pitch count fatigue logit lifts.
-        umpire_*_lift : float
-            Umpire tendency logit lifts.
-        park_k_lift, park_bb_lift, park_hr_lift : float
-            Park factor logit lifts for K, BB, and HR.
-        weather_k_lift : float
-            Weather K logit lift.
-        form_bb_lift : float
-            Pitcher rolling form BB% logit lift (from form_model).
+        ctx : GameContext, optional
+            Per-game environmental lifts (umpire, park, weather, catcher
+            framing, pitcher form). Defaults to zero lifts.
 
         Returns
         -------
         dict[str, float | np.ndarray]
             Keys: 'k', 'bb', 'hbp', 'hr', 'bip'. Values: probabilities.
         """
+        _ctx = ctx or _EMPTY_CONTEXT
+
         # K probability (with calibration offset to correct sim bias)
         k_logit = (
             self._safe_logit(pitcher_k_rate)
             + matchup_k_lift + tto_k_lift + fatigue_k_lift
-            + umpire_k_lift + park_k_lift + weather_k_lift
+            + _ctx.umpire_k_lift + _ctx.park_k_lift + _ctx.weather_k_lift
+            + _ctx.catcher_k_lift
             + _CALIBRATION_K_OFFSET
         )
         k_prob = expit(k_logit)
 
-        # BB probability (with calibration offset + pitcher form)
+        # BB probability (with calibration offset + pitcher form + XGB adjustment)
         bb_logit = (
             self._safe_logit(pitcher_bb_rate)
             + matchup_bb_lift + tto_bb_lift + fatigue_bb_lift
-            + umpire_bb_lift + park_bb_lift
-            + form_bb_lift
+            + _ctx.umpire_bb_lift + _ctx.park_bb_lift
+            + _ctx.form_bb_lift + _ctx.xgb_bb_lift
             + _CALIBRATION_BB_OFFSET
         )
         bb_prob = expit(bb_logit)
@@ -184,7 +200,7 @@ class PAOutcomeModel:
         hr_logit = (
             self._safe_logit(pitcher_hr_rate)
             + matchup_hr_lift + tto_hr_lift + fatigue_hr_lift
-            + park_hr_lift
+            + _ctx.park_hr_lift
         )
         hr_prob = expit(hr_logit)
 

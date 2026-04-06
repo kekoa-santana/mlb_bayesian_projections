@@ -3321,7 +3321,7 @@ def get_exit_model_training_data(seasons: list[int]) -> pd.DataFrame:
         WHERE fpg.pit_is_starter = TRUE
           AND dg.game_type = 'R'
           AND fpg.season IN ({season_list})
-          AND fpg.pit_bf >= 3
+          AND fpg.pit_bf >= 9
     ),
     pa_with_cumulative AS (
         SELECT
@@ -3408,7 +3408,7 @@ def get_pitcher_exit_tendencies(seasons: list[int]) -> pd.DataFrame:
         WHERE fpg.pit_is_starter = TRUE
           AND dg.game_type = 'R'
           AND fpg.season IN ({season_list})
-          AND fpg.pit_bf >= 3
+          AND fpg.pit_bf >= 9
     ),
     pitcher_agg AS (
         SELECT

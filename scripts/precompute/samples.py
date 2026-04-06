@@ -36,7 +36,7 @@ def run_pitcher_samples(
 ) -> None:
     """Extract and save pitcher posterior samples (BB%, HR/BF, K%)."""
     from src.data.feature_eng import build_multi_season_pitcher_k_data
-    from src.models.game_k_model import extract_pitcher_k_rate_samples
+    from src.models.posterior_utils import extract_pitcher_k_rate_samples
     from src.models.pitcher_k_rate_model import (
         check_pitcher_convergence,
         fit_pitcher_k_rate_model,
@@ -72,7 +72,7 @@ def run_pitcher_samples(
     # -- Pitcher K% model (for posterior samples -> Game K sim) --
     logger.info("=" * 60)
     logger.info("Fitting pitcher K%% model for posterior samples...")
-    df_pitcher = build_multi_season_pitcher_k_data(seasons, min_bf=1)
+    df_pitcher = build_multi_season_pitcher_k_data(seasons, min_bf=9)
     pitcher_data = prepare_pitcher_model_data(df_pitcher)
     _model, pitcher_trace = fit_pitcher_k_rate_model(
         pitcher_data, draws=draws, tune=tune, chains=chains,

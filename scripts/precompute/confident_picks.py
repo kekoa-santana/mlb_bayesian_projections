@@ -1119,97 +1119,73 @@ def _run_market_edge(
 ) -> None:
     """Build Layer 4 market edge analysis and save to dashboard.
 
-    Reads vegas_line/vegas_odds from the already-merged all_props,
-    constructs PropLine objects, evaluates edges against raw sim samples,
-    and writes market_edge.parquet.
+    Both PrizePicks and DraftKings require 2+ pick parlays.
+    The vig is hidden in the payout multiplier, not per-leg odds.
+
+    Pipeline:
+    1. Score every available prop leg (model_prob vs 50%)
+    2. Filter to legs with meaningful edge (>3% over coin flip)
+    3. Find optimal 2-6 leg parlay combinations
+    4. Evaluate each combo on PP Power, PP Flex, and DK Pick6
+    5. Write per-leg scores + best parlays to dashboard parquets
     """
     from src.models.market_edge import (
-        PropLine, american_to_decimal, evaluate_props,
-        build_portfolio, portfolio_to_dataframe, edges_to_dataframe,
+        build_prop_legs, find_best_parlays,
+        legs_to_dataframe, parlays_to_dataframe,
     )
 
     if all_props.empty or not player_posteriors:
         return
 
-    # Any row with a line (DK or PP) can be evaluated
-    has_line = all_props["vegas_line"].notna()
-    eligible = all_props[has_line].copy()
-    if eligible.empty:
-        logger.info("Market edge: no rows with book lines, skipping")
+    # 1. Score individual legs
+    legs = build_prop_legs(
+        all_props, player_posteriors, _STAT_MAP, min_edge_vs_even=0.03,
+    )
+    if len(legs) < 2:
+        logger.info("Market edge: fewer than 2 viable legs, skipping parlays")
         return
 
-    all_edges = []
-    all_positions = []
+    logger.info(
+        "Market edge: %d viable legs (model_prob > 53%%)", len(legs),
+    )
 
-    # Group by game_pk + player_id so we can do correlated portfolio per game
-    for (gpk, pid), group in eligible.groupby(["game_pk", "player_id"]):
-        samples = player_posteriors.get((int(gpk), int(pid)))
-        if samples is None:
-            continue
+    # 2. Save per-leg scores (useful for dashboard drill-down)
+    leg_df = legs_to_dataframe(legs)
+    leg_df.to_parquet(DASHBOARD_DIR / "market_legs.parquet", index=False)
 
-        # Build PropLine for each stat row with a book line
-        props = []
-        for _, row in group.iterrows():
-            stat_lower = _STAT_MAP.get(row["stat"])
-            if stat_lower is None or stat_lower not in samples:
-                continue
+    # 3. Find best parlay combos across platforms
+    parlays = find_best_parlays(
+        legs,
+        player_posteriors,
+        platforms=["prizepicks_power", "prizepicks_flex", "dk_pick6"],
+        n_picks_range=(2, 5),
+        max_combos_per_size=5,
+        min_ev=1.0,
+    )
 
-            source = str(row.get("line_source", "")) or "unknown"
+    if not parlays:
+        logger.info("Market edge: no +EV parlays found")
+        return
 
-            if pd.notna(row.get("vegas_odds")):
-                over_dec = american_to_decimal(row["vegas_odds"])
-                under_raw = row.get("vegas_under_odds")
-                under_dec = (
-                    american_to_decimal(under_raw)
-                    if pd.notna(under_raw) else over_dec
-                )
-            else:
-                # PP standard or missing odds → even money (no vig)
-                over_dec = 2.0
-                under_dec = 2.0
+    # 4. Save parlay recommendations
+    parlay_df = parlays_to_dataframe(parlays)
+    parlay_df.to_parquet(DASHBOARD_DIR / "market_parlays.parquet", index=False)
 
-            props.append(PropLine(
-                player_id=int(pid),
-                game_pk=int(gpk),
-                stat=stat_lower,
-                line=float(row["vegas_line"]),
-                over_odds=over_dec,
-                under_odds=under_dec,
-                source=source,
-                player_type=str(row["player_type"]),
-            ))
-
-        if not props:
-            continue
-
-        edges = evaluate_props(samples, props, min_edge=0.02)
-        all_edges.extend(edges)
-
-        positions = build_portfolio(edges, samples)
-        all_positions.extend(positions)
-
-    # Save edge analysis
-    edge_df = edges_to_dataframe(all_edges)
-    if not edge_df.empty:
-        # Add player names for readability
-        name_map = dict(zip(all_props["player_id"], all_props["player_name"]))
-        edge_df["player_name"] = edge_df["player_id"].map(name_map)
-        edge_df.to_parquet(DASHBOARD_DIR / "market_edge.parquet", index=False)
-        logger.info(
-            "Market edge: %d props evaluated, %d with edge > 2%%",
-            len(edge_df),
-            len(edge_df[edge_df["edge_over"].abs().gt(0.02) | edge_df["edge_under"].abs().gt(0.02)]),
+    # Summary logging
+    profitable = [p for p in parlays if p.ev_per_dollar > 1.0]
+    logger.info(
+        "Market edge: %d parlays evaluated, %d profitable (EV > $1)",
+        len(parlays), len(profitable),
+    )
+    for p in profitable[:5]:
+        leg_names = ", ".join(
+            f"{l.player_name} {l.stat.upper()} {l.side} {l.line}"
+            for l in p.legs
         )
-
-    # Save portfolio positions
-    portfolio_df = portfolio_to_dataframe(all_positions)
-    if not portfolio_df.empty:
-        portfolio_df["player_name"] = portfolio_df["player_id"].map(name_map)
-        portfolio_df.to_parquet(DASHBOARD_DIR / "market_portfolio.parquet", index=False)
         logger.info(
-            "Market portfolio: %d positions, total exposure %.1f%%",
-            len(portfolio_df),
-            portfolio_df["stake_pct"].sum() * 100,
+            "  %s %d-pick: EV $%.2f | edge %.1f%% | kelly %.1f%% | %s",
+            p.platform, p.n_legs, p.ev_per_dollar,
+            p.edge_pct, p.kelly_fraction * 100, leg_names,
         )
 
 

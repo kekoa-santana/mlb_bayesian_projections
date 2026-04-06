@@ -247,7 +247,7 @@ def simulate_batter_game(
         mu_bf=starter_bf_mu,
         sigma_bf=starter_bf_sigma,
         n_draws=n_sims,
-        bf_min=3,
+        bf_min=9,
         bf_max=35,
         rng=rng,
     )

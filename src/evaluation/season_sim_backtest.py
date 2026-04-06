@@ -358,7 +358,7 @@ def walk_forward_season_sim(
 
     # ---- 1. Build extended data ----
     t0 = time.time()
-    pitcher_ext = build_multi_season_pitcher_extended(all_seasons, min_bf=1)
+    pitcher_ext = build_multi_season_pitcher_extended(all_seasons, min_bf=9)
     train_ext = pitcher_ext[pitcher_ext["season"].isin(train_seasons)]
     timings["data_build"] = time.time() - t0
     logger.info("Data: %d pitcher-seasons (%.1fs)", len(pitcher_ext), timings["data_build"])

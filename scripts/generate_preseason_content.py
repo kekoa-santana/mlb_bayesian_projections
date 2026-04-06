@@ -27,7 +27,7 @@ from src.data.feature_eng import (
     build_multi_season_k_data,
     build_multi_season_pitcher_k_data,
 )
-from src.models.game_k_model import extract_pitcher_k_rate_samples
+from src.models.posterior_utils import extract_pitcher_k_rate_samples
 from src.models.k_rate_model import (
     extract_player_posteriors,
     fit_k_rate_model,
@@ -92,7 +92,7 @@ def main() -> None:
     # 1. Pitcher K% model
     # =================================================================
     logger.info("Building pitcher data for %s", TRAIN_SEASONS)
-    df_pitcher = build_multi_season_pitcher_k_data(TRAIN_SEASONS, min_bf=1)
+    df_pitcher = build_multi_season_pitcher_k_data(TRAIN_SEASONS, min_bf=9)
 
     logger.info("Preparing and fitting pitcher K%% model (%d player-seasons)",
                 len(df_pitcher))

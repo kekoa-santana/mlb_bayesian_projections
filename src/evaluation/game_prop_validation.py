@@ -489,7 +489,7 @@ def _load_pitcher_season_totals(seasons: list[int]) -> pd.DataFrame:
     pd.DataFrame
         Combined pitcher season totals.
     """
-    df = build_multi_season_pitcher_data(seasons, min_bf=1)
+    df = build_multi_season_pitcher_data(seasons, min_bf=9)
 
     # Add derived rate columns for shrinkage stats
     if "hits" in df.columns and "batters_faced" in df.columns:
@@ -1049,7 +1049,7 @@ def _build_pitcher_prop_predictions(
             )
 
     # 7b. Catcher framing lifts (K and BB only, keyed by (game_pk, pitcher_id))
-    from src.models.game_k_model import build_catcher_framing_lookup
+    from src.data.catcher_framing import build_catcher_framing_lookup
     catcher_framing_lifts: dict[tuple[int, int], float] | None = None
     if sn_key in ("k", "bb"):
         framing_lookup = build_catcher_framing_lookup(train_seasons, test_season)
@@ -1337,7 +1337,7 @@ def _build_batter_prop_predictions(
 
     # Catcher framing lifts for batter K/BB props
     # Keyed by (game_pk, pitcher_id) since different sides have different catchers
-    from src.models.game_k_model import build_catcher_framing_lookup
+    from src.data.catcher_framing import build_catcher_framing_lookup
     catcher_framing: dict[tuple[int, int], float] = {}
     if sn in ("k", "bb"):
         framing_lookup = build_catcher_framing_lookup(train_seasons, test_season)

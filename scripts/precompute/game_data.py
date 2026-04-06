@@ -98,7 +98,11 @@ def run_game_logs(
     logger.info("Saved game batter Ks: %d rows", len(game_batter_ks))
 
     # Pitcher game logs (used by Game Browser for game selection)
+    # Filter to starters with BF >= 9 to exclude openers/bullpen games
     pitcher_game_logs = get_pitcher_game_logs(from_season)
+    pitcher_game_logs = pitcher_game_logs[
+        ~((pitcher_game_logs["is_starter"] == True) & (pitcher_game_logs["batters_faced"] < 9))  # noqa: E712
+    ].copy()
     pitcher_game_logs.to_parquet(DASHBOARD_DIR / "pitcher_game_logs.parquet", index=False)
     logger.info("Saved pitcher game logs: %d rows", len(pitcher_game_logs))
 
@@ -134,7 +138,7 @@ def run_bf_priors(
     # Compute pitcher P/PA from game logs for the projection season
     _starter_logs = game_logs[
         (game_logs["is_starter"] == True)  # noqa: E712
-        & (game_logs["batters_faced"] >= 3)
+        & (game_logs["batters_faced"] >= 9)
         & (game_logs["number_of_pitches"].notna())
         & (game_logs["number_of_pitches"] > 0)
     ]

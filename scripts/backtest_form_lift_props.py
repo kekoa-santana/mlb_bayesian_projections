@@ -206,6 +206,7 @@ def run_pitcher_prop_calibration(
     """Run pitcher sim with/without form lifts and capture prop probabilities."""
     from src.data.db import read_sql
     from src.models.game_sim.exit_model import ExitModel
+    from src.models.game_sim.pa_outcome_model import GameContext
     from src.models.game_sim.simulator import simulate_game
     from src.models.game_sim.form_model import (
         compute_pitcher_form_lifts, PitcherFormLifts,
@@ -290,8 +291,10 @@ def run_pitcher_prop_calibration(
         )
 
         try:
-            sim_base = simulate_game(**shared, form_bb_lift=0.0)
-            sim_form = simulate_game(**shared, form_bb_lift=pit_form.bb_lift)
+            sim_base = simulate_game(**shared, game_context=GameContext())
+            sim_form = simulate_game(
+                **shared, game_context=GameContext(form_bb_lift=pit_form.bb_lift),
+            )
         except Exception:
             n_skipped += 1
             continue

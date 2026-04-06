@@ -992,7 +992,7 @@ def simulate_lineup_game(
         mu_bf=starter_bf_mu,
         sigma_bf=starter_bf_sigma,
         n_draws=n_sims,
-        bf_min=3,
+        bf_min=9,
         bf_max=35,
         rng=rng,
     )
@@ -1331,11 +1331,11 @@ def simulate_full_game_both_teams(
     # --- Draw starter BF for each side ---
     home_starter_bf = draw_bf_samples(
         mu_bf=home_starter_bf_mu, sigma_bf=home_starter_bf_sigma,
-        n_draws=n_sims, bf_min=3, bf_max=35, rng=rng,
+        n_draws=n_sims, bf_min=9, bf_max=35, rng=rng,
     )
     away_starter_bf = draw_bf_samples(
         mu_bf=away_starter_bf_mu, sigma_bf=away_starter_bf_sigma,
-        n_draws=n_sims, bf_min=3, bf_max=35, rng=rng,
+        n_draws=n_sims, bf_min=9, bf_max=35, rng=rng,
     )
 
     # --- Initialize batting state for each side ---

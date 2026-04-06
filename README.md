@@ -222,7 +222,7 @@ player_profiles/                          # Projection engine only
 │   │   ├── pitcher_projections.py        # Composite pitcher projections
 │   │   ├── matchup.py                    # Pitch-type matchup scoring (Layer 2)
 │   │   ├── bf_model.py                   # Batters-faced workload model
-│   │   ├── game_k_model.py               # Game-level K posterior (Layer 3)
+│   │   ├── game_k_model.py               # Game-level K posterior (legacy Layer 3 engine)
 │   │   ├── counting_projections.py       # Counting stat projections
 │   │   ├── pa_model.py                   # PA/BF shrinkage models
 │   │   └── in_season_updater.py          # Conjugate updating
@@ -231,7 +231,7 @@ player_profiles/                          # Projection engine only
 │   │   ├── hitter_backtest.py            # Walk-forward hitter backtest
 │   │   ├── pitcher_backtest.py           # Walk-forward pitcher backtest
 │   │   ├── matchup_validation.py         # Matchup lift validation
-│   │   ├── game_k_validation.py          # Game K calibration backtest
+│   │   ├── game_k_validation.py          # Game-level K backtest (legacy engine)
 │   │   ├── confidence_tiers.py           # Prop confidence scoring
 │   │   ├── ensemble.py                   # Bayes-Marcel blending
 │   │   ├── metrics.py                    # CRPS, ECE, calibration

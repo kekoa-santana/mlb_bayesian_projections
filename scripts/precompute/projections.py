@@ -116,7 +116,7 @@ def run_counting(
         hitter_venues=hitter_venues,
     )
     # Pitcher counting stats
-    pitcher_ext = build_multi_season_pitcher_extended(seasons, min_bf=1)
+    pitcher_ext = build_multi_season_pitcher_extended(seasons, min_bf=9)
     pitcher_counting = project_pitcher_counting(
         rate_model_results=pitcher_results,
         pitcher_extended=pitcher_ext,
@@ -168,7 +168,7 @@ def run_sim_pitcher(
     if health_df is None or health_df.empty:
         health_df = _load_health_df(from_season)
 
-    pitcher_ext = build_multi_season_pitcher_extended(seasons, min_bf=1)
+    pitcher_ext = build_multi_season_pitcher_extended(seasons, min_bf=9)
 
     try:
         from src.models.reliever_roles import classify_reliever_roles

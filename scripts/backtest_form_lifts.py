@@ -191,6 +191,7 @@ def run_pitcher_ab_backtest(
     """
     from src.data.db import read_sql
     from src.models.game_sim.exit_model import ExitModel
+    from src.models.game_sim.pa_outcome_model import GameContext
     from src.models.game_sim.simulator import simulate_game, compute_stamina_offset
     from src.models.game_sim.form_model import compute_pitcher_form_lifts, PitcherFormLifts
 
@@ -294,9 +295,11 @@ def run_pitcher_ab_backtest(
 
         try:
             # A: No form lift (baseline)
-            sim_a = simulate_game(**shared, form_bb_lift=0.0)
+            sim_a = simulate_game(**shared, game_context=GameContext())
             # B: With form lift
-            sim_b = simulate_game(**shared, form_bb_lift=pit_form.bb_lift)
+            sim_b = simulate_game(
+                **shared, game_context=GameContext(form_bb_lift=pit_form.bb_lift),
+            )
         except Exception as e:
             logger.debug("Sim failed pid=%d gpk=%d: %s", pid, gpk, e)
             n_skipped += 1

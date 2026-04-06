@@ -97,7 +97,27 @@ def run(
     except Exception:
         logger.exception("Failed to compute TTO profiles")
 
-    # 9f. Team bullpen rates
+    # 9f. Train + save game-level BB adjustment model
+    logger.info("Training game-level BB adjustment model...")
+    try:
+        import pickle
+        from src.models.game_bb_adj import train_game_bb_model
+
+        bb_adj_bundle = train_game_bb_model(seasons)
+        if bb_adj_bundle.get("model") is not None:
+            with open(DASHBOARD_DIR / "game_bb_adj_model.pkl", "wb") as f:
+                pickle.dump(bb_adj_bundle, f)
+            logger.info(
+                "Saved game BB adjustment model: n=%d, RMSE=%.4f",
+                bb_adj_bundle["n_train"],
+                bb_adj_bundle.get("rmse_logit", 0),
+            )
+        else:
+            logger.warning("Game BB adjustment model training returned no model")
+    except Exception:
+        logger.exception("Failed to train game BB adjustment model")
+
+    # 9g. Team bullpen rates
     logger.info("Computing team bullpen rates...")
     try:
         bullpen_rates = get_team_bullpen_rates(seasons)

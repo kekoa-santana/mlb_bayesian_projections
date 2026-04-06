@@ -52,13 +52,14 @@ _DEFAULT_EXIT_CALIBRATION_OFFSET = -0.35
 # Short-leash pitchers get less negative / positive offset → exit sooner.
 # Scale chosen so output IP spread matches observed 2025 distribution
 # (real std ≈ 0.49 IP across starters, 3.7–6.4 range).
-_STAMINA_POP_MEAN_IP = 5.28  # 2025 population mean IP for starters (10+ starts)
-_STAMINA_POP_STD_IP = 0.47   # 2025 population std
+_STAMINA_POP_MEAN_IP = 5.22  # 2022-2025 population mean IP for starters (10+ starts, BF >= 9)
+_STAMINA_POP_STD_IP = 0.50   # 2022-2025 population std
 _STAMINA_LOGIT_SCALE = 0.45  # logit shift per z-score of avg IP
 
 # BF prior bridge: population BF mean for z-scoring
-_POP_BF_MU = 22.0
-_POP_BF_STD = 2.2   # Between-pitcher std of mean BF (not within-game)
+# Revalidated 2022-2025 with BF >= 9 filter (excludes openers/bullpen games)
+_POP_BF_MU = 22.4
+_POP_BF_STD = 1.8   # Between-pitcher std of mean BF (not within-game)
 _BF_LOGIT_SCALE = 0.25  # logit shift per z-score of pitcher BF mean (tuned from 0.35 to recenter BF bias)
 
 # Bullpen state adjustment parameters

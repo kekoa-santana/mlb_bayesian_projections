@@ -133,6 +133,7 @@ def fetch_backtest_games(
             pb.team_id AS pitcher_team_id
         FROM staging.pitching_boxscores pb
         WHERE pb.is_starter = TRUE
+          AND pb.batters_faced >= 9
     ),
     game_season AS (
         SELECT game_pk, season, home_team_id, away_team_id

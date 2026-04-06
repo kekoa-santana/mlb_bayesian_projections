@@ -1,7 +1,7 @@
 # CLAUDE.md — MLB Bayesian Projection & Matchup System
 
 ## Project Overview
-A hierarchical Bayesian projection system for MLB player performance, with a game-level pitcher-batter matchup model that powers both front-office-grade analytics and betting-actionable K prop predictions. Built by The Data Diamond (Koa).
+A hierarchical Bayesian projection system for MLB player performance, with a game-level pitcher-batter matchup model that powers both front-office-grade analytics and betting-actionable game prop predictions (pitcher K/BB/HR/H/Outs, batter K/BB/HR/H). Built by The Data Diamond (Koa).
 
 **This is the projection engine.** Model training, backtesting, feature engineering, and precomputation live here. The Streamlit dashboard has been split into a separate repo (`tdd-dashboard`).
 
@@ -51,6 +51,7 @@ player_profiles/
 │   │   ├── pitch_archetypes.py  # KMeans k=8 pitch shape clustering
 │   │   ├── player_clustering.py # Player archetype clustering (hitter/pitcher)
 │   │   ├── archetype_matchups.py# Archetype-based matchup matrix + scoring
+│   │   ├── catcher_framing.py    # Catcher framing lookup utilities
 │   │   ├── park_factors.py      # Park factor queries + adjustments
 │   │   ├── milb_translation.py  # MiLB-to-MLB translation factors
 │   │   ├── team_queries.py      # Team-level SQL queries (game results, park factors, roster comp)
@@ -67,7 +68,7 @@ player_profiles/
 │   │   ├── counting_projections.py  # Rate × playing time Monte Carlo counting stats
 │   │   ├── matchup.py               # Pitch-type & archetype matchup scoring
 │   │   ├── bf_model.py              # Batters-faced workload model
-│   │   ├── game_k_model.py          # Game-level K posterior (Layer 3)
+│   │   ├── game_k_model.py          # Game-level K posterior (legacy Layer 3 engine)
 │   │   ├── player_rankings.py       # Positional rankings (hitter + pitcher composites)
 │   │   ├── scouting_grades.py       # TDD 20-80 scouting grade system
 │   │   ├── statcast_projections.py  # AR(1) Bayesian Statcast metric projections
@@ -91,6 +92,8 @@ player_profiles/
 │   │   ├── team_profiles.py         # Team profile builder (6 dimensions)
 │   │   ├── team_rankings.py         # Composite team rankings + tiers
 │   │   ├── series_elo.py            # Series-level ELO ratings
+│   │   ├── market_edge.py           # Layer 4: portfolio/market edge (Kelly sizing)
+│   │   ├── posterior_utils.py       # Posterior sample extraction + prop-line utilities
 │   │   ├── in_season_updater.py     # Beta-Binomial conjugate updating
 │   │   ├── game_sim/               # Game-level PA-by-PA simulator
 │   │   │   ├── simulator.py         # Pitcher game sim (sequential PA MC)
@@ -115,7 +118,7 @@ player_profiles/
 │   │   ├── hitter_backtest.py       # Generalized hitter walk-forward backtest
 │   │   ├── pitcher_backtest.py      # Generalized pitcher walk-forward backtest
 │   │   ├── matchup_validation.py    # Matchup lift validation (kept for future use)
-│   │   ├── game_k_validation.py     # Full game-level K backtest
+│   │   ├── game_k_validation.py     # Game-level K backtest (legacy engine)
 │   │   ├── game_sim_validation.py   # Pitcher game sim backtest
 │   │   ├── batter_sim_validation.py # Batter game sim backtest
 │   │   ├── season_sim_backtest.py   # Season sim validation
@@ -260,11 +263,31 @@ Dashboard-only files (no source equivalent): `lib/bovada.py`, `lib/draftkings.py
 
 Both pitch_type and pitch_archetype (KMeans k=8) scoring available.
 
-### Layer 3: Game-Level K Prediction
-**Purpose:** Produce full posterior over pitcher's K total for a specific game.
+### Layer 3: Game-Level Prediction & Simulation
+**Purpose:** Produce full posterior distributions over pitcher and batter stat lines for a specific game.
 
-**Inputs:** K% posterior (Layer 1) + matchup lifts (Layer 2) + BF distribution + umpire/weather adjustments
-**Output:** P(over X.5) for K prop lines, posterior distribution over total Ks
+**Engines:**
+- `game_k_model.py` — K-specific posterior (legacy, used by game prop validation)
+- `game_sim/simulator.py` — PA-by-PA Monte Carlo game simulator (pitcher + batter)
+
+**Inputs:** Rate posteriors (Layer 1) + matchup lifts (Layer 2) + BF distribution + TTO/fatigue + umpire/park/weather adjustments
+**Pitcher outputs:** K, BB, HR, H, Outs — full posterior distributions + P(over X.5) for any prop line
+**Batter outputs:** K, BB, HR, H — full posterior distributions + P(over X.5)
+**Game outputs:** Win probability, run lines, over/under, DK/ESPN fantasy point distributions
+
+### Layer 4: Portfolio / Market Edge
+**Purpose:** Translate posterior distributions into betting edge estimates and position sizing.
+
+**Module:** `src/models/market_edge.py`
+**Inputs:** SimulationResult joint distribution + market implied probabilities (DK/PrizePicks)
+**Outputs:** Per-prop edge estimates, Kelly fractions, correlated portfolio sizing
+
+**Key components:**
+- Vig removal (multiplicative method for fair implied probabilities)
+- Edge = model_prob - implied_prob per prop line
+- Kelly criterion with fractional sizing (default quarter-Kelly)
+- Correlation-aware diversification across same-game props
+- Bankroll exposure caps (max 15% per game, 5% per prop)
 
 ## Game Prop Framework
 
@@ -340,7 +363,7 @@ Every model must be evaluated with:
 - Pitch-type + pitch-archetype log-odds scoring with reliability-weighted fallback chains
 
 ### Phase 4: Layer 3 — Game Prediction — COMPLETE
-- Game K posterior (BF distribution + matchup + umpire/weather), backtest: 11,517 games
+- Game-level multi-stat posteriors (K/BB/HR/H/Outs) via BF distribution + matchup + umpire/weather, backtest: 11,517 games
 - PA-by-PA game simulator (pitcher + batter), exit model (AUC=0.921), DK/ESPN fantasy scoring
 - Game prop framework (pitcher K/BB/HR/H/Outs, batter K/BB/HR/H) with confidence tiers
 
@@ -367,7 +390,7 @@ Every model must be evaluated with:
 - Glicko-2 player ratings from PA outcomes
 
 ### Remaining
-- [ ] Betting edge finder and tracker (Kelly sizing)
+- [x] Betting edge finder and tracker (Kelly sizing) — `src/models/market_edge.py`
 - [ ] Fix SB projections (Bayes loses to Marcel — era adjustment too blunt)
 - [ ] Wire capability-gap dashboard views (prospect comps, Glicko trends, game prop summary)
 - [x] In-memory precompute intermediates (eliminate parquet round-trips for internal cache files)

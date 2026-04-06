@@ -25,10 +25,11 @@ from scipy import stats
 
 logger = logging.getLogger(__name__)
 
-# Population defaults (validated against 2022-2025 starter data)
-DEFAULT_POP_BF_MU = 22.0
-DEFAULT_POP_WITHIN_STD = 3.4
-DEFAULT_SHRINKAGE_K = 2.4  # sigma^2 / tau^2 ≈ 11.56 / 4.84
+# Population defaults (validated against 2022-2025 starter data, BF >= 9
+# to exclude openers/bullpen games that drag the mean down)
+DEFAULT_POP_BF_MU = 22.4
+DEFAULT_POP_WITHIN_STD = 3.3
+DEFAULT_SHRINKAGE_K = 3.4  # sigma^2 / tau^2 ≈ 10.97 / 3.26
 
 # Pitches-per-PA adjustment
 POP_MEAN_PPA = 3.91        # League avg P/PA for starters (2023-2025)
@@ -72,10 +73,11 @@ def compute_pitcher_bf_priors(
         pitcher_id, season, n_starts, raw_mean_bf, raw_std_bf,
         mu_bf, sigma_bf, reliability, pitches_per_pa, ppa_adj.
     """
-    # Filter to starters with BF >= 3 (minimum real appearance)
+    # Filter to starters with BF >= 9 (excludes openers/bullpen games
+    # that drag down population BF mean and add artificial variance)
     starters = game_logs[
         (game_logs["is_starter"] == True)  # noqa: E712
-        & (game_logs["batters_faced"] >= 3)
+        & (game_logs["batters_faced"] >= 9)
     ].copy()
 
     if starters.empty:

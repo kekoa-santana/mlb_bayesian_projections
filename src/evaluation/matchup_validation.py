@@ -58,9 +58,12 @@ def build_game_predictions(
     from src.data.league_baselines import get_baselines_dict
     baselines_pt = get_baselines_dict(seasons=[season], recency_weights="equal")
 
-    # Filter to starters if requested
+    # Filter to starters if requested (BF >= 9 excludes openers/bullpen games)
     if starters_only:
-        game_logs = game_logs[game_logs["is_starter"] == True].copy()  # noqa: E712
+        game_logs = game_logs[
+            (game_logs["is_starter"] == True)  # noqa: E712
+            & (game_logs["batters_faced"] >= 9)
+        ].copy()
 
     # Build pitcher season K rates lookup
     pitcher_k_rates = dict(

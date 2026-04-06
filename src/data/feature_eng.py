@@ -444,7 +444,7 @@ def build_multi_season_k_data_platoon(
 # Multi-season pitcher data for Bayesian model
 # ---------------------------------------------------------------------------
 def build_multi_season_pitcher_k_data(
-    seasons: list[int], min_bf: int = 1
+    seasons: list[int], min_bf: int = 9
 ) -> pd.DataFrame:
     """Stack pitcher season totals with arsenal-derived covariates.
 
@@ -876,7 +876,7 @@ def get_cached_pitcher_season_totals_with_age(
 # Multi-season pitcher data with age for expanded projection models
 # ---------------------------------------------------------------------------
 def build_multi_season_pitcher_data(
-    seasons: list[int], min_bf: int = 1
+    seasons: list[int], min_bf: int = 9
 ) -> pd.DataFrame:
     """Stack pitcher season totals with age and arsenal covariates.
 
@@ -1624,7 +1624,7 @@ def get_cached_pitcher_season_totals_extended(
 
 
 def build_multi_season_pitcher_extended(
-    seasons: list[int], min_bf: int = 1
+    seasons: list[int], min_bf: int = 9
 ) -> pd.DataFrame:
     """Stack extended pitcher totals across seasons.
 
