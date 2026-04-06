@@ -75,7 +75,7 @@ def _build_hitter_offense_score(
     obs_cols = [c for c in obs_cols if c in observed.columns]
     proj_cols = ["batter_id", "projected_k_rate", "projected_bb_rate",
                   "projected_hr_per_fb", "projected_gb_rate", "projected_woba",
-                  "composite_score"]
+                  "career_woba", "composite_score"]
     if "age" in proj.columns:
         proj_cols.append("age")
     proj_sub = proj[proj_cols].drop_duplicates("batter_id", keep="first")
@@ -324,7 +324,15 @@ def _build_hitter_offense_score(
     #          rate is already captured in projected wOBA; higher weight
     #          double-penalizes aggressive hitters whose results are fine.
     # =================================================================
-    woba_anchor = _pctl(merged["projected_woba"].fillna(0.310))
+    # Blend projected + career wOBA for the anchor.  Projected wOBA is
+    # heavily compressed by Bayesian shrinkage (std=0.018) — a .029 gap
+    # between an elite and average hitter maps to ~15 percentile points.
+    # Career wOBA preserves demonstrated ability (std=0.031).  50/50 blend
+    # keeps projection signal while restoring meaningful spread.
+    _proj_woba = merged["projected_woba"].fillna(0.310)
+    _career_woba = merged["career_woba"].fillna(_proj_woba) if "career_woba" in merged.columns else _proj_woba
+    _blended_woba = 0.50 * _proj_woba + 0.50 * _career_woba
+    woba_anchor = _zscore_pctl(_blended_woba)
 
     bucket_composite = (
         0.175 * merged["contact_skill"]
@@ -595,7 +603,10 @@ def _build_hitter_platoon_modifier(season: int = 2025, min_pa_side: int = 30) ->
     return result
 
 
-def _build_hitter_fielding_score(season: int = 2025) -> pd.DataFrame:
+def _build_hitter_fielding_score(
+    season: int = 2025,
+    in_season: bool = False,
+) -> pd.DataFrame:
     """Build fielding score from multi-year OAA with position-aware regression.
 
     Uses 3-year rolling OAA with recency weights (3/2/1), then regresses
@@ -606,6 +617,9 @@ def _build_hitter_fielding_score(season: int = 2025) -> pd.DataFrame:
     ----------
     season : int
         Most recent season for OAA data.
+    in_season : bool
+        If True, exclude current season OAA (too few games to be reliable)
+        and use prior 3 full seasons instead.
 
     Returns
     -------
@@ -614,10 +628,13 @@ def _build_hitter_fielding_score(season: int = 2025) -> pd.DataFrame:
     """
     from src.data.db import read_sql
 
+    # In-season: current-year OAA from ~1 week is noise (gets 3x weight and
+    # wildly distorts scores).  Use prior 3 full seasons instead.
+    anchor = season - 1 if in_season else season
     oaa = read_sql(f"""
         SELECT player_id, season, position, outs_above_average
         FROM production.fact_fielding_oaa
-        WHERE season BETWEEN {season - 2} AND {season}
+        WHERE season BETWEEN {anchor - 2} AND {anchor}
     """, {})
 
     if oaa.empty:
@@ -682,7 +699,10 @@ def _build_hitter_fielding_score(season: int = 2025) -> pd.DataFrame:
     return result.reset_index()[["player_id", "fielding_score"]]
 
 
-def _build_catcher_framing_score(season: int = 2025) -> pd.DataFrame:
+def _build_catcher_framing_score(
+    season: int = 2025,
+    in_season: bool = False,
+) -> pd.DataFrame:
     """Build catcher framing score from multi-year framing data.
 
     Uses 3-year rolling with recency weights (3/2/1) and regression
@@ -693,6 +713,9 @@ def _build_catcher_framing_score(season: int = 2025) -> pd.DataFrame:
     ----------
     season : int
         Most recent season for framing data.
+    in_season : bool
+        If True, exclude current season framing (too few games) and use
+        prior 3 full seasons instead.
 
     Returns
     -------
@@ -701,10 +724,11 @@ def _build_catcher_framing_score(season: int = 2025) -> pd.DataFrame:
     """
     from src.data.db import read_sql
 
+    anchor = season - 1 if in_season else season
     framing = read_sql(f"""
         SELECT player_id, season, runs_extra_strikes
         FROM production.fact_catcher_framing
-        WHERE season BETWEEN {season - 2} AND {season}
+        WHERE season BETWEEN {anchor - 2} AND {anchor}
     """, {})
 
     if framing.empty:
@@ -712,7 +736,7 @@ def _build_catcher_framing_score(season: int = 2025) -> pd.DataFrame:
 
     # Recency weights
     framing["weight"] = framing["season"].map(
-        {season: 3, season - 1: 2, season - 2: 1}
+        {anchor: 3, anchor - 1: 2, anchor - 2: 1}
     ).fillna(1)
 
     # Weighted average per catcher

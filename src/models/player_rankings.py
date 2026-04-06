@@ -246,7 +246,8 @@ def rank_hitters(
 
     # Preseason: allow sim wRC+ from hitter_counting_sim. In-season
     # (season == projection_season) skip -- weekly refresh does not rebuild sim.
-    use_hitter_sim = season != projection_season
+    _in_season = season == projection_season
+    use_hitter_sim = not _in_season
 
     # Build sub-scores
     offense = _build_hitter_offense_score(
@@ -255,8 +256,8 @@ def rank_hitters(
     )
     baserunning = _build_hitter_baserunning_score(season=season)
     platoon = _build_hitter_platoon_modifier(season=season)
-    fielding = _build_hitter_fielding_score(season=season)
-    framing = _build_catcher_framing_score(season=season)
+    fielding = _build_hitter_fielding_score(season=season, in_season=_in_season)
+    framing = _build_catcher_framing_score(season=season, in_season=_in_season)
     playing_time = _build_hitter_playing_time_score(health_df=health_df)
     trajectory = _build_hitter_trajectory_score()
 
@@ -583,7 +584,32 @@ def rank_hitters(
 
     try:
         from src.models.scouting_grades import grade_hitter_tools
-        scouting = grade_hitter_tools(base, season=season)
+        # In-season: use prior season for scouting grades.  Current-season
+        # data is too sparse (everyone has < 150 PA, so _composite_z
+        # confidence = 0 and every grade = 50).  Build a grade-specific
+        # base with prior-season batting stats so the PA-confidence ramp
+        # has real data to work with.
+        _grade_season = season - 1 if _in_season else season
+        if _in_season:
+            from src.data.db import read_sql as _grade_sql
+            _prior_obs = _grade_sql(f"""
+                SELECT batter_id, pa, k_pct, bb_pct, woba, wrc_plus,
+                       xba, barrel_pct, hard_hit_pct
+                FROM production.fact_batting_advanced
+                WHERE season = {season - 1} AND pa >= 50
+            """, {})
+            _grade_cols = ["batter_id", "batter_name", "age", "position",
+                          "projected_k_rate", "projected_bb_rate",
+                          "fielding_combined", "chase_rate",
+                          "two_strike_whiff_rate"]
+            _grade_cols = [c for c in _grade_cols if c in base.columns]
+            _grade_base = base[_grade_cols].copy()
+            _grade_base = _grade_base.merge(
+                _prior_obs, on="batter_id", how="left",
+            )
+        else:
+            _grade_base = base
+        scouting = grade_hitter_tools(_grade_base, season=_grade_season)
         if not scouting.empty:
             base = base.merge(scouting, on="batter_id", how="left")
             logger.info("Scouting grades computed for %d hitters", scouting["tools_rating"].notna().sum())
