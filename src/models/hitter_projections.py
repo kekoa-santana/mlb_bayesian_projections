@@ -46,6 +46,20 @@ logger = logging.getLogger(__name__)
 # Bayesian-projected stats (hierarchical + AR(1))
 ALL_STATS = ["k_rate", "bb_rate", "gb_rate", "fb_rate", "hr_per_fb", "woba", "chase_rate"]
 
+# ---------------------------------------------------------------------------
+# wOBA spread calibration — INVESTIGATED, NOT APPLIED
+# ---------------------------------------------------------------------------
+# The logit-normal hierarchical model compresses projected_woba (std~0.018)
+# below empirical true-talent spread (std~0.025).  Walk-forward backtest
+# (6 folds, 1445 player-seasons) showed:
+#   - Widening priors (mu_pop_sigma 0.25->0.35, StudentT(4) alpha) caused
+#     ESS collapse (r_hat=1.29, ESS=12) without fixing compression.
+#   - Post-hoc stretch 1.4x restores spread but costs +7.6% CRPS.
+#   - No-stretch model is already well-calibrated: z-std=1.04, 95% cov=93.8%.
+# Decision: keep compressed projections (optimal for betting/CRPS), fix
+# ranking spread via career_woba blend + zscore_pctl in _hitter_scores.py.
+_WOBA_SPREAD_STRETCH = 1.0  # 1.0 = disabled
+
 # --------------------------------------------------------------------------
 # Composite dimension weights and components
 # --------------------------------------------------------------------------
@@ -249,17 +263,31 @@ def project_forward(
         obs_map = dict(zip(stat_season["batter_id"], stat_season[cfg.rate_col]))
         base[obs_col] = base["batter_id"].map(obs_map)
 
-        # Career PA-weighted average across all training seasons
+        # Recency-weighted career average (3/2/1 weighting by season).
+        # All-time PA-weighted averages let prime-year stats prop up aging
+        # veterans (e.g. Trout career .413 wOBA inflates his offense score
+        # even as he declines).  Recency weighting (most recent 3x, oldest
+        # 1x) credits recent performance more, which better reflects
+        # current talent for both rising young players and aging vets.
         career_col = f"career_{stat}"
-        career_group = stat_df[
+        _career_df = stat_df[
             stat_df["batter_id"].isin(base["batter_id"])
-        ].groupby("batter_id")
-        career_sum = career_group.apply(
-            lambda g: (g[cfg.rate_col] * g[cfg.trials_col]).sum()
-            / g[cfg.trials_col].sum()
-            if g[cfg.trials_col].sum() > 0 else np.nan,
-            include_groups=False,
-        )
+        ].copy()
+        if not _career_df.empty:
+            _max_season = _career_df["season"].max()
+            # Recency weight: most recent season = 3, oldest = 1
+            _career_df["_recency_w"] = (
+                1.0 + 2.0 * ((_career_df["season"] - _career_df["season"].min())
+                              / max(1, _max_season - _career_df["season"].min()))
+            )
+            _career_df["_w"] = _career_df[cfg.trials_col] * _career_df["_recency_w"]
+            career_sum = _career_df.groupby("batter_id").apply(
+                lambda g: (g[cfg.rate_col] * g["_w"]).sum() / g["_w"].sum()
+                if g["_w"].sum() > 0 else np.nan,
+                include_groups=False,
+            )
+        else:
+            career_sum = pd.Series(dtype=float)
         base[career_col] = base["batter_id"].map(career_sum)
 
         # Forward-project each player
@@ -295,6 +323,7 @@ def project_forward(
         base[sd_col] = base["batter_id"].map(proj_sds)
         base[ci_lo_col] = base["batter_id"].map(proj_lo)
         base[ci_hi_col] = base["batter_id"].map(proj_hi)
+
         base[delta_col] = base[proj_col] - base[obs_col]
 
     # Enrich with observed stats (whiff, chase, EV, sprint speed, etc.)

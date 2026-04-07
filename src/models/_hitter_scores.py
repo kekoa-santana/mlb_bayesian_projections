@@ -32,6 +32,7 @@ def _build_hitter_offense_score(
     observed: pd.DataFrame,
     aggressiveness: pd.DataFrame | None = None,
     use_sim_wrc_plus: bool = True,
+    il_player_ids: set[int] | None = None,
 ) -> pd.DataFrame:
     """Decomposed hitter offense: contact + decisions + damage.
 
@@ -76,9 +77,15 @@ def _build_hitter_offense_score(
     proj_cols = ["batter_id", "projected_k_rate", "projected_bb_rate",
                   "projected_hr_per_fb", "projected_gb_rate", "projected_woba",
                   "career_woba", "composite_score"]
+    # Include prior-season PA for career reliability weighting
+    if "pa" in proj.columns:
+        proj_cols.append("pa")  # will be renamed to _proj_pa below
     if "age" in proj.columns:
         proj_cols.append("age")
     proj_sub = proj[proj_cols].drop_duplicates("batter_id", keep="first")
+    # Rename projections PA to avoid collision with observed PA
+    if "pa" in proj_sub.columns:
+        proj_sub = proj_sub.rename(columns={"pa": "_proj_pa"})
     obs_sub = observed[obs_cols].drop_duplicates("batter_id", keep="first")
     merged = proj_sub.merge(
         obs_sub,
@@ -210,13 +217,15 @@ def _build_hitter_offense_score(
     # Applies to damage + production (the two observation-heavy buckets).
     # Contact + decisions are already projection-anchored via K%/BB%.
     age = merged["age"].fillna(28)
-    # Two-phase age trust: gentle 30-33, steeper 33+ (biological decline
-    # accelerates, and career-best seasons at 33+ are far more likely to
-    # regress than at 28).
-    phase1 = (1.0 - ((age - 30).clip(0) * 0.03)).clip(0.91, 1.0)  # 30-33: gentle
-    phase2 = (0.91 - ((age - 33).clip(0) * 0.06)).clip(0.50, 0.91)  # 33+: steeper
+    # Two-phase age trust: steepened 2026-04-06 to fix aging veteran
+    # inflation (Trout #5, Springer #11 vs consensus #50+, #47).
+    # Old curve: 33→0.91, 35→0.79 (too gentle).
+    # New curve: 33→0.88, 35→0.74.  Moderate penalty that moves vets
+    # down without over-penalizing through percentile redistribution.
+    phase1 = (1.0 - ((age - 30).clip(0) * 0.04)).clip(0.88, 1.0)  # 30-33: 4%/yr
+    phase2 = (0.88 - ((age - 33).clip(0) * 0.07)).clip(0.45, 0.88)  # 33+: 7%/yr
     age_trust = np.where(age <= 33, phase1, phase2)
-    # age 30: 1.00, age 32: 0.94, age 33: 0.91, age 35: 0.79, age 37: 0.67, age 39: 0.55
+    # age 30: 1.00, age 32: 0.92, age 33: 0.88, age 35: 0.74, age 37: 0.60, age 39: 0.46
 
     # Projection-deviation dampening: when observed stats diverge sharply
     # from the Bayesian projection, reduce trust in observed.  The model
@@ -325,13 +334,27 @@ def _build_hitter_offense_score(
     #          double-penalizes aggressive hitters whose results are fine.
     # =================================================================
     # Blend projected + career wOBA for the anchor.  Projected wOBA is
-    # heavily compressed by Bayesian shrinkage (std=0.018) — a .029 gap
-    # between an elite and average hitter maps to ~15 percentile points.
-    # Career wOBA preserves demonstrated ability (std=0.031).  50/50 blend
-    # keeps projection signal while restoring meaningful spread.
+    # compressed by Bayesian shrinkage (std=0.018); career wOBA preserves
+    # demonstrated ability (std=0.031).  50/50 blend keeps projection
+    # signal while restoring meaningful spread.
+    # Note: career_woba is now recency-weighted (3/2/1 by season) in
+    # hitter_projections.py, which already discounts old prime years.
+    # Age-dependent blend weight was tested but caused population-level
+    # zscore_pctl shifts that penalized ALL players (young included)
+    # because the distribution shape changed.
     _proj_woba = merged["projected_woba"].fillna(0.310)
     _career_woba = merged["career_woba"].fillna(_proj_woba) if "career_woba" in merged.columns else _proj_woba
-    _blended_woba = 0.50 * _proj_woba + 0.50 * _career_woba
+    # Career wOBA reliability ramp: small-career players (Jahmai Jones,
+    # 150 PA) shouldn't have career_woba weighted equally with veterans.
+    # Tango stabilization for wOBA ~300-500 PA.  Uses prior-season PA
+    # from the projections parquet as a proxy for career exposure.
+    # At 150 PA: career weight = 0.50 * (150/800) = 9%.
+    # At 400 PA: career weight = 0.50 * (400/800) = 25%.
+    # At 800 PA: career weight = 0.50 * 1.0 = 50% (full blend).
+    _proj_pa = merged["_proj_pa"].fillna(400) if "_proj_pa" in merged.columns else pd.Series(400, index=merged.index)
+    _career_reliability = (_proj_pa / 800).clip(0, 1)
+    _career_weight = 0.50 * _career_reliability
+    _blended_woba = (1.0 - _career_weight) * _proj_woba + _career_weight * _career_woba
     woba_anchor = _zscore_pctl(_blended_woba)
 
     bucket_composite = (
@@ -343,19 +366,30 @@ def _build_hitter_offense_score(
 
     merged["offense_score"] = 0.70 * woba_anchor + 0.30 * bucket_composite
 
-    # Small-sample dampening toward league average.  Applied universally --
-    # players with 0 or NULL PA get maximum dampening (35% pull toward 0.50),
-    # ramping to zero dampening at 400+ PA.  Previously skipped for pa < 60
-    # which let bench players with NULL observed stats keep inflated
-    # projection-only offense scores.
-    # Strength reduced from 50% to 35%: at 50 PA the old dampening cut the
-    # Judge-vs-average gap from 0.27 to 0.15 (44% compression), making it
-    # impossible for elite bats to separate from average ones.  At 35%, the
-    # same gap goes to 0.19 (30% compression) — still dampened but signal
-    # is preserved.
+    # Small-sample dampening toward league average.  Three regimes:
+    #
+    # 1. < 10 PA and NOT on IL: heavy dampening (30%).  These players
+    #    aren't starting — bench, minors, or fringe roster.  Their
+    #    projections from Bayesian regression shouldn't carry full weight.
+    # 2. 10-49 PA, OR < 10 PA but ON IL: light dampening (10%).
+    #    Active starters in early season, or injured starters who will
+    #    return.  Projections carry the signal; heavier dampening here
+    #    compresses stars toward average and lets fielding/baserunning
+    #    dominate the composite.
+    # 3. 50-400 PA: ramp from 20% (at 50 PA) to 0% (at 400+ PA).
     pa_safe = pa.fillna(0)
-    pa_confidence = (pa_safe / 400).clip(0, 1)
-    dampening = 0.35 * (1.0 - pa_confidence)
+    _il = il_player_ids or set()
+    _on_il = merged["batter_id"].isin(_il)
+    _is_active = (pa_safe >= 10) | _on_il  # starters or IL-exempt
+    dampening = np.where(
+        ~_is_active,
+        0.30,                                          # regime 1: bench/inactive
+        np.where(
+            pa_safe < 50,
+            0.10,                                      # regime 2: early season / IL
+            0.20 * (1.0 - ((pa_safe - 50) / 350).clip(0, 1)),  # regime 3: ramp
+        ),
+    )
     merged["offense_score"] = merged["offense_score"] * (1 - dampening) + 0.50 * dampening
 
     return merged[["batter_id", "offense_score", "contact_skill",
@@ -840,24 +874,26 @@ def _build_hitter_playing_time_score(
 
 
 def _build_hitter_trajectory_score() -> pd.DataFrame:
-    """Score trajectory using posterior certainty, age, and proven status.
+    """Score trajectory using age, observed improvement, certainty, and trend.
 
-    Designed so that elite proven players (like a 33-year-old with 8
-    years of elite data) score at least neutral on trajectory.  Uses
-    coefficient of variation (SD/mean) instead of raw SD for certainty,
-    so high-K% hitters aren't mechanically penalized by wider rate-scale
-    SDs.  Does NOT include rate quality -- that's offense_score's job.
+    Redesigned 2026-04-06 to fix two systemic issues:
+    1. Certainty at 55% rewarded proven veterans and penalized young
+       breakout players (Henderson, J-Rod) whose wide posteriors are a
+       *feature* (room to grow), not a flaw.
+    2. Trend used Bayesian projected delta (projected - observed within
+       same season), which is circular and misses actual YoY improvement.
 
-    Components
-    ----------
-    - **Projection certainty** (55%): lower CV = more proven.  Uses
-      SD/mean on rate scale, which normalizes for the logit-scale
-      stretching that makes high-K% hitters look artificially uncertain.
-    - **Age factor** (25%): younger players get upside credit.  Decline
-      penalty starts at 33 (not 31) and is softer -- proven veterans
-      shouldn't be destroyed for being in their early 30s.
-    - **Season trend** (20%): if the Bayesian projection improves on the
-      prior season's observed rate, that's a positive signal.
+    New components
+    --------------
+    - **Age factor** (35%): younger players get upside credit.  The single
+      strongest predictor of future value trajectory.
+    - **YoY observed improvement** (30%): did the player's actual wOBA/wRC+
+      improve from prior year?  Captures breakouts (Henderson, Raleigh)
+      and declines (Trout, Springer) that the Bayesian delta misses.
+    - **Projection certainty** (20%): lower CV = more proven.  Reduced
+      from 55% — still rewards stability but no longer dominates.
+    - **Season trend** (15%): Bayesian projected delta signal (kept as
+      minor tiebreaker).
 
     Returns
     -------
@@ -866,9 +902,26 @@ def _build_hitter_trajectory_score() -> pd.DataFrame:
     """
     proj = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet")
 
-    # Posterior certainty via coefficient of variation (SD / mean)
-    # CV normalizes for rate-dependent SD scaling -- a 26% K hitter with
-    # 3.6pp SD has CV=0.14, comparable to a 15% K hitter with 2.1pp SD
+    # --- Age factor (35%): research-aligned curve ---
+    age = proj["age"].fillna(30)
+    age_factor = _hitter_age_factor(age)
+
+    # --- YoY observed improvement (30%) ---
+    # Compare most recent observed season to prior.  Uses delta_woba
+    # (projected - observed) as a proxy when direct YoY isn't available,
+    # but prefer actual observed_woba vs career_woba gap.
+    # Positive = player is currently above their career baseline = improving.
+    if "observed_woba" in proj.columns and "career_woba" in proj.columns:
+        _obs = proj["observed_woba"].fillna(proj["career_woba"])
+        _career = proj["career_woba"].fillna(0.315)
+        yoy_improvement = _obs - _career  # positive = above career baseline
+    elif "delta_woba" in proj.columns:
+        yoy_improvement = -proj["delta_woba"].fillna(0)  # negative delta = improving
+    else:
+        yoy_improvement = pd.Series(0.0, index=proj.index)
+    yoy_score = _zscore_pctl(yoy_improvement)
+
+    # --- Projection certainty (20%): CV-based ---
     k_mean = proj["projected_k_rate"].clip(0.01)
     bb_mean = proj["projected_bb_rate"].clip(0.01)
     k_cv = proj["projected_k_rate_sd"].fillna(k_mean.median() * 0.15) / k_mean
@@ -877,22 +930,18 @@ def _build_hitter_trajectory_score() -> pd.DataFrame:
     bb_certainty = _inv_pctl(bb_cv)
     certainty_score = 0.50 * k_certainty + 0.50 * bb_certainty
 
-    # Age factor: research-aligned curve (peak 26-29, decline from 29, accel 35+)
-    age = proj["age"].fillna(30)
-    age_factor = _hitter_age_factor(age)
-
-    # Season trend: did projected rate improve on observed?
-    # Uses K% delta (negative = improving) and BB% delta (positive = improving)
+    # --- Season trend (15%): Bayesian projected delta ---
     delta_k = proj.get("delta_k_rate", pd.Series(0.0, index=proj.index))
     delta_bb = proj.get("delta_bb_rate", pd.Series(0.0, index=proj.index))
-    k_trend = _inv_pctl(delta_k.fillna(0))   # lower delta = better (K% dropping)
-    bb_trend = _pctl(delta_bb.fillna(0))      # higher delta = better (BB% rising)
+    k_trend = _inv_pctl(delta_k.fillna(0))
+    bb_trend = _pctl(delta_bb.fillna(0))
     trend_score = 0.50 * k_trend + 0.50 * bb_trend
 
     proj["trajectory_score"] = (
-        0.55 * certainty_score
-        + 0.25 * age_factor
-        + 0.20 * trend_score
+        0.35 * age_factor
+        + 0.30 * yoy_score
+        + 0.20 * certainty_score
+        + 0.15 * trend_score
     )
     return proj[["batter_id", "trajectory_score"]]
 

@@ -249,10 +249,31 @@ def rank_hitters(
     _in_season = season == projection_season
     use_hitter_sim = not _in_season
 
+    # Load current IL player IDs for offense dampening exemption.
+    # Players on IL with < 10 PA get "active starter" treatment instead
+    # of bench-player dampening, since they'll return to the lineup.
+    _il_ids: set[int] = set()
+    if _in_season:
+        try:
+            from src.data.db import read_sql
+            _il_df = read_sql("""
+                SELECT DISTINCT player_id
+                FROM production.fact_player_status_timeline
+                WHERE season = :season
+                  AND status_type LIKE '%%IL%%'
+                  AND (status_end_date IS NULL
+                       OR status_end_date >= CURRENT_DATE - INTERVAL '7 days')
+            """, {"season": season})
+            _il_ids = set(_il_df["player_id"])
+            logger.info("Loaded %d IL player IDs for dampening exemption", len(_il_ids))
+        except Exception:
+            logger.warning("Could not load IL data; no dampening exemptions")
+
     # Build sub-scores
     offense = _build_hitter_offense_score(
         proj, observed, aggressiveness=aggressiveness,
         use_sim_wrc_plus=use_hitter_sim,
+        il_player_ids=_il_ids if _in_season else None,
     )
     baserunning = _build_hitter_baserunning_score(season=season)
     platoon = _build_hitter_platoon_modifier(season=season)
@@ -397,21 +418,17 @@ def rank_hitters(
     base["pt_score"] = base["pt_score"].fillna(0.50)
     base["trajectory_score"] = base["trajectory_score"].fillna(0.50)
 
-    # Sustain/upside blend into trajectory.
-    # Replaces pure breakout blend which penalized elite established players
-    # (Soto, Judge) who have no "room to break out" by definition.
-    # sustain_upside = max(breakout_pctl, offense_score):
-    #   - Developing players (Elly, J-Rod): breakout_pctl drives the score
-    #   - Elite players (Soto, Judge): offense_score provides a high floor
-    # Net effect: trajectory rewards both paths to value -- improving OR
-    # sustaining elite production.  Minor offense double-counting (~3.5%
-    # of total composite) is acceptable.
+    # Breakout blend into trajectory (reduced from 35% to 20%).
+    # At 35%, feeding offense_score back into trajectory created a circular
+    # dependency that amplified offense dominance (high offense → high
+    # trajectory → higher composite → repeat).  The redesigned trajectory
+    # (age + YoY improvement + certainty) already captures sustain/upside
+    # through the YoY component, so the blend can be lighter.
     base["breakout_score"] = base["breakout_score"].fillna(0.0)
     breakout_pctl = _pctl(base["breakout_score"].clip(lower=0))
     raw_trajectory = base["trajectory_score"].copy()  # save for upside calc
-    sustain_upside = np.maximum(breakout_pctl, base["offense_score"])
     base["trajectory_score"] = (
-        0.65 * base["trajectory_score"] + 0.35 * sustain_upside
+        0.80 * base["trajectory_score"] + 0.20 * breakout_pctl
     )
 
     if "health_score" not in base.columns:
@@ -565,8 +582,12 @@ def rank_hitters(
                 k_pctl = (ref_k < k_val).mean()
                 bb_pctl = (ref_bb > bb_val).mean()
                 pitcher_value = 0.60 * k_pctl + 0.40 * bb_pctl
-                # Scale bonus: elite pitcher value (0.8+) adds up to ~0.15
-                bonus = pitcher_value * 0.18
+                # Scale bonus: elite pitcher value (0.8+) adds up to ~0.10.
+                # Reduced from 0.18 (2026-04-06): old multiplier created a
+                # 0.131 gap between Ohtani (.994) and #2 (.863) — larger
+                # than the spread of the next 9 players combined.  At 0.12,
+                # Ohtani's bonus is ~0.09 (still clearly #1, gap ~0.09).
+                bonus = pitcher_value * 0.12
                 mask = base["batter_id"] == pid
                 base.loc[mask, "two_way_bonus"] = bonus
                 base.loc[mask, "is_two_way"] = True
@@ -1311,12 +1332,14 @@ def rank_all(
             hitters["pos_rank"] = hitters.groupby("position").cumcount() + 1
             hitters["overall_rank"] = (
                 hitters["current_value_score"]
-                .rank(ascending=False, method="min")
+                .rank(ascending=False, method="min", na_option="bottom")
+                .fillna(len(hitters))
                 .astype(int)
             )
             hitters["talent_rank"] = (
                 hitters["talent_upside_score"]
-                .rank(ascending=False, method="min")
+                .rank(ascending=False, method="min", na_option="bottom")
+                .fillna(len(hitters))
                 .astype(int)
             )
             hitters = hitters.sort_values(["position", "pos_rank"])
@@ -1332,12 +1355,14 @@ def rank_all(
             pitchers["role_rank"] = pitchers.groupby("role").cumcount() + 1
             pitchers["overall_rank"] = (
                 pitchers["current_value_score"]
-                .rank(ascending=False, method="min")
+                .rank(ascending=False, method="min", na_option="bottom")
+                .fillna(len(pitchers))
                 .astype(int)
             )
             pitchers["talent_rank"] = (
                 pitchers["talent_upside_score"]
-                .rank(ascending=False, method="min")
+                .rank(ascending=False, method="min", na_option="bottom")
+                .fillna(len(pitchers))
                 .astype(int)
             )
             pitchers = pitchers.sort_values(["role", "role_rank"])

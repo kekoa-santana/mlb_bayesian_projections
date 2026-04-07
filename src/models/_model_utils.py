@@ -242,7 +242,17 @@ def build_hierarchical_model(
             )
 
         # --- Player-level intercepts (non-centered) ---
-        alpha_raw = pm.Normal("alpha_raw", mu=0, sigma=1, shape=n_players)
+        # StudentT(nu) has 2-3x heavier tails than Normal, letting elite/
+        # replacement players sit further from the population mean without
+        # over-shrinkage.  Used for composite metrics (wOBA) where the tails
+        # are genuine talent, not noise.  (Gelman 2006; Jensen et al. 2009)
+        _nu = getattr(cfg, "alpha_prior_nu", None)
+        if _nu is not None:
+            alpha_raw = pm.StudentT(
+                "alpha_raw", nu=_nu, mu=0, sigma=1, shape=n_players,
+            )
+        else:
+            alpha_raw = pm.Normal("alpha_raw", mu=0, sigma=1, shape=n_players)
         milb_offset = data.get("milb_prior_offset")
         has_milb = data.get("has_milb_prior")
         if milb_offset is not None and has_milb is not None and has_milb.sum() > 0:

@@ -81,6 +81,11 @@ class StatConfig:
     # binomial stats; wOBA (natural scale, SD ~0.04) needs wider to let
     # cells separate.
     mu_pop_sigma: float = 0.3
+    # Heavy-tailed player intercept prior: if set, use StudentT(nu=alpha_prior_nu)
+    # instead of Normal for alpha_raw.  Heavier tails let elite/replacement
+    # players sit further from the population mean without being over-shrunk.
+    # None = Normal (default for rate stats); 4.0 = good default for composites.
+    alpha_prior_nu: float | None = None
 
 
 # Pre-defined stat configs
@@ -201,8 +206,10 @@ STAT_CONFIGS: dict[str, StatConfig] = {
             ("xwoba_avg", 0.0, 0.15, "xwOBA → wOBA"),
         ],
         # Logit-scale priors (Jacobian at wOBA=0.315 is ~4.63):
-        # Tuned from v1 backtest: mu_pop_sigma=0.45 too wide → ESS collapse,
-        # sigma_season_floor=0.09 too tight → 78% coverage at 95% CI.
+        # Tested: mu_pop_sigma=0.45 → ESS collapse; 0.35 + StudentT(4) →
+        # r_hat=1.29, ESS=12, still std=0.019.  Compression is structural
+        # to logit-normal hierarchical model.  Fix: post-hoc calibration
+        # slope from walk-forward backtest (van de Wiel et al. 2025).
         sigma_season_mu=0.15,
         sigma_season_floor=0.14,
         sigma_player_prior=0.5,

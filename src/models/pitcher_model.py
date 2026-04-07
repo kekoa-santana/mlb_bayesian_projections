@@ -65,6 +65,7 @@ class PitcherStatConfig:
     rho2_alpha: float = 3.0
     rho2_beta: float = 7.0
     mu_pop_sigma: float = 0.3
+    alpha_prior_nu: float | None = None
     # BetaBinomial overdispersion: if True, uses BetaBinomial instead of
     # Binomial for the likelihood (requires likelihood="binomial").
     use_beta_binomial: bool = False
