@@ -27,6 +27,101 @@ from src.models._ranking_utils import (
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Confirmed breakout score
+# ---------------------------------------------------------------------------
+
+def _build_confirmed_breakout_score(season: int = 2025) -> pd.DataFrame:
+    """Score players whose recent performance exceeds their baseline AND
+    is backed by quality metrics (not BABIP luck).
+
+    Unlike the XGBoost breakout model (which predicts *future* breakouts),
+    this captures players who *already* broke out or sustained elite
+    production in the most recent season.  The Bayesian projected_woba
+    compresses these players toward the mean (std=0.018 vs true-talent
+    0.025); this score provides a correction signal.
+
+    Components
+    ----------
+    - **Performance level** (35%): observed_woba vs league average.
+      How good was the player, not just how much did they improve.
+    - **Improvement signal** (25%): observed_woba - career_woba.
+      Positive = above career baseline = breakout or sustained peak.
+    - **Statcast backing** (25%): xwOBA ≥ wOBA means the production is
+      skill-backed, not BABIP luck.  Also incorporates barrel% and
+      hard_hit% as quality indicators.
+    - **Age credibility** (15%): young player's high performance is more
+      sustainable.  A 24-year-old breakout is more believable than a
+      35-year-old career-best.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, confirmed_breakout_score.
+    """
+    proj = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet")
+
+    # Load prior-season observed stats with xwOBA/barrel% for backing
+    try:
+        from src.data.db import read_sql
+        obs_adv = read_sql("""
+            SELECT batter_id, woba, xwoba, barrel_pct, hard_hit_pct, pa
+            FROM production.fact_batting_advanced
+            WHERE season = :season AND pa >= 100
+        """, {"season": season})
+    except Exception:
+        logger.warning("Could not load fact_batting_advanced for confirmed breakout")
+        obs_adv = pd.DataFrame(columns=["batter_id", "woba", "xwoba",
+                                         "barrel_pct", "hard_hit_pct", "pa"])
+
+    df = proj[["batter_id", "observed_woba", "career_woba", "age"]].copy()
+    df = df.merge(obs_adv, on="batter_id", how="left")
+
+    # Fill missing with neutral values
+    df["observed_woba"] = df["observed_woba"].fillna(0.315)
+    df["career_woba"] = df["career_woba"].fillna(0.315)
+    df["xwoba"] = df["xwoba"].fillna(df["woba"]).fillna(df["observed_woba"])
+    df["woba"] = df["woba"].fillna(df["observed_woba"])
+    df["barrel_pct"] = df["barrel_pct"].fillna(df["barrel_pct"].median())
+    df["hard_hit_pct"] = df["hard_hit_pct"].fillna(df["hard_hit_pct"].median())
+    age = df["age"].fillna(28)
+
+    # --- 1. Performance level (35%): how good, not just improvement ---
+    perf_level = _zscore_pctl(df["observed_woba"])
+
+    # --- 2. Improvement signal (25%): above career baseline ---
+    improvement = df["observed_woba"] - df["career_woba"]
+    improvement_score = _zscore_pctl(improvement)
+
+    # --- 3. Statcast backing (25%): is the production real? ---
+    # xwOBA - wOBA gap: positive = unlucky (deserved better), near zero = real
+    # Negative = lucky (BABIP-inflated, will regress)
+    xwoba_gap = df["xwoba"] - df["woba"]
+    # Reward: xwOBA ≥ wOBA (production is real or even unlucky)
+    # Penalize: xwOBA << wOBA (lucky, will regress)
+    backing_xwoba = _zscore_pctl(xwoba_gap)
+    # Also factor in absolute quality metrics
+    backing_barrel = _pctl(df["barrel_pct"])
+    backing_hh = _pctl(df["hard_hit_pct"])
+    statcast_backing = 0.50 * backing_xwoba + 0.25 * backing_barrel + 0.25 * backing_hh
+
+    # --- 4. Age credibility (25%) ---
+    # Young breakouts (≤28) stick at ~60% rate; 33+ career-bests regress
+    # at ~80%.  This component ensures a 35-year-old's career-best (.409
+    # Springer) scores much lower than a 24-year-old's emergence.
+    age_cred = _hitter_age_factor(age)
+
+    # --- Composite ---
+    df["confirmed_breakout_score"] = (
+        0.30 * perf_level
+        + 0.25 * improvement_score
+        + 0.20 * statcast_backing
+        + 0.25 * age_cred
+    )
+
+    return df[["batter_id", "confirmed_breakout_score"]]
+
+
 def _build_hitter_offense_score(
     proj: pd.DataFrame,
     observed: pd.DataFrame,
