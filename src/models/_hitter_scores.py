@@ -531,25 +531,39 @@ def _build_hitter_offense_score(
     # =================================================================
     # Blend projected + career wOBA for the anchor.  Projected wOBA is
     # compressed by Bayesian shrinkage (std=0.018); career wOBA preserves
-    # demonstrated ability (std=0.031).  50/50 blend keeps projection
-    # signal while restoring meaningful spread.
-    # Note: career_woba is now recency-weighted (3/2/1 by season) in
-    # hitter_projections.py, which already discounts old prime years.
-    # Age-dependent blend weight was tested but caused population-level
-    # zscore_pctl shifts that penalized ALL players (young included)
-    # because the distribution shape changed.
+    # demonstrated ability (std=0.031).
+    #
+    # The key insight: in early season (current PA < 200), career wOBA is
+    # the best available differentiator per Tango's stabilization framework.
+    # The Bayesian projection is well-calibrated for CRPS (betting), but
+    # its compressed spread fails to rank Judge vs Perdomo.  Career wOBA
+    # (recency-weighted 3/2/1 by season) provides proper spread while
+    # remaining regression-aware.
+    #
+    # As current-season PA accumulates, observed stats flow through the
+    # skill buckets (contact, decisions, damage, production) and naturally
+    # provide spread.  The career anchor weight ramps down so it doesn't
+    # dominate once real 2026 data is available.
     _proj_woba = merged["projected_woba"].fillna(0.310)
     _career_woba = merged["career_woba"].fillna(_proj_woba) if "career_woba" in merged.columns else _proj_woba
-    # Career wOBA reliability ramp: small-career players (Jahmai Jones,
-    # 150 PA) shouldn't have career_woba weighted equally with veterans.
-    # Tango stabilization for wOBA ~300-500 PA.  Uses prior-season PA
-    # from the projections parquet as a proxy for career exposure.
-    # At 150 PA: career weight = 0.50 * (150/800) = 9%.
-    # At 400 PA: career weight = 0.50 * (400/800) = 25%.
-    # At 800 PA: career weight = 0.50 * 1.0 = 50% (full blend).
+    # Career wOBA reliability: small-career players (Jahmai Jones, 150 PA)
+    # shouldn't have career_woba weighted equally with veterans.
+    # Tango stabilization for wOBA ~300-500 PA.
     _proj_pa = merged["_proj_pa"].fillna(400) if "_proj_pa" in merged.columns else pd.Series(400, index=merged.index)
     _career_reliability = (_proj_pa / 800).clip(0, 1)
-    _career_weight = 0.50 * _career_reliability
+    # Two-component career weight:
+    #   1. Base career weight (existing): 0.50 * career_reliability
+    #      Active at all PA levels, scaled by career exposure.
+    #   2. Early-season boost: up to +0.35 when current PA is low.
+    #      At 0 current PA: total career weight ≈ 0.85 (career dominates)
+    #      At 200+ current PA: boost = 0, buckets provide spread
+    _base_career_w = 0.50 * _career_reliability
+    _current_pa = pa.fillna(0)
+    # Early boost scaled by career reliability: veterans (700+ PA) get
+    # full boost, fringe players (150 PA) get minimal boost.  Prevents
+    # bench players with one fluky season from ranking alongside stars.
+    _early_boost = 0.35 * (1.0 - (_current_pa / 200).clip(0, 1)) * _career_reliability
+    _career_weight = (_base_career_w + _early_boost).clip(0, 0.85)
     _blended_woba = (1.0 - _career_weight) * _proj_woba + _career_weight * _career_woba
     woba_anchor = _zscore_pctl(_blended_woba)
 
