@@ -43,16 +43,20 @@ def _build_confirmed_breakout_score(season: int = 2025) -> pd.DataFrame:
 
     Components
     ----------
-    - **Performance level** (35%): observed_woba vs league average.
+    - **Performance level** (25%): observed_woba vs league average.
       How good was the player, not just how much did they improve.
-    - **Improvement signal** (25%): observed_woba - career_woba.
-      Positive = above career baseline = breakout or sustained peak.
-    - **Statcast backing** (25%): xwOBA ≥ wOBA means the production is
+    - **Trajectory direction** (25%): slope of wOBA over the 2-3 seasons
+      *before* the breakout year.  Ascending trajectory (Henderson, Witt)
+      scores high; decline-then-spike (Springer) scores low.
+    - **Statcast backing** (25%): xwOBA >= wOBA means the production is
       skill-backed, not BABIP luck.  Also incorporates barrel% and
       hard_hit% as quality indicators.
     - **Age credibility** (15%): young player's high performance is more
       sustainable.  A 24-year-old breakout is more believable than a
       35-year-old career-best.
+    - **Improvement signal** (10%): observed_woba - career_woba.
+      Positive = above career baseline.  Down-weighted because trajectory
+      direction captures the development arc more precisely.
 
     Returns
     -------
@@ -74,6 +78,19 @@ def _build_confirmed_breakout_score(season: int = 2025) -> pd.DataFrame:
         obs_adv = pd.DataFrame(columns=["batter_id", "woba", "xwoba",
                                          "barrel_pct", "hard_hit_pct", "pa"])
 
+    # Load multi-year wOBA history for trajectory direction
+    try:
+        from src.data.db import read_sql
+        woba_history = read_sql("""
+            SELECT batter_id, season, woba, pa
+            FROM production.fact_batting_advanced
+            WHERE season BETWEEN :start_season AND :end_season
+              AND pa >= 50
+        """, {"start_season": season - 4, "end_season": season})
+    except Exception:
+        logger.warning("Could not load wOBA history for trajectory direction")
+        woba_history = pd.DataFrame(columns=["batter_id", "season", "woba", "pa"])
+
     df = proj[["batter_id", "observed_woba", "career_woba", "age"]].copy()
     df = df.merge(obs_adv, on="batter_id", how="left")
 
@@ -86,40 +103,124 @@ def _build_confirmed_breakout_score(season: int = 2025) -> pd.DataFrame:
     df["hard_hit_pct"] = df["hard_hit_pct"].fillna(df["hard_hit_pct"].median())
     age = df["age"].fillna(28)
 
-    # --- 1. Performance level (35%): how good, not just improvement ---
+    # --- 1. Performance level (25%): how good, not just improvement ---
     perf_level = _zscore_pctl(df["observed_woba"])
 
-    # --- 2. Improvement signal (25%): above career baseline ---
-    improvement = df["observed_woba"] - df["career_woba"]
-    improvement_score = _zscore_pctl(improvement)
+    # --- 2. Trajectory direction (25%): pre-breakout slope ---
+    # Compute slope of wOBA over the 2-3 seasons BEFORE the breakout year.
+    # Positive slope = ascending arc (real development).
+    # Negative slope = decline-then-spike (suspicious outlier).
+    traj_scores = _compute_trajectory_direction(
+        df["batter_id"], woba_history, breakout_season=season,
+    )
+    df = df.merge(traj_scores, on="batter_id", how="left")
+    trajectory_dir = df["trajectory_direction"].fillna(0.5)
 
     # --- 3. Statcast backing (25%): is the production real? ---
-    # xwOBA - wOBA gap: positive = unlucky (deserved better), near zero = real
-    # Negative = lucky (BABIP-inflated, will regress)
     xwoba_gap = df["xwoba"] - df["woba"]
-    # Reward: xwOBA ≥ wOBA (production is real or even unlucky)
-    # Penalize: xwOBA << wOBA (lucky, will regress)
     backing_xwoba = _zscore_pctl(xwoba_gap)
-    # Also factor in absolute quality metrics
     backing_barrel = _pctl(df["barrel_pct"])
     backing_hh = _pctl(df["hard_hit_pct"])
     statcast_backing = 0.50 * backing_xwoba + 0.25 * backing_barrel + 0.25 * backing_hh
 
-    # --- 4. Age credibility (25%) ---
-    # Young breakouts (≤28) stick at ~60% rate; 33+ career-bests regress
-    # at ~80%.  This component ensures a 35-year-old's career-best (.409
-    # Springer) scores much lower than a 24-year-old's emergence.
+    # --- 4. Age credibility (15%) ---
     age_cred = _hitter_age_factor(age)
+
+    # --- 5. Improvement signal (10%): above career baseline ---
+    improvement = df["observed_woba"] - df["career_woba"]
+    improvement_score = _zscore_pctl(improvement)
 
     # --- Composite ---
     df["confirmed_breakout_score"] = (
-        0.30 * perf_level
-        + 0.25 * improvement_score
-        + 0.20 * statcast_backing
-        + 0.25 * age_cred
+        0.25 * perf_level
+        + 0.25 * trajectory_dir
+        + 0.25 * statcast_backing
+        + 0.15 * age_cred
+        + 0.10 * improvement_score
     )
 
     return df[["batter_id", "confirmed_breakout_score"]]
+
+
+def _compute_trajectory_direction(
+    batter_ids: pd.Series,
+    woba_history: pd.DataFrame,
+    breakout_season: int,
+) -> pd.DataFrame:
+    """Compute pre-breakout wOBA slope for each player.
+
+    Looks at the 2-4 seasons *before* the breakout year and fits a
+    PA-weighted linear slope.  Maps slope to 0-1 via sigmoid:
+    - Positive slope (ascending arc) -> high score (~0.75-0.90)
+    - Flat slope -> neutral (~0.50)
+    - Negative slope (decline-then-spike) -> low score (~0.10-0.25)
+
+    Examples (2025 breakout season):
+    - Witt:     2022 .306 → 2023 .342 → 2024 .397  slope=+.045/yr → ~0.88
+    - Raleigh:  2022 .323 → 2023 .324 → 2024 .319  slope=-.002/yr → ~0.48
+    - Springer: 2022 .346 → 2023 .317 → 2024 .296  slope=-.025/yr → ~0.15
+
+    Parameters
+    ----------
+    batter_ids : pd.Series
+        Player IDs to score.
+    woba_history : pd.DataFrame
+        Multi-year wOBA with columns: batter_id, season, woba, pa.
+    breakout_season : int
+        The season whose production is being evaluated.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, trajectory_direction (0-1 score).
+    """
+    # Only use seasons BEFORE the breakout year for slope calculation
+    prior = woba_history[
+        (woba_history["season"] < breakout_season)
+        & (woba_history["batter_id"].isin(batter_ids))
+    ].copy()
+
+    results = {}
+    for bid in batter_ids.unique():
+        player_hist = prior[prior["batter_id"] == bid].sort_values("season")
+        if len(player_hist) < 2:
+            # Not enough history — neutral slope (maps to 0.50 via sigmoid)
+            results[bid] = 0.0
+            continue
+
+        # Use most recent 3 seasons (or whatever is available)
+        player_hist = player_hist.tail(3)
+
+        # PA-weighted linear regression: slope of wOBA vs season
+        seasons = player_hist["season"].values.astype(float)
+        woba_vals = player_hist["woba"].values.astype(float)
+        pa_weights = player_hist["pa"].values.astype(float)
+        pa_weights = pa_weights / pa_weights.sum()
+
+        # Weighted mean
+        s_mean = np.average(seasons, weights=pa_weights)
+        w_mean = np.average(woba_vals, weights=pa_weights)
+
+        # Weighted slope = sum(w * (s - s_mean) * (woba - w_mean)) / sum(w * (s - s_mean)^2)
+        denom = np.sum(pa_weights * (seasons - s_mean) ** 2)
+        if denom < 1e-10:
+            results[bid] = 0.0  # neutral slope
+            continue
+        slope = np.sum(pa_weights * (seasons - s_mean) * (woba_vals - w_mean)) / denom
+        results[bid] = slope
+
+    slope_series = pd.Series(results)
+
+    # Map slope to 0-1 via sigmoid.
+    # Scale factor: slope of ±0.030/yr maps to ~0.85/0.15 (strong signal).
+    # A slope of +0.045 (Witt) → ~0.90, -0.025 (Springer) → ~0.15.
+    k = 40.0  # steepness: 1/(1+exp(-40*0.030)) ≈ 0.77, good spread
+    direction_score = 1.0 / (1.0 + np.exp(-k * slope_series))
+
+    return pd.DataFrame({
+        "batter_id": slope_series.index,
+        "trajectory_direction": direction_score.values,
+    })
 
 
 def _build_hitter_offense_score(

@@ -155,13 +155,14 @@ def _zscore_pctl(series: pd.Series) -> pd.Series:
     at the mean scores 0.50.  This properly separates a 210 wRC+ from
     a 131 wRC+ in a way that rank-based percentiles cannot.
     """
-    mu = series.mean()
-    sd = series.std()
+    s = pd.to_numeric(series, errors="coerce")
+    mu = s.mean()
+    sd = s.std()
     if sd < 1e-6:
         return pd.Series(0.5, index=series.index)
-    z = (series - mu) / sd
+    z = (s - mu) / sd
     # Sigmoid maps z to (0, 1) -- steepness 1.0 gives good spread
-    return 1.0 / (1.0 + np.exp(-z))
+    return pd.Series(1.0 / (1.0 + np.exp(-z.values)), index=series.index)
 
 
 def _inv_zscore_pctl(series: pd.Series) -> pd.Series:

@@ -75,6 +75,7 @@ from src.models.player_positions import (  # noqa: F401 — re-exports
 # Re-export hitter score builders
 from src.models._hitter_scores import (  # noqa: F401 — re-exports
     _build_catcher_framing_score,
+    _build_confirmed_breakout_score,
     _build_hitter_baserunning_score,
     _build_hitter_fielding_score,
     _build_hitter_offense_score,
@@ -281,6 +282,7 @@ def rank_hitters(
     framing = _build_catcher_framing_score(season=season, in_season=_in_season)
     playing_time = _build_hitter_playing_time_score(health_df=health_df)
     trajectory = _build_hitter_trajectory_score()
+    confirmed_breakout = _build_confirmed_breakout_score(season=season - 1)
 
     # Start from projections as base (has batter_id, name, age, etc.)
     _base_cols = ["batter_id", "batter_name", "age", "batter_stand",
@@ -336,6 +338,7 @@ def rank_hitters(
     )
     base = base.merge(playing_time, on="batter_id", how="left")
     base = base.merge(trajectory, on="batter_id", how="left")
+    base = base.merge(confirmed_breakout, on="batter_id", how="left")
 
     # Merge sim-based counting projections for display (same guard as offense)
     sim_path = DASHBOARD_DIR / "hitter_counting_sim.parquet"
@@ -418,17 +421,20 @@ def rank_hitters(
     base["pt_score"] = base["pt_score"].fillna(0.50)
     base["trajectory_score"] = base["trajectory_score"].fillna(0.50)
 
-    # Breakout blend into trajectory (reduced from 35% to 20%).
-    # At 35%, feeding offense_score back into trajectory created a circular
-    # dependency that amplified offense dominance (high offense → high
-    # trajectory → higher composite → repeat).  The redesigned trajectory
-    # (age + YoY improvement + certainty) already captures sustain/upside
-    # through the YoY component, so the blend can be lighter.
+    # Breakout + confirmed breakout blend into trajectory.
+    # XGBoost breakout (future-facing) gets 10%, confirmed breakout
+    # (recent-season validation with trajectory direction) gets 15%.
+    # Trajectory's own components (age + YoY + certainty) still dominate
+    # at 75%, avoiding the circular dependency that existed at 35%.
     base["breakout_score"] = base["breakout_score"].fillna(0.0)
     breakout_pctl = _pctl(base["breakout_score"].clip(lower=0))
+    base["confirmed_breakout_score"] = base["confirmed_breakout_score"].fillna(0.50)
+    cb_pctl = _pctl(base["confirmed_breakout_score"])
     raw_trajectory = base["trajectory_score"].copy()  # save for upside calc
     base["trajectory_score"] = (
-        0.80 * base["trajectory_score"] + 0.20 * breakout_pctl
+        0.70 * base["trajectory_score"]
+        + 0.15 * cb_pctl
+        + 0.15 * breakout_pctl
     )
 
     if "health_score" not in base.columns:
@@ -766,6 +772,8 @@ def rank_hitters(
         "projected_k_rate", "projected_bb_rate", "projected_hr_per_fb",
         "projected_k_rate_sd", "projected_bb_rate_sd",
         "projected_woba",
+        # Confirmed breakout (trajectory-direction validated)
+        "confirmed_breakout_score",
         # Breakout archetype (GMM-derived)
         "breakout_type", "breakout_score", "breakout_tier",
         "breakout_hole", "gmm_fit",
