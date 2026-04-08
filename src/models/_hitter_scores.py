@@ -229,21 +229,26 @@ def _build_hitter_offense_score(
     aggressiveness: pd.DataFrame | None = None,
     use_sim_wrc_plus: bool = True,
     il_player_ids: set[int] | None = None,
+    xwoba_talent: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Decomposed hitter offense: contact + decisions + damage.
+    """Decomposed hitter offense: xwOBA talent anchor + Bayesian skill buckets.
 
-    Three skill buckets, each with its own reliability curve:
+    Two-layer architecture:
+
+    **70% — xwOBA talent anchor** (multi-year recency-weighted xwOBA).
+    Measures bat-on-ball quality stripped of BABIP luck.  YoY r=0.759
+    (most stable offensive signal), std=0.053 (proper spread for ranking
+    differentiation).  For players with limited xwOBA history, blended
+    with Bayesian projected_woba using a reliability ramp.
+
+    **30% — Bayesian skill buckets** (the TDD differentiator).
+    Decomposes offense into process components with uncertainty:
 
     1. **Contact skill** (stabilizes ~150 PA): K% projected, K% observed.
-       Fast-stabilizing -- the most projectable hitter trait.
     2. **Swing decisions** (stabilizes ~200 PA): BB% projected, chase rate,
-       two-strike whiff rate.  Medium stability -- discipline metrics.
-    3. **Damage on contact** (stabilizes ~300 PA): xwOBA, barrel%, hard_hit%,
-       sweet_spot%.  Slow-stabilizing -- requires more BIP for signal.
-
-    Each bucket blends projected + observed using its own trust ramp, then
-    buckets are combined.  Replaces the old monolithic offense blend that
-    mixed all signals at one global PA reliability.
+       two-strike whiff rate.
+    3. **Damage on contact** (stabilizes ~300 PA): xwOBA, barrel%, hard_hit%.
+    4. **Production** (stabilizes ~250 PA): wRC+ bottom-line check.
 
     Parameters
     ----------
@@ -257,6 +262,10 @@ def _build_hitter_offense_score(
         If False, do not load ``hitter_counting_sim.parquet`` for the damage /
         production buckets (avoids stale preseason sim during in-season
         rankings when ``season == projection_season``).
+    xwoba_talent : pd.DataFrame, optional
+        Pre-computed multi-year xwOBA talent estimates.  Columns:
+        batter_id, xwoba_talent, xwoba_total_pa.  If None, falls back
+        to Bayesian projected_woba for the anchor.
 
     Returns
     -------
@@ -407,55 +416,12 @@ def _build_hitter_offense_score(
     else:
         obs_damage = proj_damage
 
-    # Age discount on observed stats: older players' outlier seasons get
-    # less trust, regressing more toward projections.  A 36-year-old's
-    # career-best is far more likely regression-bound than a 26-year-old's.
-    # Applies to damage + production (the two observation-heavy buckets).
-    # Contact + decisions are already projection-anchored via K%/BB%.
-    age = merged["age"].fillna(28)
-    # Two-phase age trust: steepened 2026-04-06 to fix aging veteran
-    # inflation (Trout #5, Springer #11 vs consensus #50+, #47).
-    # Old curve: 33→0.91, 35→0.79 (too gentle).
-    # New curve: 33→0.88, 35→0.74.  Moderate penalty that moves vets
-    # down without over-penalizing through percentile redistribution.
-    phase1 = (1.0 - ((age - 30).clip(0) * 0.04)).clip(0.88, 1.0)  # 30-33: 4%/yr
-    phase2 = (0.88 - ((age - 33).clip(0) * 0.07)).clip(0.45, 0.88)  # 33+: 7%/yr
-    age_trust = np.where(age <= 33, phase1, phase2)
-    # age 30: 1.00, age 32: 0.92, age 33: 0.88, age 35: 0.74, age 37: 0.60, age 39: 0.46
-
-    # Projection-deviation dampening: when observed stats diverge sharply
-    # from the Bayesian projection, reduce trust in observed.  The model
-    # has multi-year context -- a huge deviation signals an outlier season
-    # (positive or negative) that is unlikely to repeat.
-    # Works both ways: a career-worst year for a good player AND a
-    # career-best year for an aging player both get dampened.
-    #
-    # Computed on RAW stat scale (not percentiles) to avoid tail
-    # compression -- a 44-point wRC+ gap is meaningful even if both
-    # values are above the 90th percentile.
-    damage_deviation = (obs_damage - proj_damage).abs()
-    damage_dev_trust = (1.0 - damage_deviation).clip(0.50, 1.0)
-
-    # Aging spike penalty: if a 33+ year-old's most recent season sharply
-    # outperforms their multi-year baseline, it's almost certainly an
-    # outlier that will regress.  A 26-year-old breakout is believable;
-    # a 36-year-old career-best after two bad years is not.
-    # The penalty scales with age: harsher at 35+ than at 33.
-    aging_spike_penalty = pd.Series(1.0, index=merged.index)
-    if "xwoba" in merged.columns and "xwoba_multiyear" in merged.columns:
-        single = merged["xwoba"].fillna(0)
-        multi = merged["xwoba_multiyear"].fillna(single)
-        spike = (single - multi).clip(0)  # only penalize positive spikes
-        # Age-scaled severity: 33 = 15% per unit, 35 = 25%, 37 = 35%
-        age_severity = (0.15 + ((age - 33).clip(0) * 0.05)).clip(0.15, 0.40)
-        is_aging_spike = (age >= 33) & (spike > 0.015)
-        spike_factor = (1.0 - (spike - 0.015) / 0.030 * age_severity).clip(0.35, 1.0)
-        aging_spike_penalty = np.where(is_aging_spike, spike_factor, 1.0)
-
-    damage_trust = (
-        _stat_family_trust(pa, min_pa=150, full_pa=550)
-        * age_trust * damage_dev_trust * aging_spike_penalty
-    )
+    # Damage trust: PA-based ramp only.  Age discounts and spike penalties
+    # are no longer needed here — the xwOBA talent anchor (70% of offense)
+    # already handles aging regression and BABIP luck via multi-year
+    # recency-weighted xwOBA.  The skill buckets (30%) measure current-
+    # season process quality, not total production.
+    damage_trust = _stat_family_trust(pa, min_pa=150, full_pa=550)
     merged["damage_skill"] = (1 - damage_trust) * proj_damage + damage_trust * obs_damage
 
     # =================================================================
@@ -479,37 +445,7 @@ def _build_hitter_offense_score(
     else:
         obs_production = proj_production
 
-    # Production deviation: use raw wRC+ gap normalized by population SD.
-    # Percentile deviation compresses the tails (165 vs 121 wRC+ both map
-    # to >93rd pctl, hiding the 44-point gap).  Raw z-score preserves it.
-    if has_sim and _wrc_col in merged.columns:
-        raw_wrc_gap = (merged[_wrc_col].fillna(100) - merged["projected_wrc_plus_mean"].fillna(100)).abs()
-        wrc_std = merged["wrc_plus"].std()
-        if wrc_std > 0:
-            production_deviation_z = raw_wrc_gap / wrc_std
-        else:
-            production_deviation_z = pd.Series(0.0, index=merged.index)
-        # z=0: trust 1.0, z=1 (~30 wRC+ gap): 0.70, z=1.67+: 0.50 floor
-        production_dev_trust = (1.0 - production_deviation_z * 0.30).clip(0.50, 1.0)
-    else:
-        production_dev_trust = pd.Series(1.0, index=merged.index)
-
-    # Aging spike penalty for production (same logic as damage bucket)
-    aging_spike_prod = pd.Series(1.0, index=merged.index)
-    if "wrc_plus" in merged.columns and "wrc_plus_multiyear" in merged.columns:
-        wrc_single = merged["wrc_plus"].fillna(100)
-        wrc_multi = merged["wrc_plus_multiyear"].fillna(wrc_single)
-        wrc_spike = (wrc_single - wrc_multi).clip(0)
-        # Age-scaled wRC+ spike penalty (same pattern as damage)
-        age_severity_wrc = (0.15 + ((age - 33).clip(0) * 0.05)).clip(0.15, 0.40)
-        is_wrc_spike = (age >= 33) & (wrc_spike > 10)
-        spike_factor_wrc = (1.0 - (wrc_spike - 10) / 15 * age_severity_wrc).clip(0.35, 1.0)
-        aging_spike_prod = np.where(is_wrc_spike, spike_factor_wrc, 1.0)
-
-    production_trust = (
-        _stat_family_trust(pa, min_pa=100, full_pa=500)
-        * age_trust * production_dev_trust * aging_spike_prod
-    )
+    production_trust = _stat_family_trust(pa, min_pa=100, full_pa=500)
 
     merged["production_skill"] = (
         (1 - production_trust) * proj_production
@@ -517,55 +453,45 @@ def _build_hitter_offense_score(
     )
 
     # =================================================================
-    # Combine buckets into offense_score
-    # Two-layer blend:
-    #   70% -- projected wOBA percentile (total production truth).
-    #          Prevents the bucket decomposition from creating artificial
-    #          spread between players with similar total output (e.g. a
-    #          low-walk contact hitter vs a high-walk power hitter).
-    #   30% -- skill-bucket composite (profile differentiation).
-    #          Rewards/penalizes specific skill profiles on top of the
-    #          production anchor.  Decision skill reduced to 5% -- walk
-    #          rate is already captured in projected wOBA; higher weight
-    #          double-penalizes aggressive hitters whose results are fine.
+    # Combine: xwOBA talent anchor + Bayesian skill buckets
+    #
+    # 70% — xwOBA talent anchor.
+    #   Multi-year recency-weighted xwOBA (YoY r=0.759, std=0.053).
+    #   Measures bat-on-ball quality stripped of BABIP luck, park effects,
+    #   and defensive alignment noise.  For players with limited xwOBA
+    #   history, blended with Bayesian projected_woba via reliability ramp
+    #   (total xwOBA PA / 800, following Tango stabilization).
+    #
+    # 30% — Bayesian skill buckets (the TDD differentiator).
+    #   Decomposes offense into HOW a player produces, using Bayesian
+    #   posterior projections with full uncertainty.  Decision skill at 5%
+    #   since walk rate is already captured in xwOBA.
     # =================================================================
-    # Blend projected + career wOBA for the anchor.  Projected wOBA is
-    # compressed by Bayesian shrinkage (std=0.018); career wOBA preserves
-    # demonstrated ability (std=0.031).
-    #
-    # The key insight: in early season (current PA < 200), career wOBA is
-    # the best available differentiator per Tango's stabilization framework.
-    # The Bayesian projection is well-calibrated for CRPS (betting), but
-    # its compressed spread fails to rank Judge vs Perdomo.  Career wOBA
-    # (recency-weighted 3/2/1 by season) provides proper spread while
-    # remaining regression-aware.
-    #
-    # As current-season PA accumulates, observed stats flow through the
-    # skill buckets (contact, decisions, damage, production) and naturally
-    # provide spread.  The career anchor weight ramps down so it doesn't
-    # dominate once real 2026 data is available.
     _proj_woba = merged["projected_woba"].fillna(0.310)
-    _career_woba = merged["career_woba"].fillna(_proj_woba) if "career_woba" in merged.columns else _proj_woba
-    # Career wOBA reliability: small-career players (Jahmai Jones, 150 PA)
-    # shouldn't have career_woba weighted equally with veterans.
-    # Tango stabilization for wOBA ~300-500 PA.
-    _proj_pa = merged["_proj_pa"].fillna(400) if "_proj_pa" in merged.columns else pd.Series(400, index=merged.index)
-    _career_reliability = (_proj_pa / 800).clip(0, 1)
-    # Two-component career weight:
-    #   1. Base career weight (existing): 0.50 * career_reliability
-    #      Active at all PA levels, scaled by career exposure.
-    #   2. Early-season boost: up to +0.35 when current PA is low.
-    #      At 0 current PA: total career weight ≈ 0.85 (career dominates)
-    #      At 200+ current PA: boost = 0, buckets provide spread
-    _base_career_w = 0.50 * _career_reliability
-    _current_pa = pa.fillna(0)
-    # Early boost scaled by career reliability: veterans (700+ PA) get
-    # full boost, fringe players (150 PA) get minimal boost.  Prevents
-    # bench players with one fluky season from ranking alongside stars.
-    _early_boost = 0.35 * (1.0 - (_current_pa / 200).clip(0, 1)) * _career_reliability
-    _career_weight = (_base_career_w + _early_boost).clip(0, 0.85)
-    _blended_woba = (1.0 - _career_weight) * _proj_woba + _career_weight * _career_woba
-    woba_anchor = _zscore_pctl(_blended_woba)
+
+    if xwoba_talent is not None and not xwoba_talent.empty:
+        merged = merged.merge(
+            xwoba_talent[["batter_id", "xwoba_talent", "xwoba_total_pa"]],
+            on="batter_id", how="left",
+        )
+        _xwoba_t = merged["xwoba_talent"].fillna(_proj_woba)
+        _xwoba_pa = merged["xwoba_total_pa"].fillna(0)
+        # Reliability ramp: at 800+ PA of xwOBA data, trust xwOBA fully.
+        # At 0 PA, fall back to Bayesian projected_woba.
+        # Tango stabilization for xwOBA ~200-300 PA; we use 800 for a
+        # conservative ramp that ensures multi-season evidence.
+        _reliability = (_xwoba_pa / 800).clip(0, 1)
+        _talent_anchor = _reliability * _xwoba_t + (1 - _reliability) * _proj_woba
+        logger.info(
+            "xwOBA talent anchor: %d players, reliability mean=%.2f",
+            _reliability.notna().sum(), _reliability.mean(),
+        )
+    else:
+        # Fallback: Bayesian projected_woba only (compressed, std=0.018)
+        _talent_anchor = _proj_woba
+        logger.warning("No xwOBA talent data — falling back to projected_woba anchor")
+
+    talent_anchor = _zscore_pctl(_talent_anchor)
 
     bucket_composite = (
         0.175 * merged["contact_skill"]
@@ -574,32 +500,16 @@ def _build_hitter_offense_score(
         + 0.35 * merged["production_skill"]
     )
 
-    merged["offense_score"] = 0.70 * woba_anchor + 0.30 * bucket_composite
+    merged["offense_score"] = 0.70 * talent_anchor + 0.30 * bucket_composite
 
-    # Small-sample dampening toward league average.  Three regimes:
-    #
-    # 1. < 10 PA and NOT on IL: heavy dampening (30%).  These players
-    #    aren't starting — bench, minors, or fringe roster.  Their
-    #    projections from Bayesian regression shouldn't carry full weight.
-    # 2. 10-49 PA, OR < 10 PA but ON IL: light dampening (10%).
-    #    Active starters in early season, or injured starters who will
-    #    return.  Projections carry the signal; heavier dampening here
-    #    compresses stars toward average and lets fielding/baserunning
-    #    dominate the composite.
-    # 3. 50-400 PA: ramp from 20% (at 50 PA) to 0% (at 400+ PA).
+    # Dampening: only for players with no xwOBA history AND no current
+    # season PA.  The xwOBA reliability ramp already handles regression
+    # for small samples.  This catches true unknowns (rookies with no
+    # Statcast history at all).
     pa_safe = pa.fillna(0)
-    _il = il_player_ids or set()
-    _on_il = merged["batter_id"].isin(_il)
-    _is_active = (pa_safe >= 10) | _on_il  # starters or IL-exempt
-    dampening = np.where(
-        ~_is_active,
-        0.30,                                          # regime 1: bench/inactive
-        np.where(
-            pa_safe < 50,
-            0.10,                                      # regime 2: early season / IL
-            0.20 * (1.0 - ((pa_safe - 50) / 350).clip(0, 1)),  # regime 3: ramp
-        ),
-    )
+    _has_xwoba = merged.get("xwoba_total_pa", pd.Series(0, index=merged.index)).fillna(0) > 0
+    _is_unknown = (~_has_xwoba) & (pa_safe < 50)
+    dampening = np.where(_is_unknown, 0.20, 0.0)
     merged["offense_score"] = merged["offense_score"] * (1 - dampening) + 0.50 * dampening
 
     return merged[["batter_id", "offense_score", "contact_skill",

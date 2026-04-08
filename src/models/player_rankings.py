@@ -250,31 +250,43 @@ def rank_hitters(
     _in_season = season == projection_season
     use_hitter_sim = not _in_season
 
-    # Load current IL player IDs for offense dampening exemption.
-    # Players on IL with < 10 PA get "active starter" treatment instead
-    # of bench-player dampening, since they'll return to the lineup.
-    _il_ids: set[int] = set()
-    if _in_season:
-        try:
-            from src.data.db import read_sql
-            _il_df = read_sql("""
-                SELECT DISTINCT player_id
-                FROM production.fact_player_status_timeline
-                WHERE season = :season
-                  AND status_type LIKE '%%IL%%'
-                  AND (status_end_date IS NULL
-                       OR status_end_date >= CURRENT_DATE - INTERVAL '7 days')
-            """, {"season": season})
-            _il_ids = set(_il_df["player_id"])
-            logger.info("Loaded %d IL player IDs for dampening exemption", len(_il_ids))
-        except Exception:
-            logger.warning("Could not load IL data; no dampening exemptions")
+    # Compute multi-year xwOBA talent anchor for offense scoring.
+    # Recency-weighted (3/2/1) PA-weighted xwOBA over last 4 seasons.
+    # YoY r=0.759, std=0.053 — most stable and widest-spread offensive
+    # signal available.  Replaces compressed projected_woba/career_woba.
+    _xwoba_talent = pd.DataFrame()
+    try:
+        _xwoba_raw = read_sql("""
+            SELECT batter_id, season, xwoba, pa
+            FROM production.fact_batting_advanced
+            WHERE season BETWEEN :start AND :end AND pa >= 50
+        """, {"start": season - 4, "end": season})
+        if not _xwoba_raw.empty:
+            def _recency_xwoba(g: pd.DataFrame) -> pd.Series:
+                max_s, min_s = g["season"].max(), g["season"].min()
+                span = max(1, max_s - min_s)
+                w = g["pa"] * (1.0 + 2.0 * ((g["season"] - min_s) / span))
+                return pd.Series({
+                    "xwoba_talent": (g["xwoba"] * w).sum() / w.sum(),
+                    "xwoba_total_pa": g["pa"].sum(),
+                })
+            _xwoba_talent = (
+                _xwoba_raw.groupby("batter_id")
+                .apply(_recency_xwoba, include_groups=False)
+                .reset_index()
+            )
+            logger.info(
+                "xwOBA talent: %d players (std=%.4f)",
+                len(_xwoba_talent), _xwoba_talent["xwoba_talent"].std(),
+            )
+    except Exception:
+        logger.warning("Could not load xwOBA history for talent anchor")
 
     # Build sub-scores
     offense = _build_hitter_offense_score(
         proj, observed, aggressiveness=aggressiveness,
         use_sim_wrc_plus=use_hitter_sim,
-        il_player_ids=_il_ids if _in_season else None,
+        xwoba_talent=_xwoba_talent if not _xwoba_talent.empty else None,
     )
     baserunning = _build_hitter_baserunning_score(season=season)
     platoon = _build_hitter_platoon_modifier(season=season)
