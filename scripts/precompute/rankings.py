@@ -44,6 +44,32 @@ def run_player_rankings(
     except Exception:
         logger.exception("Failed to build MLB positional rankings")
 
+    # Frozen preseason core rankings contract.
+    # These artifacts should remain stable through in-season refreshes and are
+    # intended to power the "core rank" view separately from weekly form.
+    logger.info("=" * 60)
+    logger.info("Building frozen preseason core rankings...")
+    try:
+        from src.models.player_rankings import rank_core_preseason
+
+        core_rankings = rank_core_preseason(
+            anchor_season=from_season,
+            health_df=health_df,
+            pitcher_roles_df=pitcher_roles_df,
+        )
+        for key, rdf in core_rankings.items():
+            if rdf.empty:
+                continue
+            out = rdf.copy()
+            out["rank_type"] = "core_preseason"
+            out["core_anchor_season"] = from_season
+            out["core_projection_season"] = from_season + 1
+            fname = f"{key}_core_rankings.parquet"
+            out.to_parquet(DASHBOARD_DIR / fname, index=False)
+            logger.info("Saved %s: %d rows", fname, len(out))
+    except Exception:
+        logger.exception("Failed to build frozen preseason core rankings")
+
     # Hitter position eligibility (multi-position depth chart)
     logger.info("=" * 60)
     logger.info("Building hitter position eligibility...")
@@ -155,3 +181,91 @@ def run_breakouts(
 
     except Exception:
         logger.exception("Failed to compute pitcher breakout archetypes")
+
+
+def run_weekly_form(
+    *,
+    days: int = 14,
+    as_of_date: "str | None" = None,
+) -> None:
+    """Build hitter/pitcher weekly form leaderboards."""
+    logger.info("=" * 60)
+    logger.info("Building weekly form leaderboards (%d-day window)...", days)
+    try:
+        import pandas as pd
+        from src.models.weekly_form import build_weekly_form_boards
+
+        core_hitters = pd.DataFrame()
+        core_pitchers = pd.DataFrame()
+        h_core_path = DASHBOARD_DIR / "hitters_core_rankings.parquet"
+        p_core_path = DASHBOARD_DIR / "pitchers_core_rankings.parquet"
+        if h_core_path.exists():
+            core_hitters = pd.read_parquet(h_core_path)
+        if p_core_path.exists():
+            core_pitchers = pd.read_parquet(p_core_path)
+
+        boards = build_weekly_form_boards(
+            days=days,
+            as_of_date=as_of_date,
+            core_hitters=core_hitters,
+            core_pitchers=core_pitchers,
+        )
+        hitters = boards.get("hitters", pd.DataFrame())
+        pitchers = boards.get("pitchers", pd.DataFrame())
+
+        if not hitters.empty:
+            hitters.to_parquet(DASHBOARD_DIR / "hitters_weekly_form.parquet", index=False)
+            logger.info("Saved hitters_weekly_form.parquet: %d rows", len(hitters))
+        else:
+            logger.warning("No hitter weekly form rows generated")
+
+        if not pitchers.empty:
+            pitchers.to_parquet(DASHBOARD_DIR / "pitchers_weekly_form.parquet", index=False)
+            logger.info("Saved pitchers_weekly_form.parquet: %d rows", len(pitchers))
+        else:
+            logger.warning("No pitcher weekly form rows generated")
+    except Exception:
+        logger.exception("Failed to build weekly form leaderboards")
+
+
+def run_daily_standouts(
+    *,
+    game_date: "str | None" = None,
+) -> None:
+    """Build hitter/pitcher daily standout leaderboards."""
+    logger.info("=" * 60)
+    logger.info("Building daily standout leaderboards...")
+    try:
+        import pandas as pd
+        from src.models.daily_standouts import build_daily_standout_boards
+
+        core_hitters = pd.DataFrame()
+        core_pitchers = pd.DataFrame()
+        h_core_path = DASHBOARD_DIR / "hitters_core_rankings.parquet"
+        p_core_path = DASHBOARD_DIR / "pitchers_core_rankings.parquet"
+        if h_core_path.exists():
+            core_hitters = pd.read_parquet(h_core_path)
+        if p_core_path.exists():
+            core_pitchers = pd.read_parquet(p_core_path)
+
+        boards = build_daily_standout_boards(
+            game_date=game_date,
+            core_hitters=core_hitters,
+            core_pitchers=core_pitchers,
+        )
+        hitters = boards.get("hitters", pd.DataFrame())
+        pitchers = boards.get("pitchers", pd.DataFrame())
+
+        if not hitters.empty:
+            hitters.to_parquet(DASHBOARD_DIR / "hitters_daily_standouts.parquet", index=False)
+            logger.info("Saved hitters_daily_standouts.parquet: %d rows", len(hitters))
+        else:
+            logger.warning("No hitter daily standout rows generated")
+
+        if not pitchers.empty:
+            pitchers.to_parquet(DASHBOARD_DIR / "pitchers_daily_standouts.parquet", index=False)
+            logger.info("Saved pitchers_daily_standouts.parquet: %d rows", len(pitchers))
+        else:
+            logger.warning("No pitcher daily standout rows generated")
+    except Exception:
+        logger.exception("Failed to build daily standout leaderboards")

@@ -52,6 +52,8 @@ _SECTION_GROUPS: dict[str, list[str]] = {
     "team":        ["team_elo", "series_elo", "team_profiles", "league_sim", "team_power", "team_sim", "depth_chart", "roster"],
     "profiles":    ["arsenal", "vuln", "archetypes", "zones", "matchup_advantage"],
     "rankings":    ["player_rankings", "breakouts"],
+    "weekly_form": ["weekly_form"],
+    "daily_standouts": ["daily_standouts"],
     "game_data":   ["player_teams", "game_logs", "bf_priors", "umpire", "weather", "catcher_framing"],
     "traditional": ["trad_stats", "agg_eff"],
     "glicko":      ["player_glicko"],
@@ -331,6 +333,18 @@ def main() -> None:
     # =================================================================
     if should_run("breakouts"):
         rankings.run_breakouts(from_season=FROM_SEASON)
+
+    # =================================================================
+    # 6j2. Weekly form leaderboards (separate from frozen core rank)
+    # =================================================================
+    if should_run("weekly_form"):
+        rankings.run_weekly_form(days=14)
+
+    # =================================================================
+    # 6j3. Daily standouts (single-game performances)
+    # =================================================================
+    if should_run("daily_standouts"):
+        rankings.run_daily_standouts()
 
     # =================================================================
     # 6k. Team ELO (game-level)

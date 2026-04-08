@@ -248,6 +248,223 @@ def get_pitcher_traditional_stats(season: int) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Recent form (rolling window)
+# ---------------------------------------------------------------------------
+def get_hitter_recent_form(days: int = 14, as_of_date: str | None = None) -> pd.DataFrame:
+    """Rolling-window hitter form from boxscores + Statcast quality.
+
+    Parameters
+    ----------
+    days : int
+        Number of trailing calendar days (inclusive) in the window.
+    as_of_date : str or None
+        Anchor date (YYYY-MM-DD). If None, uses CURRENT_DATE.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns include batter_id, batter_name, pa_14d, games_14d,
+        k_rate_14d, bb_rate_14d, woba_14d, ops_14d, iso_14d,
+        hard_hit_pct_14d, barrel_pct_14d, xwoba_14d, bip_14d.
+    """
+    query = """
+    WITH params AS (
+        SELECT
+            COALESCE(CAST(:as_of_date AS date), CURRENT_DATE) AS end_date,
+            CAST(:days AS int) AS n_days
+    ),
+    box AS (
+        SELECT
+            bb.batter_id,
+            dp.player_name AS batter_name,
+            COUNT(DISTINCT bb.game_pk) AS games_14d,
+            SUM(bb.plate_appearances) AS pa_14d,
+            SUM(bb.at_bats) AS ab_14d,
+            SUM(bb.hits) AS hits_14d,
+            SUM(bb.doubles) AS doubles_14d,
+            SUM(bb.triples) AS triples_14d,
+            SUM(bb.total_bases) AS total_bases_14d,
+            SUM(bb.walks) AS bb_14d,
+            SUM(bb.intentional_walks) AS ibb_14d,
+            SUM(bb.hit_by_pitch) AS hbp_14d,
+            SUM(bb.strikeouts) AS k_14d,
+            SUM(bb.home_runs) AS hr_14d,
+            SUM(bb.runs) AS runs_14d,
+            SUM(bb.rbi) AS rbi_14d,
+            SUM(bb.sb) AS sb_14d,
+            SUM(bb.caught_stealing) AS cs_14d
+        FROM staging.batting_boxscores bb
+        JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+        LEFT JOIN production.dim_player dp ON bb.batter_id = dp.player_id
+        JOIN params p ON TRUE
+        WHERE dg.game_type = 'R'
+          AND dg.game_date::date BETWEEN (p.end_date - (p.n_days - 1) * INTERVAL '1 day') AND p.end_date
+        GROUP BY bb.batter_id, dp.player_name
+        HAVING SUM(bb.plate_appearances) >= 1
+    ),
+    sac_flies AS (
+        SELECT
+            fp.batter_id,
+            SUM(CASE WHEN fp.events IN ('sac_fly', 'sac_fly_double_play') THEN 1 ELSE 0 END) AS sf_14d
+        FROM production.fact_pa fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        JOIN params p ON TRUE
+        WHERE dg.game_type = 'R'
+          AND dg.game_date::date BETWEEN (p.end_date - (p.n_days - 1) * INTERVAL '1 day') AND p.end_date
+        GROUP BY fp.batter_id
+    ),
+    batted AS (
+        SELECT
+            fp.batter_id,
+            COUNT(*) AS bip_14d,
+            AVG(CASE WHEN sbb.hard_hit THEN 1.0 ELSE 0.0 END) AS hard_hit_pct_14d,
+            AVG(
+                CASE
+                    WHEN sbb.launch_speed >= 98 AND sbb.launch_angle BETWEEN 26 AND 30 THEN 1.0
+                    ELSE 0.0
+                END
+            ) AS barrel_pct_14d,
+            AVG(CASE WHEN sbb.xwoba != 'NaN' THEN sbb.xwoba END) AS xwoba_14d
+        FROM production.sat_batted_balls sbb
+        JOIN production.fact_pa fp ON sbb.pa_id = fp.pa_id
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        JOIN params p ON TRUE
+        WHERE dg.game_type = 'R'
+          AND dg.game_date::date BETWEEN (p.end_date - (p.n_days - 1) * INTERVAL '1 day') AND p.end_date
+        GROUP BY fp.batter_id
+    )
+    SELECT
+        b.batter_id,
+        b.batter_name,
+        b.games_14d,
+        b.pa_14d,
+        b.ab_14d,
+        b.hits_14d,
+        b.doubles_14d,
+        b.triples_14d,
+        b.total_bases_14d,
+        b.bb_14d,
+        b.ibb_14d,
+        b.hbp_14d,
+        b.k_14d,
+        b.hr_14d,
+        b.runs_14d,
+        b.rbi_14d,
+        b.sb_14d,
+        b.cs_14d,
+        COALESCE(sf.sf_14d, 0) AS sf_14d,
+        bt.bip_14d,
+        bt.hard_hit_pct_14d,
+        bt.barrel_pct_14d,
+        bt.xwoba_14d
+    FROM box b
+    LEFT JOIN sac_flies sf ON b.batter_id = sf.batter_id
+    LEFT JOIN batted bt ON b.batter_id = bt.batter_id
+    ORDER BY b.pa_14d DESC
+    """
+    logger.info("Fetching hitter recent form (%d-day)", days)
+    df = read_sql(query, {"days": days, "as_of_date": as_of_date})
+    if df.empty:
+        return df
+
+    pa = df["pa_14d"].replace(0, float("nan"))
+    ab = df["ab_14d"].replace(0, float("nan"))
+    non_ibb_bb = (df["bb_14d"] - df["ibb_14d"]).clip(lower=0)
+
+    df["k_rate_14d"] = (df["k_14d"] / pa).fillna(0.0)
+    df["bb_rate_14d"] = (df["bb_14d"] / pa).fillna(0.0)
+    df["avg_14d"] = (df["hits_14d"] / ab).fillna(0.0)
+    df["slg_14d"] = (df["total_bases_14d"] / ab).fillna(0.0)
+    obp_num = df["hits_14d"] + df["bb_14d"] + df["hbp_14d"]
+    obp_den = (df["ab_14d"] + df["bb_14d"] + df["hbp_14d"] + df["sf_14d"]).replace(0, float("nan"))
+    df["obp_14d"] = (obp_num / obp_den).fillna(0.0)
+    df["ops_14d"] = df["obp_14d"] + df["slg_14d"]
+    df["iso_14d"] = (df["slg_14d"] - df["avg_14d"]).fillna(0.0)
+
+    woba_num = (
+        non_ibb_bb * _WOBA_WEIGHTS["ubb"]
+        + df["hbp_14d"] * _WOBA_WEIGHTS["hbp"]
+        + (df["hits_14d"] - df["doubles_14d"] - df["triples_14d"] - df["hr_14d"]) * _WOBA_WEIGHTS["single"]
+        + df["doubles_14d"] * _WOBA_WEIGHTS["double"]
+        + df["triples_14d"] * _WOBA_WEIGHTS["triple"]
+        + df["hr_14d"] * _WOBA_WEIGHTS["hr"]
+    )
+    woba_den = (df["ab_14d"] + non_ibb_bb + df["sf_14d"] + df["hbp_14d"]).replace(0, float("nan"))
+    df["woba_14d"] = (woba_num / woba_den).fillna(0.0)
+
+    for c in ("hard_hit_pct_14d", "barrel_pct_14d", "xwoba_14d"):
+        if c in df.columns:
+            df[c] = df[c].fillna(0.0)
+    if "bip_14d" in df.columns:
+        df["bip_14d"] = df["bip_14d"].fillna(0).astype(int)
+
+    return df
+
+
+def get_pitcher_recent_form(days: int = 14, as_of_date: str | None = None) -> pd.DataFrame:
+    """Rolling-window pitcher form from pitching boxscores.
+
+    Parameters
+    ----------
+    days : int
+        Number of trailing calendar days (inclusive) in the window.
+    as_of_date : str or None
+        Anchor date (YYYY-MM-DD). If None, uses CURRENT_DATE.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns include pitcher_id, pitcher_name, bf_14d, games_14d,
+        starts_14d, k_rate_14d, bb_rate_14d, era_14d, whip_14d, hr_per_9_14d.
+    """
+    query = """
+    WITH params AS (
+        SELECT
+            COALESCE(CAST(:as_of_date AS date), CURRENT_DATE) AS end_date,
+            CAST(:days AS int) AS n_days
+    )
+    SELECT
+        pb.pitcher_id,
+        dp.player_name AS pitcher_name,
+        COUNT(DISTINCT pb.game_pk) AS games_14d,
+        SUM(pb.is_starter::int) AS starts_14d,
+        SUM(pb.batters_faced) AS bf_14d,
+        SUM(pb.innings_pitched) AS ip_14d,
+        SUM(pb.strike_outs) AS k_14d,
+        SUM(pb.walks + pb.intentional_walks) AS bb_14d,
+        SUM(pb.home_runs) AS hr_14d,
+        SUM(pb.hits) AS hits_14d,
+        SUM(pb.earned_runs) AS er_14d,
+        SUM(pb.saves) AS sv_14d,
+        SUM(pb.holds) AS hld_14d
+    FROM staging.pitching_boxscores pb
+    JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+    LEFT JOIN production.dim_player dp ON pb.pitcher_id = dp.player_id
+    JOIN params p ON TRUE
+    WHERE dg.game_type = 'R'
+      AND dg.game_date::date BETWEEN (p.end_date - (p.n_days - 1) * INTERVAL '1 day') AND p.end_date
+    GROUP BY pb.pitcher_id, dp.player_name
+    HAVING SUM(pb.batters_faced) >= 1
+    ORDER BY SUM(pb.batters_faced) DESC
+    """
+    logger.info("Fetching pitcher recent form (%d-day)", days)
+    df = read_sql(query, {"days": days, "as_of_date": as_of_date})
+    if df.empty:
+        return df
+
+    bf = df["bf_14d"].replace(0, float("nan"))
+    ip = df["ip_14d"].replace(0, float("nan"))
+    df["k_rate_14d"] = (df["k_14d"] / bf).fillna(0.0)
+    df["bb_rate_14d"] = (df["bb_14d"] / bf).fillna(0.0)
+    df["k_minus_bb_14d"] = df["k_rate_14d"] - df["bb_rate_14d"]
+    df["era_14d"] = ((df["er_14d"] / ip) * 9).fillna(0.0)
+    df["whip_14d"] = ((df["hits_14d"] + df["bb_14d"]) / ip).fillna(0.0)
+    df["hr_per_9_14d"] = ((df["hr_14d"] / ip) * 9).fillna(0.0)
+    df["role_14d"] = np.where(df["starts_14d"] >= 1, "SP", "RP")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Extended hitter season totals (from batting boxscores -- includes games, SB)
 # ---------------------------------------------------------------------------
 def get_hitter_season_totals_extended(season: int) -> pd.DataFrame:
@@ -960,3 +1177,213 @@ def get_milb_pitcher_season_totals(season: int) -> pd.DataFrame:
     """
     logger.info("Fetching MiLB pitcher season totals for %d", season)
     return read_sql(query, {"season": season})
+
+
+# ---------------------------------------------------------------------------
+# Daily standouts (single-game performances)
+# ---------------------------------------------------------------------------
+def get_hitter_daily_standouts(game_date: str | None = None) -> pd.DataFrame:
+    """Single-game hitter box-score lines + Statcast quality for one date.
+
+    Parameters
+    ----------
+    game_date : str or None
+        Target date (YYYY-MM-DD).  Defaults to yesterday.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per player-game with counting stats, rates, wOBA, and
+        optional Statcast quality columns.
+    """
+    query = """
+    WITH params AS (
+        SELECT COALESCE(CAST(:game_date AS date), CURRENT_DATE - INTERVAL '1 day') AS target_date
+    ),
+    box AS (
+        SELECT
+            bb.batter_id,
+            dp.player_name AS batter_name,
+            bb.game_pk,
+            dg.game_date,
+            dt_away.abbreviation AS away_team,
+            dt_home.abbreviation AS home_team,
+            bb.plate_appearances AS pa,
+            bb.at_bats          AS ab,
+            bb.hits,
+            bb.doubles,
+            bb.triples,
+            bb.home_runs        AS hr,
+            bb.total_bases,
+            bb.runs,
+            bb.rbi,
+            bb.walks            AS bb,
+            bb.intentional_walks AS ibb,
+            bb.hit_by_pitch     AS hbp,
+            bb.strikeouts       AS k,
+            bb.sb,
+            bb.caught_stealing  AS cs
+        FROM staging.batting_boxscores bb
+        JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
+        LEFT JOIN production.dim_player dp ON bb.batter_id = dp.player_id
+        LEFT JOIN production.dim_team dt_away ON dg.away_team_id = dt_away.team_id
+        LEFT JOIN production.dim_team dt_home ON dg.home_team_id = dt_home.team_id
+        JOIN params p ON TRUE
+        WHERE dg.game_type = 'R'
+          AND dg.game_date::date = p.target_date
+          AND bb.plate_appearances >= 1
+    ),
+    sac_flies AS (
+        SELECT
+            fp.batter_id,
+            fp.game_pk,
+            SUM(CASE WHEN fp.events IN ('sac_fly', 'sac_fly_double_play') THEN 1 ELSE 0 END) AS sf
+        FROM production.fact_pa fp
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        JOIN params p ON TRUE
+        WHERE dg.game_type = 'R'
+          AND dg.game_date::date = p.target_date
+        GROUP BY fp.batter_id, fp.game_pk
+    ),
+    batted AS (
+        SELECT
+            fp.batter_id,
+            fp.game_pk,
+            COUNT(*) AS bip,
+            AVG(CASE WHEN sbb.hard_hit THEN 1.0 ELSE 0.0 END) AS hard_hit_pct,
+            AVG(
+                CASE
+                    WHEN sbb.launch_speed >= 98 AND sbb.launch_angle BETWEEN 26 AND 30 THEN 1.0
+                    ELSE 0.0
+                END
+            ) AS barrel_pct,
+            AVG(CASE WHEN sbb.xwoba != 'NaN' THEN sbb.xwoba END) AS xwoba
+        FROM production.sat_batted_balls sbb
+        JOIN production.fact_pa fp ON sbb.pa_id = fp.pa_id
+        JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
+        JOIN params p ON TRUE
+        WHERE dg.game_type = 'R'
+          AND dg.game_date::date = p.target_date
+        GROUP BY fp.batter_id, fp.game_pk
+    )
+    SELECT
+        b.*,
+        COALESCE(sf.sf, 0) AS sf,
+        bt.bip,
+        bt.hard_hit_pct,
+        bt.barrel_pct,
+        bt.xwoba
+    FROM box b
+    LEFT JOIN sac_flies sf ON b.batter_id = sf.batter_id AND b.game_pk = sf.game_pk
+    LEFT JOIN batted bt ON b.batter_id = bt.batter_id AND b.game_pk = bt.game_pk
+    ORDER BY b.pa DESC
+    """
+    logger.info("Fetching hitter daily standouts for %s", game_date or "yesterday")
+    df = read_sql(query, {"game_date": game_date})
+    if df.empty:
+        return df
+
+    ab = df["ab"].replace(0, float("nan"))
+    pa = df["pa"].replace(0, float("nan"))
+    non_ibb_bb = (df["bb"] - df["ibb"]).clip(lower=0)
+
+    df["avg"] = (df["hits"] / ab).fillna(0.0)
+    df["slg"] = (df["total_bases"] / ab).fillna(0.0)
+    obp_num = df["hits"] + df["bb"] + df["hbp"]
+    obp_den = (df["ab"] + df["bb"] + df["hbp"] + df["sf"]).replace(0, float("nan"))
+    df["obp"] = (obp_num / obp_den).fillna(0.0)
+    df["ops"] = df["obp"] + df["slg"]
+    df["iso"] = (df["slg"] - df["avg"]).fillna(0.0)
+
+    singles = df["hits"] - df["doubles"] - df["triples"] - df["hr"]
+    woba_num = (
+        non_ibb_bb * _WOBA_WEIGHTS["ubb"]
+        + df["hbp"] * _WOBA_WEIGHTS["hbp"]
+        + singles * _WOBA_WEIGHTS["single"]
+        + df["doubles"] * _WOBA_WEIGHTS["double"]
+        + df["triples"] * _WOBA_WEIGHTS["triple"]
+        + df["hr"] * _WOBA_WEIGHTS["hr"]
+    )
+    woba_den = (df["ab"] + non_ibb_bb + df["sf"] + df["hbp"]).replace(0, float("nan"))
+    df["woba"] = (woba_num / woba_den).fillna(0.0)
+
+    df["k_rate"] = (df["k"] / pa).fillna(0.0)
+    df["bb_rate"] = (df["bb"] / pa).fillna(0.0)
+
+    for c in ("hard_hit_pct", "barrel_pct", "xwoba"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    if "bip" in df.columns:
+        df["bip"] = df["bip"].fillna(0).astype(int)
+
+    return df
+
+
+def get_pitcher_daily_standouts(game_date: str | None = None) -> pd.DataFrame:
+    """Single-game pitcher lines for one date.
+
+    Parameters
+    ----------
+    game_date : str or None
+        Target date (YYYY-MM-DD).  Defaults to yesterday.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per pitcher-game with counting stats and derived rates.
+    """
+    query = """
+    WITH params AS (
+        SELECT COALESCE(CAST(:game_date AS date), CURRENT_DATE - INTERVAL '1 day') AS target_date
+    )
+    SELECT
+        pb.pitcher_id,
+        dp.player_name AS pitcher_name,
+        pb.game_pk,
+        dg.game_date,
+        dt_away.abbreviation AS away_team,
+        dt_home.abbreviation AS home_team,
+        pb.is_starter,
+        pb.batters_faced AS bf,
+        pb.innings_pitched AS ip,
+        pb.strike_outs AS k,
+        pb.walks + pb.intentional_walks AS bb,
+        pb.home_runs AS hr,
+        pb.hits,
+        pb.earned_runs AS er,
+        pb.runs,
+        pb.wins AS w,
+        pb.losses AS l,
+        pb.saves AS sv,
+        pb.holds AS hld,
+        pb.number_of_pitches AS pitches
+    FROM staging.pitching_boxscores pb
+    JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+    LEFT JOIN production.dim_player dp ON pb.pitcher_id = dp.player_id
+    LEFT JOIN production.dim_team dt_away ON dg.away_team_id = dt_away.team_id
+    LEFT JOIN production.dim_team dt_home ON dg.home_team_id = dt_home.team_id
+    JOIN params p ON TRUE
+    WHERE dg.game_type = 'R'
+      AND dg.game_date::date = p.target_date
+      AND pb.batters_faced >= 1
+    ORDER BY pb.innings_pitched DESC, pb.strike_outs DESC
+    """
+    logger.info("Fetching pitcher daily standouts for %s", game_date or "yesterday")
+    df = read_sql(query, {"game_date": game_date})
+    if df.empty:
+        return df
+
+    bf = df["bf"].replace(0, float("nan"))
+    ip = df["ip"].replace(0, float("nan"))
+    df["k_rate"] = (df["k"] / bf).fillna(0.0)
+    df["bb_rate"] = (df["bb"] / bf).fillna(0.0)
+    df["k_minus_bb"] = df["k_rate"] - df["bb_rate"]
+    df["era"] = ((df["er"] / ip) * 9).fillna(0.0)
+    df["whip"] = ((df["hits"] + df["bb"]) / ip).fillna(0.0)
+    df["hr_per_9"] = ((df["hr"] / ip) * 9).fillna(0.0)
+    df["role"] = np.where(df["is_starter"], "SP", "RP")
+
+    # Quality start flag: 6+ IP and <= 3 ER
+    df["qs"] = ((df["ip"] >= 6.0) & (df["er"] <= 3)).astype(int)
+
+    return df

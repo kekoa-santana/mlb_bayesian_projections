@@ -122,3 +122,16 @@ Use this checklist after modifying any high-risk modeling, simulation, or calibr
 - Add parquet schema/column contract validation for the dashboard outputs.
 - Add small invariant tests for matchup/TTO/rest/logit monotonicity.
 - Centralize clip bounds and default constants used across modules.
+
+## 12) Core Rank + Weekly Form contract checks
+- Core rank contract artifacts:
+  - `hitters_core_rankings.parquet`
+  - `pitchers_core_rankings.parquet`
+  - Required metadata: `rank_type='core_preseason'`, `core_anchor_season`, `core_projection_season`.
+- Weekly form artifacts:
+  - `hitters_weekly_form.parquet`
+  - `pitchers_weekly_form.parquet`
+  - Required window fields: `*_14d` opportunity columns and `weekly_form_score`.
+- Verify separation of concerns:
+  - Weekly files may include `delta_vs_core`, but **must not** mutate core parquet values.
+  - Existing live ranking artifacts (`hitters_rankings.parquet`, `pitchers_rankings.parquet`) remain backward-compatible for downstream consumers.

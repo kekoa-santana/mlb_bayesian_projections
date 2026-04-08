@@ -1394,3 +1394,23 @@ def rank_all(
         len(hitters), len(pitchers),
     )
     return {"hitters": hitters, "pitchers": pitchers}
+
+
+def rank_core_preseason(
+    anchor_season: int = 2025,
+    *,
+    health_df: pd.DataFrame | None = None,
+    pitcher_roles_df: pd.DataFrame | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Build frozen core rankings using the preseason contract.
+
+    Core rankings are explicitly defined as preseason-style rankings:
+    observed season = ``anchor_season`` and projection season =
+    ``anchor_season + 1``.
+    """
+    return rank_all(
+        season=anchor_season,
+        projection_season=anchor_season + 1,
+        health_df=health_df,
+        pitcher_roles_df=pitcher_roles_df,
+    )
