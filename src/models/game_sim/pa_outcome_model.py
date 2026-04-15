@@ -83,6 +83,7 @@ class GameContext:
     weather_hr_lift: float = 0.0
     form_bb_lift: float = 0.0
     catcher_k_lift: float = 0.0
+    catcher_bb_lift: float = 0.0
     xgb_bb_lift: float = 0.0
 
 
@@ -200,6 +201,7 @@ class PAOutcomeModel:
             + matchup_bb_lift + tto_bb_lift + fatigue_bb_lift
             + _ctx.umpire_bb_lift + _ctx.park_bb_lift
             + _ctx.form_bb_lift + _ctx.xgb_bb_lift
+            + _ctx.catcher_bb_lift
             + _CALIBRATION_BB_OFFSET
         )
 
