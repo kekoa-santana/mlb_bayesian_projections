@@ -39,6 +39,7 @@ from src.models.projection_utils import (
     compute_composite,
     find_breakouts_and_regressions as _find_breakouts_and_regressions,
     fit_all_models_generic,
+    project_rate_samples,
 )
 
 logger = logging.getLogger(__name__)
@@ -291,33 +292,20 @@ def project_forward(
         base[career_col] = base["batter_id"].map(career_sum)
 
         # Forward-project each player
-        proj_means = {}
-        proj_sds = {}
-        proj_lo = {}
-        proj_hi = {}
-
         _cal_t = (calibration_t or {}).get(stat, 1.0)
 
-        for batter_id in base["batter_id"]:
-            try:
-                if batter_id in pre_extracted:
-                    samples = pre_extracted[batter_id].copy()
-                elif trace is not None:
-                    samples = extract_rate_samples(
-                        trace, data, batter_id, from_season,
-                        project_forward=True, random_seed=random_seed,
-                    )
-                else:
-                    continue
-                if _cal_t != 1.0:
-                    from src.evaluation.metrics import calibrate_posterior_samples
-                    samples = calibrate_posterior_samples(samples, _cal_t)
-                proj_means[batter_id] = float(np.mean(samples))
-                proj_sds[batter_id] = float(np.std(samples))
-                proj_lo[batter_id] = float(np.percentile(samples, 2.5))
-                proj_hi[batter_id] = float(np.percentile(samples, 97.5))
-            except ValueError:
-                continue
+        proj_means, proj_sds, proj_lo, proj_hi, _ = project_rate_samples(
+            ids=base["batter_id"],
+            pre_extracted=pre_extracted,
+            trace=trace,
+            data=data,
+            from_season=from_season,
+            id_col="batter_id",
+            extract_samples_fn=extract_rate_samples,
+            calibration_t=_cal_t,
+            random_seed=random_seed,
+            collect_samples=False,
+        )
 
         base[proj_col] = base["batter_id"].map(proj_means)
         base[sd_col] = base["batter_id"].map(proj_sds)
