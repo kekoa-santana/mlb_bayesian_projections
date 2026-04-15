@@ -27,6 +27,7 @@ from src.evaluation.game_k_validation import (
     run_full_game_backtest,
     run_full_game_k_backtest,
 )
+from src.evaluation.runner import save_csv
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,16 +56,13 @@ def main() -> None:
     logger.info("  Stats: %s", "K only" if args.k_only else "K + BB + HR + Outs")
     logger.info("=" * 70)
 
-    out_dir = PROJECT_ROOT / "outputs"
-    out_dir.mkdir(exist_ok=True)
-
     if args.k_only:
         # Original K-only backtest
         results = run_full_game_k_backtest(
             draws=draws, tune=tune, chains=chains,
             n_mc_draws=n_mc, random_seed=42,
         )
-        results.to_csv(out_dir / "game_k_backtest.csv", index=False)
+        save_csv(results, "game_k_backtest.csv", logger)
 
         _print_k_results(results)
     else:
@@ -74,9 +72,9 @@ def main() -> None:
             n_mc_draws=n_mc, random_seed=42,
         )
 
-        k_results.to_csv(out_dir / "game_k_backtest.csv", index=False)
+        save_csv(k_results, "game_k_backtest.csv", logger)
         if not stat_results.empty:
-            stat_results.to_csv(out_dir / "game_stat_backtest.csv", index=False)
+            save_csv(stat_results, "game_stat_backtest.csv", logger)
 
         _print_k_results(k_results)
         _print_stat_results(stat_results)

@@ -22,7 +22,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from pathlib import Path
 
@@ -30,13 +29,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.evaluation.hitter_backtest import run_hitter_backtest
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)-25s %(levelname)-7s %(message)s",
-    datefmt="%H:%M:%S",
+from src.evaluation.runner import (
+    add_common_args,
+    quick_full_sampling,
+    save_csv,
+    setup_logging,
 )
-logger = logging.getLogger("hitter_backtest")
+
+logger = setup_logging("hitter_backtest")
 
 RATE_FOLDS = [
     {"train_seasons": [2018, 2019, 2020, 2021, 2022], "test_season": 2023},
@@ -54,22 +54,11 @@ COUNTING_FOLDS = [
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hitter multi-stat backtest")
-    parser.add_argument("--quick", action="store_true")
-    parser.add_argument("--stat", type=str, default=None,
-                        help="Single rate stat to backtest (e.g. k_rate, bb_rate)")
-    parser.add_argument("--skip-counting", action="store_true",
-                        help="Skip counting stat backtest")
+    add_common_args(parser, stat=True, skip_counting=True)
     args = parser.parse_args()
 
-    if args.quick:
-        sampling = dict(draws=500, tune=250, chains=2, random_seed=42)
-        logger.info("QUICK mode: %s", sampling)
-    else:
-        sampling = dict(draws=2000, tune=1000, chains=4, random_seed=42)
-        logger.info("FULL mode: %s", sampling)
-
-    out_dir = PROJECT_ROOT / "outputs"
-    out_dir.mkdir(exist_ok=True)
+    sampling = quick_full_sampling(args.quick)
+    logger.info("%s mode: %s", "QUICK" if args.quick else "FULL", sampling)
 
     # ---- Rate stat backtest ----
     stats = [args.stat] if args.stat else None
@@ -91,8 +80,7 @@ def main() -> None:
         print(f"    Ensemble: w={avg_ens_w:.2f}")
         print(f"    CRPS: Bayes={avg_bayes_crps:.4f}, Marcel={avg_marcel_crps:.4f}")
 
-    summary.to_csv(out_dir / "hitter_multi_stat_backtest.csv", index=False)
-    logger.info("Rate results saved to outputs/hitter_multi_stat_backtest.csv")
+    save_csv(summary, "hitter_multi_stat_backtest.csv", logger)
 
     # ---- Counting stat backtest ----
     if not args.skip_counting and args.stat is None:
@@ -129,8 +117,7 @@ def main() -> None:
             )
         print()
 
-        counting_summary.to_csv(out_dir / "hitter_counting_backtest.csv", index=False)
-        logger.info("Counting results saved to outputs/hitter_counting_backtest.csv")
+        save_csv(counting_summary, "hitter_counting_backtest.csv", logger)
 
 
 if __name__ == "__main__":
