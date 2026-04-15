@@ -137,6 +137,29 @@ def _print_results(
         if "ip_corr" in row and pd.notna(row.get("ip_corr")):
             print(f"   IP: corr={row['ip_corr']:.3f}")
 
+        # Run-level metrics
+        if "runs_n" in row and pd.notna(row.get("runs_n")):
+            print(f"  --- RUNS (n={int(row['runs_n'])}) ---")
+            print(f"    bias={row.get('runs_bias', float('nan')):+.3f}  "
+                  f"mae={row.get('runs_mae', float('nan')):.3f}  "
+                  f"rmse={row.get('runs_rmse', float('nan')):.3f}  "
+                  f"corr={row.get('runs_corr', float('nan')):.3f}")
+            if pd.notna(row.get("runs_crps_mean")):
+                print(f"    CRPS: mean={row['runs_crps_mean']:.3f}  "
+                      f"median={row.get('runs_crps_median', float('nan')):.3f}")
+            for ci in ("50", "80", "90"):
+                k = f"runs_coverage_{ci}"
+                if k in row and pd.notna(row[k]):
+                    print(f"    Runs Coverage {ci}%: {row[k]:.1%}")
+            if pd.notna(row.get("runs_coverage_q80_empirical")):
+                print(f"    Runs Coverage (empirical q10-q90, ~80%): "
+                      f"{row['runs_coverage_q80_empirical']:.1%}")
+            sr = row.get("expected_starter_runs_mean")
+            br = row.get("expected_bullpen_runs_mean")
+            if pd.notna(sr) and pd.notna(br):
+                print(f"    Decomp: starter={sr:.2f}  bullpen={br:.2f}  "
+                      f"total={sr + br:.2f}")
+
         # Sharpness
         for prefix, label in [("k", "K"), ("outs", "Outs")]:
             conf_key = f"{prefix}_sharpness_mean_confidence"

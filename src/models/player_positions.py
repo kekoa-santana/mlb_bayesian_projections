@@ -198,6 +198,11 @@ def _verify_positions_mlb_api(
     already set from actual game lineup data (more current than the
     API's static ``primaryPosition`` field which MLB updates slowly).
 
+    Assignments of **DH** are never overridden: roster ``primaryPosition``
+    often lists OF/1B for bat-only profiles even when lineup-weighted
+    starts are mostly DH; replacing DH with a fielding position wrongly
+    applies fielding penalties.
+
     Parameters
     ----------
     positions : pd.DataFrame
@@ -268,10 +273,14 @@ def _verify_positions_mlb_api(
     skip_ids = lineup_override_ids or set()
     n_fixed = 0
     n_skipped = 0
+    n_skipped_dh = 0
     for idx, row in positions.iterrows():
         pid = row["player_id"]
         if pid in skip_ids:
             n_skipped += 1
+            continue
+        if row["position"] == "DH":
+            n_skipped_dh += 1
             continue
         if pid in api_positions:
             api_pos = api_positions[pid]
@@ -285,8 +294,9 @@ def _verify_positions_mlb_api(
                 n_fixed += 1
 
     logger.info(
-        "MLB API verification: %d players checked, %d corrected, %d skipped (lineup override)",
-        len(api_positions), n_fixed, n_skipped,
+        "MLB API verification: %d players checked, %d corrected, "
+        "%d skipped (lineup override), %d skipped (DH protected)",
+        len(api_positions), n_fixed, n_skipped, n_skipped_dh,
     )
     return positions
 

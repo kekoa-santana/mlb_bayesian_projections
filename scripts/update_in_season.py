@@ -6,6 +6,13 @@ Performs Beta-Binomial conjugate updating of preseason projections
 with observed 2026 data, regenerates dashboard parquets, and
 fetches today's schedule with matchup analysis.
 
+Game-level **model** probabilities (ML / spread / O/U) are built here via
+``src.models.game_predictions`` and saved as ``todays_game_predictions.parquet``.
+**Sportsbook** lines are still fetched by the dashboard
+``scripts/collect_game_odds.py`` (``game_odds_history.parquet``,
+``game_odds_daily.parquet``). ``confident_picks`` merges DraftKings **player**
+props into ``game_props.parquet``.
+
 Usage
 -----
     python scripts/update_in_season.py                    # today's date
@@ -23,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.special import logit as _scipy_logit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -38,6 +46,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 SEASON = 2026
+
+
+def _parse_temp_bucket(temp) -> str:
+    """Convert temperature to dim_weather bucket. Mirrors confident_picks."""
+    if temp is None or (isinstance(temp, float) and np.isnan(temp)):
+        return "unknown"
+    try:
+        t = float(temp)
+    except (TypeError, ValueError):
+        return "unknown"
+    if t < 55:
+        return "cold"
+    if t <= 69:
+        return "cool"
+    if t <= 84:
+        return "warm"
+    return "hot"
+
+
+def _wind_category(game) -> str:
+    """Read pre-parsed weather_wind_direction from a schedule row."""
+    direction = game.get("weather_wind_direction") if hasattr(game, "get") else None
+    if direction is None or (isinstance(direction, float) and np.isnan(direction)):
+        return "unknown"
+    direction = str(direction).strip().lower()
+    if direction in ("in", "out", "cross", "none"):
+        return direction
+    return "unknown"
+
 
 # Rate stats to update via conjugate updating
 HITTER_RATE_STATS = [
@@ -313,11 +350,11 @@ def simulate_todays_games(
     pitcher_proj: pd.DataFrame,
     bf_priors: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Step 4: Run PA-by-PA simulations for each starting pitcher.
+    """Run PA-by-PA sims for each starter and persist dashboard artifacts.
 
-    Uses the full game simulator (simulate_game) with exit model,
-    matchup lifts, TTO adjustments, and pitch count features for
-    comprehensive stat distributions (K, BB, H, HR, IP, pitches).
+    Writes ``todays_sims.parquet``, ``pitcher_game_sim_samples.npz`` (K/BB/H/HR/
+    outs/runs draws per starter), and ``todays_game_predictions.parquet``
+    (moneyline, run-line, and total probabilities from paired run samples).
     """
     from src.models.game_sim.exit_model import ExitModel
     from src.models.game_sim.pa_outcome_model import GameContext
@@ -383,15 +420,73 @@ def simulate_todays_games(
         for _, r in pitcher_obs[["pitcher_id", "zone_pct"]].drop_duplicates("pitcher_id").iterrows():
             pitcher_zone_lookup[int(r["pitcher_id"])] = float(r["zone_pct"])
 
-    # Umpire BB lifts for BB adjustment
+    # Umpire K and BB lifts. BB flows through both the XGB side-channel and
+    # the GameContext direct path; K flows only through GameContext.
     ump_bb_lift_map: dict[str, float] = {}
+    ump_k_lift_map: dict[str, float] = {}
     try:
         from src.data.queries import get_umpire_tendencies
         ump_df = get_umpire_tendencies(seasons=list(range(2021, SEASON)), min_games=30)
         if not ump_df.empty:
             ump_bb_lift_map = dict(zip(ump_df["hp_umpire_name"], ump_df["bb_logit_lift"]))
+            ump_k_lift_map = dict(zip(ump_df["hp_umpire_name"], ump_df["k_logit_lift"]))
     except Exception:
         pass
+
+    # Park factor lifts. Pre-computed logit offsets for each venue covering
+    # K%, BB%, HR%, and BABIP. Applied as constant GameContext terms.
+    park_lift_lookup: dict[int, tuple[float, float, float, float]] = {}
+    park_lift_path = DASHBOARD_DIR / "park_factor_lifts.parquet"
+    if park_lift_path.exists():
+        _pl = pd.read_parquet(park_lift_path)
+        for _, r in _pl.iterrows():
+            park_lift_lookup[int(r["venue_id"])] = (
+                float(r.get("k_lift", 0.0) or 0.0),
+                float(r.get("bb_lift", 0.0) or 0.0),
+                float(r.get("hr_lift", 0.0) or 0.0),
+                float(r.get("h_babip_adj", 0.0) or 0.0),
+            )
+        logger.info("Loaded park factor lifts for %d venues", len(park_lift_lookup))
+
+    # Weather effects lookup: (temp_bucket, wind_category) → multipliers.
+    # Same parquet confident_picks consumes; produced by the precompute
+    # pipeline from production.dim_weather aggregations.
+    wx_lookup: dict[tuple[str, str], dict] = {}
+    wx_path = DASHBOARD_DIR / "weather_effects.parquet"
+    if wx_path.exists():
+        try:
+            _wx_df = pd.read_parquet(wx_path)
+            for _, _wr in _wx_df.iterrows():
+                wx_lookup[(_wr["temp_bucket"], _wr["wind_category"])] = {
+                    "k_multiplier": float(_wr["k_multiplier"]),
+                    "overall_k_rate": float(_wr["overall_k_rate"]),
+                    "hr_multiplier": float(_wr["hr_multiplier"]),
+                    "overall_hr_rate": float(_wr["overall_hr_rate"]),
+                }
+            logger.info(
+                "Loaded %d weather effect combos", len(wx_lookup),
+            )
+        except (KeyError, ValueError) as e:
+            logger.warning("Failed to load weather effects: %s", e)
+
+    # Team defense (OAA → BABIP) lifts. Prefer current-season data once a
+    # team has accumulated enough fielding plays; fall back to prior season.
+    defense_babip_lookup: dict[int, float] = {}
+    defense_path = DASHBOARD_DIR / "team_defense_lifts.parquet"
+    if defense_path.exists():
+        _dl = pd.read_parquet(defense_path)
+        _prev = _dl[_dl["season"] == SEASON - 1]
+        for _, r in _prev.iterrows():
+            defense_babip_lookup[int(r["team_id"])] = float(r["defense_babip_adj"])
+        _cur = _dl[_dl["season"] == SEASON]
+        for _, r in _cur.iterrows():
+            # Current-season override only when the team has shown a real
+            # signal — gate on absolute frp magnitude as a sample-size proxy.
+            if abs(float(r["frp"])) >= 5:
+                defense_babip_lookup[int(r["team_id"])] = float(r["defense_babip_adj"])
+        logger.info(
+            "Loaded team defense lifts for %d teams", len(defense_babip_lookup),
+        )
 
     # Hitter BB samples for lineup BB rate computation
     hitter_bb_npz: dict[str, np.ndarray] = {}
@@ -410,6 +505,34 @@ def simulate_todays_games(
 
     tto_path = DASHBOARD_DIR / "tto_profiles.parquet"
     tto_profiles = pd.read_parquet(tto_path) if tto_path.exists() else pd.DataFrame()
+
+    # Team bullpen rates — keyed by (team_id, season). Used as the pitcher's
+    # team rates for the post-starter tail of the game sim.
+    bullpen_rates_path = DASHBOARD_DIR / "team_bullpen_rates.parquet"
+    bullpen_rates_df = (
+        pd.read_parquet(bullpen_rates_path)
+        if bullpen_rates_path.exists()
+        else pd.DataFrame()
+    )
+    bullpen_rates_lookup: dict[int, tuple[float, float, float]] = {}
+    if not bullpen_rates_df.empty:
+        # Prefer current-season rates; fall back to most recent completed
+        # season when 2026 hasn't accumulated enough BF yet.
+        _cur = bullpen_rates_df[bullpen_rates_df["season"] == SEASON]
+        _prev = bullpen_rates_df[bullpen_rates_df["season"] == SEASON - 1]
+        for _, r in _prev.iterrows():
+            bullpen_rates_lookup[int(r["team_id"])] = (
+                float(r["k_rate"]), float(r["bb_rate"]), float(r["hr_rate"]),
+            )
+        # Current season overrides prior when BF is sufficient (>= 200)
+        for _, r in _cur.iterrows():
+            if float(r.get("total_bf", 0.0)) >= 200:
+                bullpen_rates_lookup[int(r["team_id"])] = (
+                    float(r["k_rate"]), float(r["bb_rate"]), float(r["hr_rate"]),
+                )
+        logger.info(
+            "Loaded team bullpen rates for %d teams", len(bullpen_rates_lookup),
+        )
 
     last_train = SEASON - 1
 
@@ -465,7 +588,9 @@ def simulate_todays_games(
         except Exception as e:
             logger.warning("Failed to load batter rolling form: %s", e)
 
-    results = []
+    results: list[dict[str, object]] = []
+    sim_sample_arrays: dict[str, np.ndarray] = {}
+
     for _, game in schedule.iterrows():
         gpk = game["game_pk"]
 
@@ -609,6 +734,63 @@ def simulate_todays_games(
                     days_rest=5,
                 )
 
+            # Park + umpire lifts for this game. venue_id and hp_umpire_name
+            # come from the schedule row; missing entries default to 0.
+            venue_id = game.get("venue_id")
+            park_k, park_bb, park_hr, park_babip = park_lift_lookup.get(
+                int(venue_id) if pd.notna(venue_id) else -1,
+                (0.0, 0.0, 0.0, 0.0),
+            )
+            ump_k = ump_k_lift_map.get(ump_name, 0.0) if ump_name else 0.0
+
+            # Weather lifts. Domes / closed roofs get neutral. Missing temp
+            # or wind direction silently fall through to "unknown" → no
+            # lookup hit → zero lift.
+            wx_k_lift = 0.0
+            wx_hr_lift = 0.0
+            if wx_lookup:
+                _wcond = str(game.get("weather_condition") or "").strip().lower()
+                _is_indoor = _wcond in ("dome", "roof closed")
+                _temp_bucket = _parse_temp_bucket(game.get("weather_temp"))
+                _wind_cat = _wind_category(game)
+                _wx_info = (
+                    None if _is_indoor
+                    else wx_lookup.get((_temp_bucket, _wind_cat))
+                )
+                if _wx_info:
+                    _k_overall = float(np.clip(_wx_info["overall_k_rate"], 1e-6, 1 - 1e-6))
+                    _k_adj = float(np.clip(_wx_info["overall_k_rate"] * _wx_info["k_multiplier"], 1e-6, 1 - 1e-6))
+                    wx_k_lift = float(_scipy_logit(_k_adj) - _scipy_logit(_k_overall))
+                    _hr_overall = float(np.clip(_wx_info["overall_hr_rate"], 1e-6, 1 - 1e-6))
+                    _hr_adj = float(np.clip(_wx_info["overall_hr_rate"] * _wx_info["hr_multiplier"], 1e-6, 1 - 1e-6))
+                    wx_hr_lift = float(_scipy_logit(_hr_adj) - _scipy_logit(_hr_overall))
+
+            # Pitching team's bullpen rates for the post-starter tail.
+            # Falls back to league-average constants when the team has no
+            # entry in the lookup.
+            pitching_team_id = game.get(f"{side}_team_id")
+            # Defense BABIP adj — same team that owns the pitcher is the
+            # team fielding behind him.
+            defense_babip = defense_babip_lookup.get(
+                int(pitching_team_id) if pd.notna(pitching_team_id) else -1,
+                0.0,
+            )
+            # Combine park BABIP shift with defense BABIP shift; both use
+            # the same GameContext slot and are additive on hit probability.
+            combined_babip = park_babip + defense_babip
+            bp_rates = bullpen_rates_lookup.get(
+                int(pitching_team_id) if pd.notna(pitching_team_id) else -1
+            )
+            if bp_rates is not None:
+                bp_k, bp_bb, bp_hr = bp_rates
+            else:
+                from src.utils.constants import (
+                    BULLPEN_K_RATE, BULLPEN_BB_RATE, BULLPEN_HR_RATE,
+                )
+                bp_k, bp_bb, bp_hr = (
+                    BULLPEN_K_RATE, BULLPEN_BB_RATE, BULLPEN_HR_RATE,
+                )
+
             # Run PA-by-PA simulation
             try:
                 sim = simulate_game(
@@ -622,17 +804,45 @@ def simulate_todays_games(
                     exit_model=exit_model,
                     pitcher_avg_pitches=avg_pitches,
                     game_context=GameContext(
+                        umpire_k_lift=ump_k,
+                        umpire_bb_lift=ump_bb,
+                        park_k_lift=park_k,
+                        park_bb_lift=park_bb,
+                        park_hr_lift=park_hr,
+                        park_h_babip_adj=combined_babip,
+                        weather_k_lift=wx_k_lift,
+                        weather_hr_lift=wx_hr_lift,
                         form_bb_lift=pit_form.bb_lift,
                         xgb_bb_lift=xgb_bb_delta,
                     ),
                     exit_calibration_offset=exit_offset,
                     manager_pull_tendency=team_avg_p,
+                    babip_adj=combined_babip,
+                    bullpen_k_rate=bp_k,
+                    bullpen_bb_rate=bp_bb,
+                    bullpen_hr_rate=bp_hr,
                     n_sims=10000,
-                    random_seed=42 + gpk,
+                    random_seed=42 + gpk + (0 if side == "away" else 1),
                 )
             except Exception as e:
                 logger.warning("Sim failed for pitcher %d game %d: %s", pid, gpk, e)
                 continue
+
+            _sim_key = f"{gpk}_{pid}"
+            sim_sample_arrays[f"{_sim_key}_k"] = sim.k_samples.astype(np.float32)
+            sim_sample_arrays[f"{_sim_key}_bb"] = sim.bb_samples.astype(np.float32)
+            sim_sample_arrays[f"{_sim_key}_h"] = sim.h_samples.astype(np.float32)
+            sim_sample_arrays[f"{_sim_key}_hr"] = sim.hr_samples.astype(np.float32)
+            sim_sample_arrays[f"{_sim_key}_outs"] = sim.outs_samples.astype(np.float32)
+            sim_sample_arrays[f"{_sim_key}_runs"] = sim.runs_samples.astype(np.float32)
+            if sim.starter_runs_samples is not None:
+                sim_sample_arrays[f"{_sim_key}_starter_runs"] = (
+                    sim.starter_runs_samples.astype(np.float32)
+                )
+            if sim.bullpen_runs_samples is not None:
+                sim_sample_arrays[f"{_sim_key}_bullpen_runs"] = (
+                    sim.bullpen_runs_samples.astype(np.float32)
+                )
 
             summary = sim.summary()
             ip_samples = sim.ip_samples()
@@ -681,7 +891,32 @@ def simulate_todays_games(
                 **p_over_dict,
             })
 
-    return pd.DataFrame(results)
+    sim_df = pd.DataFrame(results)
+    if results and sim_sample_arrays:
+        sim_df.to_parquet(DASHBOARD_DIR / "todays_sims.parquet", index=False)
+        logger.info("Saved game simulations for %d pitcher appearances", len(sim_df))
+        np.savez_compressed(
+            DASHBOARD_DIR / "pitcher_game_sim_samples.npz",
+            **sim_sample_arrays,
+        )
+        logger.info(
+            "Saved pitcher game sim sample arrays (%d keys)", len(sim_sample_arrays),
+        )
+        from src.models.game_predictions import build_game_predictions_from_sims
+
+        game_preds = build_game_predictions_from_sims(sim_df, sim_sample_arrays)
+        if game_preds.empty:
+            logger.warning("No game-level predictions produced (missing paired starters?)")
+        else:
+            game_preds.to_parquet(
+                DASHBOARD_DIR / "todays_game_predictions.parquet", index=False,
+            )
+            logger.info("Saved game predictions for %d games", len(game_preds))
+    elif results:
+        sim_df.to_parquet(DASHBOARD_DIR / "todays_sims.parquet", index=False)
+        logger.info("Saved game simulations for %d pitcher appearances", len(sim_df))
+
+    return sim_df
 
 
 def update_season_stats_step() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -993,23 +1228,27 @@ def update_weekly_team_step() -> None:
     except Exception:
         logger.exception("Failed to update team profiles/rankings")
 
-    # 3. Rebuild power rankings
+    # 3. Rebuild power rankings (with in-season Beta-Binomial blend)
     try:
+        from scripts.precompute.team import _merge_power_into_team_rankings
+        from src.models.in_season_wins import load_current_team_records
         from src.models.team_rankings import build_power_rankings
 
-        h_rank_path = DASHBOARD_DIR / "hitters_rankings.parquet"
-        p_rank_path = DASHBOARD_DIR / "pitchers_rankings.parquet"
         h_proj_path = DASHBOARD_DIR / "hitter_projections.parquet"
         p_proj_path = DASHBOARD_DIR / "pitcher_projections.parquet"
         roster_path = DASHBOARD_DIR / "roster.parquet"
 
-        if all(p.exists() for p in [h_rank_path, p_rank_path, roster_path]):
+        if roster_path.exists():
+            try:
+                team_records = load_current_team_records(SEASON)
+            except Exception:
+                logger.warning("Could not load team records for blend", exc_info=True)
+                team_records = None
+
             power = build_power_rankings(
                 elo_ratings=elo_current,
                 profiles=profiles,
                 current_roster=pd.read_parquet(roster_path),
-                hitter_rankings=pd.read_parquet(h_rank_path),
-                pitcher_rankings=pd.read_parquet(p_rank_path),
                 hitter_projections=(
                     pd.read_parquet(h_proj_path) if h_proj_path.exists()
                     else pd.DataFrame()
@@ -1018,18 +1257,18 @@ def update_weekly_team_step() -> None:
                     pd.read_parquet(p_proj_path) if p_proj_path.exists()
                     else pd.DataFrame()
                 ),
+                team_records=team_records,
             )
             if not power.empty:
                 power.to_parquet(
                     DASHBOARD_DIR / "team_power_rankings.parquet",
                     index=False,
                 )
-                logger.info(
-                    "Saved power rankings: %d teams", len(power),
-                )
+                _merge_power_into_team_rankings(power)
+                logger.info("Saved power rankings: %d teams", len(power))
         else:
             logger.warning(
-                "Skipping power rankings — missing required parquets",
+                "Skipping power rankings — missing roster.parquet",
             )
     except Exception:
         logger.exception("Failed to update power rankings")
@@ -1153,8 +1392,10 @@ def main() -> None:
                 schedule, lineups, k_samples, p_updated, bf_priors,
             )
             if not sim_results.empty:
-                sim_results.to_parquet(DASHBOARD_DIR / "todays_sims.parquet", index=False)
-                logger.info("Saved K simulations for %d pitcher appearances", len(sim_results))
+                logger.info(
+                    "Game sims + predictions materialized for %d pitcher appearances",
+                    len(sim_results),
+                )
         else:
             logger.info("No games today — skipping simulation")
     else:

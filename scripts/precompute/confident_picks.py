@@ -142,6 +142,20 @@ def run(
     bullpen_rates = pd.read_parquet(
         DASHBOARD_DIR / "team_bullpen_rates.parquet"
     )
+    # Two-tier bullpen profiles (CL/SU high-leverage vs MR low-leverage)
+    try:
+        bullpen_profiles_df = pd.read_parquet(
+            DASHBOARD_DIR / "team_bullpen_profiles.parquet"
+        )
+    except FileNotFoundError:
+        bullpen_profiles_df = pd.DataFrame()
+    # Per-batter BIP probability profiles (out/single/double/triple)
+    try:
+        batter_bip_df = pd.read_parquet(
+            DASHBOARD_DIR / "batter_bip_profiles.parquet"
+        )
+    except FileNotFoundError:
+        batter_bip_df = pd.DataFrame()
 
     # Matchup data
     pitcher_arsenal = pd.read_parquet(
@@ -290,6 +304,8 @@ def run(
             wx_lookup[(wr["temp_bucket"], wr["wind_category"])] = {
                 "k_multiplier": float(wr["k_multiplier"]),
                 "overall_k_rate": float(wr["overall_k_rate"]),
+                "hr_multiplier": float(wr["hr_multiplier"]),
+                "overall_hr_rate": float(wr["overall_hr_rate"]),
             }
         logger.info("Loaded %d weather effect combos", len(wx_lookup))
     except (FileNotFoundError, KeyError):
@@ -328,6 +344,44 @@ def run(
         bullpen_rates.sort_values("season")
         .groupby("team_id").last().reset_index()
     )
+
+    # Build TeamBullpenProfile lookup for leverage-tier bullpen rate selection
+    from src.models.game_sim.bullpen_model import TeamBullpenProfile
+    bullpen_profile_lookup: dict[int, TeamBullpenProfile] = {}
+    if not bullpen_profiles_df.empty:
+        for _, r in bullpen_profiles_df.iterrows():
+            bullpen_profile_lookup[int(r["team_id"])] = TeamBullpenProfile(
+                team_id=int(r["team_id"]),
+                high_lev_k_rate=float(r["high_lev_k_rate"]),
+                high_lev_bb_rate=float(r["high_lev_bb_rate"]),
+                high_lev_hr_rate=float(r["high_lev_hr_rate"]),
+                high_lev_bf=int(r.get("high_lev_bf", 0)),
+                low_lev_k_rate=float(r["low_lev_k_rate"]),
+                low_lev_bb_rate=float(r["low_lev_bb_rate"]),
+                low_lev_hr_rate=float(r["low_lev_hr_rate"]),
+                low_lev_bf=int(r.get("low_lev_bf", 0)),
+            )
+        logger.info(
+            "Loaded %d team bullpen tier profiles", len(bullpen_profile_lookup),
+        )
+
+    # Build per-batter BIP probability lookup (batter_id -> (4,) out/1B/2B/3B)
+    _LEAGUE_BIP_PROBS = np.array([0.700, 0.222, 0.065, 0.005])
+    batter_bip_lookup: dict[int, np.ndarray] = {}
+    if not batter_bip_df.empty:
+        # Most recent season per batter
+        bip_latest = (
+            batter_bip_df.sort_values("season")
+            .groupby("batter_id").last().reset_index()
+        )
+        for _, r in bip_latest.iterrows():
+            batter_bip_lookup[int(r["batter_id"])] = np.array([
+                float(r["p_out"]), float(r["p_single"]),
+                float(r["p_double"]), float(r["p_triple"]),
+            ])
+        logger.info(
+            "Loaded BIP profiles for %d batters", len(batter_bip_lookup),
+        )
 
     # Latest exit tendencies per pitcher
     tend_latest = (
@@ -368,15 +422,27 @@ def run(
         ump_bb_lift = ump_bb_lookup.get(hp_ump_name, 0.0) if hp_ump_name else 0.0
 
         wx_k_lift = 0.0
+        wx_hr_lift = 0.0
+        # Dome and retractable-roof-closed games get no weather effect
+        # regardless of what the temp/wind fields report (those still
+        # reflect outdoor conditions on roof-closed games).
+        weather_condition = str(game.get("weather_condition") or "").strip().lower()
+        is_indoor = weather_condition in ("dome", "roof closed")
         temp_bucket = _parse_temp_bucket(game.get("weather_temp"))
-        wind_cat = _parse_wind_category(game.get("weather_wind"))
-        wx_info = wx_lookup.get((temp_bucket, wind_cat))
+        wind_cat = _wind_category(game)
+        wx_info = None if is_indoor else wx_lookup.get((temp_bucket, wind_cat))
         if wx_info:
             k_mult = wx_info["k_multiplier"]
             overall_k = wx_info["overall_k_rate"]
             adj_k = np.clip(overall_k * k_mult, 1e-6, 1 - 1e-6)
             wx_k_lift = float(
                 _logit(adj_k) - _logit(np.clip(overall_k, 1e-6, 1 - 1e-6))
+            )
+            hr_mult = wx_info["hr_multiplier"]
+            overall_hr = wx_info["overall_hr_rate"]
+            adj_hr = np.clip(overall_hr * hr_mult, 1e-6, 1 - 1e-6)
+            wx_hr_lift = float(
+                _logit(adj_hr) - _logit(np.clip(overall_hr, 1e-6, 1 - 1e-6))
             )
 
         # Park factor lifts (K and HR only)
@@ -522,6 +588,15 @@ def run(
             # Pitcher form lift (BB% only)
             pit_form = pitcher_form_lifts.get(pitcher_id, PitcherFormLifts())
 
+            # Two-tier bullpen profile for the pitching team
+            team_bullpen_profile = bullpen_profile_lookup.get(pitcher_team_id)
+
+            # Per-batter BIP probabilities for the opposing lineup (9, 4)
+            lineup_bip_probs_arr = np.stack([
+                batter_bip_lookup.get(int(bid), _LEAGUE_BIP_PROBS)
+                for bid in lineup_ids[:9]
+            ], axis=0).astype(np.float64)
+
             # Run pitcher sim (with umpire/weather/catcher/form context)
             try:
                 sim = simulate_game(
@@ -538,11 +613,14 @@ def run(
                         umpire_k_lift=ump_k_lift + platoon_k_lift,
                         umpire_bb_lift=ump_bb_lift + platoon_bb_lift,
                         weather_k_lift=wx_k_lift,
+                        weather_hr_lift=wx_hr_lift,
                         catcher_k_lift=catcher_k_lift,
                         form_bb_lift=pit_form.bb_lift,
                     ),
                     exit_calibration_offset=exit_offset,
                     manager_pull_tendency=team_avg_p,
+                    bullpen_profile=team_bullpen_profile,
+                    lineup_bip_probs=lineup_bip_probs_arr,
                     n_sims=n_sims,
                     random_seed=42 + game_pk % 10000,
                 )
@@ -612,13 +690,13 @@ def run(
                 # Default line: nearest X.5 to expected
                 default_line = max(np.floor(expected) + 0.5, 0.5)
                 # Precompute p_over for all standard lines (for DK resolution)
-                all_lines = [x + 0.5 for x in range(16)]
+                all_lines = [x + 0.5 for x in range(25)]
                 over_df = sim.over_probs(stat_key, all_lines)
                 p_over_map = dict(zip(over_df["line"], over_df["p_over"]))
 
                 # Store P(over) at standard lines 0.5-10.5
                 p_over_cols = {}
-                for lv in [x + 0.5 for x in range(11)]:
+                for lv in [x + 0.5 for x in range(25)]:
                     p_over_cols[f"p_over_{lv:.1f}"] = round(
                         p_over_map.get(lv, 0), 3
                     )
@@ -830,6 +908,7 @@ def run(
                         form_k_lift=bat_form.k_lift,
                         form_bb_lift=bat_form.bb_lift,
                         form_hr_lift=bat_form.hr_lift + bat_form.hh_lift,
+                        batter_bip_probs=batter_bip_lookup.get(batter_id),
                         n_sims=n_sims,
                         random_seed=(
                             42 + game_pk % 10000 + batter_id % 1000
@@ -846,14 +925,14 @@ def run(
                             continue
                         expected = batter_summary[stat_key]["mean"]
                         std = batter_summary[stat_key]["std"]
-                        all_lines = [x + 0.5 for x in range(16)]
+                        all_lines = [x + 0.5 for x in range(25)]
                         over_df = batter_sim.over_probs(
                             stat_key, all_lines,
                         )
                     else:
                         expected = lineup_summary[stat_key]["mean"]
                         std = lineup_summary[stat_key]["std"]
-                        all_lines = [x + 0.5 for x in range(16)]
+                        all_lines = [x + 0.5 for x in range(25)]
                         over_df = lineup_sim.batter_over_probs(
                             slot_idx, stat_key, all_lines,
                         )
@@ -865,7 +944,7 @@ def run(
 
                     # Store P(over) at standard lines 0.5-10.5
                     p_over_cols = {}
-                    for lv in [x + 0.5 for x in range(11)]:
+                    for lv in [x + 0.5 for x in range(25)]:
                         p_over_cols[f"p_over_{lv:.1f}"] = round(
                             p_over_map.get(lv, 0), 3
                         )
@@ -1017,6 +1096,50 @@ def run(
 
     # --- Layer 4: Market edge analysis ---
     _run_market_edge(all_props, player_posteriors)
+
+    # --- Save raw sample arrays so the dashboard can render distributions
+    # from the same simulation that produced game_props.parquet. Key format
+    # is ``{game_pk}_{player_id}_{stat}`` to match GameSimSampleStore.
+    _PITCHER_SAVE_STATS = ("k", "bb", "h", "hr", "outs")
+    _BATTER_SAVE_STATS = ("k", "bb", "h", "hr")
+    pitcher_arrays: dict[str, np.ndarray] = {}
+    batter_arrays: dict[str, np.ndarray] = {}
+    for (gpk, pid), samples in player_posteriors.items():
+        is_pitcher = "outs" in samples
+        target = pitcher_arrays if is_pitcher else batter_arrays
+        stats = _PITCHER_SAVE_STATS if is_pitcher else _BATTER_SAVE_STATS
+        for stat in stats:
+            arr = samples.get(stat)
+            if arr is not None:
+                target[f"{gpk}_{pid}_{stat}"] = np.asarray(arr, dtype=np.float32)
+    from datetime import date as _date
+    _history_dir = DASHBOARD_DIR / "history"
+    _history_dir.mkdir(exist_ok=True)
+    _today_iso = _date.today().isoformat()
+    if pitcher_arrays:
+        np.savez_compressed(
+            DASHBOARD_DIR / "pitcher_game_sim_samples.npz", **pitcher_arrays,
+        )
+        np.savez_compressed(
+            _history_dir / f"pitcher_game_sim_samples_{_today_iso}.npz",
+            **pitcher_arrays,
+        )
+        logger.info(
+            "Saved pitcher game sim samples: %d arrays (+ dated archive)",
+            len(pitcher_arrays),
+        )
+    if batter_arrays:
+        np.savez_compressed(
+            DASHBOARD_DIR / "batter_game_sim_samples.npz", **batter_arrays,
+        )
+        np.savez_compressed(
+            _history_dir / f"batter_game_sim_samples_{_today_iso}.npz",
+            **batter_arrays,
+        )
+        logger.info(
+            "Saved batter game sim samples: %d arrays (+ dated archive)",
+            len(batter_arrays),
+        )
 
     # --- Merge with history: freeze started/finished, update pre-game ---
     # Props for games that have started or finished are never overwritten.
@@ -1456,7 +1579,7 @@ def _save_empty(game_date: str) -> None:
         "espn_mean", "espn_median",
         "expected_ip", "expected_pitches", "expected_bf",
         "actual", "over_hit", "game_status",
-    ] + [f"p_over_{x + 0.5:.1f}" for x in range(11)]
+    ] + [f"p_over_{x + 0.5:.1f}" for x in range(25)]
     ).to_parquet(history_path, index=False)
 
 
@@ -1569,32 +1692,44 @@ def _lookup_name(
 
 
 def _parse_temp_bucket(temp) -> str:
-    """Convert temperature to bucket string."""
+    """Convert temperature to bucket string.
+
+    Bucket cutoffs and labels MUST match the SQL in
+    src/data/queries/environment.py:291-296 so lookups against
+    weather_effects.parquet actually resolve. Returns "unknown" when
+    input is missing so the downstream lookup falls through to neutral
+    lift (previously returned "moderate" which never matched any bucket
+    in the table — silent zero-lift, but for the wrong reason).
+    """
     if temp is None or (isinstance(temp, float) and np.isnan(temp)):
-        return "moderate"
+        return "unknown"
     try:
         t = float(temp)
     except (TypeError, ValueError):
-        return "moderate"
-    if t < 50:
+        return "unknown"
+    if t < 55:
         return "cold"
-    if t < 70:
+    if t <= 69:
         return "cool"
-    if t < 85:
-        return "moderate"
+    if t <= 84:
+        return "warm"
     return "hot"
 
 
-def _parse_wind_category(wind) -> str:
-    """Convert wind speed to category string."""
-    if wind is None or (isinstance(wind, float) and np.isnan(wind)):
-        return "calm"
-    try:
-        w = float(wind)
-    except (TypeError, ValueError):
-        return "calm"
-    if w < 5:
-        return "calm"
-    if w < 12:
-        return "moderate"
-    return "windy"
+def _wind_category(game: dict) -> str:
+    """Return the weather direction bucket for a game row.
+
+    Reads pre-parsed ``weather_wind_direction`` (populated by
+    ``fetch_todays_schedule`` via ``parse_wind_string``). Falls back
+    to "unknown" if the field is missing or empty so the
+    ``weather_effects.parquet`` lookup safely returns None → zero
+    lift. Matches categories in ``production.dim_weather``:
+    ``in``/``out``/``cross``/``none``/``unknown``.
+    """
+    direction = game.get("weather_wind_direction")
+    if direction is None or (isinstance(direction, float) and np.isnan(direction)):
+        return "unknown"
+    direction = str(direction).strip().lower()
+    if direction in ("in", "out", "cross", "none"):
+        return direction
+    return "unknown"

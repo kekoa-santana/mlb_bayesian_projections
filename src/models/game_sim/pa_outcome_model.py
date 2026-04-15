@@ -1,9 +1,11 @@
 """
 PA outcome model — multinomial over 8 outcome types.
 
-For each plate appearance, computes adjusted probabilities for:
-K, BB, HBP, HR (modeled individually on logit scale), then allocates
-remaining probability to BIP outcomes via the BIP model.
+For each plate appearance, computes adjusted logits for K, BB, HR, and
+HBP on the log-odds scale, then applies softmax normalization with BIP
+as the reference category (eta_bip = 0). This proper multinomial logit
+formulation ensures probabilities sum to 1.0 without ad-hoc rescaling
+and correctly handles simultaneous adjustments across outcomes.
 
 Integrates:
 - Pitcher rate posteriors (Layer 1)
@@ -18,7 +20,6 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.special import expit
 
 from src.models.game_sim.bip_model import (
     BIP_DOUBLE,
@@ -43,12 +44,15 @@ PA_HOME_RUN = 6
 PA_OUT = 7
 
 # Sim calibration offsets (logit scale).
-# After exit model calibration fix (-0.35 logit offset), residual biases are:
-#   K: ~-0.18/game (still slightly under-predicted by stacked logit lifts)
-#   BB: ~+0.33/game (over-predicted)
-# These offsets fine-tune the per-PA rates.
-_CALIBRATION_K_OFFSET = -0.02   # slight K logit reduction (was -0.06, reduced after exit fix)
-_CALIBRATION_BB_OFFSET = 0.01   # slight BB logit increase (was 0.03, reduced after exit fix)
+# After softmax refactor (2026-04-13), the old offsets tuned for expit+renorm
+# produced systematic biases: K/BB/HR rates shifted lower and runs bias ~-0.5/game.
+# Re-tuned offsets after softmax:
+#   K: removed the -0.02 reduction (softmax already pushes toward BIP)
+#   BB: kept small positive nudge
+#   HR: added +0.08 logit bump to counter softmax-induced runs under-prediction
+_CALIBRATION_K_OFFSET = 0.0     # was -0.02 pre-softmax; softmax no longer needs the cut
+_CALIBRATION_BB_OFFSET = 0.01   # unchanged
+_CALIBRATION_HR_OFFSET = 0.22   # offsets softmax HR suppression (was 0.15; bumped to close -0.35 runs bias)
 
 # Fatigue adjustment thresholds and slopes (logit scale)
 _FATIGUE_PITCH_THRESHOLD = 90   # Research (Bradbury 2007, Statcast velocity studies): meaningful
@@ -76,6 +80,7 @@ class GameContext:
     park_hr_lift: float = 0.0
     park_h_babip_adj: float = 0.0
     weather_k_lift: float = 0.0
+    weather_hr_lift: float = 0.0
     form_bb_lift: float = 0.0
     catcher_k_lift: float = 0.0
     xgb_bb_lift: float = 0.0
@@ -147,11 +152,12 @@ class PAOutcomeModel:
         fatigue_hr_lift: float = 0.0,
         ctx: GameContext | None = None,
     ) -> dict[str, float | np.ndarray]:
-        """Compute adjusted PA outcome probabilities.
+        """Compute adjusted PA outcome probabilities via softmax.
 
-        All lifts are on the logit scale. Probabilities are computed
-        independently for K, BB, HR, then renormalized to ensure they
-        don't exceed 1.0 (with HBP).
+        Builds logit scores for K, BB, HR, and HBP, then applies softmax
+        normalization with BIP as the reference category (eta_bip = 0).
+        This multinomial logit formulation properly handles the constraint
+        that all outcome probabilities sum to 1.0.
 
         Parameters
         ----------
@@ -174,55 +180,63 @@ class PAOutcomeModel:
         Returns
         -------
         dict[str, float | np.ndarray]
-            Keys: 'k', 'bb', 'hbp', 'hr', 'bip'. Values: probabilities.
+            Keys: 'k', 'bb', 'hbp', 'hr', 'bip'. Values: probabilities
+            that sum to 1.0.
         """
         _ctx = ctx or _EMPTY_CONTEXT
 
-        # K probability (with calibration offset to correct sim bias)
-        k_logit = (
+        # K logit (with calibration offset to correct sim bias)
+        eta_k = (
             self._safe_logit(pitcher_k_rate)
             + matchup_k_lift + tto_k_lift + fatigue_k_lift
             + _ctx.umpire_k_lift + _ctx.park_k_lift + _ctx.weather_k_lift
             + _ctx.catcher_k_lift
             + _CALIBRATION_K_OFFSET
         )
-        k_prob = expit(k_logit)
 
-        # BB probability (with calibration offset + pitcher form + XGB adjustment)
-        bb_logit = (
+        # BB logit (with calibration offset + pitcher form + XGB adjustment)
+        eta_bb = (
             self._safe_logit(pitcher_bb_rate)
             + matchup_bb_lift + tto_bb_lift + fatigue_bb_lift
             + _ctx.umpire_bb_lift + _ctx.park_bb_lift
             + _ctx.form_bb_lift + _ctx.xgb_bb_lift
             + _CALIBRATION_BB_OFFSET
         )
-        bb_prob = expit(bb_logit)
 
-        # HR probability
-        hr_logit = (
+        # HR logit (with calibration offset to counter softmax suppression)
+        eta_hr = (
             self._safe_logit(pitcher_hr_rate)
             + matchup_hr_lift + tto_hr_lift + fatigue_hr_lift
-            + _ctx.park_hr_lift
+            + _ctx.park_hr_lift + _ctx.weather_hr_lift
+            + _CALIBRATION_HR_OFFSET
         )
-        hr_prob = expit(hr_logit)
 
-        # HBP probability (constant)
-        hbp_prob = self.hbp_rate
+        # HBP logit (fixed)
+        eta_hbp = self._safe_logit(self.hbp_rate)
 
-        # Renormalize if sum exceeds 1.0
-        total = k_prob + bb_prob + hr_prob + hbp_prob
-        if np.any(total > 0.95):
-            # Scale down proportionally, preserving HBP
-            scale = np.where(
-                total > 0.95,
-                (0.95 - hbp_prob) / (k_prob + bb_prob + hr_prob),
-                1.0,
-            )
-            k_prob = k_prob * scale
-            bb_prob = bb_prob * scale
-            hr_prob = hr_prob * scale
+        # BIP is the reference category (eta_bip = 0)
+        # Softmax: p_j = exp(eta_j) / sum_k(exp(eta_k))
+        # Subtract max for numerical stability
+        eta_bip = np.zeros_like(eta_k) if isinstance(eta_k, np.ndarray) else 0.0
+        max_eta = np.maximum(np.maximum(np.maximum(np.maximum(
+            eta_k, eta_bb), eta_hr), eta_hbp), eta_bip)
 
-        bip_prob = np.maximum(1.0 - k_prob - bb_prob - hr_prob - hbp_prob, 0.01)
+        exp_k = np.exp(eta_k - max_eta)
+        exp_bb = np.exp(eta_bb - max_eta)
+        exp_hr = np.exp(eta_hr - max_eta)
+        exp_hbp = np.exp(eta_hbp - max_eta)
+        exp_bip = np.exp(eta_bip - max_eta)
+
+        denom = exp_k + exp_bb + exp_hr + exp_hbp + exp_bip
+
+        k_prob = exp_k / denom
+        bb_prob = exp_bb / denom
+        hr_prob = exp_hr / denom
+        hbp_prob = exp_hbp / denom
+        bip_prob = exp_bip / denom
+
+        # Safety floor on BIP (should rarely activate with softmax)
+        bip_prob = np.maximum(bip_prob, 0.01)
 
         return {
             "k": k_prob,
@@ -238,6 +252,7 @@ class PAOutcomeModel:
         rng: np.random.Generator,
         n_draws: int = 1,
         babip_adj: float = 0.0,
+        batter_bip_probs: np.ndarray | None = None,
     ) -> np.ndarray:
         """Draw PA outcomes from computed probabilities.
 
@@ -251,6 +266,11 @@ class PAOutcomeModel:
             Number of draws.
         babip_adj : float
             Pitcher BABIP adjustment for BIP outcomes.
+        batter_bip_probs : np.ndarray, optional
+            Shape (n_draws, 4) per-sample BIP probability vectors
+            [out, single, double, triple]. When provided, BIP outcomes
+            are resolved via the per-sample BIP model instead of the
+            shared league-average splits.
 
         Returns
         -------
@@ -294,9 +314,17 @@ class PAOutcomeModel:
         n_bip = bip_mask.sum()
 
         if n_bip > 0:
-            bip_outcomes = self.bip_model.draw_outcomes(
-                rng=rng, n_draws=n_bip, babip_adj=babip_adj
-            )
+            if batter_bip_probs is not None:
+                # Per-sample BIP probs (batter-specific)
+                bip_outcomes = self.bip_model.draw_outcomes_per_sample(
+                    rng=rng,
+                    probs=batter_bip_probs[bip_mask],
+                    babip_adj=babip_adj,
+                )
+            else:
+                bip_outcomes = self.bip_model.draw_outcomes(
+                    rng=rng, n_draws=n_bip, babip_adj=babip_adj
+                )
             # Map BIP codes to PA codes
             bip_to_pa = {
                 BIP_OUT: PA_OUT,

@@ -407,6 +407,72 @@ def get_days_rest(seasons: list[int] | None = None) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Catcher framing effects
 # ---------------------------------------------------------------------------
+def get_team_defense_lifts(
+    seasons: list[int] | None = None,
+) -> pd.DataFrame:
+    """Aggregate Statcast Outs Above Average to per-team-season defense
+    lifts that the simulator can apply as a BABIP shift.
+
+    Sums ``fielding_runs_prevented`` across all players on each team in
+    the season, divides by 162 games to get a runs/game rate, then
+    converts that to a probability shift on BIP hit rate using:
+
+        babip_adj = -frp_per_game / (run_value_of_hit * BIP_per_game)
+
+    With league-average run value of an avg hit ~0.55 and BIP/team-game
+    ~25, the conversion factor is ~-0.0727 per R/G of frp. Positive frp
+    means good defense, so the BABIP adj is negative (fewer hits).
+
+    Parameters
+    ----------
+    seasons : list[int], optional
+        Seasons to include. Defaults to 2018-2026.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: team_id, abbreviation, season, frp, frp_per_game,
+        defense_babip_adj.
+    """
+    if seasons is None:
+        seasons = list(range(2018, 2027))
+
+    season_list = ",".join(str(int(s)) for s in seasons)
+    query = f"""
+        SELECT t.team_id,
+               t.abbreviation,
+               agg.season,
+               agg.frp
+        FROM (
+            SELECT f.team_name,
+                   f.season,
+                   SUM(f.fielding_runs_prevented) AS frp
+            FROM production.fact_fielding_oaa f
+            WHERE f.season IN ({season_list})
+              AND f.team_name <> '---'
+            GROUP BY f.team_name, f.season
+        ) agg
+        JOIN production.dim_team t ON t.team_name = agg.team_name
+    """
+    logger.info("Fetching team defense lifts for seasons %s", seasons)
+    df = read_sql(query, {})
+    if df.empty:
+        return df
+
+    # Run-value-per-hit weighted across single/double/triple ~0.55
+    # BIP per team-game (after K/BB/HBP/HR removed) ~25
+    _CONV = -1.0 / (0.55 * 25.0)  # ≈ -0.0727 per R/G frp
+
+    df["frp_per_game"] = df["frp"] / 162.0
+    df["defense_babip_adj"] = (df["frp_per_game"] * _CONV).round(5)
+    df = df.sort_values(["season", "frp"], ascending=[True, False]).reset_index(drop=True)
+    logger.info(
+        "Team defense lifts: %d team-seasons, babip_adj range=[%.4f, %.4f]",
+        len(df), df["defense_babip_adj"].min(), df["defense_babip_adj"].max(),
+    )
+    return df
+
+
 def get_catcher_framing_effects(
     seasons: list[int] | None = None,
     shrinkage_k: int = 500,

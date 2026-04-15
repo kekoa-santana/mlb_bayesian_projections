@@ -7,10 +7,16 @@ pure deduplication.
 """
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 from scipy.special import logit
 
 from src.utils.constants import CLIP_LO, CLIP_HI
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -38,13 +44,67 @@ def resample_posterior(
 
 
 # ---------------------------------------------------------------------------
-# Matchup dampening constants
+# Matchup shrinkage slopes (Path A calibration, 2026-04-10)
 # ---------------------------------------------------------------------------
+#
+# Slopes fitted via logistic regression of actual PA outcomes (K, BB) against
+# the raw matchup logit lift produced by score_matchup / score_matchup_bb.
+# The simulator multiplies per-slot raw lifts by these slopes before adding
+# them to the PA outcome logit — equivalent to the old scalar dampeners but
+# derived from walk-forward train (2020-2023) -> holdout (2024) data rather
+# than hand-picked from a backtest.
+#
+# Fitting script: scripts/fit_matchup_shrinkage.py
+# Coefficient cache: data/cached/matchup_shrinkage_coefs.parquet
+# Diagnostic: memory/layer2_bvp_diagnostic_2026_04_10.md
+#
+# HR lifts are disabled at the source (see matchup.py:score_matchup_for_stat
+# HR branch). The slope remains as a pass-through scalar for array-shape
+# compatibility, but the underlying lift is always zero.
 
-# Empirical calibration from 11,517 game walk-forward backtest (2023-2025).
-# Raw pitch-type matchup scoring over-applies lifts by ~2x for K/BB.
-# HR signal is near-zero.
-MATCHUP_DAMPEN: dict[str, float] = {"k": 0.55, "bb": 0.40, "hr": 0.20}
+_FALLBACK_MATCHUP_DAMPEN: dict[str, float] = {"k": 0.55, "bb": 0.40, "hr": 0.0}
+
+# BB slope is pinned to the hand-picked value regardless of what the PA-level
+# fit produces. The 2026-04-11 A/B on 422 real 2024 starter games showed that
+# the fitted BB slope (0.766) amplifies a pre-existing +0.1 BB/game structural
+# bias and loses to the hand-picked 0.40 on Poisson log-likelihood, Brier at
+# BB > 2.5, and bias. The root problem is that BB calibration slope is ~0.5
+# at game level (model overreacts to its own BB signal), which no matchup
+# slope can fix. Tracked for follow-up — see memory/bb_game_level_bias.md.
+_BB_SLOPE_PIN: float = 0.40
+
+_SIM_UTILS_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_SHRINKAGE_COEFS_PATH = (
+    _SIM_UTILS_PROJECT_ROOT / "data" / "cached" / "matchup_shrinkage_coefs.parquet"
+)
+
+
+def _load_matchup_dampen() -> dict[str, float]:
+    """Load fitted matchup slopes from cache, or fall back to hand-picked."""
+    if not _SHRINKAGE_COEFS_PATH.exists():
+        logger.warning(
+            "Matchup shrinkage coefs not found at %s; using fallback %s. "
+            "Run scripts/fit_matchup_shrinkage.py to fit.",
+            _SHRINKAGE_COEFS_PATH,
+            _FALLBACK_MATCHUP_DAMPEN,
+        )
+        return dict(_FALLBACK_MATCHUP_DAMPEN)
+    df = pd.read_parquet(_SHRINKAGE_COEFS_PATH)
+    result = dict(_FALLBACK_MATCHUP_DAMPEN)
+    for _, row in df.iterrows():
+        stat = str(row["stat"])
+        result[stat] = float(row["slope"])
+    # HR always zero — Path B short-circuits the HR lift in
+    # score_matchup_for_stat and we do not want a fitted slope to
+    # accidentally reintroduce it.
+    result["hr"] = 0.0
+    # BB pinned — game-level A/B preferred the hand-picked value.
+    result["bb"] = _BB_SLOPE_PIN
+    logger.info("Loaded matchup shrinkage slopes: %s", result)
+    return result
+
+
+MATCHUP_DAMPEN: dict[str, float] = _load_matchup_dampen()
 
 
 # ---------------------------------------------------------------------------

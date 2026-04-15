@@ -391,7 +391,7 @@ def main() -> None:
     # 6o. Power rankings (uses league sim + team sim wins)
     # =================================================================
     if should_run("team_power"):
-        team.run_team_power(league_sim_df=league_sim_df, team_sim_df=team_sim_df)
+        team.run_team_power(league_sim_df=league_sim_df)
 
     # =================================================================
     # 7. Preseason snapshot

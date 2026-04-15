@@ -38,12 +38,17 @@ _SHRINKAGE_K = 500  # BIP needed for full weight on pitcher-specific BABIP
 # Coefficients for quality-metric BIP split prediction
 # Trained on 2021-2025 BIP data (337 year-pairs, walk-forward validated)
 # BABIP = f(exit_velo, launch_angle, gb_pct, sprint_speed)
+# Intercept re-centered (2026-04-14) so avg-quality batter
+# (EV=88, LA=12, GB=0.44, sprint=27) maps to pred_babip=0.300, matching the
+# league default out rate in _DEFAULT_BIP_PROBS. Previous intercept (0.21759)
+# produced pred_babip=0.280 → 0.720 out rate, biasing every lineup's BIP
+# outcomes ~2pp toward outs and pulling ~0.1 runs/game off sim totals.
 _BABIP_COEFS = {
     "avg_ev": 0.00035,
     "avg_la": -0.00396,
     "gb_pct": -0.08537,
     "sprint_speed": 0.00433,
-    "intercept": 0.21759,
+    "intercept": 0.23718,
 }
 
 # Per-hit-type share adjustments from quality metrics
@@ -260,6 +265,54 @@ class BIPOutcomeModel:
         # Ensure exact sum to 1.0 for numpy multinomial
         probs = probs / probs.sum()
         return rng.choice(4, size=n_draws, p=probs)
+
+    def draw_outcomes_per_sample(
+        self,
+        rng: np.random.Generator,
+        probs: np.ndarray,
+        babip_adj: float = 0.0,
+    ) -> np.ndarray:
+        """Draw BIP outcomes where each sample has its own probability vector.
+
+        Vectorized inverse-CDF sampling: each row of ``probs`` defines that
+        sample's [out, single, double, triple] distribution. The pitcher
+        BABIP adjustment (if any) is applied as a multiplicative shift on
+        hit mass, preserving the relative hit-type distribution.
+
+        Parameters
+        ----------
+        rng : np.random.Generator
+            Random number generator.
+        probs : np.ndarray
+            Shape (n, 4) per-sample [out, single, double, triple] probs.
+            Rows need not sum to exactly 1.0; they are renormalized.
+        babip_adj : float
+            Pitcher BABIP adjustment (positive = more hits on BIP).
+
+        Returns
+        -------
+        np.ndarray
+            Integer outcome codes, shape (n,). 0=out, 1=single, 2=double, 3=triple.
+        """
+        p = np.asarray(probs, dtype=np.float64).copy()
+        # Apply pitcher BABIP adjustment by shifting hit mass
+        if abs(babip_adj) >= 0.001:
+            hit_p = p[:, 1:].sum(axis=1)
+            # Avoid divide-by-zero on pathological rows
+            safe_hit = np.where(hit_p > 1e-9, hit_p, 1e-9)
+            new_hit = np.clip(hit_p + babip_adj, 0.05, 0.50)
+            scale = new_hit / safe_hit
+            p[:, 1:] = p[:, 1:] * scale[:, None]
+            p[:, 0] = 1.0 - p[:, 1:].sum(axis=1)
+        p = np.clip(p, 1e-9, 1.0)
+        p = p / p.sum(axis=1, keepdims=True)
+
+        # Inverse-CDF sampling using a single uniform per sample
+        cdf = np.cumsum(p, axis=1)
+        u = rng.random(p.shape[0])
+        # argmax returns first True index along axis
+        outcomes = (u[:, None] < cdf).argmax(axis=1).astype(np.int8)
+        return outcomes
 
 
 # Outcome code mapping

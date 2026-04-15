@@ -1038,9 +1038,19 @@ def score_matchup_for_stat(
             pitcher_id, batter_id, pitcher_arsenal, hitter_vuln, baselines_pt
         )
     elif stat == "hr":
-        result = score_matchup_hr(
-            pitcher_id, batter_id, pitcher_arsenal, hitter_vuln, baselines_pt
-        )
+        # Path B (2026-04-10): HR matchup lifts disabled at the source. Raw
+        # per-pair profile math has reliability ~0.62 and a systematic logit
+        # mean bias of -0.43 from low-denominator pitch types; dampening to
+        # 0.20 left noise plus a pitcher-favoring drift. See
+        # memory/layer2_bvp_diagnostic_2026_04_10.md. Reliability=1.0 so the
+        # simulator's (1-reliability) noise term also collapses to zero.
+        return {
+            "pitcher_id": pitcher_id,
+            "batter_id": batter_id,
+            "matchup_hr_logit_lift": 0.0,
+            "n_pitch_types": 0,
+            "avg_reliability": 1.0,
+        }
     else:
         # No matchup adjustment for other stats (hits, outs, etc.)
         return {

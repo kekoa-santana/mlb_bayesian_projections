@@ -164,6 +164,7 @@ def simulate_batter_game(
     form_bb_lift: float = 0.0,
     form_hr_lift: float = 0.0,
     game_context: GameContext | None = None,
+    batter_bip_probs: np.ndarray | None = None,
     n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> BatterSimulationResult:
@@ -355,9 +356,16 @@ def simulate_batter_game(
             pitcher_bb_rate=bb_rate_adj,
             pitcher_hr_rate=hr_rate_adj,
         )
+        # Per-sim batter BIP probability array (tile the single (4,) vector)
+        batter_bip_arr = None
+        if batter_bip_probs is not None:
+            batter_bip_arr = np.broadcast_to(
+                np.asarray(batter_bip_probs, dtype=np.float64), (n_active, 4),
+            )
         outcomes = pa_model.draw_outcomes(
             probs=probs, rng=rng, n_draws=n_active,
             babip_adj=batter_babip_adj + park_h_babip_adj,
+            batter_bip_probs=batter_bip_arr,
         )
 
         # Accumulate

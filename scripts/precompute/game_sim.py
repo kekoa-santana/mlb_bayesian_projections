@@ -23,9 +23,11 @@ def run(
         get_exit_model_training_data,
         get_pitcher_exit_tendencies,
         get_pitcher_pitch_count_features,
+        get_reliever_stats_by_team,
         get_team_bullpen_rates,
         get_tto_adjustment_profiles,
     )
+    from src.models.game_sim.bullpen_model import build_team_bullpen_profiles
     from src.models.game_sim.exit_model import ExitModel
 
     logger.info("=" * 60)
@@ -127,5 +129,139 @@ def run(
         logger.info("Saved team bullpen rates: %d rows", len(bullpen_rates))
     except Exception:
         logger.exception("Failed to compute team bullpen rates")
+
+    # 9h. Two-tier bullpen profiles (high-leverage CL/SU vs low-leverage MR)
+    logger.info("Computing team bullpen tier profiles...")
+    try:
+        from src.models.reliever_roles import classify_reliever_roles
+
+        reliever_stats = get_reliever_stats_by_team(seasons)
+        roles = classify_reliever_roles(
+            seasons=[from_season - 1, from_season],
+            current_season=from_season,
+            min_games=5,
+        )
+
+        # Build profiles for current season
+        profiles = build_team_bullpen_profiles(
+            role_history=reliever_stats,
+            roles=roles,
+            team_aggregate=bullpen_rates,
+            season=from_season,
+        )
+
+        # Save as parquet for dashboard consumption
+        if profiles:
+            profile_rows = [
+                {
+                    "team_id": p.team_id,
+                    "high_lev_k_rate": p.high_lev_k_rate,
+                    "high_lev_bb_rate": p.high_lev_bb_rate,
+                    "high_lev_hr_rate": p.high_lev_hr_rate,
+                    "high_lev_bf": p.high_lev_bf,
+                    "low_lev_k_rate": p.low_lev_k_rate,
+                    "low_lev_bb_rate": p.low_lev_bb_rate,
+                    "low_lev_hr_rate": p.low_lev_hr_rate,
+                    "low_lev_bf": p.low_lev_bf,
+                }
+                for p in profiles.values()
+            ]
+            pd.DataFrame(profile_rows).to_parquet(
+                DASHBOARD_DIR / "team_bullpen_profiles.parquet", index=False,
+            )
+            logger.info("Saved %d team bullpen tier profiles", len(profile_rows))
+        else:
+            logger.warning("No bullpen tier profiles built")
+    except Exception:
+        logger.exception("Failed to compute bullpen tier profiles")
+
+    # 9i. Batter BIP profiles (per-batter out/single/double/triple probabilities)
+    logger.info("Computing batter BIP profiles...")
+    try:
+        from src.data.queries.hitter import get_batter_bip_profile
+        from src.data.queries.traditional import get_sprint_speed
+        from src.models.game_sim.bip_model import compute_player_bip_probs
+
+        bip_raw = get_batter_bip_profile(seasons)
+        if bip_raw.empty:
+            logger.warning("No batter BIP data returned")
+        else:
+            # Pull sprint speed for the current season (fallback 27.0 if missing)
+            try:
+                sprint = get_sprint_speed(from_season)
+                sprint = sprint[["player_id", "sprint_speed"]].rename(
+                    columns={"player_id": "batter_id"},
+                )
+            except Exception:
+                logger.exception("Failed to fetch sprint speed; defaulting to 27.0")
+                sprint = pd.DataFrame(columns=["batter_id", "sprint_speed"])
+
+            # Keep only current season for profile construction; history rows
+            # retained in case we ever want multi-season blending.
+            cur = bip_raw[bip_raw["season"] == from_season].copy()
+            cur = cur.merge(sprint, on="batter_id", how="left")
+            cur["sprint_speed"] = cur["sprint_speed"].fillna(27.0)
+            cur["avg_ev"] = cur["avg_ev"].fillna(88.0).astype(float)
+            cur["avg_la"] = cur["avg_la"].fillna(12.0).astype(float)
+            cur["gb_pct"] = cur["gb_pct"].fillna(0.44).astype(float)
+
+            rows = []
+            for _, r in cur.iterrows():
+                bip = int(r["bip"])
+                outs = int(r["bip_outs"])
+                sgl = int(r["bip_singles"])
+                dbl = int(r["bip_doubles"])
+                tpl = int(r["bip_triples"])
+                resolved = outs + sgl + dbl + tpl
+                if resolved <= 0:
+                    continue
+                observed = {
+                    "out": outs / resolved,
+                    "single": sgl / resolved,
+                    "double": dbl / resolved,
+                    "triple": tpl / resolved,
+                }
+                probs = compute_player_bip_probs(
+                    avg_ev=float(r["avg_ev"]),
+                    avg_la=float(r["avg_la"]),
+                    gb_pct=float(r["gb_pct"]),
+                    sprint_speed=float(r["sprint_speed"]),
+                    observed_bip_splits=observed,
+                    bip_count=bip,
+                    shrinkage_k=900,  # tuned via OOF sweep (2024→2025): beats
+                                      # league on both log loss and Brier
+                )
+                rows.append({
+                    "batter_id": int(r["batter_id"]),
+                    "season": int(r["season"]),
+                    "bip": bip,
+                    "p_out": float(probs[0]),
+                    "p_single": float(probs[1]),
+                    "p_double": float(probs[2]),
+                    "p_triple": float(probs[3]),
+                    "avg_ev": float(r["avg_ev"]),
+                    "avg_la": float(r["avg_la"]),
+                    "gb_pct": float(r["gb_pct"]),
+                    "sprint_speed": float(r["sprint_speed"]),
+                })
+
+            if rows:
+                out_df = pd.DataFrame(rows)
+                out_df.to_parquet(
+                    DASHBOARD_DIR / "batter_bip_profiles.parquet", index=False,
+                )
+                logger.info(
+                    "Saved batter BIP profiles: %d batters. "
+                    "Mean p_out=%.3f p_single=%.3f p_double=%.3f p_triple=%.4f",
+                    len(out_df),
+                    out_df["p_out"].mean(),
+                    out_df["p_single"].mean(),
+                    out_df["p_double"].mean(),
+                    out_df["p_triple"].mean(),
+                )
+            else:
+                logger.warning("No batter BIP rows built")
+    except Exception:
+        logger.exception("Failed to compute batter BIP profiles")
 
     logger.info("Game simulator data complete.")

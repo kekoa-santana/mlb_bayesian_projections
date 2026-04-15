@@ -44,6 +44,7 @@ from src.models._ranking_utils import (  # noqa: F401 — re-exports
     _HITTER_WEIGHTS,
     _OBS_WEIGHT_BASE,
     _POS_ADJUSTMENT,
+    _POS_FIELDING_SCALE,
     _POS_TIER,
     _POSITIONAL_OFFENSE_ADJ,
     _PROJ_WEIGHT_BASE,
@@ -250,45 +251,13 @@ def rank_hitters(
     _in_season = season == projection_season
     use_hitter_sim = not _in_season
 
-    # Compute multi-year xwOBA talent anchor for offense scoring.
-    # Recency-weighted (3/2/1) PA-weighted xwOBA over last 4 seasons.
-    # YoY r=0.759, std=0.053 — most stable and widest-spread offensive
-    # signal available.  Replaces compressed projected_woba/career_woba.
-    _xwoba_talent = pd.DataFrame()
-    try:
-        _xwoba_raw = read_sql("""
-            SELECT batter_id, season, xwoba, pa
-            FROM production.fact_batting_advanced
-            WHERE season BETWEEN :start AND :end AND pa >= 50
-        """, {"start": season - 4, "end": season})
-        if not _xwoba_raw.empty:
-            def _recency_xwoba(g: pd.DataFrame) -> pd.Series:
-                max_s, min_s = g["season"].max(), g["season"].min()
-                span = max(1, max_s - min_s)
-                w = g["pa"] * (1.0 + 2.0 * ((g["season"] - min_s) / span))
-                return pd.Series({
-                    "xwoba_talent": (g["xwoba"] * w).sum() / w.sum(),
-                    "xwoba_total_pa": g["pa"].sum(),
-                })
-            _xwoba_talent = (
-                _xwoba_raw.groupby("batter_id")
-                .apply(_recency_xwoba, include_groups=False)
-                .reset_index()
-            )
-            logger.info(
-                "xwOBA talent: %d players (std=%.4f)",
-                len(_xwoba_talent), _xwoba_talent["xwoba_talent"].std(),
-            )
-    except Exception:
-        logger.warning("Could not load xwOBA history for talent anchor")
-
-    # Build sub-scores
+    # Build sub-scores — baserunning first so it feeds into offense
+    baserunning = _build_hitter_baserunning_score(season=season)
     offense = _build_hitter_offense_score(
         proj, observed, aggressiveness=aggressiveness,
         use_sim_wrc_plus=use_hitter_sim,
-        xwoba_talent=_xwoba_talent if not _xwoba_talent.empty else None,
+        baserunning=baserunning,
     )
-    baserunning = _build_hitter_baserunning_score(season=season)
     platoon = _build_hitter_platoon_modifier(season=season)
     fielding = _build_hitter_fielding_score(season=season, in_season=_in_season)
     framing = _build_catcher_framing_score(season=season, in_season=_in_season)
@@ -483,61 +452,75 @@ def rank_hitters(
         + 0.50 * base.loc[is_catcher, "framing_score"]
     )
 
-    # Percentile-rank fielding and baserunning, then compress toward 0.50
-    # so their effective spread matches offense.  After early-season PA
-    # dampening, offense IQR ≈ 0.14 while raw percentile IQR ≈ 0.47.
-    # Without compression, 13% fielding weight has ~44% effective impact.
-    # Sigmoid compression: preserves rank order but pulls extremes toward
-    # center.  A 0.067 fielder → ~0.25 (not devastated), a 0.95 → ~0.80
-    # (still rewarded, not dominant).
-    base["fielding_combined"] = _pctl(base["fielding_combined"])
+    # Percentile-rank fielding WITHIN position group and baserunning
+    # across all hitters, then compress toward 0.50 so their effective
+    # spread matches offense.
+    #
+    # Fielding is inherently position-relative: a 0 OAA CF is exactly
+    # average at a premium defensive position, not 84th percentile of
+    # all hitters (which is what across-all-positions ranking produces
+    # when DHs and 1Bs fill the bottom).  Grouping by position means:
+    #   - PCA (+24 OAA CF) → top CF → 100th pctl CF → 0.875
+    #   - Marsh (0 OAA CF) → median CF → ~50th pctl CF → 0.500
+    #   - Buxton (+3 OAA CF) → above median CF → ~65th pctl CF → 0.613
+    # This matches fWAR's treatment where defensive runs are compared
+    # to positional baseline.
+    #
+    # Baserunning stays cross-position (speed matters equally everywhere).
+    #
+    # Reduced compression from 60/40 to 75/25.  The old 60/40 hard-capped
+    # the #1 fielder at 0.800 (indistinguishable from 95th pctl at 0.770),
+    # which was squashing elite defenders.  75/25 gives:
+    #   100th pctl → 0.875 (clear separation)
+    #    50th pctl → 0.500 (neutral unchanged)
+    #     0th pctl → 0.125 (still penalized, not zeroed)
+    base["fielding_combined"] = base.groupby("position")["fielding_combined"].transform(
+        lambda x: x.rank(pct=True, method="average")
+    )
     base["baserunning_score"] = _pctl(base["baserunning_score"])
-    # Compress: blend 60% percentile + 40% center (0.50)
-    base["fielding_combined"] = 0.60 * base["fielding_combined"] + 0.40 * 0.50
-    base["baserunning_score"] = 0.60 * base["baserunning_score"] + 0.40 * 0.50
+    base["fielding_combined"] = 0.75 * base["fielding_combined"] + 0.25 * 0.50
+    base["baserunning_score"] = 0.75 * base["baserunning_score"] + 0.25 * 0.50
 
     # Positional adjustment (FanGraphs-standard run values, 0-1 scale)
     base["positional_adj"] = base["position"].map(_POSITIONAL_OFFENSE_ADJ).fillna(0.333)
 
-    # For DH: redistribute fielding weight to offense + baserunning.
-    # DHs are evaluated purely on production -- no artificial cap.
-    is_dh = base["position"] == "DH"
-    dh_offense_wt = _HITTER_WEIGHTS["offense"] + _HITTER_WEIGHTS["fielding"] * 0.70
-    dh_baserunning_wt = _HITTER_WEIGHTS["baserunning"] + _HITTER_WEIGHTS["fielding"] * 0.30
+    # --- Position-dependent fielding weight (fWAR-aligned) ---
+    #
+    # Defense is a larger fraction of total WAR at premium positions
+    # (CF ~30%, SS ~28%) than at bat-first positions (1B ~11%, DH 0%).
+    # The fielding weight is scaled by position via _POS_FIELDING_SCALE,
+    # with the excess/deficit traded 1:1 with offense weight.
+    #
+    # This extends the existing DH pattern (DH scale=0.0, fielding
+    # weight fully redistributed to offense) to all positions.
+    base_fld_wt = _HITTER_WEIGHTS["fielding"]
+    base_off_wt = _HITTER_WEIGHTS["offense"]
+    pos_scale = base["position"].map(_POS_FIELDING_SCALE).fillna(1.0)
+    eff_fielding_wt = base_fld_wt * pos_scale
+    eff_offense_wt = base_off_wt + base_fld_wt * (1.0 - pos_scale)
 
-    # Dynamic fielding dampening for elite hitters.
-    # If you're so good with the bat, teams will hide you at DH/1B/corner OF.
-    # Worst fielder costs ~-15 runs; best hitter adds ~+50 runs -- fielding
-    # range is ~30% of offense range, so elite bats should have reduced
-    # fielding penalty.  Kicks in above 0.65 offense, reduces fielding
-    # weight by up to 75% at 1.00 offense.  Redistributed weight goes to
-    # offense.  Threshold lowered from 0.70 and ceiling raised from 0.50
-    # because early-season dampening compresses offense (IQR ~0.14),
-    # making 0.70 harder to reach while fielding spread stays wide.
+    # Dynamic fielding dampening for elite hitters — downside only.
+    #
+    # Kicks in above 0.65 offense AND below 0.50 fielding.  Reduces
+    # the position-scaled fielding weight by up to 60% at max
+    # (offense=1.0, fielding=0.0), redistributing to offense.
+    # More consequential at premium positions (SS/CF) where the
+    # fielding weight is higher.
     offense_excess = (base["offense_score"] - 0.65).clip(0) / 0.35
-    fielding_dampening = 0.75 * offense_excess
-    eff_fielding_wt = _HITTER_WEIGHTS["fielding"] * (1 - fielding_dampening)
-    eff_offense_boost = _HITTER_WEIGHTS["fielding"] * fielding_dampening
+    fielding_deficit = (0.50 - base["fielding_combined"]).clip(0) / 0.50
+    fielding_dampening = 0.60 * offense_excess * fielding_deficit
+    eff_offense_wt = eff_offense_wt + eff_fielding_wt * fielding_dampening
+    eff_fielding_wt = eff_fielding_wt * (1 - fielding_dampening)
 
-    # Standard composite (non-DH)
+    # Composite score (position-dependent offense/fielding, universal others)
     base["tdd_value_score"] = (
-        (_HITTER_WEIGHTS["offense"] + eff_offense_boost) * base["offense_score"]
+        eff_offense_wt * base["offense_score"]
         + _HITTER_WEIGHTS["baserunning"] * base["baserunning_score"]
         + eff_fielding_wt * base["fielding_combined"]
         + _HITTER_WEIGHTS["positional_adj"] * base["positional_adj"]
         + _HITTER_WEIGHTS["role"] * base["role_score"]
         + _HITTER_WEIGHTS["trajectory"] * base["trajectory_score"]
         + _HITTER_WEIGHTS["versatility"] * base["versatility_score"]
-    )
-    # DH composite: fielding + positional weight fully redistributed
-    dh_pos_wt = _HITTER_WEIGHTS["positional_adj"]  # DH positional_adj = 0.0, so this zeroes out
-    base.loc[is_dh, "tdd_value_score"] = (
-        dh_offense_wt * base.loc[is_dh, "offense_score"]
-        + dh_baserunning_wt * base.loc[is_dh, "baserunning_score"]
-        + dh_pos_wt * base.loc[is_dh, "positional_adj"]
-        + _HITTER_WEIGHTS["role"] * base.loc[is_dh, "role_score"]
-        + _HITTER_WEIGHTS["trajectory"] * base.loc[is_dh, "trajectory_score"]
-        + _HITTER_WEIGHTS["versatility"] * base.loc[is_dh, "versatility_score"]
     )
 
     # --- Two-way player bonus ---
@@ -680,11 +663,22 @@ def rank_hitters(
             dr_talent = dr_regressed.copy()       # no health penalty for talent
             dr_regressed = dr_regressed * health_penalty  # health penalty for current value
 
+            # DH players have zero defensive value -- their entire worth is
+            # already captured by production_composite (DH weight redistribution
+            # puts offense at 74% and fielding at 0%).  Scouting tools add noise
+            # rather than signal for full-time DHs, and low-PA dr_regressed
+            # regression toward 0.50 actively harms injured sluggers whose
+            # production is strong but sample is small.  Disable the scouting
+            # blend entirely for DH-classified hitters.
+            pos_col = base["position"] if "position" in base.columns else pd.Series("", index=base.index)
+            dh_mask = (pos_col == "DH").fillna(False)
+
             # ----- talent_upside_score: scouting-dominant -----
             # Tool grades carry heavy weight for forward-looking assessment.
             # Uses dr_talent (no health penalty -- tools and health are separate).
             # No positional multiplier -- raw talent regardless of position.
-            upside_w = cfg["upside_scout_weight"]
+            upside_w_default = cfg["upside_scout_weight"]
+            upside_w = pd.Series(upside_w_default, index=base.index).where(~dh_mask, 0.0)
             base["talent_upside_score"] = (
                 upside_w * dr_talent + (1 - upside_w) * production_composite
             )
@@ -701,6 +695,8 @@ def rank_hitters(
                 weight_ceil=cfg["scout_weight_ceil"],
                 weight_floor=cfg["scout_weight_floor"],
             )
+            if isinstance(scout_w, pd.Series):
+                scout_w = scout_w.where(~dh_mask, 0.0)
             base["current_value_score"] = (
                 scout_w * dr_regressed + (1 - scout_w) * production_composite
             )
@@ -769,6 +765,7 @@ def rank_hitters(
         "tdd_value_score",
         # Sub-scores
         "offense_score", "contact_skill", "decision_skill", "damage_skill", "production_skill",
+        "pathway_score", "pathway_lead", "offense_archetype",
         "baserunning_score", "platoon_score",
         "fielding_combined", "framing_score", "pt_score",
         "health_adj", "role_score", "versatility_score", "roster_value_score",
@@ -887,6 +884,154 @@ def rank_pitchers(
             _n_po, len(observed),
         )
 
+    # --- Multi-year observed stats for score computation ---
+    #
+    # Pull 2023-2025 pitching stats and build a recency × BF weighted
+    # blend.  This gives injury-return pitchers (McClanahan, Bradish,
+    # Ragans, deGrom) a meaningful fallback when 2025 data is missing
+    # or limited.  Parallels the hitter multi-year block (lines ~186-228).
+    #
+    # For display, we still use the single-season `observed` frame.
+    # For scoring, we use `observed_blended` which has:
+    #   - Weighted-average rate stats across 2023-2025
+    #   - SUM of batters_faced across years (so trust ramp sees full
+    #     data volume, not just single-season)
+    #
+    # Weights: recency 3/2/1 × BF (sample size).  A pitcher with 0 BF
+    # in 2025 but 700 BF in 2023 still gets full scoring treatment.
+    try:
+        obs_multi_p = read_sql(f"""
+            SELECT pitcher_id, season, batters_faced,
+                   k_pct, bb_pct, swstr_pct, csw_pct,
+                   zone_pct, chase_pct, contact_pct, xwoba_against,
+                   barrel_pct_against, hard_hit_pct_against, woba_against
+            FROM production.fact_pitching_advanced
+            WHERE season BETWEEN {season - 3} AND {season}
+              AND batters_faced >= 50
+        """, {})
+        if not obs_multi_p.empty:
+            # 4-year window (season-3 to season) with heavy recency bias.
+            # The 3-year window missed pitchers like McClanahan whose last
+            # healthy year was 2022.  Weights 4/3/2/1 keep current year
+            # dominant while giving ghost-data for long-injured pitchers.
+            recency_map = {season: 4, season - 1: 3, season - 2: 2, season - 3: 1}
+            obs_multi_p["recency_wt"] = obs_multi_p["season"].map(recency_map).fillna(1)
+            obs_multi_p["total_wt"] = obs_multi_p["recency_wt"] * obs_multi_p["batters_faced"]
+
+            _rate_cols_p = [
+                "k_pct", "bb_pct", "swstr_pct", "csw_pct",
+                "zone_pct", "chase_pct", "contact_pct", "xwoba_against",
+                "barrel_pct_against", "hard_hit_pct_against", "woba_against",
+            ]
+
+            def _wtd_p(g, col):
+                valid = g[g[col].notna()]
+                if valid.empty or valid["total_wt"].sum() == 0:
+                    return np.nan
+                return np.average(valid[col], weights=valid["total_wt"])
+
+            # Base multi-year blend (recency × BF weighted)
+            rows = []
+            for pid, g in obs_multi_p.groupby("pitcher_id"):
+                row = {"pitcher_id": pid}
+                for col in _rate_cols_p:
+                    row[col] = _wtd_p(g, col)
+                # Total BF across years (lets trust ramp see full data)
+                row["batters_faced"] = g["batters_faced"].sum()
+                row["obs_years_p"] = g["season"].nunique()
+                rows.append(row)
+            observed_blended = pd.DataFrame(rows)
+
+            # --- Breakout detection + confidence-weighted override ---
+            #
+            # When a pitcher's current-year K% is dramatically better than
+            # their prior-year average, treat the current year as a
+            # belief update rather than just another data point.  Players
+            # like Cole Ragans (2025: 37.9% K% in 258 BF, vs 29.4% career)
+            # get their breakout diluted by merely-good prior years in
+            # a pure weighted average because 2024 had 3x the BF.
+            #
+            # Trigger: current year K% > 25% relative to prior weighted
+            # average AND current year >= 100 BF.
+            #
+            # Override: replace the weighted average for breakout players
+            # with a confidence-scaled blend:
+            #   current_share = 0.50 + 0.30 × min(current_bf / 300, 1.0)
+            # At 100 BF → 0.60 current, 0.40 prior
+            # At 300 BF → 0.80 current, 0.20 prior
+            # The prior component is the BF-weighted average of prior
+            # years (no recency weighting — equal treatment for the floor).
+            _current = obs_multi_p[obs_multi_p["season"] == season]
+            _prior = obs_multi_p[obs_multi_p["season"] < season]
+            _cur_k = _current.set_index("pitcher_id")["k_pct"]
+            _cur_bf = _current.set_index("pitcher_id")["batters_faced"]
+            if not _prior.empty:
+                _prior_k_avg = (
+                    _prior.groupby("pitcher_id")
+                    .apply(
+                        lambda g: (g["k_pct"] * g["batters_faced"]).sum() / max(g["batters_faced"].sum(), 1),
+                        include_groups=False,
+                    )
+                )
+            else:
+                _prior_k_avg = pd.Series(dtype=float)
+            _k_gain = (_cur_k / _prior_k_avg.reindex(_cur_k.index)) - 1
+            breakout_pids = set(
+                _cur_k.index[
+                    (_k_gain > 0.25) & (_cur_bf.reindex(_cur_k.index) >= 100)
+                ]
+            )
+            if breakout_pids:
+                # Apply Option B override to each breakout player
+                obs_blended_indexed = observed_blended.set_index("pitcher_id")
+                current_indexed = _current.set_index("pitcher_id")
+                overridden = 0
+                for pid in breakout_pids:
+                    if pid not in obs_blended_indexed.index or pid not in current_indexed.index:
+                        continue
+                    prior_rows = _prior[_prior["pitcher_id"] == pid]
+                    if prior_rows.empty:
+                        continue
+                    cur_row = current_indexed.loc[pid]
+                    cur_bf_val = cur_row["batters_faced"]
+                    confidence = min(cur_bf_val / 300.0, 1.0)
+                    current_share = 0.50 + 0.30 * confidence
+                    prior_share = 1.0 - current_share
+
+                    for col in _rate_cols_p:
+                        cur_val = cur_row[col] if col in cur_row.index else np.nan
+                        if pd.isna(cur_val):
+                            continue
+                        prior_vals = prior_rows[col]
+                        prior_wts = prior_rows["batters_faced"]
+                        valid = prior_vals.notna() & (prior_wts > 0)
+                        if not valid.any():
+                            continue
+                        prior_avg = np.average(
+                            prior_vals[valid].values,
+                            weights=prior_wts[valid].values,
+                        )
+                        obs_blended_indexed.at[pid, col] = (
+                            current_share * cur_val + prior_share * prior_avg
+                        )
+                    overridden += 1
+                observed_blended = obs_blended_indexed.reset_index()
+                logger.info(
+                    "Breakout detection: %d pitchers overridden with confidence blend (K%% gain > 25%%)",
+                    overridden,
+                )
+
+            logger.info(
+                "Multi-year pitching stats: %d pitchers (%d with 2+ years)",
+                len(observed_blended),
+                (observed_blended["obs_years_p"] >= 2).sum(),
+            )
+        else:
+            observed_blended = observed
+    except Exception:
+        logger.warning("Could not load multi-year pitching stats -- using single-season", exc_info=True)
+        observed_blended = observed
+
     # Role assignment -- prefer in-memory roles, then disk, then heuristic
     rp_roles = pitcher_roles_df
     if rp_roles is None:
@@ -922,9 +1067,11 @@ def rank_pitchers(
 
     use_pitcher_sim = season != projection_season
 
-    # Build sub-scores
-    stuff = _build_pitcher_stuff_score(proj, observed, run_values=run_values)
-    command = _build_pitcher_command_score(proj, observed, efficiency=efficiency)
+    # Build sub-scores (use multi-year blended observed for scoring so
+    # injury-return pitchers get fallback to prior years; single-season
+    # `observed` is kept for display merge below)
+    stuff = _build_pitcher_stuff_score(proj, observed_blended, run_values=run_values)
+    command = _build_pitcher_command_score(proj, observed_blended, efficiency=efficiency)
     workload = _build_pitcher_workload_score(
         health_df=health_df, use_counting_sim=use_pitcher_sim,
     )
@@ -1138,6 +1285,51 @@ def rank_pitchers(
             + _SP_WEIGHTS["trajectory"] * base.loc[neither, "trajectory_score"]
             + _SP_WEIGHTS["glicko"] * base.loc[neither, "glicko_score"]
         )
+
+    # --- Career-BF regression (small-sample rookie discount) ---
+    #
+    # Low-BF rookies (Messick 165 BF, similar-sized samples) get
+    # overranked because their observed stats look good in a partial
+    # season AND the Bayesian projection doesn't regress them enough.
+    # Apply a direct multiplicative regression on the composite based
+    # on career BF (multi-year sum already in observed_blended).
+    #
+    # Formula: factor = 0.80 + 0.20 × (career_bf / 1000).clip(0, 1)
+    #      0 BF → 0.80 (20% discount)
+    #    200 BF → 0.84
+    #    500 BF → 0.90
+    #   1000 BF → 1.00 (no discount)
+    #
+    # This only affects pitchers with less than ~1.5 full starter
+    # seasons of career data.  Skenes (1200+ BF), Crochet (full career),
+    # Schwellenbach (936 BF) get minimal or no discount.  Messick
+    # (165 BF) gets a meaningful cap.
+    career_bf_map = (
+        observed_blended.set_index("pitcher_id")["batters_faced"]
+        if "batters_faced" in observed_blended.columns
+        else pd.Series(dtype=float)
+    )
+    base["career_bf"] = base["pitcher_id"].map(career_bf_map).fillna(0)
+    bf_reliability = (base["career_bf"] / 1000).clip(0, 1)
+    base["career_bf_factor"] = 0.80 + 0.20 * bf_reliability
+    base["tdd_value_score"] = base["tdd_value_score"] * base["career_bf_factor"]
+
+    # --- Role value multiplier (SP vs RP fWAR parity) ---
+    #
+    # SP composites and RP composites are role-normalized percentiles:
+    # a 0.80 RP stuff_score means "top 20% of RPs", not comparable to
+    # a 0.80 SP stuff_score which means "top 20% of SPs".  Without a
+    # role-level adjustment, sorting them together puts top RPs in the
+    # overall top 10 despite their lower fWAR potential.
+    #
+    # fWAR evidence: top SPs project ~5-6 fWAR, top RPs project ~2-3
+    # fWAR, giving a ratio of roughly 2.2-2.5x.  Applying a 0.70 RP
+    # multiplier lands top RPs around overall #50-80 (alongside mid-tier
+    # SPs), which matches FG Depth Charts distribution.
+    _RP_ROLE_VALUE = 0.70
+    base.loc[is_rp, "tdd_value_score"] = (
+        base.loc[is_rp, "tdd_value_score"] * _RP_ROLE_VALUE
+    )
 
     # --- Two-score architecture: current_value + talent_upside ---
     # Save production composite before scouting blending.

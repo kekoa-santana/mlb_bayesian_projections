@@ -96,10 +96,12 @@ def _build_pitcher_stuff_score(
         ["pitcher_id", "projected_k_rate", "projected_hr_per_bf",
          "whiff_rate", "gb_pct"]
     ].drop_duplicates("pitcher_id", keep="first")
-    o_cols = ["pitcher_id", "swstr_pct", "csw_pct", "xwoba_against",
+    o_cols = ["pitcher_id", "k_pct", "swstr_pct", "csw_pct", "xwoba_against",
               "barrel_pct_against", "hard_hit_pct_against"]
     if "batters_faced" in observed.columns:
         o_cols.append("batters_faced")
+    # Gracefully handle observed frames missing k_pct
+    o_cols = [c for c in o_cols if c in observed.columns]
     o_sub = observed[o_cols].drop_duplicates("pitcher_id", keep="first")
     merged = p_sub.merge(o_sub, on="pitcher_id", how="left")
 
@@ -122,34 +124,53 @@ def _build_pitcher_stuff_score(
 
     # Projected: K rate (higher = better), HR/BF (lower = better),
     # GB% (higher = better -- values groundball pitchers)
+    #
+    # Reweighted 2026-04-10 (v2): K% dominates 0.80, HR 0.15, GB 0.05.
+    # Previous 0.70/0.20/0.10 was still penalizing extreme-whiff RPs
+    # (Mason Miller: 45.9% K but 14th pctl GB%, 62nd pctl HR/BF) whose
+    # contact quality is inherently volatile at 200-300 BF samples.
+    # Stuff should measure PITCH QUALITY (what comes out of his hand),
+    # not run prevention; GB/HR stay as minor tiebreakers.
     proj_k = _pctl(merged["projected_k_rate"])
     proj_hr = _inv_pctl(merged["projected_hr_per_bf"])
     proj_gb = _pctl(merged["gb_pct"].fillna(merged["gb_pct"].median()))
-    projected = 0.55 * proj_k + 0.25 * proj_hr + 0.20 * proj_gb
+    projected = 0.80 * proj_k + 0.15 * proj_hr + 0.05 * proj_gb
 
-    # Observed: SwStr%, CSW%, xwOBA-against, barrel%-against,
-    # plus Stuff+ when available (league-normalized pitch quality)
+    # Observed: K%, SwStr%, CSW%, xwOBA-against, barrel%-against,
+    # plus Stuff+ when available (league-normalized pitch quality).
+    #
+    # K% added 2026-04-09 as the primary direct measure of stuff
+    # dominance.  Without it, K-dominant SPs like Crochet and Skenes
+    # were undervalued relative to command+efficiency profiles.
+    obs_k = _pctl(merged["k_pct"].fillna(0)) if "k_pct" in merged.columns else pd.Series(0.5, index=merged.index)
     obs_swstr = _pctl(merged["swstr_pct"].fillna(0))
     obs_csw = _pctl(merged["csw_pct"].fillna(0))
     obs_xwoba = _inv_pctl(merged["xwoba_against"].fillna(merged["xwoba_against"].median()))
     obs_barrel = _inv_pctl(merged["barrel_pct_against"].fillna(0))
 
+    # Observed branches reweighted 2026-04-10 (v2): contact-quality
+    # metrics (xwOBA, barrel%) reduced from ~20% to ~10% because they
+    # are noisy for small-sample RPs and redundant with Stuff+ which
+    # already reflects pitch quality.  K%/Stuff+ get the extra weight.
     if has_stuff_plus:
         # Stuff+ captures underlying pitch quality better than raw SwStr%/CSW%;
         # stabilizes in fewer pitches (~80) and predicts ROS better
         stuff_plus_score = _zscore_pctl(merged["arsenal_stuff_plus"].fillna(100))
         observed_score = (
-            0.30 * stuff_plus_score + 0.20 * obs_swstr + 0.20 * obs_csw
-            + 0.20 * obs_xwoba + 0.10 * obs_barrel
+            0.30 * obs_k + 0.30 * stuff_plus_score + 0.15 * obs_swstr + 0.15 * obs_csw
+            + 0.07 * obs_xwoba + 0.03 * obs_barrel
         )
     elif "weighted_rv_per_100" in merged.columns:
         obs_run_value = _inv_pctl(merged["weighted_rv_per_100"].fillna(merged["weighted_rv_per_100"].median()))
         observed_score = (
-            0.25 * obs_swstr + 0.25 * obs_csw + 0.20 * obs_run_value
-            + 0.20 * obs_xwoba + 0.10 * obs_barrel
+            0.30 * obs_k + 0.22 * obs_swstr + 0.20 * obs_csw + 0.15 * obs_run_value
+            + 0.08 * obs_xwoba + 0.05 * obs_barrel
         )
     else:
-        observed_score = 0.30 * obs_swstr + 0.30 * obs_csw + 0.25 * obs_xwoba + 0.15 * obs_barrel
+        observed_score = (
+            0.35 * obs_k + 0.27 * obs_swstr + 0.23 * obs_csw
+            + 0.10 * obs_xwoba + 0.05 * obs_barrel
+        )
 
     # BF-based trust ramp: SwStr%/CSW% stabilize ~150 pitches (~40 BF),
     # but full stuff picture needs ~300 BF.  At low BF, lean on projections.
@@ -326,6 +347,10 @@ def _build_pitcher_velo_trend(season: int = 2025) -> pd.DataFrame:
     """
     from src.data.db import read_sql
 
+    # Fastballs only (FF, SI) to isolate arm strength from pitch mix drift.
+    # Previous all-pitch average produced spurious deltas for pitchers with
+    # role changes (Whitlock 2024 injury -> 2025 health, changeup-heavy ->
+    # sinker-heavy gave +3.55 mph; his actual sinker gain was +2.4).
     velo = read_sql(f"""
         SELECT fp.pitcher_id, dg.season,
                AVG(fp.release_speed) as avg_velo,
@@ -334,8 +359,9 @@ def _build_pitcher_velo_trend(season: int = 2025) -> pd.DataFrame:
         JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
         WHERE dg.season >= {season - 1} AND dg.game_type = 'R'
               AND fp.release_speed != 'NaN'
+              AND fp.pitch_type IN ('FF', 'SI')
         GROUP BY fp.pitcher_id, dg.season
-        HAVING COUNT(*) >= 300
+        HAVING COUNT(*) >= 100
     """, {})
 
     if velo.empty:
@@ -413,15 +439,21 @@ def _build_pitcher_innings_durability(min_seasons: int = 2) -> pd.DataFrame:
 
 
 def _build_pitcher_trajectory_score(season: int = 2025) -> pd.DataFrame:
-    """Score trajectory using posterior certainty, projected quality,
-    age/decline risk, and velocity trend.
+    """Score trajectory using age, velocity trend, rate quality, and
+    projection certainty.
+
+    Reweighted 2026-04-10 to mirror the hitter trajectory composition:
+    age becomes the dominant signal (50%) because forward-looking
+    trajectory IS fundamentally about expected future value.  This
+    properly penalizes aging aces like Chris Sale (37, age factor 0.60)
+    relative to young aces like Crochet (26, age factor 1.0).
 
     Components
     ----------
-    - **Projection certainty** (35%): tighter posterior SD = more proven
-    - **Projected rate quality** (25%): high K%, low BB%
-    - **Age factor** (20%): upside for youth, decline penalty for 32+
+    - **Age factor** (50%): forward-looking decline curve
     - **Velocity trend** (20%): velo gain = upside, velo loss = risk
+    - **Projected rate quality** (15%): high K%, low BB%
+    - **Projection certainty** (15%): tighter posterior SD = more proven
 
     Returns
     -------
@@ -455,13 +487,24 @@ def _build_pitcher_trajectory_score(season: int = 2025) -> pd.DataFrame:
     proj = proj.merge(velo_trend, on="pitcher_id", how="left")
     proj["velo_delta"] = proj["velo_delta"].fillna(0)
 
-    # Convert velo delta to 0-1 score: +2 mph gain = 1.0, -2 mph loss = 0.0
-    velo_score = ((proj["velo_delta"] + 2.0) / 4.0).clip(0, 1)
+    # Asymmetric velo scale: losses penalized fully, gains rewarded modestly.
+    # Velo gains in established (especially 30+) pitchers are often noise
+    # or role-usage artifacts rather than real skill gains, while velo
+    # losses are a clear decline signal.  Scale: -1.5 mph = 0.0, 0 = 0.50,
+    # +1.5 mph or more = 0.80 (capped).  This prevents noisy velo gains
+    # from dominating trajectory for guys like Phil Maton or Gabe Speier.
+    _vd = proj["velo_delta"].values
+    velo_score = np.where(
+        _vd >= 0,
+        0.50 + 0.30 * np.clip(_vd / 1.5, 0, 1),
+        0.50 * (1 - np.clip(-_vd / 1.5, 0, 1)),
+    )
+    velo_score = pd.Series(velo_score, index=proj.index)
 
     proj["trajectory_score"] = (
-        0.35 * certainty_score
-        + 0.25 * rate_quality
-        + 0.20 * age_factor
+        0.50 * age_factor
         + 0.20 * velo_score
+        + 0.15 * rate_quality
+        + 0.15 * certainty_score
     )
     return proj[["pitcher_id", "trajectory_score", "velo_delta"]]

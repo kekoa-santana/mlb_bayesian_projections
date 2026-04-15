@@ -686,6 +686,66 @@ def get_hitter_observed_profile(season: int) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Hitter BIP profile (for batter-specific BIP outcome resolution in game sim)
+# ---------------------------------------------------------------------------
+def get_batter_bip_profile(seasons: list[int]) -> pd.DataFrame:
+    """Per-batter BIP quality metrics and observed BIP outcome splits.
+
+    Used by the game sim to resolve batted-in-play outcomes into
+    out/single/double/triple using batter-specific probabilities rather
+    than league averages.
+
+    Parameters
+    ----------
+    seasons : list[int]
+        One or more MLB seasons.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: batter_id, season, bip, bip_outs, bip_singles,
+        bip_doubles, bip_triples, avg_ev, avg_la, gb_pct.
+        Restricted to batters with >= 25 BIP.
+    """
+    query = """
+    SELECT
+        fpa.batter_id,
+        dg.season,
+        COUNT(*)                                                           AS bip,
+        SUM(CASE WHEN fpa.events IN (
+                'field_out','force_out','grounded_into_double_play',
+                'fielders_choice','fielders_choice_out','sac_fly',
+                'sac_fly_double_play','double_play','triple_play',
+                'sac_bunt','sac_bunt_double_play','field_error')
+                 THEN 1 ELSE 0 END)                                        AS bip_outs,
+        SUM(CASE WHEN fpa.events = 'single' THEN 1 ELSE 0 END)             AS bip_singles,
+        SUM(CASE WHEN fpa.events = 'double' THEN 1 ELSE 0 END)             AS bip_doubles,
+        SUM(CASE WHEN fpa.events = 'triple' THEN 1 ELSE 0 END)             AS bip_triples,
+        AVG(sbb.launch_speed)                                              AS avg_ev,
+        AVG(sbb.launch_angle)                                              AS avg_la,
+        SUM(CASE WHEN sbb.launch_angle < 10 THEN 1 ELSE 0 END)::float
+            / NULLIF(COUNT(*), 0)                                          AS gb_pct
+    FROM production.fact_pa fpa
+    JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
+    JOIN production.sat_batted_balls sbb ON fpa.pa_id = sbb.pa_id
+    WHERE dg.season = ANY(:seasons)
+      AND dg.game_type = 'R'
+      AND sbb.launch_speed IS NOT NULL
+      AND sbb.launch_speed != 'NaN'
+      AND sbb.launch_angle IS NOT NULL
+      AND sbb.launch_angle != 'NaN'
+      AND fpa.events IS NOT NULL
+      AND fpa.events NOT IN ('home_run','strikeout','strikeout_double_play',
+                             'walk','intent_walk','hit_by_pitch','catcher_interf')
+    GROUP BY fpa.batter_id, dg.season
+    HAVING COUNT(*) >= 25
+    ORDER BY dg.season, COUNT(*) DESC
+    """
+    logger.info("Fetching batter BIP profile for seasons %s", seasons)
+    return read_sql(query, {"seasons": seasons})
+
+
+# ---------------------------------------------------------------------------
 # Hitter aggressiveness profile
 # ---------------------------------------------------------------------------
 def get_hitter_aggressiveness(season: int) -> pd.DataFrame:

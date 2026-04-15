@@ -98,6 +98,132 @@ def _compute_prop_metrics(
     }
 
 
+def _compute_point_metrics(df: pd.DataFrame) -> dict[str, float]:
+    """Point-prediction quality: expected vs actual count."""
+    mask = df["expected"].notna() & df["actual"].notna()
+    if mask.sum() < 10:
+        return {}
+    exp = df.loc[mask, "expected"].astype(float).values
+    act = df.loc[mask, "actual"].astype(float).values
+    diff = exp - act
+    return {
+        "n_point": int(mask.sum()),
+        "mean_exp": float(exp.mean()),
+        "mean_act": float(act.mean()),
+        "bias": float(diff.mean()),
+        "mae": float(np.abs(diff).mean()),
+        "rmse": float(np.sqrt((diff ** 2).mean())),
+    }
+
+
+def _compute_pick_metrics(df: pd.DataFrame) -> dict[str, float]:
+    """Pick hit rate: blind-bet the model's favored side at each row's
+    default line. Also breaks out by confidence quartile."""
+    mask = (
+        df["p_over"].notna()
+        & df["actual"].notna()
+        & df["line"].notna()
+    )
+    if mask.sum() < 20:
+        return {}
+    p = df.loc[mask, "p_over"].astype(float).values
+    actual = df.loc[mask, "actual"].astype(float).values
+    line = df.loc[mask, "line"].astype(float).values
+    # Drop exact coin flips (no pick)
+    nontrivial = p != 0.5
+    p = p[nontrivial]
+    actual = actual[nontrivial]
+    line = line[nontrivial]
+    if len(p) == 0:
+        return {}
+    pick_over = p > 0.5
+    actual_over = actual > line
+    win = pick_over == actual_over
+    # Confidence quartiles on |p - 0.5|
+    conf = np.abs(p - 0.5)
+    edges = np.quantile(conf, [0.25, 0.5, 0.75])
+    bucket = np.digitize(conf, edges)  # 0..3
+    out = {
+        "n_picks": int(len(p)),
+        "pick_hit_rate": float(win.mean()),
+    }
+    for b in range(4):
+        idx = bucket == b
+        if idx.sum() >= 10:
+            out[f"hit_q{b + 1}"] = float(win[idx].mean())
+    return out
+
+
+def _compute_per_line_metrics(
+    df: pd.DataFrame, lines: list[float],
+) -> list[dict]:
+    """Per-line Brier / ECE / calibration breakdown."""
+    rows: list[dict] = []
+    for line in lines:
+        col = f"p_over_{line:.1f}"
+        if col not in df.columns:
+            continue
+        mask = df[col].notna() & df["actual"].notna()
+        if mask.sum() < 20:
+            continue
+        p = np.clip(df.loc[mask, col].astype(float).values, 0, 1)
+        y = (df.loc[mask, "actual"].astype(float).values > line).astype(float)
+        if y.std() == 0:
+            continue
+        rows.append({
+            "line": line,
+            "n": int(mask.sum()),
+            "mean_pred": float(p.mean()),
+            "mean_actual": float(y.mean()),
+            "brier": float(brier_score_loss(y, p)),
+            "ece": compute_ece(p, y),
+            "temp": compute_temperature(p, y),
+        })
+    return rows
+
+
+def _compute_calibration_bins(
+    df: pd.DataFrame, lines: list[float], n_bins: int = 10,
+) -> list[dict]:
+    """Pool predictions across all stored lines and bin into n_bins
+    calibration buckets. Each row shows predicted-vs-empirical hit rate."""
+    preds: list[float] = []
+    hits: list[int] = []
+    for line in lines:
+        col = f"p_over_{line:.1f}"
+        if col not in df.columns:
+            continue
+        mask = df[col].notna() & df["actual"].notna()
+        if mask.sum() == 0:
+            continue
+        p = np.clip(df.loc[mask, col].astype(float).values, 0, 1)
+        y = (df.loc[mask, "actual"].astype(float).values > line).astype(int)
+        preds.extend(p.tolist())
+        hits.extend(y.tolist())
+    if len(preds) < 50:
+        return []
+    preds_arr = np.asarray(preds)
+    hits_arr = np.asarray(hits)
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    rows: list[dict] = []
+    for i in range(n_bins):
+        lo, hi = edges[i], edges[i + 1]
+        if i == n_bins - 1:
+            idx = (preds_arr >= lo) & (preds_arr <= hi)
+        else:
+            idx = (preds_arr >= lo) & (preds_arr < hi)
+        n = int(idx.sum())
+        if n == 0:
+            continue
+        rows.append({
+            "bin": f"[{lo:.1f},{hi:.1f})",
+            "n": n,
+            "mean_pred": float(preds_arr[idx].mean()),
+            "empirical": float(hits_arr[idx].mean()),
+        })
+    return rows
+
+
 def _stratified_daily(
     df: pd.DataFrame,
     lines: list[float],
@@ -159,11 +285,19 @@ def main() -> None:
                         help="Stats to validate (K, BB, HR, H, Outs, TB)")
     parser.add_argument("--stratify", action="store_true",
                         help="Show stratified metrics by context columns")
+    parser.add_argument("--detail", action="store_true",
+                        help="Show per-line breakdown and calibration bins")
+    parser.add_argument("--props-path", type=str, default=None,
+                        help="Override path to the props parquet file "
+                             "(defaults to dashboard game_props.parquet)")
     args = parser.parse_args()
 
-    props_path = DASHBOARD_DIR / "game_props.parquet"
+    props_path = (
+        Path(args.props_path) if args.props_path
+        else DASHBOARD_DIR / "game_props.parquet"
+    )
     if not props_path.exists():
-        logger.error("game_props.parquet not found at %s", props_path)
+        logger.error("props parquet not found at %s", props_path)
         sys.exit(1)
 
     df = pd.read_parquet(props_path)
@@ -202,32 +336,89 @@ def main() -> None:
 
     # Compute metrics per (player_type, stat)
     summary_rows: list[dict] = []
+    point_rows: list[dict] = []
+    pick_rows: list[dict] = []
 
     for (ptype, stat), group in df.groupby(["player_type", "stat"]):
         line_map = _BATTER_LINES if ptype == "batter" else _STAT_LINES
         lines = line_map.get(stat, [0.5, 1.5])
 
         m = _compute_prop_metrics(group, lines)
-        if not m:
-            continue
+        if m:
+            summary_rows.append({"side": ptype, "stat": stat, **m})
 
-        summary_rows.append({
-            "side": ptype,
-            "stat": stat,
-            **m,
-        })
+        pm = _compute_point_metrics(group)
+        if pm:
+            point_rows.append({"side": ptype, "stat": stat, **pm})
+
+        km = _compute_pick_metrics(group)
+        if km:
+            pick_rows.append({"side": ptype, "stat": stat, **km})
 
     if summary_rows:
         summary = pd.DataFrame(summary_rows)
         print("\n" + "=" * 75)
-        print("DAY-FORWARD PROP VALIDATION")
+        print("PROBABILITY CALIBRATION (Brier / ECE / Temperature)")
         print("=" * 75)
+        print("  Brier  -- lower is better (0.25 = coin flip)")
+        print("  ECE    -- expected calibration error, lower is better")
+        print("  Temp   -- >1 overconfident, <1 underconfident, 1 = calibrated")
         display = ["side", "stat", "n",
                     "avg_brier", "avg_ece", "avg_temp"]
         avail = [c for c in display if c in summary.columns]
         print(summary[avail].to_string(index=False))
     else:
         logger.warning("No groups had enough data for metrics")
+
+    if point_rows:
+        point_df = pd.DataFrame(point_rows)
+        print("\n" + "=" * 75)
+        print("POINT PREDICTION (Expected vs Actual)")
+        print("=" * 75)
+        print("  bias   -- mean(expected - actual); positive = model runs hot")
+        print("  mae    -- mean absolute error")
+        print("  rmse   -- root mean squared error")
+        display = ["side", "stat", "n_point",
+                    "mean_exp", "mean_act", "bias", "mae", "rmse"]
+        avail = [c for c in display if c in point_df.columns]
+        print(point_df[avail].round(3).to_string(index=False))
+
+    if pick_rows:
+        pick_df = pd.DataFrame(pick_rows)
+        print("\n" + "=" * 75)
+        print("PICK HIT RATE (blind-bet the model's favored side)")
+        print("=" * 75)
+        print("  pick_hit_rate -- fraction of rows where favored side won")
+        print("  hit_q1..q4    -- hit rate by confidence quartile (q4 = most confident)")
+        display = ["side", "stat", "n_picks",
+                    "pick_hit_rate", "hit_q1", "hit_q2", "hit_q3", "hit_q4"]
+        avail = [c for c in display if c in pick_df.columns]
+        print(pick_df[avail].round(3).to_string(index=False))
+
+    if args.detail:
+        print("\n" + "=" * 75)
+        print("PER-LINE BREAKDOWN")
+        print("=" * 75)
+        for (ptype, stat), group in df.groupby(["player_type", "stat"]):
+            line_map = _BATTER_LINES if ptype == "batter" else _STAT_LINES
+            lines = line_map.get(stat, [0.5, 1.5])
+            rows = _compute_per_line_metrics(group, lines)
+            if not rows:
+                continue
+            print(f"\n{ptype} {stat}:")
+            print(pd.DataFrame(rows).round(4).to_string(index=False))
+
+        print("\n" + "=" * 75)
+        print("CALIBRATION BINS (predicted vs empirical hit rate)")
+        print("=" * 75)
+        for (ptype, stat), group in df.groupby(["player_type", "stat"]):
+            line_map = _BATTER_LINES if ptype == "batter" else _STAT_LINES
+            lines = line_map.get(stat, [0.5, 1.5])
+            rows = _compute_calibration_bins(group, lines)
+            if not rows:
+                continue
+            print(f"\n{ptype} {stat}:")
+            print(pd.DataFrame(rows).round(3).to_string(index=False))
 
     # Stratified metrics
     if args.stratify:

@@ -631,3 +631,57 @@ def get_reliever_role_history(
     """
     logger.info("Fetching reliever role history for seasons %s (min_games=%d)", seasons, min_games)
     return read_sql(query)
+
+
+def get_reliever_stats_by_team(
+    seasons: list[int],
+    min_bf: int = 20,
+) -> pd.DataFrame:
+    """Per-reliever-season stats with team assignment for bullpen tier profiles.
+
+    Like ``get_reliever_role_history`` but includes ``team_id`` (most-used
+    team) and filters by BF instead of games.
+
+    Parameters
+    ----------
+    seasons : list[int]
+        Seasons to include.
+    min_bf : int
+        Minimum total BF to include a reliever.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, team_id, season, games, bf, k, bb, hr.
+    """
+    season_list = ", ".join(str(s) for s in seasons)
+    query = f"""
+    WITH reliever_team AS (
+        SELECT
+            fpg.player_id AS pitcher_id,
+            fpg.team_id,
+            fpg.season,
+            COUNT(*)         AS games,
+            SUM(fpg.pit_bf)  AS bf,
+            SUM(fpg.pit_k)   AS k,
+            SUM(fpg.pit_bb)  AS bb,
+            SUM(fpg.pit_hr)  AS hr,
+            ROW_NUMBER() OVER (
+                PARTITION BY fpg.player_id, fpg.season
+                ORDER BY SUM(fpg.pit_bf) DESC
+            ) AS team_rank
+        FROM production.fact_player_game_mlb fpg
+        JOIN production.dim_game dg ON fpg.game_pk = dg.game_pk
+        WHERE fpg.pit_is_starter = FALSE
+          AND dg.game_type = 'R'
+          AND fpg.pit_bf >= 1
+          AND fpg.season IN ({season_list})
+        GROUP BY fpg.player_id, fpg.team_id, fpg.season
+    )
+    SELECT pitcher_id, team_id, season, games, bf, k, bb, hr
+    FROM reliever_team
+    WHERE team_rank = 1 AND bf >= {min_bf}
+    ORDER BY team_id, season, bf DESC
+    """
+    logger.info("Fetching reliever stats by team for seasons %s", seasons)
+    return read_sql(query)

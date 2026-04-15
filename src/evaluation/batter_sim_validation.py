@@ -242,6 +242,47 @@ def build_batter_sim_predictions(
     # --- 7. Matchup data ---
     pitcher_arsenal = get_pitcher_arsenal(last_train)
     hitter_vuln = get_hitter_vulnerability(last_train)
+
+    # --- 7b. Batter BIP profiles (per-batter out/single/double/triple) ---
+    # Strictly train-only: use train_seasons to build profiles so we don't
+    # leak test-season BIP splits.
+    from src.data.queries.hitter import get_batter_bip_profile
+    from src.data.queries.traditional import get_sprint_speed
+    from src.models.game_sim.bip_model import compute_player_bip_probs
+    _bip_raw = get_batter_bip_profile(train_seasons)
+    _sprint_map: dict[int, float] = {}
+    try:
+        _sp = get_sprint_speed(last_train)
+        for _, r in _sp.iterrows():
+            _sprint_map[int(r["player_id"])] = float(r["sprint_speed"])
+    except Exception:
+        pass
+    batter_bip_lookup: dict[int, np.ndarray] = {}
+    if not _bip_raw.empty:
+        _bip_raw = _bip_raw.sort_values(["batter_id", "season"])
+        _bip_latest = _bip_raw.groupby("batter_id").tail(1)
+        for _, r in _bip_latest.iterrows():
+            resolved = int(
+                r["bip_outs"] + r["bip_singles"] + r["bip_doubles"] + r["bip_triples"]
+            )
+            if resolved <= 0:
+                continue
+            obs = {
+                "out": r["bip_outs"] / resolved,
+                "single": r["bip_singles"] / resolved,
+                "double": r["bip_doubles"] / resolved,
+                "triple": r["bip_triples"] / resolved,
+            }
+            probs = compute_player_bip_probs(
+                avg_ev=float(r.get("avg_ev") or 88.0),
+                avg_la=float(r.get("avg_la") or 12.0),
+                gb_pct=float(r.get("gb_pct") or 0.44),
+                sprint_speed=_sprint_map.get(int(r["batter_id"]), 27.0),
+                observed_bip_splits=obs, bip_count=int(r["bip"]),
+                shrinkage_k=900,
+            )
+            batter_bip_lookup[int(r["batter_id"])] = np.asarray(probs, dtype=np.float64)
+    logger.info("Batter BIP lookup: %d batters", len(batter_bip_lookup))
     from src.data.league_baselines import get_baselines_dict
     baselines_pt = get_baselines_dict(seasons=train_seasons, recency_weights="equal")
 
@@ -377,6 +418,7 @@ def build_batter_sim_predictions(
                 bullpen_matchup_k_lift=bp_matchup_k,
                 bullpen_matchup_bb_lift=bp_matchup_bb,
                 bullpen_matchup_hr_lift=bp_matchup_hr,
+                batter_bip_probs=batter_bip_lookup.get(int(batter_id)),
                 n_sims=n_sims,
                 random_seed=random_seed + game_pk % 10000 + batter_id % 1000,
             )
@@ -417,36 +459,19 @@ def build_batter_sim_predictions(
             "actual_pa": int(row["bat_pa"]),
         }
 
-        # Prop line probs
-        k_over = sim_result.over_probs("k", [0.5, 1.5])
-        for _, prow in k_over.iterrows():
-            col = f"p_k_over_{prow['line']:.1f}".replace(".", "_")
-            rec[col] = prow["p_over"]
-
-        h_over = sim_result.over_probs("h", [0.5, 1.5, 2.5])
-        for _, prow in h_over.iterrows():
-            col = f"p_h_over_{prow['line']:.1f}".replace(".", "_")
-            rec[col] = prow["p_over"]
-
-        hr_over = sim_result.over_probs("hr", [0.5])
-        for _, prow in hr_over.iterrows():
-            col = f"p_hr_over_{prow['line']:.1f}".replace(".", "_")
-            rec[col] = prow["p_over"]
-
-        tb_over = sim_result.over_probs("tb", [0.5, 1.5, 2.5, 3.5])
-        for _, prow in tb_over.iterrows():
-            col = f"p_tb_over_{prow['line']:.1f}".replace(".", "_")
-            rec[col] = prow["p_over"]
-
-        double_over = sim_result.over_probs("double", [0.5])
-        for _, prow in double_over.iterrows():
-            col = f"p_double_over_{prow['line']:.1f}".replace(".", "_")
-            rec[col] = prow["p_over"]
-
-        triple_over = sim_result.over_probs("triple", [0.5])
-        for _, prow in triple_over.iterrows():
-            col = f"p_triple_over_{prow['line']:.1f}".replace(".", "_")
-            rec[col] = prow["p_over"]
+        # Full p_over grid for every batter stat at half-lines 0.5-24.5,
+        # dot-formatted to match confident_picks / game_props.parquet so the
+        # dashboard validator can score them directly.
+        _ALL_LINES = [x + 0.5 for x in range(25)]
+        _BATTER_STATS = ("k", "bb", "h", "hr", "tb", "r", "rbi",
+                         "hrr", "double", "triple")
+        for stat_key in _BATTER_STATS:
+            over_df = sim_result.over_probs(stat_key, _ALL_LINES)
+            rec.setdefault(f"expected_{stat_key}", float(over_df["expected"].iloc[0]))
+            rec.setdefault(f"std_{stat_key}", float(over_df["std"].iloc[0]))
+            for _, prow in over_df.iterrows():
+                col = f"p_{stat_key}_over_{prow['line']:.1f}"
+                rec[col] = round(float(prow["p_over"]), 4)
 
         results.append(rec)
 

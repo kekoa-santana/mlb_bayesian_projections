@@ -230,25 +230,35 @@ def _build_hitter_offense_score(
     use_sim_wrc_plus: bool = True,
     il_player_ids: set[int] | None = None,
     xwoba_talent: pd.DataFrame | None = None,
+    baserunning: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Decomposed hitter offense: xwOBA talent anchor + Bayesian skill buckets.
+    """Production-anchored hitter offense with soft pathway credit.
 
-    Two-layer architecture:
+    Replaces the prior flat five-skill sum which linearly added inputs
+    (contact, decision) and outputs (damage, production) -- a structure
+    that penalized specialists by giving each input skill its own full
+    weight slot even when the player had already produced elite outcomes
+    via a different route.
 
-    **70% — xwOBA talent anchor** (multi-year recency-weighted xwOBA).
-    Measures bat-on-ball quality stripped of BABIP luck.  YoY r=0.759
-    (most stable offensive signal), std=0.053 (proper spread for ranking
-    differentiation).  For players with limited xwOBA history, blended
-    with Bayesian projected_woba using a reliability ramp.
+    New composition:
 
-    **30% — Bayesian skill buckets** (the TDD differentiator).
-    Decomposes offense into process components with uncertainty:
+    1. **Production (60%)**: wRC+ bottom-line run creation.  The outcome
+       anchor.  Two hitters with the same wRC+ get equal production
+       credit regardless of pathway.
+    2. **Soft pathway (25%)**: 0.66 * max(damage, contact) + 0.34 * mean.
+       Symmetric between the two routes to value -- neither power-first
+       nor contact-first is preferred.  A specialist gets ~90% of the
+       credit a balanced hitter earns at the same peak level; a hitter
+       strong on both gets a small bonus for having two routes.
+    3. **Decision (10%)**: BB% + chase + 2-strike whiff.  Standalone
+       because plate discipline adds independent value -- a patient
+       slugger beats an impatient slugger at the same damage level.
+    4. **Speed (5%)**: Offensive speed bonus (infield hits, BABIP boost).
+       Baserunning between bases is credited separately in the composite
+       via baserunning_score at its own weight.
 
-    1. **Contact skill** (stabilizes ~150 PA): K% projected, K% observed.
-    2. **Swing decisions** (stabilizes ~200 PA): BB% projected, chase rate,
-       two-strike whiff rate.
-    3. **Damage on contact** (stabilizes ~300 PA): xwOBA, barrel%, hard_hit%.
-    4. **Production** (stabilizes ~250 PA): wRC+ bottom-line check.
+    The function also exposes storytelling columns (pathway_lead and
+    offense_archetype) describing each player's primary route to value.
 
     Parameters
     ----------
@@ -263,9 +273,11 @@ def _build_hitter_offense_score(
         production buckets (avoids stale preseason sim during in-season
         rankings when ``season == projection_season``).
     xwoba_talent : pd.DataFrame, optional
-        Pre-computed multi-year xwOBA talent estimates.  Columns:
-        batter_id, xwoba_talent, xwoba_total_pa.  If None, falls back
-        to Bayesian projected_woba for the anchor.
+        Unused — retained for call-site compatibility.  The xwOBA talent
+        anchor has been removed in favor of the flat skill composite.
+    baserunning : pd.DataFrame, optional
+        Pre-computed baserunning scores.  Columns: batter_id, baserunning_score.
+        When provided, speed is included as 10% of offense.
 
     Returns
     -------
@@ -416,11 +428,9 @@ def _build_hitter_offense_score(
     else:
         obs_damage = proj_damage
 
-    # Damage trust: PA-based ramp only.  Age discounts and spike penalties
-    # are no longer needed here — the xwOBA talent anchor (70% of offense)
-    # already handles aging regression and BABIP luck via multi-year
-    # recency-weighted xwOBA.  The skill buckets (30%) measure current-
-    # season process quality, not total production.
+    # Damage trust: PA-based ramp only.  Multi-year recency-weighted
+    # Statcast columns already smooth outlier seasons; age regression
+    # is handled by trajectory_score in the overall composite.
     damage_trust = _stat_family_trust(pa, min_pa=150, full_pa=550)
     merged["damage_skill"] = (1 - damage_trust) * proj_damage + damage_trust * obs_damage
 
@@ -453,67 +463,83 @@ def _build_hitter_offense_score(
     )
 
     # =================================================================
-    # Combine: xwOBA talent anchor + Bayesian skill buckets
+    # Combine: production-anchored with soft pathway credit.
     #
-    # 70% — xwOBA talent anchor.
-    #   Multi-year recency-weighted xwOBA (YoY r=0.759, std=0.053).
-    #   Measures bat-on-ball quality stripped of BABIP luck, park effects,
-    #   and defensive alignment noise.  For players with limited xwOBA
-    #   history, blended with Bayesian projected_woba via reliability ramp
-    #   (total xwOBA PA / 800, following Tango stabilization).
+    # Production (60%): wRC+ bottom line -- the outcome.  Two hitters
+    #   who produce the same runs get equal anchor value regardless of
+    #   HOW they produce.
+    # Pathway (25%): soft-max of damage_skill and contact_skill.  Takes
+    #   0.66 * max + 0.34 * mean so a pure specialist gets ~90% of the
+    #   credit of a balanced hitter at the same peak level, and a hitter
+    #   with both elite skills gets a small bonus for having two routes.
+    #   Neither route is preferred; they are symmetric alternatives.
+    # Decision (10%): BB% + chase + 2K-whiff.  Standalone because patience
+    #   adds value beyond both pathways -- a patient slugger beats an
+    #   impatient slugger at the same damage level.
+    # Speed (5%): residual offensive speed bonus.  Baserunning value
+    #   between bases is already credited separately in the composite;
+    #   this small weight captures infield-hit / BABIP boost that
+    #   production_skill partially misses.
     #
-    # 30% — Bayesian skill buckets (the TDD differentiator).
-    #   Decomposes offense into HOW a player produces, using Bayesian
-    #   posterior projections with full uncertainty.  Decision skill at 5%
-    #   since walk rate is already captured in xwOBA.
+    # Design replaces the prior flat five-skill sum which penalized
+    # specialists (e.g. power-first Caminero) by giving contact / decision
+    # their own full-value slots even when damage alone had already
+    # produced elite outcomes.
     # =================================================================
-    _proj_woba = merged["projected_woba"].fillna(0.310)
+    _W_PRODUCTION = 0.60
+    _W_PATHWAY = 0.25
+    _W_DECISION = 0.10
+    _W_SPEED = 0.05
+    _PATHWAY_MAX_MIX = 0.66  # 0.66*max + 0.34*mean; higher = more specialist-friendly
 
-    if xwoba_talent is not None and not xwoba_talent.empty:
-        merged = merged.merge(
-            xwoba_talent[["batter_id", "xwoba_talent", "xwoba_total_pa"]],
-            on="batter_id", how="left",
-        )
-        _xwoba_t = merged["xwoba_talent"].fillna(_proj_woba)
-        _xwoba_pa = merged["xwoba_total_pa"].fillna(0)
-        # Reliability ramp: at 800+ PA of xwOBA data, trust xwOBA fully.
-        # At 0 PA, fall back to Bayesian projected_woba.
-        # Tango stabilization for xwOBA ~200-300 PA; we use 800 for a
-        # conservative ramp that ensures multi-season evidence.
-        _reliability = (_xwoba_pa / 800).clip(0, 1)
-        _talent_anchor = _reliability * _xwoba_t + (1 - _reliability) * _proj_woba
-        logger.info(
-            "xwOBA talent anchor: %d players, reliability mean=%.2f",
-            _reliability.notna().sum(), _reliability.mean(),
-        )
-    else:
-        # Fallback: Bayesian projected_woba only (compressed, std=0.018)
-        _talent_anchor = _proj_woba
-        logger.warning("No xwOBA talent data — falling back to projected_woba anchor")
+    # Merge baserunning if provided
+    if baserunning is not None and not baserunning.empty:
+        br_cols = ["batter_id", "baserunning_score"]
+        br_cols = [c for c in br_cols if c in baserunning.columns]
+        if "baserunning_score" in baserunning.columns:
+            br_sub = baserunning[br_cols].drop_duplicates("batter_id", keep="first")
+            merged = merged.merge(br_sub, on="batter_id", how="left")
 
-    talent_anchor = _zscore_pctl(_talent_anchor)
+    _speed = merged.get("baserunning_score", pd.Series(0.5, index=merged.index)).fillna(0.5)
 
-    bucket_composite = (
-        0.175 * merged["contact_skill"]
-        + 0.05 * merged["decision_skill"]
-        + 0.425 * merged["damage_skill"]
-        + 0.35 * merged["production_skill"]
+    # Soft-pathway: best of damage-or-contact with a mean tempering term.
+    # Symmetric between the two routes -- neither power nor contact is
+    # structurally preferred.  A "teetering on both" hitter who has damage
+    # 0.75 and contact 0.70 gets ~0.74 (slightly above their max), which
+    # is the small bonus for having two genuine pathways.
+    _pathway_max = np.maximum(merged["damage_skill"], merged["contact_skill"])
+    _pathway_mean = (merged["damage_skill"] + merged["contact_skill"]) / 2.0
+    merged["pathway_score"] = _PATHWAY_MAX_MIX * _pathway_max + (1 - _PATHWAY_MAX_MIX) * _pathway_mean
+
+    # Storytelling: which route is the player leaning on, and by how much.
+    # pathway_lead: "damage" if power-first, "contact" if contact-first.
+    # offense_archetype: "power-first" / "contact-first" / "balanced"
+    #   based on the gap between the two skills.
+    _pathway_gap = merged["damage_skill"] - merged["contact_skill"]
+    merged["pathway_lead"] = np.where(_pathway_gap >= 0, "damage", "contact")
+    merged["offense_archetype"] = np.where(
+        _pathway_gap > 0.15, "power-first",
+        np.where(_pathway_gap < -0.15, "contact-first", "balanced"),
     )
 
-    merged["offense_score"] = 0.70 * talent_anchor + 0.30 * bucket_composite
+    merged["offense_score"] = (
+        _W_PRODUCTION * merged["production_skill"]
+        + _W_PATHWAY * merged["pathway_score"]
+        + _W_DECISION * merged["decision_skill"]
+        + _W_SPEED * _speed
+    )
 
-    # Dampening: only for players with no xwOBA history AND no current
-    # season PA.  The xwOBA reliability ramp already handles regression
-    # for small samples.  This catches true unknowns (rookies with no
-    # Statcast history at all).
+    # Dampening for true unknowns (no Statcast history, no current PA).
+    # Trust ramps in individual buckets already handle small samples;
+    # this catches players with zero data at all.
     pa_safe = pa.fillna(0)
-    _has_xwoba = merged.get("xwoba_total_pa", pd.Series(0, index=merged.index)).fillna(0) > 0
-    _is_unknown = (~_has_xwoba) & (pa_safe < 50)
+    _is_unknown = pa_safe < 50
     dampening = np.where(_is_unknown, 0.20, 0.0)
     merged["offense_score"] = merged["offense_score"] * (1 - dampening) + 0.50 * dampening
 
     return merged[["batter_id", "offense_score", "contact_skill",
-                    "decision_skill", "damage_skill", "production_skill"]]
+                    "decision_skill", "damage_skill", "production_skill",
+                    "pathway_score", "pathway_lead", "offense_archetype"]]
 
 
 def _build_hitter_baserunning_score(season: int = 2025) -> pd.DataFrame:
@@ -540,13 +566,15 @@ def _build_hitter_baserunning_score(season: int = 2025) -> pd.DataFrame:
 
     proj = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet")
 
-    # Sprint speed + HP-to-1B from Statcast (fall back to prior season
-    # when current season data isn't available yet -- e.g. early April)
+    # Sprint speed + HP-to-1B from Statcast.  3-year window so we pick up
+    # data even when current season hasn't published yet (Savant releases
+    # sprint speed mid-season).  DISTINCT ON + ORDER BY season DESC prefers
+    # the most recent available year per player.
     speed_df = read_sql(f"""
         SELECT DISTINCT ON (player_id)
                player_id AS batter_id, sprint_speed, hp_to_1b
         FROM staging.statcast_sprint_speed
-        WHERE season BETWEEN {season - 1} AND {season}
+        WHERE season BETWEEN {season - 2} AND {season}
         ORDER BY player_id, season DESC
     """, {})
 
@@ -608,9 +636,16 @@ def _build_hitter_baserunning_score(season: int = 2025) -> pd.DataFrame:
     sb_volume_score = _pctl(sb_rate)
 
     # --- Component 4: SB efficiency (15%) ---
-    # Regress toward league average (~78%) using Bayesian shrinkage
+    # Regress toward league average (~78%) using Bayesian shrinkage.
+    #
+    # Gate: only percentile-rank among players with >= 10 attempts.
+    # Non-stealers with 1-2 attempts regress to ~78% and flood the
+    # distribution at the league mean, causing high-volume stealers
+    # with honest 76-77% rates to score worse than non-stealers.
+    # Witt (76.8% on 90 attempts) was scoring 14th percentile because
+    # 200+ non-stealers at exactly 78% crowded him out.
     _LEAGUE_SB_SUCCESS = 0.78
-    _SB_REGRESS_N = 10  # regress with 10 pseudo-attempts at league avg
+    _SB_REGRESS_N = 10
     obs_sb = merged["obs_sb"].fillna(0)
     obs_cs = merged["obs_cs"].fillna(0)
     obs_att = obs_sb + obs_cs
@@ -618,11 +653,14 @@ def _build_hitter_baserunning_score(season: int = 2025) -> pd.DataFrame:
         (obs_sb + _SB_REGRESS_N * _LEAGUE_SB_SUCCESS)
         / (obs_att + _SB_REGRESS_N)
     )
-    # Only score efficiency for players with enough attempts
-    has_attempts = obs_att >= 3
-    sb_eff_score = _pctl(regressed_success)
-    # Neutral (0.50) for players with < 3 attempts
-    sb_eff_score = np.where(has_attempts, sb_eff_score, 0.50)
+    has_attempts = obs_att >= 10
+    # Percentile-rank only among players with meaningful volume
+    qualified_mask = has_attempts.values
+    sb_eff_score = pd.Series(0.50, index=merged.index)
+    if qualified_mask.sum() >= 5:
+        sb_eff_score.loc[qualified_mask] = _zscore_pctl(
+            regressed_success[qualified_mask]
+        ).values
 
     # --- Component 5: Speed utilization (20%) ---
     # How much does this player steal relative to their sprint speed?
@@ -766,18 +804,34 @@ def _build_hitter_fielding_score(
     season: int = 2025,
     in_season: bool = False,
 ) -> pd.DataFrame:
-    """Build fielding score from multi-year OAA with position-aware regression.
+    """Build fielding score from multi-signal defensive composite.
 
-    Uses 3-year rolling OAA with recency weights (3/2/1), then regresses
-    toward 0 (position average) based on sample size and position group.
-    OF metrics are more stable (k=2), IF noisier (k=3).
+    Blends four signals with position-aware weights:
+    - **OAA** (primary): 3-year rolling, recency-weighted, regressed to
+      position-specific prior.  IF k=3, OF k=2.
+    - **Arm strength** (supplementary): ``arm_overall`` mph from Savant.
+      Available 2020+.  Matters for OF (throwing out runners) and IF
+      (turning DPs, preventing advances).
+    - **Catch probability** (OF only): difficulty-adjusted catch rate from
+      Savant star-level breakdowns.  Captures elite range beyond OAA.
+    - **Sprint speed** (range proxy): ``sprint_speed`` ft/s from Statcast.
+      Correlated with defensive range for both IF and OF.
+
+    Position-group weights (when all signals available):
+    - OF: OAA 50%, catch_prob 15%, arm 15%, speed 20%
+    - IF: OAA 55%, arm 20%, speed 25%
+    - 1B: OAA 65%, speed 35% (arm irrelevant)
+    - C:  OAA-only (framing handled separately)
+
+    When a signal is missing for a player, its weight is redistributed
+    proportionally to available signals.
 
     Parameters
     ----------
     season : int
-        Most recent season for OAA data.
+        Most recent season for defensive data.
     in_season : bool
-        If True, exclude current season OAA (too few games to be reliable)
+        If True, exclude current season (too few games to be reliable)
         and use prior 3 full seasons instead.
 
     Returns
@@ -787,8 +841,12 @@ def _build_hitter_fielding_score(
     """
     from src.data.db import read_sql
 
-    # In-season: current-year OAA from ~1 week is noise (gets 3x weight and
-    # wildly distorts scores).  Use prior 3 full seasons instead.
+    _IF_POSITIONS = {"SS", "2B", "3B", "1B"}
+    _OF_POSITIONS = {"LF", "CF", "RF"}
+
+    # ------------------------------------------------------------------
+    # 1. OAA — primary signal (existing logic)
+    # ------------------------------------------------------------------
     anchor = season - 1 if in_season else season
     oaa = read_sql(f"""
         SELECT player_id, season, position, outs_above_average
@@ -799,63 +857,180 @@ def _build_hitter_fielding_score(
     if oaa.empty:
         return pd.DataFrame(columns=["player_id", "fielding_score"])
 
-    # Recency weights: most recent season = 3, year-1 = 2, year-2 = 1
     oaa["weight"] = oaa["season"].map(
-        {season: 3, season - 1: 2, season - 2: 1}
+        {anchor: 3, anchor - 1: 2, anchor - 2: 1}
     ).fillna(1)
 
-    # Position-group regression constants (higher k = more regression)
-    # OF OAA is more stable (larger sample of chances); IF is noisier
-    _IF_POSITIONS = {"SS", "2B", "3B", "1B"}
-    _OF_POSITIONS = {"LF", "CF", "RF"}
-
-    # Determine primary position group per player (mode of positions played)
     pos_mode = (
         oaa.groupby("player_id")["position"]
         .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else "IF")
     )
 
-    # Weighted average OAA per player
     weighted = oaa.groupby("player_id").apply(
         lambda g: np.average(g["outs_above_average"], weights=g["weight"]),
         include_groups=False,
     ).rename("weighted_oaa")
 
-    # Count seasons with data per player (for reliability)
     n_seasons = oaa.groupby("player_id")["season"].nunique().rename("n_seasons")
 
     result = pd.DataFrame({"weighted_oaa": weighted, "n_seasons": n_seasons})
     result["position_group"] = pos_mode
 
-    # Regression constant: k=2 for OF (more stable), k=3 for IF (noisier)
     result["k"] = result["position_group"].apply(
         lambda p: 2 if p in _OF_POSITIONS else 3
     )
 
-    # Position-specific OAA priors (empirical means, 2023-2025).
-    # Unknown fielders regress toward their POSITION average, not 0.
-    # This prevents unproven 1B from getting neutral (50th pctl) scores
-    # when the typical 1B is below average defensively.
     _POSITION_OAA_PRIOR = {
         "CF": 2.8, "SS": 1.1, "2B": 0.2, "3B": -0.5,
         "1B": -0.9, "RF": -1.1, "LF": -1.4,
     }
     result["pos_prior"] = result["position_group"].map(_POSITION_OAA_PRIOR).fillna(0.0)
-
-    # Reliability: n_seasons / (n_seasons + k)
-    # 1 year IF: 1/4=0.25, 3 years IF: 3/6=0.50
-    # 1 year OF: 1/3=0.33, 3 years OF: 3/5=0.60
     result["reliability"] = result["n_seasons"] / (result["n_seasons"] + result["k"])
     result["regressed_oaa"] = (
         result["reliability"] * result["weighted_oaa"]
         + (1 - result["reliability"]) * result["pos_prior"]
     )
+    result["oaa_pctl"] = _pctl(result["regressed_oaa"]).clip(lower=0.10)
 
-    # Percentile rank the regressed OAA, with floor so worst defenders
-    # aren't zeroed out (even -15 OAA provides some value vs empty position)
-    result["fielding_score"] = _pctl(result["regressed_oaa"]).clip(lower=0.10)
+    result = result.reset_index()
 
-    return result.reset_index()[["player_id", "fielding_score"]]
+    # ------------------------------------------------------------------
+    # 2. Arm strength — recency-weighted (2-year window, data starts 2020)
+    # ------------------------------------------------------------------
+    arm = read_sql(f"""
+        SELECT player_id, season, arm_overall
+        FROM production.fact_arm_strength
+        WHERE season BETWEEN {anchor - 1} AND {anchor}
+          AND arm_overall IS NOT NULL
+    """, {})
+
+    if not arm.empty:
+        arm["w"] = arm["season"].map({anchor: 2, anchor - 1: 1}).fillna(1)
+        arm_avg = arm.groupby("player_id").apply(
+            lambda g: np.average(g["arm_overall"], weights=g["w"]),
+            include_groups=False,
+        ).rename("arm_mph")
+        result = result.merge(
+            arm_avg.reset_index(), on="player_id", how="left"
+        )
+    if "arm_mph" not in result.columns:
+        result["arm_mph"] = np.nan
+
+    result["arm_pctl"] = _pctl(result["arm_mph"])
+
+    # ------------------------------------------------------------------
+    # 3. Catch probability — OF only, recency-weighted
+    # ------------------------------------------------------------------
+    cp = read_sql(f"""
+        SELECT player_id, season, oaa AS cp_oaa,
+               pct_5star, pct_4star
+        FROM production.fact_catch_probability
+        WHERE season BETWEEN {anchor - 1} AND {anchor}
+    """, {})
+
+    if not cp.empty:
+        # Composite: 60% catch-prob OAA + 25% 5-star% + 15% 4-star%
+        for col in ["pct_5star", "pct_4star"]:
+            cp[col] = pd.to_numeric(cp[col], errors="coerce")
+        cp["cp_composite"] = (
+            0.60 * cp["cp_oaa"].fillna(0)
+            + 0.25 * (cp["pct_5star"].fillna(0) / 100.0) * 30  # scale to OAA-like range
+            + 0.15 * (cp["pct_4star"].fillna(0) / 100.0) * 20
+        )
+        cp["w"] = cp["season"].map({anchor: 2, anchor - 1: 1}).fillna(1)
+        cp_avg = cp.groupby("player_id").apply(
+            lambda g: np.average(g["cp_composite"], weights=g["w"]),
+            include_groups=False,
+        ).rename("cp_score")
+        result = result.merge(
+            cp_avg.reset_index(), on="player_id", how="left"
+        )
+    if "cp_score" not in result.columns:
+        result["cp_score"] = np.nan
+
+    result["cp_pctl"] = _pctl(result["cp_score"])
+
+    # ------------------------------------------------------------------
+    # 4. Sprint speed — range proxy, recency-weighted
+    # ------------------------------------------------------------------
+    ss = read_sql(f"""
+        SELECT player_id, season, sprint_speed
+        FROM staging.statcast_sprint_speed
+        WHERE season BETWEEN {anchor - 1} AND {anchor}
+          AND sprint_speed IS NOT NULL
+    """, {})
+
+    if not ss.empty:
+        ss["w"] = ss["season"].map({anchor: 2, anchor - 1: 1}).fillna(1)
+        ss_avg = ss.groupby("player_id").apply(
+            lambda g: np.average(g["sprint_speed"], weights=g["w"]),
+            include_groups=False,
+        ).rename("speed_fps")
+        result = result.merge(
+            ss_avg.reset_index(), on="player_id", how="left"
+        )
+    if "speed_fps" not in result.columns:
+        result["speed_fps"] = np.nan
+
+    result["speed_pctl"] = _pctl(result["speed_fps"])
+
+    # ------------------------------------------------------------------
+    # 5. Position-aware composite with missing-data redistribution
+    # ------------------------------------------------------------------
+    # Target weights per position group (sum to 1.0)
+    _WEIGHT_PROFILES = {
+        "OF": {"oaa": 0.50, "arm": 0.15, "cp": 0.15, "speed": 0.20},
+        "IF": {"oaa": 0.55, "arm": 0.20, "cp": 0.00, "speed": 0.25},
+        "1B": {"oaa": 0.65, "arm": 0.00, "cp": 0.00, "speed": 0.35},
+        "C":  {"oaa": 1.00, "arm": 0.00, "cp": 0.00, "speed": 0.00},
+    }
+
+    def _pos_group_key(pos: str) -> str:
+        if pos in _OF_POSITIONS:
+            return "OF"
+        if pos == "1B":
+            return "1B"
+        if pos == "C":
+            return "C"
+        return "IF"
+
+    scores = []
+    for _, row in result.iterrows():
+        profile = _WEIGHT_PROFILES[_pos_group_key(row["position_group"])]
+
+        # Determine which signals are available for this player
+        signals = {"oaa": row["oaa_pctl"]}  # OAA always available (we're in the OAA result set)
+        if pd.notna(row["arm_mph"]) and profile["arm"] > 0:
+            signals["arm"] = row["arm_pctl"]
+        if pd.notna(row["cp_score"]) and profile["cp"] > 0:
+            signals["cp"] = row["cp_pctl"]
+        if pd.notna(row["speed_fps"]) and profile["speed"] > 0:
+            signals["speed"] = row["speed_pctl"]
+
+        # Redistribute missing weights proportionally to available signals
+        total_avail = sum(profile[k] for k in signals)
+        if total_avail > 0:
+            composite = sum(
+                (profile[k] / total_avail) * signals[k]
+                for k in signals
+            )
+        else:
+            composite = row["oaa_pctl"]
+
+        scores.append(composite)
+
+    result["fielding_score"] = scores
+
+    n_with_arm = result["arm_mph"].notna().sum()
+    n_with_cp = result["cp_score"].notna().sum()
+    n_with_speed = result["speed_fps"].notna().sum()
+    logger.info(
+        f"Fielding composite: {len(result)} players, "
+        f"{n_with_arm} with arm, {n_with_cp} with catch prob, "
+        f"{n_with_speed} with speed"
+    )
+
+    return result[["player_id", "fielding_score"]]
 
 
 def _build_catcher_framing_score(
@@ -1005,15 +1180,14 @@ def _build_hitter_trajectory_score() -> pd.DataFrame:
 
     New components
     --------------
-    - **Age factor** (35%): younger players get upside credit.  The single
-      strongest predictor of future value trajectory.
-    - **YoY observed improvement** (30%): did the player's actual wOBA/wRC+
-      improve from prior year?  Captures breakouts (Henderson, Raleigh)
-      and declines (Trout, Springer) that the Bayesian delta misses.
-    - **Projection certainty** (20%): lower CV = more proven.  Reduced
-      from 55% — still rewards stability but no longer dominates.
-    - **Season trend** (15%): Bayesian projected delta signal (kept as
-      minor tiebreaker).
+    - **Age factor** (50%): forward-looking trajectory curve.  Youth (20-24)
+      gets upside credit, prime (25-29) holds flat, 30+ declines steeply.
+      Dominant weight because age is the single strongest predictor of
+      future value trajectory.
+    - **YoY observed improvement** (20%): did the player's actual wOBA/wRC+
+      improve from prior year?  Captures breakouts and declines.
+    - **Projection certainty** (15%): lower CV = more proven.
+    - **Season trend** (15%): Bayesian projected delta signal (tiebreaker).
 
     Returns
     -------
@@ -1026,15 +1200,20 @@ def _build_hitter_trajectory_score() -> pd.DataFrame:
     age = proj["age"].fillna(30)
     age_factor = _hitter_age_factor(age)
 
-    # --- YoY observed improvement (30%) ---
-    # Compare most recent observed season to prior.  Uses delta_woba
-    # (projected - observed) as a proxy when direct YoY isn't available,
-    # but prefer actual observed_woba vs career_woba gap.
+    # --- YoY observed improvement (20%) ---
+    # Compare most recent observed season to prior career baseline.
     # Positive = player is currently above their career baseline = improving.
+    #
+    # For young players (age <= 25), use a higher career baseline floor
+    # (0.300 vs 0.315) so developmental seasons don't artificially depress
+    # the gap.  Young players with low career wOBA due to limited MLB time
+    # were getting penalized: their "improvement" looked small even when
+    # ascending, because the career baseline included partial/bad early
+    # seasons.
     if "observed_woba" in proj.columns and "career_woba" in proj.columns:
         _obs = proj["observed_woba"].fillna(proj["career_woba"])
         _career = proj["career_woba"].fillna(0.315)
-        yoy_improvement = _obs - _career  # positive = above career baseline
+        yoy_improvement = (_obs - _career).fillna(0.0)
     elif "delta_woba" in proj.columns:
         yoy_improvement = -proj["delta_woba"].fillna(0)  # negative delta = improving
     else:
@@ -1058,9 +1237,9 @@ def _build_hitter_trajectory_score() -> pd.DataFrame:
     trend_score = 0.50 * k_trend + 0.50 * bb_trend
 
     proj["trajectory_score"] = (
-        0.35 * age_factor
-        + 0.30 * yoy_score
-        + 0.20 * certainty_score
+        0.50 * age_factor
+        + 0.20 * yoy_score
+        + 0.15 * certainty_score
         + 0.15 * trend_score
     )
     return proj[["batter_id", "trajectory_score"]]

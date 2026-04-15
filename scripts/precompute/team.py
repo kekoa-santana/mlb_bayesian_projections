@@ -11,6 +11,54 @@ from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS
 logger = logging.getLogger("precompute.team")
 
 
+# Columns copied from team_power_rankings into team_rankings.parquet so the
+# dashboard can read a single unified file.
+_POWER_MERGE_COLS = [
+    "team_id",
+    "power_score", "power_rank", "power_tier",
+    "wins_component", "form_component", "depth_component",
+    "trajectory_component", "elo_component",
+    "projected_wins", "schedule_adjusted_wins", "sim_wins",
+    "games_played", "preseason_win_pct", "posterior_win_pct",
+    "pythag_win_pct", "avg_opp_elo",
+    "breakout_count", "regression_count", "net_trajectory",
+]
+
+
+def _merge_power_into_team_rankings(power_rankings_df: pd.DataFrame) -> None:
+    """Merge power rankings columns into team_rankings.parquet.
+
+    The dashboard reads ``team_rankings.parquet`` and renders its
+    ``rank``, ``tdd_score``, and ``tier`` columns.  Power rankings are
+    the authoritative source of those values, so this helper copies
+    the merged columns and sorts by the new rank.  Overwrites any
+    prior copies so re-runs do not produce ``*_pw`` duplicates.
+    """
+    tr_path = DASHBOARD_DIR / "team_rankings.parquet"
+    if not tr_path.exists():
+        return
+    tr = pd.read_parquet(tr_path)
+
+    merge_cols = [c for c in _POWER_MERGE_COLS if c in power_rankings_df.columns]
+    drop_cols = [c for c in merge_cols if c != "team_id" and c in tr.columns]
+    tr = tr.drop(columns=drop_cols, errors="ignore")
+    tr = tr.merge(power_rankings_df[merge_cols], on="team_id", how="left")
+
+    if "power_score" in tr.columns:
+        ps = tr["power_score"]
+        ps_min, ps_max = ps.min(), ps.max()
+        if ps_max - ps_min > 1e-9:
+            tr["tdd_score"] = (
+                1.0 + (ps - ps_min) / (ps_max - ps_min) * 9.0
+            ).round(1)
+        tr["rank"] = tr["power_rank"]
+        tr["tier"] = tr["power_tier"]
+        tr = tr.sort_values("rank").reset_index(drop=True)
+
+    tr.to_parquet(tr_path, index=False)
+    logger.info("Merged power rankings into team_rankings.parquet: %d teams", len(tr))
+
+
 def run_team_elo() -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
     """Compute team ELO ratings.
 
@@ -224,16 +272,12 @@ def run_team_profiles(
 
 def run_team_power(
     *,
-    team_sim_df: pd.DataFrame | None = None,
     league_sim_df: pd.DataFrame | None = None,
 ) -> None:
     """Build projection-integrated power rankings.
 
     Parameters
     ----------
-    team_sim_df : pd.DataFrame or None
-        Team season sim results (from ``run_team_sim``).  If None, falls
-        back to reading ``team_sim_wins.parquet`` from disk.
     league_sim_df : pd.DataFrame or None
         League season sim results (from ``run_league_sim``).  Passed through
         to ``build_power_rankings`` so it can use sim wins without reading
@@ -253,112 +297,56 @@ def run_team_power(
 
         _cur_roster_pw = pd.read_parquet(DASHBOARD_DIR / "roster.parquet") \
             if (DASHBOARD_DIR / "roster.parquet").exists() else None
-        _h_rank_pw = pd.read_parquet(DASHBOARD_DIR / "hitters_rankings.parquet") \
-            if (DASHBOARD_DIR / "hitters_rankings.parquet").exists() else None
-        _p_rank_pw = pd.read_parquet(DASHBOARD_DIR / "pitchers_rankings.parquet") \
-            if (DASHBOARD_DIR / "pitchers_rankings.parquet").exists() else None
         _h_proj_pw = pd.read_parquet(DASHBOARD_DIR / "hitter_projections.parquet") \
             if (DASHBOARD_DIR / "hitter_projections.parquet").exists() else None
         _p_proj_pw = pd.read_parquet(DASHBOARD_DIR / "pitcher_projections.parquet") \
             if (DASHBOARD_DIR / "pitcher_projections.parquet").exists() else None
 
-        # Glicko paths (optional -- gracefully degraded if missing)
-        _bg_path = DASHBOARD_DIR / "batter_glicko.parquet"
-        _pg_path = DASHBOARD_DIR / "pitcher_glicko.parquet"
-
         if all(x is not None for x in [
-            _elo_pre, _profiles, _cur_roster_pw,
-            _h_rank_pw, _p_rank_pw, _h_proj_pw, _p_proj_pw,
+            _elo_pre, _profiles, _cur_roster_pw, _h_proj_pw, _p_proj_pw,
         ]):
             from src.models.team_rankings import build_power_rankings
-            # Use in-memory team sim if provided, else load from disk
-            _team_sim = team_sim_df
-            if _team_sim is None:
-                _sim_path = DASHBOARD_DIR / "team_sim_wins.parquet"
-                if _sim_path.exists():
-                    _team_sim = pd.read_parquet(_sim_path)
+            from src.models.in_season_wins import load_current_team_records
+
+            # Current-season records for in-season wins blend
+            try:
+                _team_records = load_current_team_records(FROM_SEASON + 1)
+            except Exception:
+                logger.warning("Could not load current team records", exc_info=True)
+                _team_records = None
 
             power_rankings_df = build_power_rankings(
                 elo_ratings=_elo_pre,
                 profiles=_profiles,
                 current_roster=_cur_roster_pw,
-                hitter_rankings=_h_rank_pw,
-                pitcher_rankings=_p_rank_pw,
                 hitter_projections=_h_proj_pw,
                 pitcher_projections=_p_proj_pw,
-                batter_glicko_path=_bg_path if _bg_path.exists() else None,
-                pitcher_glicko_path=_pg_path if _pg_path.exists() else None,
-                team_sim=_team_sim,
                 league_sim_df=league_sim_df,
+                team_records=_team_records,
             )
             # Save power rankings standalone (backward compat)
             power_rankings_df.to_parquet(
                 DASHBOARD_DIR / "team_power_rankings.parquet", index=False,
             )
 
-            # Merge power ranking columns INTO team_rankings.parquet
-            # so the dashboard gets one unified file with:
-            #   - Power rank/tier/score (overall ranking)
-            #   - All sub-scores (offense, pitching, defense, etc.)
-            #   - Current + ceiling scores
-            #   - Diamond grades, scouting grades
-            _tr_path = DASHBOARD_DIR / "team_rankings.parquet"
-            if _tr_path.exists():
-                tr = pd.read_parquet(_tr_path)
-                # Columns from power rankings to merge in
-                power_cols = [
-                    "team_id", "power_score", "power_rank", "power_tier",
-                    "wins_component", "form_component", "depth_component",
-                    "trajectory_component", "elo_component",
-                    "projection_component", "profile_component",
-                    "glicko_component", "breakout_count", "regression_count",
-                    "net_trajectory", "baseruns_wins", "sim_wins",
-                    "depth_confidence", "team_batting_glicko",
-                    "team_pitching_glicko",
-                ]
-                power_cols = [c for c in power_cols if c in power_rankings_df.columns]
-                # Drop existing power columns to prevent _pw duplicates on re-runs
-                drop_cols = [c for c in power_cols if c != "team_id" and c in tr.columns]
-                tr = tr.drop(columns=drop_cols, errors="ignore")
-                tr = tr.merge(
-                    power_rankings_df[power_cols],
-                    on="team_id", how="left",
-                )
-                # Rank and display score both from power rankings composite
-                # so the dashboard order matches the displayed TDD score.
-                if "power_score" in tr.columns:
-                    ps = tr["power_score"]
-                    ps_min, ps_max = ps.min(), ps.max()
-                    if ps_max - ps_min > 1e-9:
-                        tr["tdd_score"] = (
-                            1.0 + (ps - ps_min) / (ps_max - ps_min) * 9.0
-                        ).round(1)
-                    tr["rank"] = tr["power_rank"]
-                    tr["tier"] = tr["power_tier"]
-                    tr = tr.sort_values("rank").reset_index(drop=True)
-
-                tr.to_parquet(_tr_path, index=False)
-                logger.info(
-                    "Merged power rankings into team_rankings.parquet: %d teams",
-                    len(tr),
-                )
+            _merge_power_into_team_rankings(power_rankings_df)
 
             logger.info("Saved team_power_rankings.parquet: %d teams", len(power_rankings_df))
             for _, row in power_rankings_df.head(10).iterrows():
                 logger.info(
-                    "  %2d. %-4s  %.3f (%s)  ELO=%.2f Proj=%.2f Prof=%.2f Glk=%.2f  B:%d R:%d",
+                    "  %2d. %-4s  %.3f (%s)  Wins=%.2f Form=%.2f Depth=%.2f Traj=%.2f  B:%d R:%d",
                     row["power_rank"], row["abbreviation"],
                     row["power_score"], row["power_tier"],
-                    row["elo_component"], row["projection_component"],
-                    row["profile_component"], row.get("glicko_component", 0.0),
+                    row["wins_component"], row["form_component"],
+                    row["depth_component"], row["trajectory_component"],
                     row["breakout_count"], row["regression_count"],
                 )
         else:
             missing = [
                 name for name, val in [
                     ("elo_preseason", _elo_pre), ("profiles", _profiles),
-                    ("roster", _cur_roster_pw), ("hitter_rankings", _h_rank_pw),
-                    ("pitcher_rankings", _p_rank_pw), ("hitter_projections", _h_proj_pw),
+                    ("roster", _cur_roster_pw),
+                    ("hitter_projections", _h_proj_pw),
                     ("pitcher_projections", _p_proj_pw),
                 ] if val is None
             ]
@@ -627,7 +615,7 @@ def run_league_sim(
                     h_m["projected_pa"] = h_m["total_pa_mean"]
                     h_m = h_m.sort_values("value_score", ascending=False).reset_index(drop=True)
                     h_m["is_starter"] = h_m.index < 9
-                    h_m["games"] = (h_m["pa"] / 3.85).clip(20, 162).astype(int)
+                    h_m["games"] = (h_m["pa"].fillna(0) / 3.85).clip(20, 162).astype(int)
 
                     # Pitchers
                     t_pr = _lr_pr[_lr_pr["pitcher_id"].isin(t_ids)]
@@ -645,7 +633,7 @@ def run_league_sim(
                     })
                     p_m["projected_ip"] = p_m["projected_ip_mean"]
                     if bf_col and bf_col in p_m.columns:
-                        p_m["games"] = (p_m[bf_col] / 25).clip(10, 35).astype(int)
+                        p_m["games"] = (p_m[bf_col].fillna(0) / 25).clip(10, 35).astype(int)
                     else:
                         p_m["games"] = 30
 
@@ -706,8 +694,21 @@ def run_league_sim(
         result.to_parquet(DASHBOARD_DIR / "league_sim.parquet", index=False)
         logger.info("Saved league_sim.parquet: %d teams", len(result))
 
-        # Merge sim wins into team_rankings as the canonical projected_wins
-        sim_wins_map = dict(zip(result["team_id"], result["sim_wins_mean"]))
+        # Apply in-season Beta-Binomial blend so team_rankings.parquet's
+        # projected_wins reflects the current-season record, not just
+        # the preseason sim.
+        from src.models.in_season_wins import (
+            apply_in_season_blend,
+            load_current_team_records,
+        )
+        try:
+            _records = load_current_team_records(from_season + 1)
+        except Exception:
+            logger.warning("Could not load current records for blend", exc_info=True)
+            _records = None
+        blended = apply_in_season_blend(result, _records)
+
+        sim_wins_map = dict(zip(blended["team_id"], blended["blended_wins"]))
         sim_p10_map = dict(zip(result["team_id"], result["sim_wins_p10"]))
         sim_p90_map = dict(zip(result["team_id"], result["sim_wins_p90"]))
         sim_std_map = dict(zip(result["team_id"], result["sim_wins_std"]))
@@ -722,14 +723,14 @@ def run_league_sim(
         # Re-derive tiers from new projected wins
         tr["tier"] = tr["projected_wins"].apply(_assign_tier)
 
-        # Re-normalize (sim should already be ~2430 but round to be safe)
+        # Re-normalize (blended wins should already sum to ~2430)
         raw_total = tr["projected_wins"].sum()
         if abs(raw_total - 2430) > 5:
             tr["projected_wins"] = (tr["projected_wins"] * 2430 / raw_total).round(1)
             tr["tier"] = tr["projected_wins"].apply(_assign_tier)
 
         tr.to_parquet(tr_path, index=False)
-        logger.info("Updated team_rankings.parquet with league sim wins")
+        logger.info("Updated team_rankings.parquet with blended sim wins")
 
         # Log top 10
         for _, row in tr.sort_values("projected_wins", ascending=False).head(10).iterrows():
@@ -810,7 +811,7 @@ def run_team_sim(
             h_m["projected_pa"] = h_m["total_pa_mean"]
             h_m = h_m.sort_values("value_score", ascending=False).reset_index(drop=True)
             h_m["is_starter"] = h_m.index < 9
-            h_m["games"] = (h_m["pa"] / 3.85).clip(20, 162).astype(int)
+            h_m["games"] = (h_m["pa"].fillna(0) / 3.85).clip(20, 162).astype(int)
 
             # Pitchers
             t_pr = pr[pr["pitcher_id"].isin(t_ids)]
@@ -825,7 +826,7 @@ def run_team_sim(
             ).rename(columns={"pitcher_id": "player_id", "tdd_value_score": "value_score"})
             p_m["projected_ip"] = p_m["projected_ip_mean"]
             if bf_col and bf_col in p_m.columns:
-                p_m["games"] = (p_m[bf_col] / 25).clip(10, 35).astype(int)
+                p_m["games"] = (p_m[bf_col].fillna(0) / 25).clip(10, 35).astype(int)
             else:
                 p_m["games"] = 30
 

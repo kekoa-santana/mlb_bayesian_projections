@@ -205,19 +205,22 @@ STAT_CONFIGS: dict[str, StatConfig] = {
             # Catches lucky/unlucky hitters the model would otherwise miss.
             ("xwoba_avg", 0.0, 0.15, "xwOBA → wOBA"),
         ],
-        # Logit-scale priors (Jacobian at wOBA=0.315 is ~4.63):
-        # Tested: mu_pop_sigma=0.45 → ESS collapse; 0.35 + StudentT(4) →
-        # r_hat=1.29, ESS=12, still std=0.019.  Compression is structural
-        # to logit-normal hierarchical model.  Fix: post-hoc calibration
-        # slope from walk-forward backtest (van de Wiel et al. 2025).
         sigma_season_mu=0.15,
         sigma_season_floor=0.14,
         sigma_player_prior=0.5,
         sigma_obs_prior=0.18,       # natural 0.04 → logit ~0.18
         # wOBA composite metric — high persistence for true talent
-        rho_alpha=8.0, rho_beta=2.0,  # mean ~0.80 (was 0.74 — under-projected young elites)
+        rho_alpha=8.0, rho_beta=2.0,  # mean ~0.80
         rho2_alpha=2.0, rho2_beta=8.0,  # mean ~0.20
-        mu_pop_sigma=0.25,  # tighter than binomial stats — helps identification on logit scale
+        mu_pop_sigma=0.30,  # widened from 0.25 to let age×tier cells separate more
+        # StudentT(4) tails for player intercepts: EDA shows young Tier-1
+        # hitters (xwOBA>=.400) have population wOBA=.350, but Normal
+        # shrinkage crushes outliers toward cell means.  StudentT lets
+        # elite young players (Caminero, Soto, Acuna archetypes) sit further
+        # from the population mean without over-regression.
+        # Prior testing: StudentT(4) + mu_pop_sigma=0.30 avoids the ESS
+        # collapse seen at mu_pop_sigma=0.45 with Normal tails.
+        alpha_prior_nu=4.0,
     ),
     "chase_rate": StatConfig(
         name="chase_rate",

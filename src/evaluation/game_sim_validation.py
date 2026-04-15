@@ -61,7 +61,9 @@ from src.models.posterior_utils import extract_pitcher_k_rate_samples
 from src.data.league_baselines import get_baselines_dict
 from src.models.bf_model import compute_pitcher_bf_priors
 from src.models.game_sim.pitch_count_model import build_pitch_count_features
-from src.data.queries import get_bullpen_trailing_workload
+from src.data.queries import get_bullpen_trailing_workload, get_team_bullpen_rates
+from src.models.game_predictions import crps_sample
+from src.utils.constants import BULLPEN_K_RATE, BULLPEN_BB_RATE, BULLPEN_HR_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +160,237 @@ def _fit_pitcher_posteriors(
     return {"k": k_posteriors, "bb": bb_posteriors, "hr": hr_posteriors}
 
 
+def _load_team_bullpen_rates_lookup(
+    train_seasons: list[int],
+) -> dict[int, tuple[float, float, float]]:
+    """Build a team_id → (k_rate, bb_rate, hr_rate) lookup using ONLY
+    training seasons, to avoid look-ahead leakage into the test fold.
+
+    Aggregates across all provided training seasons (weighted by BF) so a
+    team that existed for all seasons gets a stable multi-year rate.
+    """
+    bp_df = get_team_bullpen_rates(train_seasons)
+    if bp_df.empty:
+        return {}
+
+    # Weighted aggregate across seasons by total_bf
+    lookup: dict[int, tuple[float, float, float]] = {}
+    for team_id, g in bp_df.groupby("team_id"):
+        w = g["total_bf"].astype(float)
+        if w.sum() <= 0:
+            continue
+        lookup[int(team_id)] = (
+            float(np.average(g["k_rate"], weights=w)),
+            float(np.average(g["bb_rate"], weights=w)),
+            float(np.average(g["hr_rate"], weights=w)),
+        )
+    return lookup
+
+
+def _load_batter_bip_profiles(
+    train_seasons: list[int],
+) -> dict[int, np.ndarray]:
+    """Build a batter_id → (4,) BIP probability lookup using only training
+    seasons. Rates returned as [p_out, p_single, p_double, p_triple].
+
+    Uses the most-recent training season for each batter (so breakout
+    profiles don't get averaged with older weaker years). Batters not
+    present in any training season fall back to league average at call
+    time by returning nothing for their ID.
+    """
+    from src.data.queries.hitter import get_batter_bip_profile
+    from src.data.queries.traditional import get_sprint_speed
+    from src.models.game_sim.bip_model import compute_player_bip_probs
+
+    raw = get_batter_bip_profile(train_seasons)
+    if raw.empty:
+        logger.warning("No batter BIP profile data for train seasons %s",
+                       train_seasons)
+        return {}
+
+    # Sprint speed for the latest train season (most recent proxy available
+    # at test time).
+    latest = max(train_seasons)
+    try:
+        sprint = get_sprint_speed(latest)[["player_id", "sprint_speed"]]
+        sprint = sprint.rename(columns={"player_id": "batter_id"})
+    except Exception:
+        logger.exception("Sprint speed fetch failed; defaulting to 27.0")
+        sprint = pd.DataFrame(columns=["batter_id", "sprint_speed"])
+
+    # Most-recent-training-season row per batter (breakouts dominate)
+    raw = raw.sort_values(["batter_id", "season"])
+    latest_rows = raw.groupby("batter_id").tail(1)
+    latest_rows = latest_rows.merge(sprint, on="batter_id", how="left")
+    latest_rows["sprint_speed"] = latest_rows["sprint_speed"].fillna(27.0)
+    latest_rows["avg_ev"] = latest_rows["avg_ev"].fillna(88.0).astype(float)
+    latest_rows["avg_la"] = latest_rows["avg_la"].fillna(12.0).astype(float)
+    latest_rows["gb_pct"] = latest_rows["gb_pct"].fillna(0.44).astype(float)
+
+    lookup: dict[int, np.ndarray] = {}
+    for _, r in latest_rows.iterrows():
+        resolved = int(
+            r["bip_outs"] + r["bip_singles"] + r["bip_doubles"] + r["bip_triples"]
+        )
+        if resolved <= 0:
+            continue
+        observed = {
+            "out": r["bip_outs"] / resolved,
+            "single": r["bip_singles"] / resolved,
+            "double": r["bip_doubles"] / resolved,
+            "triple": r["bip_triples"] / resolved,
+        }
+        probs = compute_player_bip_probs(
+            avg_ev=float(r["avg_ev"]),
+            avg_la=float(r["avg_la"]),
+            gb_pct=float(r["gb_pct"]),
+            sprint_speed=float(r["sprint_speed"]),
+            observed_bip_splits=observed,
+            bip_count=int(r["bip"]),
+            shrinkage_k=900,
+        )
+        lookup[int(r["batter_id"])] = np.asarray(probs, dtype=np.float64)
+
+    logger.info(
+        "Loaded batter BIP profiles: %d batters from train seasons %s",
+        len(lookup), train_seasons,
+    )
+    return lookup
+
+
+# League-average BIP fallback for batters without a training profile
+_LEAGUE_BIP_PROBS = np.array([0.700, 0.222, 0.065, 0.005])
+
+
+def _build_lineup_bip_probs(
+    batter_ids: list[int],
+    bip_profiles: dict[int, np.ndarray],
+) -> np.ndarray:
+    """Assemble a (9, 4) BIP probability matrix for a lineup.
+
+    Missing batters fall back to league average.
+    """
+    rows = []
+    for bid in batter_ids[:9]:
+        rows.append(bip_profiles.get(int(bid), _LEAGUE_BIP_PROBS))
+    while len(rows) < 9:
+        rows.append(_LEAGUE_BIP_PROBS)
+    return np.asarray(rows, dtype=np.float64)
+
+
+def _load_team_runs_allowed(
+    test_season: int,
+) -> dict[tuple[int, int], int]:
+    """Build a (game_pk, allowing_team_id) → runs_allowed lookup for the
+    test season, joining ``fact_game_totals`` against ``dim_game`` so we
+    know which team was on defense when those runs were scored.
+    """
+    df = read_sql(f"""
+        WITH game_teams AS (
+            SELECT game_pk, home_team_id, away_team_id
+            FROM production.dim_game
+            WHERE season = {int(test_season)}
+        )
+        SELECT
+            fgt.game_pk,
+            fgt.team_id AS scoring_team_id,
+            fgt.runs AS runs_scored,
+            CASE WHEN fgt.team_id = gt.home_team_id
+                 THEN gt.away_team_id
+                 ELSE gt.home_team_id END AS allowing_team_id
+        FROM production.fact_game_totals fgt
+        JOIN game_teams gt ON fgt.game_pk = gt.game_pk
+        WHERE fgt.season = {int(test_season)}
+    """)
+
+    lookup: dict[tuple[int, int], int] = {}
+    for _, r in df.iterrows():
+        lookup[(int(r["game_pk"]), int(r["allowing_team_id"]))] = int(r["runs_scored"])
+    logger.info(
+        "Loaded team runs-allowed lookup: %d (game_pk, team) entries", len(lookup),
+    )
+    return lookup
+
+
+def _load_team_defense_lifts(
+    train_seasons: list[int],
+) -> dict[int, float]:
+    """Build a team_id → defense BABIP shift lookup from training-season
+    fielding_runs_prevented totals. Strict train-only to avoid leakage.
+
+    Aggregates across the requested train seasons (most-recent-wins so
+    later seasons override earlier ones with more representative rosters).
+    """
+    from src.data.queries import get_team_defense_lifts
+
+    lookup: dict[int, float] = {}
+    df = get_team_defense_lifts(seasons=train_seasons)
+    if df.empty:
+        return lookup
+    df = df.sort_values("season")
+    for _, r in df.iterrows():
+        lookup[int(r["team_id"])] = float(r["defense_babip_adj"])
+    logger.info(
+        "Team defense lifts: %d teams from train seasons %s",
+        len(lookup), train_seasons,
+    )
+    return lookup
+
+
+def _load_park_lifts(
+    test_season: int,
+) -> tuple[dict[int, tuple[float, float, float, float]], dict[int, int]]:
+    """Load park factor logit lifts and per-game venue mapping for the
+    backtest.
+
+    Reuses the precomputed ``park_factor_lifts.parquet`` from the dashboard
+    data directory. Since park factors are derived from multi-year rolling
+    windows and change very slowly, using precomputed values introduces
+    negligible leakage for walk-forward evaluation.
+
+    Returns
+    -------
+    (park_lift_lookup, game_venue_lookup)
+        ``park_lift_lookup[venue_id] = (k, bb, hr, babip)`` logit lifts.
+        ``game_venue_lookup[game_pk] = venue_id``.
+    """
+    from pathlib import Path
+
+    park_lift_lookup: dict[int, tuple[float, float, float, float]] = {}
+    park_path = (
+        Path(__file__).resolve().parents[2].parent
+        / "tdd-dashboard" / "data" / "dashboard" / "park_factor_lifts.parquet"
+    )
+    if park_path.exists():
+        pl = pd.read_parquet(park_path)
+        for _, r in pl.iterrows():
+            park_lift_lookup[int(r["venue_id"])] = (
+                float(r.get("k_lift", 0.0) or 0.0),
+                float(r.get("bb_lift", 0.0) or 0.0),
+                float(r.get("hr_lift", 0.0) or 0.0),
+                float(r.get("h_babip_adj", 0.0) or 0.0),
+            )
+        logger.info("Loaded park factor lifts for %d venues", len(park_lift_lookup))
+    else:
+        logger.warning("Park factor lifts parquet not found at %s", park_path)
+
+    # game_pk → venue_id for the test season
+    game_venue_lookup: dict[int, int] = {}
+    df = read_sql(f"""
+        SELECT DISTINCT game_pk, venue_id
+        FROM production.dim_game
+        WHERE season = {int(test_season)}
+          AND game_type = 'R'
+          AND venue_id IS NOT NULL
+    """)
+    for _, r in df.iterrows():
+        game_venue_lookup[int(r["game_pk"])] = int(r["venue_id"])
+    logger.info(
+        "Loaded game_pk → venue_id map: %d games", len(game_venue_lookup),
+    )
+    return park_lift_lookup, game_venue_lookup
+
+
 def _load_game_context(
     train_seasons: list[int],
     test_season: int,
@@ -213,6 +446,8 @@ def _load_game_context(
 
     umpire_lifts = build_umpire_logit_lifts(train_seasons, test_season)
     weather_lifts = build_weather_logit_lifts(train_seasons, test_season)
+    park_lift_lookup, game_venue_lookup = _load_park_lifts(test_season)
+    team_defense_lookup = _load_team_defense_lifts(train_seasons)
 
     # Pitcher exit tendencies (latest per pitcher)
     pitcher_tend_latest = (
@@ -246,6 +481,19 @@ def _load_game_context(
             bullpen_wl_lookup[key] = float(bw_row["bullpen_trailing_ip"])
         logger.info("Bullpen workload: %d team-games", len(bullpen_wl_lookup))
 
+    # Team bullpen rate aggregate — training seasons only (no leakage)
+    team_bullpen_rates_lookup = _load_team_bullpen_rates_lookup(train_seasons)
+    logger.info(
+        "Team bullpen rates: %d teams loaded from train seasons",
+        len(team_bullpen_rates_lookup),
+    )
+
+    # Actual team runs allowed per (game_pk, team) for test season
+    team_runs_allowed_lookup = _load_team_runs_allowed(test_season)
+
+    # Batter BIP profiles — train-only (no leakage)
+    batter_bip_lookup = _load_batter_bip_profiles(train_seasons)
+
     return {
         "exit_model": exit_model,
         "pitcher_pc_latest": pitcher_pc_latest,
@@ -256,9 +504,15 @@ def _load_game_context(
         "baselines_pt": baselines_pt,
         "umpire_lifts": umpire_lifts,
         "weather_lifts": weather_lifts,
+        "park_lift_lookup": park_lift_lookup,
+        "game_venue_lookup": game_venue_lookup,
+        "team_defense_lookup": team_defense_lookup,
         "pitcher_tend_latest": pitcher_tend_latest,
         "bf_priors_latest": bf_priors_latest,
         "bullpen_wl_lookup": bullpen_wl_lookup,
+        "team_bullpen_rates_lookup": team_bullpen_rates_lookup,
+        "team_runs_allowed_lookup": team_runs_allowed_lookup,
+        "batter_bip_lookup": batter_bip_lookup,
     }
 
 
@@ -478,9 +732,15 @@ def build_game_sim_predictions(
     baselines_pt = ctx["baselines_pt"]
     umpire_lifts = ctx["umpire_lifts"]
     weather_lifts = ctx["weather_lifts"]
+    park_lift_lookup = ctx["park_lift_lookup"]
+    game_venue_lookup = ctx["game_venue_lookup"]
+    team_defense_lookup = ctx["team_defense_lookup"]
     pitcher_tend_latest = ctx["pitcher_tend_latest"]
     bf_priors_latest = ctx["bf_priors_latest"]
     bullpen_wl_lookup = ctx["bullpen_wl_lookup"]
+    team_bullpen_rates_lookup = ctx["team_bullpen_rates_lookup"]
+    team_runs_allowed_lookup = ctx["team_runs_allowed_lookup"]
+    batter_bip_lookup = ctx["batter_bip_lookup"]
 
     # ---------------------------------------------------------------
     # 7. Load test season data — actuals + lineups
@@ -601,7 +861,17 @@ def build_game_sim_predictions(
         ump_k = umpire_lifts["k"].get(game_pk, 0.0)
         ump_bb = umpire_lifts["bb"].get(game_pk, 0.0)
         wx_k = weather_lifts.get("k", {}).get(game_pk, 0.0)
-        park_hr = weather_lifts.get("hr", {}).get(game_pk, 0.0)
+        wx_hr = weather_lifts.get("hr", {}).get(game_pk, 0.0)
+        venue_id = game_venue_lookup.get(game_pk)
+        pk_k, pk_bb, pk_hr, pk_babip = park_lift_lookup.get(
+            venue_id, (0.0, 0.0, 0.0, 0.0),
+        )
+        # Defense BABIP shift for the team currently fielding
+        defense_babip = (
+            team_defense_lookup.get(int(pitcher_team_id_for_bp), 0.0)
+            if pitcher_team_id_for_bp is not None else 0.0
+        )
+        combined_babip = pk_babip + defense_babip
 
         # Build pitch count features
         pitcher_adj, batter_adjs = build_pitch_count_features(
@@ -623,6 +893,23 @@ def build_game_sim_predictions(
             lineup_ppa_aggregate=lineup_ppa_agg,
         )
 
+        # Pitching team's bullpen rates — train-only aggregate
+        bp_rates = (
+            team_bullpen_rates_lookup.get(pitcher_team_id_for_bp)
+            if pitcher_team_id_for_bp is not None else None
+        )
+        if bp_rates is not None:
+            bp_k, bp_bb, bp_hr = bp_rates
+        else:
+            bp_k, bp_bb, bp_hr = (
+                BULLPEN_K_RATE, BULLPEN_BB_RATE, BULLPEN_HR_RATE,
+            )
+
+        # Assemble per-batter BIP probabilities for this lineup (9, 4)
+        lineup_bip_probs = _build_lineup_bip_probs(
+            batter_ids, batter_bip_lookup,
+        )
+
         # Run simulation
         try:
             sim_result = simulate_game(
@@ -639,11 +926,20 @@ def build_game_sim_predictions(
                 game_context=GameContext(
                     umpire_k_lift=ump_k,
                     umpire_bb_lift=ump_bb,
-                    park_hr_lift=park_hr,
+                    park_k_lift=pk_k,
+                    park_bb_lift=pk_bb,
+                    park_hr_lift=pk_hr,
+                    park_h_babip_adj=combined_babip,
                     weather_k_lift=wx_k,
+                    weather_hr_lift=wx_hr,
                 ),
                 lineup_matchup_reliabilities=matchup_reliabilities,
                 manager_pull_tendency=team_avg_p,
+                babip_adj=combined_babip,
+                bullpen_k_rate=bp_k,
+                bullpen_bb_rate=bp_bb,
+                bullpen_hr_rate=bp_hr,
+                lineup_bip_probs=lineup_bip_probs,
                 n_sims=n_sims,
                 random_seed=random_seed + game_pk % 10000,
             )
@@ -658,18 +954,37 @@ def build_game_sim_predictions(
             pitcher_id, game_pk, game_row, actuals,
         )
 
+        # Team-level actual runs allowed: uses the pitcher's team + game_pk
+        # key in the lookup (runs scored by the opposing offense).
+        actual_total_runs = (
+            team_runs_allowed_lookup.get((game_pk, pitcher_team_id_for_bp))
+            if pitcher_team_id_for_bp is not None else None
+        )
+
         summary = sim_result.summary()
 
-        # Build K over-prob columns
-        k_over = sim_result.over_probs("k", [3.5, 4.5, 5.5, 6.5, 7.5])
-        # Outs prop lines (14.5 ~ 5.0 IP, 17.5 ~ 6.0 IP, etc.)
-        outs_over = sim_result.over_probs(
-            "outs", [14.5, 15.5, 16.5, 17.5, 18.5],
+        # Full 0.5-24.5 p_over grids for every pitcher stat — matches the
+        # format that confident_picks.py writes to game_props.parquet so the
+        # dashboard validator can score these directly.
+        _ALL_LINES = [x + 0.5 for x in range(25)]
+        k_over = sim_result.over_probs("k", _ALL_LINES)
+        bb_over = sim_result.over_probs("bb", _ALL_LINES)
+        h_over = sim_result.over_probs("h", _ALL_LINES)
+        hr_over = sim_result.over_probs("hr", _ALL_LINES)
+        outs_over = sim_result.over_probs("outs", _ALL_LINES)
+
+        # Run-level quantities — runs_samples is full-game (starter+pen)
+        runs_samples = sim_result.runs_samples.astype(np.float64)
+        runs_q10, runs_q50, runs_q90 = np.percentile(runs_samples, [10, 50, 90])
+        runs_crps = (
+            crps_sample(runs_samples, float(actual_total_runs))
+            if actual_total_runs is not None else np.nan
         )
 
         rec = {
             "game_pk": game_pk,
             "pitcher_id": pitcher_id,
+            "pitcher_team_id": pitcher_team_id_for_bp,
             "test_season": test_season,
             # Predicted
             "expected_k": summary["k"]["mean"],
@@ -685,19 +1000,37 @@ def build_game_sim_predictions(
             "expected_outs": summary["outs"]["mean"],
             "std_outs": summary["outs"]["std"],
             "expected_ip": float(np.mean(sim_result.outs_samples)) / 3.0,
+            # Run-level predictions (full game, starter + bullpen tail)
             "expected_runs": summary["runs"]["mean"],
+            "std_runs": summary["runs"]["std"],
+            "runs_q10": float(runs_q10),
+            "runs_q50": float(runs_q50),
+            "runs_q90": float(runs_q90),
+            "expected_starter_runs": (
+                float(np.mean(sim_result.starter_runs_samples))
+                if sim_result.starter_runs_samples is not None else np.nan
+            ),
+            "expected_bullpen_runs": (
+                float(np.mean(sim_result.bullpen_runs_samples))
+                if sim_result.bullpen_runs_samples is not None else np.nan
+            ),
+            "actual_total_runs": actual_total_runs,
+            "runs_crps": runs_crps,
             **game_actuals,
         }
 
-        # K prop line probabilities
-        for _, prow in k_over.iterrows():
-            col = f"p_over_{prow['line']:.1f}".replace(".", "_")
-            rec[col] = prow["p_over"]
-
-        # Outs prop line probabilities
-        for _, prow in outs_over.iterrows():
-            col = f"p_outs_over_{prow['line']:.1f}".replace(".", "_")
-            rec[col] = prow["p_over"]
+        # Per-stat p_over columns. We tag with the stat so this dataframe
+        # has p_k_over_X.Y, p_bb_over_X.Y, etc. at every half-line. The
+        # dashboard's game_props uses one row per (player, stat) — this
+        # single-row-per-pitcher format is exploded when validation joins
+        # by stat.
+        for stat_key, over_df in (
+            ("k", k_over), ("bb", bb_over), ("h", h_over),
+            ("hr", hr_over), ("outs", outs_over),
+        ):
+            for _, prow in over_df.iterrows():
+                col = f"p_{stat_key}_over_{prow['line']:.1f}"
+                rec[col] = round(float(prow["p_over"]), 4)
 
         results.append(rec)
 
@@ -852,6 +1185,60 @@ def compute_game_sim_metrics(
                 np.mean((actual_outs_arr >= lo) & (actual_outs_arr <= hi))
             )
 
+    # Run-level metrics (full game, starter + bullpen tail). Requires
+    # actual_total_runs joined from fact_game_totals.
+    if (
+        "expected_runs" in predictions.columns
+        and "actual_total_runs" in predictions.columns
+    ):
+        run_mask = predictions["actual_total_runs"].notna()
+        if run_mask.sum() > 0:
+            rdf = predictions[run_mask]
+            expected = rdf["expected_runs"].values.astype(float)
+            actual = rdf["actual_total_runs"].values.astype(float)
+            errors = expected - actual
+
+            metrics["runs_n"] = int(len(rdf))
+            metrics["runs_bias"] = float(np.mean(errors))
+            metrics["runs_mae"] = float(np.mean(np.abs(errors)))
+            metrics["runs_rmse"] = float(np.sqrt(np.mean(errors ** 2)))
+            if np.std(actual) > 0 and np.std(expected) > 0:
+                metrics["runs_corr"] = float(np.corrcoef(actual, expected)[0, 1])
+
+            if "runs_crps" in rdf.columns:
+                crps_vals = rdf["runs_crps"].dropna().values
+                if len(crps_vals) > 0:
+                    metrics["runs_crps_mean"] = float(np.mean(crps_vals))
+                    metrics["runs_crps_median"] = float(np.median(crps_vals))
+
+            # Coverage via std-based CI (Normal approximation)
+            if "std_runs" in rdf.columns:
+                std_runs = rdf["std_runs"].values.astype(float)
+                for ci_name, z in [("50", 0.6745), ("80", 1.2816), ("90", 1.6449)]:
+                    lo = expected - z * std_runs
+                    hi = expected + z * std_runs
+                    metrics[f"runs_coverage_{ci_name}"] = float(
+                        np.mean((actual >= lo) & (actual <= hi))
+                    )
+
+            # Coverage via empirical quantile bands (q10/q90 = 80%)
+            if "runs_q10" in rdf.columns and "runs_q90" in rdf.columns:
+                q10 = rdf["runs_q10"].values.astype(float)
+                q90 = rdf["runs_q90"].values.astype(float)
+                metrics["runs_coverage_q80_empirical"] = float(
+                    np.mean((actual >= q10) & (actual <= q90))
+                )
+
+            # Decomposition: how much of the prediction comes from each phase
+            if "expected_starter_runs" in rdf.columns:
+                sr = rdf["expected_starter_runs"].dropna()
+                if len(sr) > 0:
+                    metrics["expected_starter_runs_mean"] = float(sr.mean())
+            if "expected_bullpen_runs" in rdf.columns:
+                br = rdf["expected_bullpen_runs"].dropna()
+                if len(br) > 0:
+                    metrics["expected_bullpen_runs_mean"] = float(br.mean())
+
     return metrics
 
 
@@ -949,6 +1336,17 @@ def run_full_game_sim_backtest(
             fold_rec["outs_avg_log_loss"] = metrics["outs_avg_log_loss"]
         for ci in ("50", "80", "90"):
             key = f"outs_coverage_{ci}"
+            if key in metrics:
+                fold_rec[key] = metrics[key]
+
+        # Run-level metrics (new — game total runs vs actual)
+        for key in (
+            "runs_n", "runs_bias", "runs_mae", "runs_rmse", "runs_corr",
+            "runs_crps_mean", "runs_crps_median",
+            "runs_coverage_50", "runs_coverage_80", "runs_coverage_90",
+            "runs_coverage_q80_empirical",
+            "expected_starter_runs_mean", "expected_bullpen_runs_mean",
+        ):
             if key in metrics:
                 fold_rec[key] = metrics[key]
 

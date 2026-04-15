@@ -57,13 +57,43 @@ _RANK_CFG = _load_ranking_config()
 # Hitter sub-component weights (sum to 1.0)
 # ---------------------------------------------------------------------------
 _HITTER_WEIGHTS = {
-    "offense": 0.63,
-    "fielding": 0.13,
+    "offense": 0.59,
+    "fielding": 0.15,
     "baserunning": 0.08,
-    "trajectory": 0.08,
-    "positional_adj": 0.05,
+    "trajectory": 0.09,
+    "positional_adj": 0.06,
     "role": 0.02,
     "versatility": 0.01,
+}
+
+# Position-dependent fielding scale factors.
+# Fielding weight is scaled by position; the excess/deficit is traded 1:1
+# with offense weight.  This mirrors fWAR decomposition where defense is
+# a larger fraction of total value at premium positions (CF, SS) and a
+# smaller fraction at bat-first positions (1B, DH).
+#
+# Mechanism (extends existing DH redistribution pattern):
+#   eff_fielding = _HITTER_WEIGHTS["fielding"] × scale
+#   eff_offense  = _HITTER_WEIGHTS["offense"] + _HITTER_WEIGHTS["fielding"] × (1 - scale)
+#
+# Effective weights per position:
+#   CF:    off=53.7%, fld=20.3%  → defense share ≈ 24%
+#   SS:    off=56.0%, fld=18.0%  → defense share ≈ 23%
+#   C:     off=58.3%, fld=15.8%  → defense share ≈ 22%  (+framing)
+#   2B/3B: off=59.0%, fld=15.0%  → defense share ≈ 19%
+#   LF/RF: off=61.3%, fld=12.8%  → defense share ≈ 15%
+#   1B:    off=66.5%, fld= 7.5%  → defense share ≈  9%
+#   DH:    off=74.0%, fld= 0.0%  → defense share =  0%
+_POS_FIELDING_SCALE: dict[str, float] = {
+    "CF": 1.35,
+    "SS": 1.20,
+    "C": 1.05,
+    "2B": 1.00,
+    "3B": 1.00,
+    "RF": 0.85,
+    "LF": 0.85,
+    "1B": 0.50,
+    "DH": 0.00,
 }
 
 # FanGraphs positional adjustment per 162 games (runs):
@@ -82,29 +112,44 @@ _OBS_WEIGHT_BASE = 0.60
 # Pitcher sub-component weights by role (sum to 1.0)
 # ---------------------------------------------------------------------------
 _SP_WEIGHTS = {
-    # Walk-forward validated 2022-2025, then calibrated 2026-03-28.
-    # Workload raised from 0.05 -> 0.12: for SPs, innings availability IS value.
-    # A 3.00 ERA over 160 IP is worth more than 2.50 ERA over 100 IP.
-    # Trajectory 0.25 -> 0.20, glicko 0.10 -> 0.08 to fund the increase.
-    # Workload + health = 23% (availability is ~quarter of SP value).
-    "stuff": 0.27,
-    "command": 0.22,
-    "workload": 0.12,
-    "health": 0.11,
+    # Reweighted 2026-04-09 to apply the same talent-first philosophy
+    # used for hitters: elite stuff/command shouldn't be penalized by
+    # historical injury volatility that's already reflected in the
+    # sim's BF projection downstream.
+    #
+    # Workload 12 -> 7, health 11 -> 7 (combined 23 -> 14, -9 points).
+    # Redistributed: stuff +5, cmd +2, trajectory +2.  Stuff becomes
+    # the dominant signal (32%) matching RP weighting, which better
+    # rewards K-dominant aces (Crochet, Skenes, Ragans) whose injury
+    # histories were penalizing them against lower-talent but durable
+    # control pitchers (Gilbert, Sánchez).
+    "stuff": 0.32,
+    "command": 0.24,
+    "workload": 0.07,
+    "health": 0.07,
     "role": 0.00,
-    "trajectory": 0.20,
+    "trajectory": 0.22,
     "glicko": 0.08,
 }
 _RP_WEIGHTS = {
-    # RP: stuff stays dominant; trajectory/command boosted same direction
-    # as SP validation.  Workload minimal for relievers.
-    "stuff": 0.32,
-    "command": 0.22,
+    # Rebalanced 2026-04-10 to be K/stuff-centric for 1-inning relievers.
+    # For short-burst high-leverage work, strikeouts dominate the value
+    # equation: walks matter less than for SPs because closers only
+    # face 3-4 batters.  Previous weights (stuff 32, command 22,
+    # trajectory 26, glicko 10) gave pitch-to-contact setups (Speier,
+    # Morejon) inflated ranks over elite-K closers (Díaz, Hader, Williams,
+    # Mason Miller) whose command scores were merely average.
+    #
+    # Shifts: stuff +8 (32->40), command -7 (22->15), trajectory -6
+    # (26->20), glicko +5 (10->15).  Glicko is outcome-based (did the
+    # batters get out?) which is exactly what matters for closers.
+    "stuff": 0.40,
+    "command": 0.15,
     "workload": 0.03,
-    "health": 0.10,
+    "health": 0.07,
     "role": 0.00,
-    "trajectory": 0.23,
-    "glicko": 0.10,
+    "trajectory": 0.20,
+    "glicko": 0.15,
 }
 
 # fWAR-style positional adjustments (runs per 162 games, normalized to 0-1)
@@ -185,57 +230,83 @@ def _dynamic_blend_weights(pa: pd.Series, min_pa: int = 150, full_pa: int = 600)
 
 
 def _hitter_age_factor(age: pd.Series) -> pd.Series:
-    """Research-aligned hitter aging curve (piecewise linear).
+    """Forward-looking hitter trajectory curve (piecewise linear).
+
+    Models expected *future* value trajectory, not current aging level.
+    Young players approaching their prime get upside credit; aging
+    players past peak get penalized proportionally to expected decline.
 
     Based on industry consensus (FanGraphs, ZiPS, Marcel, OOPSY):
-    - Plateau 26-29: wRC+ peaks 26-27, ISO holds to ~28-29, BB%
-      improves through 29.  No penalty during prime window.
-    - Gradual decline 30-34: ~3-4% of peak per year (~0.5 WAR/yr)
-    - Steep decline 35-40: accelerating loss
+    - Youth upside (20-24): climbing toward peak, years of prime ahead.
+    - Prime plateau (25-29): at peak, stable production expected.
+    - Early decline (30-33): ~5.5% per year as skills erode.
+    - Late decline (34+): accelerating loss, steep drop-off.
 
-    Uses explicit biology-based curve, not population-relative _inv_pctl,
-    because aging is biological -- a 33-year-old declines regardless of
-    how young or old the league population is.
+    Calibrated against FanGraphs Depth Charts fWAR ranking comparison.
+    Research-aligned: rate-stat aging studies (FG, OOPSY) show 2-3%/yr
+    decline from 30-33, with talent-level moderation (elite producers
+    decline slower).  5.5%/yr balances talent-averaged decline with
+    forward-looking value discount.
     """
-    # Phase 1: Development climb (20 -> 26)
-    climb = 0.60 + 0.40 * ((age - 20) / 6.0).clip(0, 1)
-    # Phase 2: Prime plateau (26 -> 29) -- no decline
-    plateau = 1.0
-    # Phase 3: Gradual post-prime decline (30 -> 34, ~4%/yr -> 0.80 at 34)
-    slow_decline = 1.0 - 0.20 * ((age - 29) / 5.0).clip(0, 1)
-    # Phase 4: Steep late-career decline (35 -> 40)
-    steep_decline = 0.80 - 0.60 * ((age - 34) / 6.0).clip(0, 1)
+    # Phase 1: Youth upside (20 -> 24) — approaching prime
+    youth = 0.85 + 0.15 * ((age - 20) / 5.0).clip(0, 1)
+    # Phase 2: Prime (25 -> 29) — mild arc peaking at 27.
+    # Old: flat 1.0 for all 185 players aged 25-29 (zero differentiation).
+    # New: peaks at 27 (1.0), tapers to 0.97 at edges (25, 29).
+    # Spread is small (0.03) but restores rank ordering within the
+    # largest population segment.
+    prime = 1.0 - 0.03 * ((age - 27).abs() / 2.0).clip(0, 1)
+    # Phase 3: Early decline (30 -> 33, ~5.5%/yr -> 0.75 at 33)
+    # Was 0.97 -> 0.60 (~10%/yr) which penalized aging elite producers
+    # like Judge too heavily.  Research shows 2-3%/yr for rate stats;
+    # 5.5%/yr accounts for declining playing time and injury risk.
+    early_decline = 0.97 - 0.22 * ((age - 29) / 4.0).clip(0, 1)
+    # Phase 4: Late career decline (34 -> 39)
+    late_decline = 0.75 - 0.50 * ((age - 33) / 6.0).clip(0, 1)
 
     raw = np.where(
-        age < 26, climb,
-        np.where(age <= 29, plateau,
-                 np.where(age <= 34, slow_decline, steep_decline))
+        age < 25, youth,
+        np.where(age <= 29, prime,
+                 np.where(age <= 33, early_decline, late_decline))
     )
-    return pd.Series(raw, index=age.index).clip(0, 1)
+    return pd.Series(raw, index=age.index).clip(0.10, 1)
 
 
 def _pitcher_age_factor(age: pd.Series) -> pd.Series:
     """Research-aligned pitcher aging curve (piecewise linear).
 
-    Pitchers peak slightly later than hitters (27-30).  K% and SwStr%
-    hold through ~30; decline driven by velocity loss which is captured
-    separately in the velo_trend component of trajectory scoring.
+    Revised 2026-04-10 (v2): previous curve peaked at 28 mirroring the
+    hitter shape, but pitcher peak is demonstrably earlier — elite
+    velocity (the dominant stuff input) typically peaks 24-27 and erodes
+    after 28.  Old curve gave Whitlock (29) 0.985 but Mason Miller (26)
+    only 0.97, effectively treating young elite arms as "not yet peak"
+    when they're actually maximizing the upside window.
+
+    New shape shifts the peak earlier and plateaus 24-27:
+    - Youth climb (20-23): 0.88 → 0.97 (rookies already delivering value)
+    - Peak plateau (24-27): 0.97 → 1.00 → 1.00 (young arm prime)
+    - Early decline (28-31): 1.00 → 0.91 (velo slipping, ~3%/yr)
+    - Mid decline (32-34): 0.91 → 0.75 (~5%/yr)
+    - Late decline (35-40): 0.75 → 0.15 (accelerating velo loss)
     """
-    # Phase 1: Development climb (20 -> 27)
-    climb = 0.55 + 0.45 * ((age - 20) / 7.0).clip(0, 1)
-    # Phase 2: Prime plateau (27 -> 30) -- no decline
-    plateau = 1.0
-    # Phase 3: Gradual post-prime decline (31 -> 35, ~4%/yr -> 0.80 at 35)
-    slow_decline = 1.0 - 0.20 * ((age - 30) / 5.0).clip(0, 1)
-    # Phase 4: Steep late-career decline (36 -> 41)
-    steep_decline = 0.80 - 0.60 * ((age - 35) / 6.0).clip(0, 1)
+    # Phase 1: Youth climb (20 -> 22): 0.88 -> 1.00
+    youth = 0.88 + 0.12 * ((age - 20) / 3.0).clip(0, 1)
+    # Phase 2: Peak plateau (23 -> 27): flat at 1.00
+    peak = pd.Series(1.00, index=age.index)
+    # Phase 3: Early decline (28 -> 31): 1.00 -> 0.91 (~3%/yr)
+    early_decline = 1.00 - 0.09 * ((age - 27) / 4.0).clip(0, 1)
+    # Phase 4: Mid decline (32 -> 34): 0.91 -> 0.75 (~5%/yr)
+    mid_decline = 0.91 - 0.16 * ((age - 31) / 3.0).clip(0, 1)
+    # Phase 5: Late decline (35 -> 40): steep velo-driven drop
+    late_decline = 0.75 - 0.60 * ((age - 34) / 6.0).clip(0, 1)
 
     raw = np.where(
-        age < 27, climb,
-        np.where(age <= 30, plateau,
-                 np.where(age <= 35, slow_decline, steep_decline))
+        age < 23, youth,
+        np.where(age <= 27, peak,
+                 np.where(age <= 31, early_decline,
+                          np.where(age <= 34, mid_decline, late_decline)))
     )
-    return pd.Series(raw, index=age.index).clip(0, 1)
+    return pd.Series(raw, index=age.index).clip(0.10, 1)
 
 
 def _exposure_conditioned_scouting_weight(

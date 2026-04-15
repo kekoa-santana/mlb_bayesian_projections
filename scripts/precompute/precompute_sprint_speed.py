@@ -43,7 +43,7 @@ LEAGUE_SPRINT_SPEED = 27.0
 SHRINKAGE_K = 0.5
 
 # Seasons to compute sprint speed for
-SEASONS = [2022, 2023, 2024, 2025]
+SEASONS = [2022, 2023, 2024, 2025, 2026]
 
 
 def compute_sprint_speeds() -> pd.DataFrame:
@@ -52,25 +52,41 @@ def compute_sprint_speeds() -> pd.DataFrame:
     Shrinkage is based on number of observed seasons per player. Players
     with more seasons of data get less regression toward league average.
 
+    For seasons without data (e.g. early 2026 before Savant publishes),
+    carries forward the most recent season's data.  Sprint speed YoY
+    correlation is r=0.90, making carry-forward a strong prior until
+    new data arrives.
+
     Returns DataFrame with columns:
         player_id, season, sprint_speed, sprint_speed_regressed
     """
     all_dfs: list[pd.DataFrame] = []
+    last_good_df: pd.DataFrame | None = None
 
     for season in SEASONS:
         try:
             df = get_cached_sprint_speed(season)
         except Exception as e:
             logger.warning("Could not load sprint speed for %d: %s", season, e)
-            continue
+            df = pd.DataFrame()
 
         if df.empty:
-            logger.warning("No sprint speed data for %d", season)
-            continue
+            # Carry forward prior season data (sprint speed r=0.90 YoY)
+            if last_good_df is not None:
+                logger.info(
+                    "No sprint speed for %d — carrying forward %d data (%d players)",
+                    season, season - 1, len(last_good_df),
+                )
+                df = last_good_df.copy()
+                df["season"] = season
+            else:
+                logger.warning("No sprint speed data for %d and no prior to carry forward", season)
+                continue
 
         df = df[["player_id", "sprint_speed"]].copy()
         df["season"] = season
         all_dfs.append(df)
+        last_good_df = df
 
     if not all_dfs:
         logger.error("No sprint speed data found across any season")
