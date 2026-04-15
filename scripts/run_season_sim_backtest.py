@@ -18,7 +18,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from pathlib import Path
 
@@ -27,14 +26,15 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.evaluation.runner import (
+    add_common_args,
+    quick_full_sampling,
+    save_csv,
+    setup_logging,
+)
 from src.evaluation.season_sim_backtest import walk_forward_season_sim, walk_forward_hitter_sim
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)-25s %(levelname)-7s %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("season_sim_backtest")
+logger = setup_logging("season_sim_backtest")
 
 
 def _print_summary(summary: pd.DataFrame) -> None:
@@ -98,21 +98,14 @@ PITCHER_FOLDS = [
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Season sim backtest")
-    parser.add_argument("--quick", action="store_true",
-                        help="Fewer MCMC draws for fast iteration")
+    add_common_args(parser)
     parser.add_argument("--single-fold", action="store_true",
                         help="Only run 2024->2025 fold (faster)")
     args = parser.parse_args()
 
-    if args.quick:
-        sampling = dict(draws=500, tune=250, chains=2, random_seed=42, n_seasons=100)
-        logger.info("QUICK mode: draws=500, tune=250, chains=2, n_seasons=100")
-    else:
-        sampling = dict(draws=2000, tune=1000, chains=4, random_seed=42, n_seasons=200)
-        logger.info("FULL mode: draws=2000, tune=1000, chains=4, n_seasons=200")
-
-    out_dir = PROJECT_ROOT / "outputs"
-    out_dir.mkdir(exist_ok=True)
+    sampling = quick_full_sampling(args.quick)
+    sampling["n_seasons"] = 100 if args.quick else 200
+    logger.info("%s mode: %s", "QUICK" if args.quick else "FULL", sampling)
 
     folds = PITCHER_FOLDS[-1:] if args.single_fold else PITCHER_FOLDS
 
@@ -130,8 +123,7 @@ def main() -> None:
     _print_summary(summary)
 
     # Save
-    summary.to_csv(out_dir / "season_sim_backtest_summary.csv", index=False)
-    logger.info("Saved summary to outputs/season_sim_backtest_summary.csv")
+    save_csv(summary, "season_sim_backtest_summary.csv", logger)
 
     # Print timings
     timings = result["timings"]
@@ -168,8 +160,7 @@ def main() -> None:
         parts = [p for p in [bias, corr, cov80] if p]
         print(f"  {stat:15s}  {r['n']:3.0f}p  {'  '.join(parts)}")
 
-    h_summary.to_csv(out_dir / "hitter_sim_backtest_summary.csv", index=False)
-    logger.info("Saved hitter summary to outputs/hitter_sim_backtest_summary.csv")
+    save_csv(h_summary, "hitter_sim_backtest_summary.csv", logger)
 
     h_timings = h_result["timings"]
     h_total = sum(h_timings.values())
