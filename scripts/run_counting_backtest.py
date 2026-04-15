@@ -26,7 +26,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from pathlib import Path
 
@@ -37,13 +36,14 @@ from src.evaluation.counting_backtest import (
     run_hitter_counting_backtest,
     run_pitcher_counting_backtest,
 )
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)-25s %(levelname)-7s %(message)s",
-    datefmt="%H:%M:%S",
+from src.evaluation.runner import (
+    add_common_args,
+    quick_full_sampling,
+    save_csv,
+    setup_logging,
 )
-logger = logging.getLogger("counting_backtest")
+
+logger = setup_logging("counting_backtest")
 
 FOLDS = [
     {"train_seasons": list(range(2018, 2022)), "test_season": 2022},
@@ -84,26 +84,17 @@ def _print_summary(summary, player_type: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Counting stat backtest")
-    parser.add_argument("--quick", action="store_true",
-                        help="Fewer MCMC draws (faster)")
+    add_common_args(parser, stat=True)
     parser.add_argument("--type", choices=["hitter", "pitcher", "both"],
                         default="both", help="Player type to backtest")
-    parser.add_argument("--stat", type=str, default=None,
-                        help="Single counting stat (e.g. total_k, total_sb)")
     parser.add_argument("--n-draws", type=int, default=4000,
                         help="Monte Carlo draws for counting distributions")
     args = parser.parse_args()
 
-    if args.quick:
-        sampling = dict(draws=500, tune=250, chains=2, random_seed=42)
-        logger.info("QUICK mode: %s", sampling)
-    else:
-        sampling = dict(draws=2000, tune=1000, chains=4, random_seed=42)
-        logger.info("FULL mode: %s", sampling)
+    sampling = quick_full_sampling(args.quick)
+    logger.info("%s mode: %s", "QUICK" if args.quick else "FULL", sampling)
 
     sampling["n_draws"] = args.n_draws
-    out_dir = PROJECT_ROOT / "outputs"
-    out_dir.mkdir(exist_ok=True)
 
     # Hitter backtest
     if args.type in ("hitter", "both"):
@@ -112,8 +103,7 @@ def main() -> None:
             stats=stats, folds=FOLDS, **sampling,
         )
         _print_summary(hitter_summary, "hitter")
-        hitter_summary.to_csv(out_dir / "hitter_counting_backtest.csv", index=False)
-        logger.info("Saved to outputs/hitter_counting_backtest.csv")
+        save_csv(hitter_summary, "hitter_counting_backtest.csv", logger)
 
     # Pitcher backtest
     if args.type in ("pitcher", "both"):
@@ -122,8 +112,7 @@ def main() -> None:
             stats=stats, folds=FOLDS, **sampling,
         )
         _print_summary(pitcher_summary, "pitcher")
-        pitcher_summary.to_csv(out_dir / "pitcher_counting_backtest.csv", index=False)
-        logger.info("Saved to outputs/pitcher_counting_backtest.csv")
+        save_csv(pitcher_summary, "pitcher_counting_backtest.csv", logger)
 
 
 if __name__ == "__main__":
