@@ -70,7 +70,7 @@ _STAMINA_LOGIT_SCALE = 0.45  # logit shift per z-score of avg IP
 # Revalidated 2022-2025 with BF >= 9 filter (excludes openers/bullpen games)
 _POP_BF_MU = 22.4
 _POP_BF_STD = 1.8   # Between-pitcher std of mean BF (not within-game)
-_BF_LOGIT_SCALE = 0.25  # logit shift per z-score of pitcher BF mean (tuned from 0.35 to recenter BF bias)
+_BF_LOGIT_SCALE = 0.45  # logit shift per z-score of pitcher BF mean (was 0.25; raised to widen expected_bf spread — sim std was 1.41 vs actual 3.04, causing short starts to over-project H by +1.37)
 
 # Bullpen state adjustment parameters
 _BULLPEN_WORKLOAD_POP_MEAN = 5.0   # Mean relief IP over trailing 3 days
