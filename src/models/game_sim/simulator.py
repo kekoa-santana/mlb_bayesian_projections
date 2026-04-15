@@ -72,6 +72,14 @@ _POP_BF_MU = 22.4
 _POP_BF_STD = 1.8   # Between-pitcher std of mean BF (not within-game)
 _BF_LOGIT_SCALE = 0.45  # logit shift per z-score of pitcher BF mean (was 0.25; raised to widen expected_bf spread — sim std was 1.41 vs actual 3.04, causing short starts to over-project H by +1.37)
 
+# Per-sim exit-offset noise (Option 2): inject within-pitcher game-to-game BF variance.
+# The pitcher-population z-score (_BF_LOGIT_SCALE) scales between-pitcher spread,
+# but real BF variance is dominated by within-pitcher per-start variation
+# ("this pitcher's day"). Without per-sim noise the exit model collapses all sims
+# for the same pitcher toward a narrow band (sim BF std 1.70 vs actual game std 3.04).
+# Sampled once per sim at simulate_game entry, held constant across PAs within a sim.
+_EXIT_OFFSET_PER_SIM_SIGMA = 0.6
+
 # Bullpen state adjustment parameters
 _BULLPEN_WORKLOAD_POP_MEAN = 5.0   # Mean relief IP over trailing 3 days
 _BULLPEN_WORKLOAD_POP_STD = 2.5    # Std of trailing 3-day bullpen IP
@@ -757,6 +765,13 @@ def simulate_game(
     bb_rates = resample_posterior(pitcher_bb_rate_samples, n_sims, rng)
     hr_rates = resample_posterior(pitcher_hr_rate_samples, n_sims, rng)
 
+    # Per-sim exit-offset noise: each sim gets its own "this pitcher's day"
+    # adjustment so the BF distribution reflects within-pitcher game variance,
+    # not just pitcher-to-pitcher spread. Held constant across PAs within a sim.
+    exit_offset_per_sim = rng.normal(
+        0.0, _EXIT_OFFSET_PER_SIM_SIGMA, size=n_sims
+    ).astype(np.float32)
+
     # Default matchup lifts to zeros if missing stat keys
     for stat in ("k", "bb", "hr"):
         if stat not in lineup_matchup_lifts:
@@ -972,11 +987,12 @@ def simulate_game(
             manager_pull_tendency=manager_pull_tendency,
         )
 
-        # Apply calibration offset (logit scale)
-        if exit_calibration_offset != 0.0:
-            exit_prob = np.clip(exit_prob, CLIP_LO, CLIP_HI)
-            exit_logit = logit(exit_prob) + exit_calibration_offset
-            exit_prob = expit(exit_logit)
+        # Apply calibration offset (logit scale) + per-sim noise.
+        # Per-sim noise widens the BF distribution to reflect within-pitcher
+        # game variance (sim std was 1.70 vs actual 3.04 without it).
+        exit_prob = np.clip(exit_prob, CLIP_LO, CLIP_HI)
+        exit_logit = logit(exit_prob) + exit_calibration_offset + exit_offset_per_sim[active]
+        exit_prob = expit(exit_logit)
 
         # Draw exit decisions
         exit_draw = rng.random(n_active) < exit_prob
