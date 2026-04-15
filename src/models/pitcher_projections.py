@@ -37,6 +37,7 @@ from src.models.projection_utils import (
     compute_composite,
     find_breakouts_and_regressions as _find_breakouts_and_regressions,
     fit_all_models_generic,
+    project_rate_samples,
 )
 
 logger = logging.getLogger(__name__)
@@ -342,34 +343,21 @@ def project_forward(
         )
         base[career_col] = base["pitcher_id"].map(career_sum)
 
-        proj_means = {}
-        proj_sds = {}
-        proj_lo = {}
-        proj_hi = {}
-        pitcher_rate_samples[stat] = {}
         _cal_t = (calibration_t or {}).get(stat, 1.0)
 
-        for pitcher_id in base["pitcher_id"]:
-            try:
-                if pitcher_id in pre_extracted:
-                    samples = pre_extracted[pitcher_id].copy()
-                elif trace is not None:
-                    samples = extract_rate_samples(
-                        trace, data, pitcher_id, from_season,
-                        project_forward=True, random_seed=random_seed,
-                    )
-                else:
-                    continue
-                if _cal_t != 1.0:
-                    from src.evaluation.metrics import calibrate_posterior_samples
-                    samples = calibrate_posterior_samples(samples, _cal_t)
-                proj_means[pitcher_id] = float(np.mean(samples))
-                proj_sds[pitcher_id] = float(np.std(samples))
-                proj_lo[pitcher_id] = float(np.percentile(samples, 2.5))
-                proj_hi[pitcher_id] = float(np.percentile(samples, 97.5))
-                pitcher_rate_samples[stat][pitcher_id] = samples
-            except ValueError:
-                continue
+        proj_means, proj_sds, proj_lo, proj_hi, stat_samples = project_rate_samples(
+            ids=base["pitcher_id"],
+            pre_extracted=pre_extracted,
+            trace=trace,
+            data=data,
+            from_season=from_season,
+            id_col="pitcher_id",
+            extract_samples_fn=extract_rate_samples,
+            calibration_t=_cal_t,
+            random_seed=random_seed,
+            collect_samples=True,
+        )
+        pitcher_rate_samples[stat] = stat_samples if stat_samples is not None else {}
 
         base[proj_col] = base["pitcher_id"].map(proj_means)
         base[sd_col] = base["pitcher_id"].map(proj_sds)

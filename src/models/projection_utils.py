@@ -10,12 +10,100 @@ from __future__ import annotations
 
 import gc
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+def project_rate_samples(
+    ids: Iterable[int],
+    pre_extracted: dict[int, np.ndarray],
+    trace: Any | None,
+    data: dict[str, Any],
+    from_season: int,
+    id_col: str,
+    extract_samples_fn: Callable,
+    calibration_t: float = 1.0,
+    random_seed: int = 42,
+    collect_samples: bool = False,
+) -> tuple[
+    dict[int, float],
+    dict[int, float],
+    dict[int, float],
+    dict[int, float],
+    dict[int, np.ndarray] | None,
+]:
+    """Forward-project posterior rate samples for a set of players.
+
+    Iterates over *ids*, drawing rate samples either from the pre-extracted
+    dict or by invoking *extract_samples_fn* on the trace. Optional calibration
+    is applied before summary statistics are computed.
+
+    Parameters
+    ----------
+    ids : iterable of int
+        Player IDs to project.
+    pre_extracted : dict[int, ndarray]
+        Pre-extracted rate samples keyed by player id (may be empty).
+    trace : InferenceData | None
+        MCMC trace used when *pre_extracted* is missing an id.
+    data : dict
+        Model data dict passed to *extract_samples_fn*.
+    from_season : int
+        Season to project forward from.
+    id_col : str
+        ID keyword name used in the extract call ("batter_id"/"pitcher_id").
+    extract_samples_fn : callable
+        Per-player sample extractor. Called positionally as
+        ``fn(trace, data, pid, from_season, project_forward=True,
+        random_seed=...)``.
+    calibration_t : float
+        Temperature scaling. If != 1.0, samples are run through
+        ``calibrate_posterior_samples`` (lazy import).
+    random_seed : int
+        RNG seed forwarded to the extractor.
+    collect_samples : bool
+        When True, the returned fifth element maps id -> samples array.
+        When False, the fifth element is None.
+
+    Returns
+    -------
+    tuple
+        (proj_means, proj_sds, proj_lo_2_5, proj_hi_97_5, samples_or_None)
+    """
+    proj_means: dict[int, float] = {}
+    proj_sds: dict[int, float] = {}
+    proj_lo: dict[int, float] = {}
+    proj_hi: dict[int, float] = {}
+    samples_dict: dict[int, np.ndarray] | None = {} if collect_samples else None
+
+    for pid in ids:
+        try:
+            if pid in pre_extracted:
+                samples = pre_extracted[pid].copy()
+            elif trace is not None:
+                samples = extract_samples_fn(
+                    trace, data, pid, from_season,
+                    project_forward=True, random_seed=random_seed,
+                )
+            else:
+                continue
+            if calibration_t != 1.0:
+                from src.evaluation.metrics import calibrate_posterior_samples
+                samples = calibrate_posterior_samples(samples, calibration_t)
+            proj_means[int(pid)] = float(np.mean(samples))
+            proj_sds[int(pid)] = float(np.std(samples))
+            proj_lo[int(pid)] = float(np.percentile(samples, 2.5))
+            proj_hi[int(pid)] = float(np.percentile(samples, 97.5))
+            if samples_dict is not None:
+                samples_dict[int(pid)] = samples
+        except ValueError:
+            continue
+
+    return proj_means, proj_sds, proj_lo, proj_hi, samples_dict
 
 
 def compute_composite(
