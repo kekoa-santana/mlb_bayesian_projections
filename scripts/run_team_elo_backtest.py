@@ -10,7 +10,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from pathlib import Path
 
@@ -20,17 +19,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.team_queries import get_game_results, get_team_info, get_venue_run_factors
+from src.evaluation.runner import ensure_out_dir, save_csv, setup_logging
 from src.evaluation.team_elo_validation import walk_forward_validation
 from src.models.team_elo import compute_elo_history, get_current_ratings
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)-25s %(levelname)-7s %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("team_elo_backtest")
-
-OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+logger = setup_logging("team_elo_backtest")
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,7 +37,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    OUTPUTS_DIR.mkdir(exist_ok=True)
+    ensure_out_dir()
 
     # Load data
     logger.info("Loading game results...")
@@ -71,8 +64,7 @@ def main() -> None:
         )
 
     # Save current ratings
-    current.to_csv(OUTPUTS_DIR / "team_elo_current.csv", index=False)
-    logger.info("Saved current ratings to outputs/team_elo_current.csv")
+    save_csv(current, "team_elo_current.csv", logger)
 
     # Walk-forward validation
     logger.info("=" * 60)
@@ -83,13 +75,12 @@ def main() -> None:
 
     # Save results
     if not results["predictions"].empty:
-        results["predictions"].to_csv(
-            OUTPUTS_DIR / "team_elo_predictions.csv", index=False,
-        )
-    pd.DataFrame(results["per_season"]).to_csv(
-        OUTPUTS_DIR / "team_elo_per_season.csv", index=False,
+        save_csv(results["predictions"], "team_elo_predictions.csv", logger)
+    save_csv(
+        pd.DataFrame(results["per_season"]),
+        "team_elo_per_season.csv",
+        logger,
     )
-    logger.info("Saved validation results to outputs/")
 
     # Print per-season summary
     logger.info("\n=== Per-Season Accuracy ===")
