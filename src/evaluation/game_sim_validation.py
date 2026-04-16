@@ -449,6 +449,13 @@ def _load_game_context(
     park_lift_lookup, game_venue_lookup = _load_park_lifts(test_season)
     team_defense_lookup = _load_team_defense_lifts(train_seasons)
 
+    # Catcher framing lifts — keyed by (game_pk, pitcher_id). Legacy engine
+    # applies both K and BB lifts here; PA-sim now reads both via GameContext.
+    from src.data.catcher_framing import build_catcher_framing_lookup
+    framing_lookup = build_catcher_framing_lookup(train_seasons, test_season)
+    catcher_k_lifts = framing_lookup.get("k", {}) or {}
+    catcher_bb_lifts = framing_lookup.get("bb", {}) or {}
+
     # Pitcher exit tendencies (latest per pitcher)
     pitcher_tend_latest = (
         exit_tendencies.copy()
@@ -513,6 +520,8 @@ def _load_game_context(
         "team_bullpen_rates_lookup": team_bullpen_rates_lookup,
         "team_runs_allowed_lookup": team_runs_allowed_lookup,
         "batter_bip_lookup": batter_bip_lookup,
+        "catcher_k_lifts": catcher_k_lifts,
+        "catcher_bb_lifts": catcher_bb_lifts,
     }
 
 
@@ -741,6 +750,8 @@ def build_game_sim_predictions(
     team_bullpen_rates_lookup = ctx["team_bullpen_rates_lookup"]
     team_runs_allowed_lookup = ctx["team_runs_allowed_lookup"]
     batter_bip_lookup = ctx["batter_bip_lookup"]
+    catcher_k_lifts = ctx["catcher_k_lifts"]
+    catcher_bb_lifts = ctx["catcher_bb_lifts"]
 
     # ---------------------------------------------------------------
     # 7. Load test season data — actuals + lineups
@@ -873,6 +884,10 @@ def build_game_sim_predictions(
         )
         combined_babip = pk_babip + defense_babip
 
+        # Catcher framing (per (game_pk, pitcher_id))
+        fram_k = catcher_k_lifts.get((game_pk, pitcher_id), 0.0)
+        fram_bb = catcher_bb_lifts.get((game_pk, pitcher_id), 0.0)
+
         # Build pitch count features
         pitcher_adj, batter_adjs = build_pitch_count_features(
             pitcher_features=pitcher_pc_latest,
@@ -932,6 +947,8 @@ def build_game_sim_predictions(
                     park_h_babip_adj=combined_babip,
                     weather_k_lift=wx_k,
                     weather_hr_lift=wx_hr,
+                    catcher_k_lift=fram_k,
+                    catcher_bb_lift=fram_bb,
                 ),
                 lineup_matchup_reliabilities=matchup_reliabilities,
                 manager_pull_tendency=team_avg_p,

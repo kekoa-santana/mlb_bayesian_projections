@@ -1750,6 +1750,27 @@ def run_full_game_prop_backtest(
             ([2020, 2021, 2022, 2023, 2024], 2025),
         ]
 
+    # Pitcher Outs: route to PA-sim (production already does this; legacy
+    # Outs ECE 0.111 vs PA-sim 0.084 on 2024+2025 side-by-side backtest).
+    # K/BB/HR/H stay on legacy pending PA-sim BF-compression rework.
+    if config.side == "pitcher" and config.stat_name == "outs":
+        logger.info(
+            "Routing pitcher Outs through PA-sim engine (production path)"
+        )
+        from src.evaluation.pa_sim_prop_adapter import run_pa_sim_prop_backtest
+        summary_df, preds_by_stat = run_pa_sim_prop_backtest(
+            folds=folds,
+            stats=("outs",),
+            draws=draws,
+            tune=tune,
+            chains=chains,
+            n_sims=n_mc_draws,
+            random_seed=random_seed,
+        )
+        summary_df = summary_df.drop(columns=["engine"], errors="ignore")
+        all_pred_df = preds_by_stat.get("outs", pd.DataFrame())
+        return summary_df, all_pred_df
+
     fold_results: list[dict[str, Any]] = []
     all_predictions: list[pd.DataFrame] = []
 
