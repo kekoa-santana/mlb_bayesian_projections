@@ -5,7 +5,7 @@ import logging
 
 import pandas as pd
 
-from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS
+from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS, save_dashboard_parquet
 
 logger = logging.getLogger("precompute.game_data")
 
@@ -71,7 +71,7 @@ def run_player_teams(
     except Exception as e:
         logger.warning("Could not load spring training teams: %s", e)
 
-    player_teams.to_parquet(DASHBOARD_DIR / "player_teams.parquet", index=False)
+    save_dashboard_parquet(player_teams, "player_teams.parquet")
     logger.info("Saved player teams: %d players", len(player_teams))
 
 
@@ -89,12 +89,12 @@ def run_game_logs(
     logger.info("=" * 60)
     logger.info("Computing game browser data for %d...", from_season)
     game_lineups = get_game_lineups(from_season)
-    game_lineups.to_parquet(DASHBOARD_DIR / "game_lineups.parquet", index=False)
+    save_dashboard_parquet(game_lineups, "game_lineups.parquet")
     logger.info("Saved game lineups: %d rows (%d games)",
                 len(game_lineups), game_lineups["game_pk"].nunique())
 
     game_batter_ks = get_game_batter_ks(from_season)
-    game_batter_ks.to_parquet(DASHBOARD_DIR / "game_batter_ks.parquet", index=False)
+    save_dashboard_parquet(game_batter_ks, "game_batter_ks.parquet")
     logger.info("Saved game batter Ks: %d rows", len(game_batter_ks))
 
     # Pitcher game logs (used by Game Browser for game selection)
@@ -103,7 +103,7 @@ def run_game_logs(
     pitcher_game_logs = pitcher_game_logs[
         ~((pitcher_game_logs["is_starter"] == True) & (pitcher_game_logs["batters_faced"] < 9))  # noqa: E712
     ].copy()
-    pitcher_game_logs.to_parquet(DASHBOARD_DIR / "pitcher_game_logs.parquet", index=False)
+    save_dashboard_parquet(pitcher_game_logs, "pitcher_game_logs.parquet")
     logger.info("Saved pitcher game logs: %d rows", len(pitcher_game_logs))
 
     # Game info (date, teams)
@@ -115,7 +115,7 @@ def run_game_logs(
         FROM production.dim_game
         WHERE game_type = 'R' AND season = :season
     """, {"season": from_season})
-    game_info.to_parquet(DASHBOARD_DIR / "game_info.parquet", index=False)
+    save_dashboard_parquet(game_info, "game_info.parquet")
     logger.info("Saved game info: %d games", len(game_info))
 
 
@@ -156,7 +156,7 @@ def run_bf_priors(
         _ppa = None
 
     bf_priors = compute_pitcher_bf_priors(game_logs, pitcher_ppa=_ppa)
-    bf_priors.to_parquet(DASHBOARD_DIR / "bf_priors.parquet", index=False)
+    save_dashboard_parquet(bf_priors, "bf_priors.parquet")
     logger.info("Saved BF priors: %d pitcher-seasons", len(bf_priors))
 
 
@@ -172,7 +172,7 @@ def run_umpire(
     umpire_tendencies = get_umpire_tendencies(
         seasons=list(range(2021, from_season + 1)), min_games=30,
     )
-    umpire_tendencies.to_parquet(DASHBOARD_DIR / "umpire_tendencies.parquet", index=False)
+    save_dashboard_parquet(umpire_tendencies, "umpire_tendencies.parquet")
     logger.info("Saved umpire tendencies: %d umpires", len(umpire_tendencies))
 
 
@@ -186,7 +186,7 @@ def run_weather(
     logger.info("=" * 60)
     logger.info("Computing weather effects...")
     weather_effects = get_weather_effects(seasons=seasons)
-    weather_effects.to_parquet(DASHBOARD_DIR / "weather_effects.parquet", index=False)
+    save_dashboard_parquet(weather_effects, "weather_effects.parquet")
     logger.info("Saved weather effects: %d combinations", len(weather_effects))
 
 
@@ -209,7 +209,7 @@ def run_catcher_framing(
             logger.warning("Catcher framing failed for season %d: %s", s, e)
     if frames:
         framing = pd.concat(frames, ignore_index=True)
-        framing.to_parquet(DASHBOARD_DIR / "catcher_framing.parquet", index=False)
+        save_dashboard_parquet(framing, "catcher_framing.parquet")
         logger.info("Saved catcher framing: %d catcher-seasons", len(framing))
     else:
         logger.warning("No catcher framing data produced")

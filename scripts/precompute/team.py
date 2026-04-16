@@ -6,7 +6,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS
+from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS, save_dashboard_parquet
 
 logger = logging.getLogger("precompute.team")
 
@@ -91,7 +91,7 @@ def run_team_elo() -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFra
 
         # Current (end-of-2025) ratings
         elo_current = get_current_ratings(elo_ratings, elo_team_info)
-        elo_current.to_parquet(DASHBOARD_DIR / "team_elo.parquet", index=False)
+        save_dashboard_parquet(elo_current, "team_elo.parquet")
         logger.info("Saved team_elo.parquet: %d teams", len(elo_current))
 
         # Pre-season 2026 ratings (regressed, then roster-adjusted)
@@ -125,12 +125,12 @@ def run_team_elo() -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFra
             )
 
         elo_preseason = get_current_ratings(elo_preseason_ratings, elo_team_info)
-        elo_preseason.to_parquet(DASHBOARD_DIR / "team_elo_preseason.parquet", index=False)
+        save_dashboard_parquet(elo_preseason, "team_elo_preseason.parquet")
         logger.info("Saved team_elo_preseason.parquet: %d teams (roster-adjusted)", len(elo_preseason))
 
         # History (last 3 seasons for dashboard charts)
         recent_history = elo_history[elo_history["season"] >= FROM_SEASON - 2]
-        recent_history.to_parquet(DASHBOARD_DIR / "team_elo_history.parquet", index=False)
+        save_dashboard_parquet(recent_history, "team_elo_history.parquet")
         logger.info("Saved team_elo_history.parquet: %d rows", len(recent_history))
 
         return elo_current, elo_preseason, elo_history
@@ -178,9 +178,7 @@ def run_series_elo(*, from_season: int = FROM_SEASON) -> None:
         # Pre-season 2026 projection (regressed)
         preseason_ratings = project_preseason_elo(ratings)
         preseason = get_current_ratings(preseason_ratings, team_info)
-        preseason.to_parquet(
-            DASHBOARD_DIR / "team_series_elo_preseason.parquet", index=False,
-        )
+        save_dashboard_parquet(preseason, "team_series_elo_preseason.parquet")
         logger.info("Saved team_series_elo_preseason.parquet: %d teams", len(preseason))
 
         # Log top 10
@@ -218,7 +216,7 @@ def run_team_profiles(
             elo_history=elo_history,
             pitcher_roles_df=pitcher_roles_df,
         )
-        team_profiles.to_parquet(DASHBOARD_DIR / "team_profiles.parquet", index=False)
+        save_dashboard_parquet(team_profiles, "team_profiles.parquet")
         logger.info("Saved team_profiles.parquet: %d teams", len(team_profiles))
 
         # Roster WAA delta: compare prior season rosters to current
@@ -254,7 +252,7 @@ def run_team_profiles(
             waa_deltas=waa_deltas,
             observed_rs_ra=obs_2h,
         )
-        team_rankings_df.to_parquet(DASHBOARD_DIR / "team_rankings.parquet", index=False)
+        save_dashboard_parquet(team_rankings_df, "team_rankings.parquet")
         logger.info("Saved team_rankings.parquet: %d teams", len(team_rankings_df))
 
         # Log top 10
@@ -325,9 +323,7 @@ def run_team_power(
                 team_records=_team_records,
             )
             # Save power rankings standalone (backward compat)
-            power_rankings_df.to_parquet(
-                DASHBOARD_DIR / "team_power_rankings.parquet", index=False,
-            )
+            save_dashboard_parquet(power_rankings_df, "team_power_rankings.parquet")
 
             _merge_power_into_team_rankings(power_rankings_df)
 
@@ -691,7 +687,7 @@ def run_league_sim(
         # Map team_id to abbreviation
         tid_abbr = dict(zip(tr["team_id"], tr["abbreviation"]))
         result["team_abbr"] = result["team_id"].map(tid_abbr)
-        result.to_parquet(DASHBOARD_DIR / "league_sim.parquet", index=False)
+        save_dashboard_parquet(result, "league_sim.parquet")
         logger.info("Saved league_sim.parquet: %d teams", len(result))
 
         # Apply in-season Beta-Binomial blend so team_rankings.parquet's
@@ -848,7 +844,7 @@ def run_team_sim(
 
         # Run simulation
         results = simulate_all_teams(team_rosters, n_sims=n_sims, random_seed=random_seed)
-        results.to_parquet(DASHBOARD_DIR / "team_sim_wins.parquet", index=False)
+        save_dashboard_parquet(results, "team_sim_wins.parquet")
         logger.info("Saved team_sim_wins.parquet: %d teams", len(results))
 
         # Log top 10
@@ -1279,9 +1275,7 @@ def run_depth_chart(
 
         probable_df = pd.DataFrame(all_starters)
         if not probable_df.empty:
-            probable_df.to_parquet(
-                DASHBOARD_DIR / "probable_starters.parquet", index=False,
-            )
+            save_dashboard_parquet(probable_df, "probable_starters.parquet")
             logger.info(
                 "Saved probable starters: %d players across %d teams",
                 len(probable_df), probable_df["team_abbr"].nunique(),
@@ -1303,9 +1297,7 @@ def run_depth_chart(
 
             hand_df = pd.DataFrame(hand_starters)
             if not hand_df.empty:
-                hand_df.to_parquet(
-                    DASHBOARD_DIR / "probable_starters_by_hand.parquet", index=False,
-                )
+                save_dashboard_parquet(hand_df, "probable_starters_by_hand.parquet")
                 logger.info(
                     "Saved platoon starters: %d entries (%d vs RHP, %d vs LHP)",
                     len(hand_df),
@@ -1314,9 +1306,7 @@ def run_depth_chart(
                 )
 
         if not lineup_priors.empty:
-            lineup_priors.to_parquet(
-                DASHBOARD_DIR / "lineup_priors.parquet", index=False,
-            )
+            save_dashboard_parquet(lineup_priors, "lineup_priors.parquet")
             logger.info("Saved lineup priors: %d rows", len(lineup_priors))
     except Exception:
         logger.exception("Failed to compute probable starters")
@@ -1426,9 +1416,7 @@ def run_roster(*, from_season: int = FROM_SEASON) -> None:
                     roster_full.at[i, "is_depth_starter"] = True
 
         if not roster_full.empty:
-            roster_full.to_parquet(
-                DASHBOARD_DIR / "roster.parquet", index=False,
-            )
+            save_dashboard_parquet(roster_full, "roster.parquet")
             n_starters = roster_full["is_depth_starter"].sum()
             n_with_pos = roster_full["lineup_position"].notna().sum()
             logger.info(

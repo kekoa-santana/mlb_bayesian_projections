@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from src.data.db import read_sql
+from src.data.queries._common import season_in_clause
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ def compute_multi_stat_park_factors(
     if seasons is None:
         seasons = [2023, 2024, 2025]
 
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
 
     raw = read_sql(f"""
         WITH game_team AS (

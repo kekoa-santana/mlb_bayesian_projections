@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from src.evaluation.runner import setup_logging
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -44,13 +45,7 @@ from scripts.precompute.backtest_harness import (
     simulate_one_side as _harness_simulate_one_side,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
+logger = setup_logging(__name__)
 def load_posteriors() -> dict:
     """Load all pre-computed posterior NPZ files and supporting data."""
     logger.info("Loading posterior samples and supporting data...")

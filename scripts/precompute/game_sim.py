@@ -6,7 +6,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS
+from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS, save_dashboard_parquet
 
 logger = logging.getLogger("precompute.game_sim")
 
@@ -64,9 +64,7 @@ def run(
             exit_metrics["auc"], exit_metrics["n_samples"],
         )
         exit_model.save(DASHBOARD_DIR / "exit_model.pkl")
-        exit_tendencies.to_parquet(
-            DASHBOARD_DIR / "pitcher_exit_tendencies.parquet", index=False,
-        )
+        save_dashboard_parquet(exit_tendencies, "pitcher_exit_tendencies.parquet")
         logger.info("Saved exit model + tendencies")
     except Exception:
         logger.exception("Failed to train exit model")
@@ -75,15 +73,11 @@ def run(
     logger.info("Computing pitch count features...")
     try:
         pitcher_pc = get_pitcher_pitch_count_features(seasons)
-        pitcher_pc.to_parquet(
-            DASHBOARD_DIR / "pitcher_pitch_count_features.parquet", index=False,
-        )
+        save_dashboard_parquet(pitcher_pc, "pitcher_pitch_count_features.parquet")
         logger.info("Saved pitcher pitch count features: %d rows", len(pitcher_pc))
 
         batter_pc = get_batter_pitch_count_features(seasons)
-        batter_pc.to_parquet(
-            DASHBOARD_DIR / "batter_pitch_count_features.parquet", index=False,
-        )
+        save_dashboard_parquet(batter_pc, "batter_pitch_count_features.parquet")
         logger.info("Saved batter pitch count features: %d rows", len(batter_pc))
     except Exception:
         logger.exception("Failed to compute pitch count features")
@@ -92,9 +86,7 @@ def run(
     logger.info("Computing TTO adjustment profiles...")
     try:
         tto_profiles = get_tto_adjustment_profiles(seasons)
-        tto_profiles.to_parquet(
-            DASHBOARD_DIR / "tto_profiles.parquet", index=False,
-        )
+        save_dashboard_parquet(tto_profiles, "tto_profiles.parquet")
         logger.info("Saved TTO profiles: %d rows", len(tto_profiles))
     except Exception:
         logger.exception("Failed to compute TTO profiles")
@@ -123,9 +115,7 @@ def run(
     logger.info("Computing team bullpen rates...")
     try:
         bullpen_rates = get_team_bullpen_rates(seasons)
-        bullpen_rates.to_parquet(
-            DASHBOARD_DIR / "team_bullpen_rates.parquet", index=False,
-        )
+        save_dashboard_parquet(bullpen_rates, "team_bullpen_rates.parquet")
         logger.info("Saved team bullpen rates: %d rows", len(bullpen_rates))
     except Exception:
         logger.exception("Failed to compute team bullpen rates")
@@ -247,9 +237,7 @@ def run(
 
             if rows:
                 out_df = pd.DataFrame(rows)
-                out_df.to_parquet(
-                    DASHBOARD_DIR / "batter_bip_profiles.parquet", index=False,
-                )
+                save_dashboard_parquet(out_df, "batter_bip_profiles.parquet")
                 logger.info(
                     "Saved batter BIP profiles: %d batters. "
                     "Mean p_out=%.3f p_single=%.3f p_double=%.3f p_triple=%.4f",

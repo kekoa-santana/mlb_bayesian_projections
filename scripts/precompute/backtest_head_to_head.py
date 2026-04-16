@@ -25,6 +25,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.models.game_sim.lineup_simulator import simulate_lineup_game
 from src.models.game_sim.batter_simulator import simulate_batter_game
+from src.evaluation.runner import setup_logging
 
 # Reuse helpers from the existing backtest
 from scripts.precompute.backtest_lineup_sim import (
@@ -35,12 +36,7 @@ from scripts.precompute.backtest_lineup_sim import (
     DEFAULT_BP_HR,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
+logger = setup_logging(__name__)
 N_SIMS = 10_000
 BATCH_SIZE = 25
 

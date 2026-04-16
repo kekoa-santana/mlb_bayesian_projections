@@ -41,13 +41,9 @@ from src.evaluation.pa_sim_prop_adapter import (
     compute_engine_diff,
     run_pa_sim_prop_backtest,
 )
+from src.evaluation.runner import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-)
-logger = logging.getLogger(__name__)
-
+logger = setup_logging(__name__)
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs"
 
 

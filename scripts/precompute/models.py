@@ -5,7 +5,7 @@ import logging
 
 import pandas as pd
 
-from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS, load_calibration_t
+from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS, load_calibration_t, save_dashboard_parquet
 
 logger = logging.getLogger("precompute.models")
 
@@ -71,7 +71,7 @@ def run(
             hitter_results, from_season=from_season, min_pa=150,
             calibration_t=hitter_cal_t,
         )
-        hitter_proj.to_parquet(DASHBOARD_DIR / "hitter_projections.parquet", index=False)
+        save_dashboard_parquet(hitter_proj, "hitter_projections.parquet")
         logger.info("Saved hitter projections: %d players", len(hitter_proj))
 
     # -- Pitcher models --
@@ -106,7 +106,7 @@ def run(
             calibration_t=pitcher_cal_t,
             xgb_priors=xgb_preds,
         )
-        pitcher_proj.to_parquet(DASHBOARD_DIR / "pitcher_projections.parquet", index=False)
+        save_dashboard_parquet(pitcher_proj, "pitcher_projections.parquet")
         logger.info("Saved pitcher projections: %d players", len(pitcher_proj))
 
     return hitter_results, pitcher_results, hitter_proj, pitcher_proj

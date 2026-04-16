@@ -27,15 +27,9 @@ from src.evaluation.game_k_validation import (
     run_full_game_backtest,
     run_full_game_k_backtest,
 )
-from src.evaluation.runner import save_csv
+from src.evaluation.runner import quick_full_game_mcmc, save_csv, setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
+logger = setup_logging(__name__)
 def main() -> None:
     parser = argparse.ArgumentParser(description="Game-level prediction backtest")
     parser.add_argument("--quick", action="store_true",
@@ -44,10 +38,8 @@ def main() -> None:
                         help="Only run K predictions (skip BB/HR/Outs)")
     args = parser.parse_args()
 
-    if args.quick:
-        draws, tune, chains, n_mc = 500, 250, 2, 1000
-    else:
-        draws, tune, chains, n_mc = 1000, 500, 2, 2000
+    draws, tune, chains = quick_full_game_mcmc(args.quick)
+    n_mc = 1000 if args.quick else 2000
 
     logger.info("=" * 70)
     logger.info("GAME-LEVEL PREDICTION BACKTEST")

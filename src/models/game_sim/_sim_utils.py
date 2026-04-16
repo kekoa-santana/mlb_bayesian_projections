@@ -12,20 +12,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.special import logit
 
-from src.utils.constants import CLIP_LO, CLIP_HI
+from src.utils.math_helpers import safe_logit
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Logit helper
-# ---------------------------------------------------------------------------
-
-def safe_logit(p: np.ndarray | float) -> np.ndarray | float:
-    """Logit with clipping to avoid infinities."""
-    return logit(np.clip(p, CLIP_LO, CLIP_HI))
+__all__ = ["safe_logit", "resample_posterior"]
 
 
 # ---------------------------------------------------------------------------

@@ -15,9 +15,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.special import expit, logit
+from scipy.special import expit
 
-from src.utils.constants import CLIP_LO, CLIP_HI
+from src.utils.math_helpers import safe_logit as _safe_logit
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +35,6 @@ PA_WEIGHTS_BY_SLOT: np.ndarray = np.array([
     3.75,  # slot 8
     3.55,  # slot 9
 ])
-
-
-def _safe_logit(p: float | np.ndarray) -> float | np.ndarray:
-    """Logit with clipping to avoid infinities."""
-    return logit(np.clip(p, CLIP_LO, CLIP_HI))
 
 
 # ---------------------------------------------------------------------------

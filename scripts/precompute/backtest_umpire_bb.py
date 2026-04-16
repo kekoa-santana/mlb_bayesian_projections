@@ -44,14 +44,9 @@ from scripts.precompute.backtest_lineup_sim import (
     load_posteriors as _load_base_posteriors,
 )
 from src.data.queries import get_umpire_tendencies
+from src.evaluation.runner import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
+logger = setup_logging(__name__)
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------

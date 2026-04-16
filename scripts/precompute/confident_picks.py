@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from scipy.special import logit as _logit
 
-from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS
+from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS, save_dashboard_parquet
 
 logger = logging.getLogger("precompute.confident_picks")
 
@@ -1274,7 +1274,7 @@ def _run_market_edge(
 
     # 2. Save per-leg scores (useful for dashboard drill-down)
     leg_df = legs_to_dataframe(legs)
-    leg_df.to_parquet(DASHBOARD_DIR / "market_legs.parquet", index=False)
+    save_dashboard_parquet(leg_df, "market_legs.parquet")
 
     # 3. Find best parlay combos across platforms
     parlays = find_best_parlays(
@@ -1292,7 +1292,7 @@ def _run_market_edge(
 
     # 4. Save parlay recommendations
     parlay_df = parlays_to_dataframe(parlays)
-    parlay_df.to_parquet(DASHBOARD_DIR / "market_parlays.parquet", index=False)
+    save_dashboard_parquet(parlay_df, "market_parlays.parquet")
 
     # Summary logging
     profitable = [p for p in parlays if p.ev_per_dollar > 1.0]
@@ -1381,7 +1381,7 @@ def _fetch_book_props(
             dk_df = dk_df[dk_df["player_id"].notna()].copy()
             dk_df["player_id"] = dk_df["player_id"].astype(int)
             dk_df["game_date"] = game_date
-            dk_df.to_parquet(DASHBOARD_DIR / "dk_props.parquet", index=False)
+            save_dashboard_parquet(dk_df, "dk_props.parquet")
             # Append to history
             _dk_hist_path = DASHBOARD_DIR / "dk_props_history.parquet"
             if _dk_hist_path.exists():
@@ -1420,7 +1420,7 @@ def _fetch_book_props(
             pp_df = pp_df[pp_df["player_id"].notna()].copy()
             pp_df["player_id"] = pp_df["player_id"].astype(int)
             pp_df["game_date"] = game_date
-            pp_df.to_parquet(DASHBOARD_DIR / "pp_props.parquet", index=False)
+            save_dashboard_parquet(pp_df, "pp_props.parquet")
             # Append to history
             _pp_hist_path = DASHBOARD_DIR / "pp_props_history.parquet"
             if _pp_hist_path.exists():

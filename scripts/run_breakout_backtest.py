@@ -19,18 +19,12 @@ from pathlib import Path
 
 import pandas as pd
 import yaml
+from src.evaluation.runner import setup_logging
 
 # Project root on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(name)-30s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("breakout_backtest")
-
-
+logger = setup_logging("breakout_backtest")
 def _load_config() -> dict:
     cfg_path = Path("config/model.yaml")
     if cfg_path.exists():

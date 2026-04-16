@@ -27,6 +27,7 @@ import pymc as pm
 
 from src.data.feature_eng import N_SKILL_TIERS, SKILL_TIER_LABELS  # noqa: F401 — re-exported
 from src.utils.constants import LEAGUE_AVG_OVERALL
+from src.utils.math_helpers import flatten_posterior, posterior_point_summary
 
 logger = logging.getLogger(__name__)
 
@@ -366,8 +367,7 @@ def extract_posteriors(
     cfg = STAT_CONFIGS[stat]
     df = data["df"]
 
-    rate_post = trace.posterior["rate"].values  # (chains, draws, obs)
-    rate_flat = rate_post.reshape(-1, rate_post.shape[-1])
+    rate_flat = flatten_posterior(trace, "rate")
 
     records = []
     for pos, (i, row) in enumerate(df.iterrows()):
@@ -382,13 +382,7 @@ def extract_posteriors(
             "skill_tier": row.get("skill_tier", 1),
             "pa": row["pa"],
             f"observed_{stat}": row[cfg.rate_col],
-            f"{stat}_mean": float(np.mean(samples)),
-            f"{stat}_sd": float(np.std(samples)),
-            f"{stat}_2_5": float(np.percentile(samples, 2.5)),
-            f"{stat}_25": float(np.percentile(samples, 25)),
-            f"{stat}_50": float(np.percentile(samples, 50)),
-            f"{stat}_75": float(np.percentile(samples, 75)),
-            f"{stat}_97_5": float(np.percentile(samples, 97.5)),
+            **posterior_point_summary(samples, prefix=stat),
         }
         records.append(rec)
 

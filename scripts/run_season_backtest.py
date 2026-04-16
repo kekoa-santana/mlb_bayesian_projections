@@ -23,14 +23,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.evaluation.backtesting import run_full_backtest, run_full_pitcher_backtest
+from src.evaluation.runner import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)-25s %(levelname)-7s %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("season_backtest")
-
+logger = setup_logging("season_backtest")
 FOLDS = [
     {"train_seasons": [2018, 2019, 2020, 2021, 2022], "test_season": 2023},
     {"train_seasons": [2018, 2019, 2020, 2021, 2022, 2023], "test_season": 2024},

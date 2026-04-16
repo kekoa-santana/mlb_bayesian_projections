@@ -33,10 +33,40 @@ def setup_logging(name: str) -> logging.Logger:
 
 
 def quick_full_sampling(quick: bool) -> dict:
-    """Return the canonical quick/full PyMC sampling kwargs dict."""
+    """Return the canonical quick/full PyMC sampling kwargs dict.
+
+    Used by rate-model backtests (hitter, pitcher, counting, season sim).
+    """
     if quick:
         return dict(draws=500, tune=250, chains=2, random_seed=42)
     return dict(draws=2000, tune=1000, chains=4, random_seed=42)
+
+
+def quick_full_game_mcmc(quick: bool) -> tuple[int, int, int]:
+    """Return ``(draws, tune, chains)`` for game-level engine backtests.
+
+    Distinct from :func:`quick_full_sampling` — game-level backtests
+    (game_k, game_sim, batter_sim) use a lighter spec because Monte Carlo
+    draws dominate runtime. Callers pick their own ``n_mc`` / ``n_sims``
+    count on top.
+    """
+    return (500, 250, 2) if quick else (1000, 500, 2)
+
+
+# Canonical walk-forward fold windows for rate-model backtests.
+# Matched across hitter and pitcher runners so metrics are comparable.
+RATE_FOLDS: list[dict] = [
+    {"train_seasons": [2018, 2019, 2020, 2021, 2022], "test_season": 2023},
+    {"train_seasons": [2018, 2019, 2020, 2021, 2022, 2023], "test_season": 2024},
+    {"train_seasons": [2018, 2019, 2020, 2021, 2022, 2023, 2024], "test_season": 2025},
+]
+
+COUNTING_FOLDS: list[dict] = [
+    {"train_seasons": list(range(2018, 2022)), "test_season": 2022},
+    {"train_seasons": list(range(2018, 2023)), "test_season": 2023},
+    {"train_seasons": list(range(2018, 2024)), "test_season": 2024},
+    {"train_seasons": list(range(2018, 2025)), "test_season": 2025},
+]
 
 
 def ensure_out_dir() -> Path:

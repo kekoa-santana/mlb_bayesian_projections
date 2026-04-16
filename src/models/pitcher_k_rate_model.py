@@ -29,6 +29,7 @@ import pandas as pd
 import pymc as pm
 
 from src.utils.constants import LEAGUE_AVG_OVERALL
+from src.utils.math_helpers import flatten_posterior, posterior_point_summary
 
 logger = logging.getLogger(__name__)
 
@@ -303,8 +304,7 @@ def extract_pitcher_posteriors(
         k_rate_2_5, k_rate_25, k_rate_50, k_rate_75, k_rate_97_5.
     """
     df = data["df"]
-    k_rate_post = trace.posterior["k_rate"].values  # (chains, draws, obs)
-    k_rate_flat = k_rate_post.reshape(-1, k_rate_post.shape[-1])
+    k_rate_flat = flatten_posterior(trace, "k_rate")
 
     records = []
     for pos, (i, row) in enumerate(df.iterrows()):
@@ -316,13 +316,7 @@ def extract_pitcher_posteriors(
             "season": row["season"],
             "batters_faced": row["batters_faced"],
             "observed_k_rate": row["k_rate"],
-            "k_rate_mean": np.mean(samples),
-            "k_rate_sd": np.std(samples),
-            "k_rate_2_5": np.percentile(samples, 2.5),
-            "k_rate_25": np.percentile(samples, 25),
-            "k_rate_50": np.percentile(samples, 50),
-            "k_rate_75": np.percentile(samples, 75),
-            "k_rate_97_5": np.percentile(samples, 97.5),
+            **posterior_point_summary(samples, prefix="k_rate"),
         }
         if "is_starter" in row.index:
             rec["is_starter"] = int(row["is_starter"])

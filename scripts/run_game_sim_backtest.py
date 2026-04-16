@@ -25,14 +25,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.evaluation.game_sim_validation import (
     run_full_game_sim_backtest,
 )
+from src.evaluation.runner import quick_full_game_mcmc, setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
+logger = setup_logging(__name__)
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Game simulator walk-forward backtest"
@@ -47,10 +42,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.quick:
-        draws, tune, chains, n_sims = 500, 250, 2, 2000
-    else:
-        draws, tune, chains, n_sims = 1000, 500, 2, 5000
+    draws, tune, chains = quick_full_game_mcmc(args.quick)
+    n_sims = 2000 if args.quick else 5000
 
     # Configure folds
     if args.single_fold:

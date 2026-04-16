@@ -20,6 +20,18 @@ FROM_SEASON = 2025
 logger = logging.getLogger("precompute")
 
 
+def save_dashboard_parquet(df: pd.DataFrame, filename: str) -> Path:
+    """Write ``df`` to ``DASHBOARD_DIR/filename`` with ``index=False``.
+
+    Returns the full path so callers can log row counts, track sizes, etc.
+    Ensures ``index=False`` is applied consistently across every dashboard
+    artifact — callers should not pass a full path.
+    """
+    path = DASHBOARD_DIR / filename
+    df.to_parquet(path, index=False)
+    return path
+
+
 def precache_profiles(from_season: int = FROM_SEASON) -> None:
     """Pre-cache observed profiles needed by projection enrichment."""
     from src.data.feature_eng import (

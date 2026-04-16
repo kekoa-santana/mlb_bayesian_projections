@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from src.data.db import read_sql
-from src.data.queries._common import _WOBA_WEIGHTS
+from src.data.queries._common import _WOBA_WEIGHTS, season_in_clause
 
 logger = logging.getLogger(__name__)
 
@@ -598,7 +598,7 @@ def get_postseason_batter_stats(seasons: list[int]) -> pd.DataFrame:
     if not seasons:
         return pd.DataFrame()
 
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     WITH game_rounds AS (
         SELECT
@@ -689,7 +689,7 @@ def get_postseason_pitcher_stats(seasons: list[int]) -> pd.DataFrame:
     if not seasons:
         return pd.DataFrame()
 
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     WITH game_rounds AS (
         SELECT

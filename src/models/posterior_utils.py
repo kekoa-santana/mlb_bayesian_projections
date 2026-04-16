@@ -10,16 +10,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.special import expit, logit
+from scipy.special import expit
 
-from src.utils.constants import CLIP_LO, CLIP_HI
+from src.utils.math_helpers import safe_logit as _safe_logit
 
 logger = logging.getLogger(__name__)
-
-
-def _safe_logit(p: np.ndarray | float) -> np.ndarray | float:
-    """Logit with clipping."""
-    return logit(np.clip(p, CLIP_LO, CLIP_HI))
 
 
 def extract_pitcher_k_rate_samples(

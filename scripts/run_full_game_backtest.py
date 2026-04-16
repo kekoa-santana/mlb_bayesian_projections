@@ -28,14 +28,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.data.db import read_sql
 from src.data.feature_eng import get_cached_game_lineups
 from src.evaluation.full_game_sim_batch import fit_full_game_sim_bundle, simulate_full_games
+from src.evaluation.runner import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
+logger = setup_logging(__name__)
 # ---------------------------------------------------------------------------
 # Data loading helpers
 # ---------------------------------------------------------------------------

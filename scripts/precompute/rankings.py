@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 
-from precompute import DASHBOARD_DIR, FROM_SEASON
+from precompute import DASHBOARD_DIR, FROM_SEASON, save_dashboard_parquet
 
 logger = logging.getLogger("precompute.rankings")
 
@@ -79,10 +79,7 @@ def run_player_rankings(
 
         elig = get_hitter_position_eligibility(season=from_season, min_starts=10)
         if not elig.empty:
-            elig.to_parquet(
-                DASHBOARD_DIR / "hitter_position_eligibility.parquet",
-                index=False,
-            )
+            save_dashboard_parquet(elig, "hitter_position_eligibility.parquet")
             n_players = elig["player_id"].nunique()
             n_rows = len(elig)
             logger.info(
@@ -115,17 +112,13 @@ def run_player_rankings(
             elig = elig.merge(oaa_by_pos, on=["player_id", "position"], how="left")
             elig["oaa"] = elig["oaa"].fillna(0).astype(int)
             elig["frp"] = elig["frp"].fillna(0).astype(int)
-            elig.to_parquet(
-                DASHBOARD_DIR / "hitter_position_eligibility.parquet", index=False,
-            )
+            save_dashboard_parquet(elig, "hitter_position_eligibility.parquet")
             logger.info("Enriched position eligibility with per-position OAA: %d rows", len(elig))
 
             # Convert per-position OAA to 20-80 fielding grades
             from src.models.scouting_grades import grade_position_fielding
             elig = grade_position_fielding(elig, season=from_season)
-            elig.to_parquet(
-                DASHBOARD_DIR / "hitter_position_eligibility.parquet", index=False,
-            )
+            save_dashboard_parquet(elig, "hitter_position_eligibility.parquet")
             logger.info("Added per-position fielding grades (20-80)")
     except Exception as e:
         logger.warning("Could not enrich position OAA: %s", e)
@@ -145,10 +138,7 @@ def run_breakouts(
 
         breakouts = score_breakout_candidates(season=from_season, min_pa=150)
         if not breakouts.empty:
-            breakouts.to_parquet(
-                DASHBOARD_DIR / "hitter_breakout_candidates.parquet",
-                index=False,
-            )
+            save_dashboard_parquet(breakouts, "hitter_breakout_candidates.parquet")
             logger.info(
                 "Saved hitter_breakout_candidates.parquet: %d rows",
                 len(breakouts),
@@ -168,10 +158,7 @@ def run_breakouts(
 
         p_breakouts = score_pitcher_breakout_candidates(season=from_season, min_bf=150)
         if not p_breakouts.empty:
-            p_breakouts.to_parquet(
-                DASHBOARD_DIR / "pitcher_breakout_candidates.parquet",
-                index=False,
-            )
+            save_dashboard_parquet(p_breakouts, "pitcher_breakout_candidates.parquet")
             logger.info(
                 "Saved pitcher_breakout_candidates.parquet: %d rows",
                 len(p_breakouts),
@@ -214,13 +201,13 @@ def run_weekly_form(
         pitchers = boards.get("pitchers", pd.DataFrame())
 
         if not hitters.empty:
-            hitters.to_parquet(DASHBOARD_DIR / "hitters_weekly_form.parquet", index=False)
+            save_dashboard_parquet(hitters, "hitters_weekly_form.parquet")
             logger.info("Saved hitters_weekly_form.parquet: %d rows", len(hitters))
         else:
             logger.warning("No hitter weekly form rows generated")
 
         if not pitchers.empty:
-            pitchers.to_parquet(DASHBOARD_DIR / "pitchers_weekly_form.parquet", index=False)
+            save_dashboard_parquet(pitchers, "pitchers_weekly_form.parquet")
             logger.info("Saved pitchers_weekly_form.parquet: %d rows", len(pitchers))
         else:
             logger.warning("No pitcher weekly form rows generated")
@@ -257,13 +244,13 @@ def run_daily_standouts(
         pitchers = boards.get("pitchers", pd.DataFrame())
 
         if not hitters.empty:
-            hitters.to_parquet(DASHBOARD_DIR / "hitters_daily_standouts.parquet", index=False)
+            save_dashboard_parquet(hitters, "hitters_daily_standouts.parquet")
             logger.info("Saved hitters_daily_standouts.parquet: %d rows", len(hitters))
         else:
             logger.warning("No hitter daily standout rows generated")
 
         if not pitchers.empty:
-            pitchers.to_parquet(DASHBOARD_DIR / "pitchers_daily_standouts.parquet", index=False)
+            save_dashboard_parquet(pitchers, "pitchers_daily_standouts.parquet")
             logger.info("Saved pitchers_daily_standouts.parquet: %d rows", len(pitchers))
         else:
             logger.warning("No pitcher daily standout rows generated")

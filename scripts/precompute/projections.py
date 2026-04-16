@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS
+from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS, save_dashboard_parquet
 
 logger = logging.getLogger("precompute.projections")
 
@@ -32,7 +32,7 @@ def run_health_parks(
     logger.info("=" * 60)
     logger.info("Computing health/durability scores...")
     health_df = compute_health_scores(from_season)
-    health_df.to_parquet(DASHBOARD_DIR / "health_scores.parquet", index=False)
+    save_dashboard_parquet(health_df, "health_scores.parquet")
     logger.info("Saved health scores: %d players", len(health_df))
 
     logger.info("Loading park factors for HR adjustment...")
@@ -42,8 +42,8 @@ def run_health_parks(
                 len(park_factors), len(hitter_venues))
 
     # Save so _load_park_factors() can find them when health_parks is skipped
-    park_factors.to_parquet(DASHBOARD_DIR / "hr_park_factors.parquet", index=False)
-    hitter_venues.to_parquet(DASHBOARD_DIR / "hitter_venues.parquet", index=False)
+    save_dashboard_parquet(park_factors, "hr_park_factors.parquet")
+    save_dashboard_parquet(hitter_venues, "hitter_venues.parquet")
 
     return health_df, park_factors, hitter_venues
 
@@ -130,9 +130,9 @@ def run_counting(
         health_scores=health_df,
     )
 
-    hitter_counting.to_parquet(DASHBOARD_DIR / "hitter_counting.parquet", index=False)
+    save_dashboard_parquet(hitter_counting, "hitter_counting.parquet")
     logger.info("Saved hitter counting projections: %d players", len(hitter_counting))
-    pitcher_counting.to_parquet(DASHBOARD_DIR / "pitcher_counting.parquet", index=False)
+    save_dashboard_parquet(pitcher_counting, "pitcher_counting.parquet")
     logger.info("Saved pitcher counting projections: %d players", len(pitcher_counting))
 
 
@@ -155,7 +155,7 @@ def _classify_pitcher_roles(
         current_season=from_season,
         min_games=10,
     )
-    reliever_roles.to_parquet(DASHBOARD_DIR / "pitcher_roles.parquet", index=False)
+    save_dashboard_parquet(reliever_roles, "pitcher_roles.parquet")
     logger.info("Saved reliever roles: %d relievers", len(reliever_roles))
     return reliever_roles
 
@@ -426,9 +426,7 @@ def run_sim_pitcher(
         elapsed = time.time() - t0
 
         pitcher_counting_sim = add_confidence_tiers(pitcher_counting_sim, player_type="pitcher")
-        pitcher_counting_sim.to_parquet(
-            DASHBOARD_DIR / "pitcher_counting_sim.parquet", index=False,
-        )
+        save_dashboard_parquet(pitcher_counting_sim, "pitcher_counting_sim.parquet")
         logger.info(
             "Saved sim-based pitcher projections: %d pitchers in %.1fs",
             len(pitcher_counting_sim), elapsed,
@@ -441,9 +439,7 @@ def run_sim_pitcher(
             roles_df=reliever_roles,
             season=from_season,
         )
-        rp_rankings.to_parquet(
-            DASHBOARD_DIR / "reliever_rankings.parquet", index=False,
-        )
+        save_dashboard_parquet(rp_rankings, "reliever_rankings.parquet")
         logger.info("Saved reliever rankings: %d relievers", len(rp_rankings))
 
         return reliever_roles
@@ -841,9 +837,7 @@ def run_sim_hitter(
         elapsed_h = time.time() - t0_h
 
         hitter_counting_sim = add_confidence_tiers(hitter_counting_sim, player_type="hitter")
-        hitter_counting_sim.to_parquet(
-            DASHBOARD_DIR / "hitter_counting_sim.parquet", index=False,
-        )
+        save_dashboard_parquet(hitter_counting_sim, "hitter_counting_sim.parquet")
         logger.info(
             "Saved sim-based hitter projections: %d batters in %.1fs",
             len(hitter_counting_sim), elapsed_h,

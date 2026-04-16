@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from src.data.db import read_sql
+from src.data.queries._common import season_in_clause
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ def get_tto_adjustment_profiles(
         overall_hr_rate, pa_count.
         One row per (pitcher_id, season, tto).
     """
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     WITH pitcher_tto AS (
         SELECT
@@ -127,7 +128,7 @@ def get_pitcher_pitch_count_features(seasons: list[int]) -> pd.DataFrame:
         Columns: pitcher_id, season, pitches_per_pa, putaway_rate,
         foul_rate, total_pa.
     """
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     WITH pitcher_pa_pitches AS (
         SELECT
@@ -200,7 +201,7 @@ def get_batter_pitch_count_features(seasons: list[int]) -> pd.DataFrame:
         Columns: batter_id, season, pitches_per_pa, contact_rate,
         foul_rate, z_contact_rate, o_contact_rate, total_pa.
     """
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     WITH batter_pa_pitches AS (
         SELECT
@@ -292,7 +293,7 @@ def get_exit_model_training_data(seasons: list[int]) -> pd.DataFrame:
         pitcher_pa_number, cumulative_pitches, inning, outs_when_up,
         score_diff, events, is_last_pa.
     """
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     WITH starter_games AS (
         -- Identify starter games and their total PA count
@@ -379,7 +380,7 @@ def get_pitcher_exit_tendencies(seasons: list[int]) -> pd.DataFrame:
         Columns: pitcher_id, season, team_id, n_starts, avg_pitches,
         std_pitches, avg_bf, team_avg_pitches.
     """
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     WITH pitcher_starts AS (
         SELECT
@@ -457,7 +458,7 @@ def get_team_bullpen_rates(seasons: list[int]) -> pd.DataFrame:
     pd.DataFrame
         Columns: team_id, season, k_rate, bb_rate, hr_rate, total_bf.
     """
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     SELECT
         fpg.team_id,
@@ -497,7 +498,7 @@ def get_team_reliever_roster(
     pd.DataFrame
         Columns: team_id, season, pitcher_id, bf, bf_share.
     """
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     SELECT
         fpg.team_id,
@@ -542,7 +543,7 @@ def get_bullpen_trailing_workload(
     pd.DataFrame
         Columns: team_id, game_pk, game_date, bullpen_trailing_ip.
     """
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     WITH reliever_ip AS (
         SELECT
@@ -600,7 +601,7 @@ def get_reliever_role_history(
         Columns: pitcher_id, season, games, saves, holds, blown_saves,
         bf, k, bb, hr, h, runs, outs, pitches, k_rate, bb_rate.
     """
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     SELECT
         fpg.player_id AS pitcher_id,
@@ -654,7 +655,7 @@ def get_reliever_stats_by_team(
     pd.DataFrame
         Columns: pitcher_id, team_id, season, games, bf, k, bb, hr.
     """
-    season_list = ", ".join(str(s) for s in seasons)
+    season_list = season_in_clause(seasons)
     query = f"""
     WITH reliever_team AS (
         SELECT

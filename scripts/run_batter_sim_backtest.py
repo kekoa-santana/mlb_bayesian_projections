@@ -20,14 +20,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.evaluation.batter_sim_validation import run_full_batter_sim_backtest
+from src.evaluation.runner import quick_full_game_mcmc, setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
+logger = setup_logging(__name__)
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Batter game simulator backtest"
@@ -38,12 +33,9 @@ def main() -> None:
                         help="Cap batter-games per fold for quick testing")
     args = parser.parse_args()
 
-    if args.quick:
-        draws, tune, chains, n_sims = 500, 250, 2, 2000
-        max_batters = args.max_batters or 5000
-    else:
-        draws, tune, chains, n_sims = 1000, 500, 2, 5000
-        max_batters = args.max_batters
+    draws, tune, chains = quick_full_game_mcmc(args.quick)
+    n_sims = 2000 if args.quick else 5000
+    max_batters = (args.max_batters or 5000) if args.quick else args.max_batters
 
     if args.single_fold:
         test = args.single_fold

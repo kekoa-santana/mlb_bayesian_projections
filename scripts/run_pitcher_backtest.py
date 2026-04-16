@@ -30,6 +30,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.evaluation.pitcher_backtest import run_pitcher_backtest
 from src.evaluation.runner import (
+    COUNTING_FOLDS,
+    RATE_FOLDS,
     add_common_args,
     quick_full_sampling,
     save_csv,
@@ -37,19 +39,6 @@ from src.evaluation.runner import (
 )
 
 logger = setup_logging("pitcher_backtest")
-
-RATE_FOLDS = [
-    {"train_seasons": [2018, 2019, 2020, 2021, 2022], "test_season": 2023},
-    {"train_seasons": [2018, 2019, 2020, 2021, 2022, 2023], "test_season": 2024},
-    {"train_seasons": [2018, 2019, 2020, 2021, 2022, 2023, 2024], "test_season": 2025},
-]
-
-COUNTING_FOLDS = [
-    {"train_seasons": list(range(2018, 2022)), "test_season": 2022},
-    {"train_seasons": list(range(2018, 2023)), "test_season": 2023},
-    {"train_seasons": list(range(2018, 2024)), "test_season": 2024},
-    {"train_seasons": list(range(2018, 2025)), "test_season": 2025},
-]
 
 
 def main() -> None:

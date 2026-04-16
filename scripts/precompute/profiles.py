@@ -7,7 +7,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS
+from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS, save_dashboard_parquet
 
 logger = logging.getLogger("precompute.profiles")
 
@@ -28,15 +28,15 @@ def run_arsenal_vuln(
     logger.info("Loading matchup profiles for %d...", from_season)
 
     pitcher_arsenal = get_pitcher_arsenal(from_season)
-    pitcher_arsenal.to_parquet(DASHBOARD_DIR / "pitcher_arsenal.parquet", index=False)
+    save_dashboard_parquet(pitcher_arsenal, "pitcher_arsenal.parquet")
     logger.info("Saved pitcher arsenal: %d rows", len(pitcher_arsenal))
 
     hitter_vuln = get_hitter_vulnerability(from_season)
-    hitter_vuln.to_parquet(DASHBOARD_DIR / "hitter_vuln.parquet", index=False)
+    save_dashboard_parquet(hitter_vuln, "hitter_vuln.parquet")
     logger.info("Saved hitter vulnerability: %d rows", len(hitter_vuln))
 
     hitter_str = get_hitter_strength(from_season)
-    hitter_str.to_parquet(DASHBOARD_DIR / "hitter_str.parquet", index=False)
+    save_dashboard_parquet(hitter_str, "hitter_str.parquet")
     logger.info("Saved hitter strength: %d rows", len(hitter_str))
 
     # Career-aggregated vulnerability (weighted across all seasons)
@@ -78,7 +78,7 @@ def run_arsenal_vuln(
     else:
         career_vuln["xwoba_contact"] = np.nan
 
-    career_vuln.to_parquet(DASHBOARD_DIR / "hitter_vuln_career.parquet", index=False)
+    save_dashboard_parquet(career_vuln, "hitter_vuln_career.parquet")
     logger.info("Saved career hitter vulnerability: %d rows", len(career_vuln))
 
     # Career-aggregated strength
@@ -111,7 +111,7 @@ def run_arsenal_vuln(
     else:
         career_str["xwoba_contact"] = np.nan
 
-    career_str.to_parquet(DASHBOARD_DIR / "hitter_str_career.parquet", index=False)
+    save_dashboard_parquet(career_str, "hitter_str_career.parquet")
     logger.info("Saved career hitter strength: %d rows", len(career_str))
 
 
@@ -130,7 +130,7 @@ def run_zones(
     logger.info("Computing location grids for %d...", from_season)
 
     pitcher_loc = get_pitcher_location_grid(from_season)
-    pitcher_loc.to_parquet(DASHBOARD_DIR / "pitcher_location_grid.parquet", index=False)
+    save_dashboard_parquet(pitcher_loc, "pitcher_location_grid.parquet")
     logger.info("Saved pitcher location grid: %d rows (%d pitchers)",
                 len(pitcher_loc), pitcher_loc["pitcher_id"].nunique())
 
@@ -139,12 +139,12 @@ def run_zones(
     # Store plate_x/plate_z as float32 to keep file size reasonable
     for col in ("plate_x", "plate_z"):
         pitch_locs[col] = pitch_locs[col].astype("float32")
-    pitch_locs.to_parquet(DASHBOARD_DIR / "pitcher_pitch_locations.parquet", index=False)
+    save_dashboard_parquet(pitch_locs, "pitcher_pitch_locations.parquet")
     logger.info("Saved raw pitch locations: %d pitches (%d pitchers)",
                 len(pitch_locs), pitch_locs["pitcher_id"].nunique())
 
     hitter_zone = get_hitter_zone_grid(from_season)
-    hitter_zone.to_parquet(DASHBOARD_DIR / "hitter_zone_grid.parquet", index=False)
+    save_dashboard_parquet(hitter_zone, "hitter_zone_grid.parquet")
     logger.info("Saved hitter zone grid: %d rows (%d batters)",
                 len(hitter_zone), hitter_zone["batter_id"].nunique())
 
@@ -171,7 +171,7 @@ def run_zones(
         career_zones = career_zones.drop(columns=["batter_name"]).merge(
             latest_names, on="batter_id", how="left"
         )
-        career_zones.to_parquet(DASHBOARD_DIR / "hitter_zone_grid_career.parquet", index=False)
+        save_dashboard_parquet(career_zones, "hitter_zone_grid_career.parquet")
         logger.info("Saved career hitter zone grid: %d rows (%d batters)",
                     len(career_zones), career_zones["batter_id"].nunique())
 
@@ -193,15 +193,15 @@ def run_archetypes(
         from src.data.league_baselines import get_baselines_by_archetype_stand
 
         pitcher_offerings = get_pitch_archetype_offerings(from_season)
-        pitcher_offerings.to_parquet(DASHBOARD_DIR / "pitcher_offerings.parquet", index=False)
+        save_dashboard_parquet(pitcher_offerings, "pitcher_offerings.parquet")
         logger.info("Saved pitcher offerings with archetypes: %d rows", len(pitcher_offerings))
 
         cluster_metadata = get_pitch_archetype_clusters()
-        cluster_metadata.to_parquet(DASHBOARD_DIR / "pitcher_cluster_metadata.parquet", index=False)
+        save_dashboard_parquet(cluster_metadata, "pitcher_cluster_metadata.parquet")
         logger.info("Saved pitcher cluster metadata: %d archetypes", len(cluster_metadata))
 
         baselines_arch = get_baselines_by_archetype_stand(from_season)
-        baselines_arch.to_parquet(DASHBOARD_DIR / "baselines_arch.parquet", index=False)
+        save_dashboard_parquet(baselines_arch, "baselines_arch.parquet")
         logger.info("Saved league baselines by archetype: %d rows", len(baselines_arch))
     except Exception as e:
         logger.warning("Archetype pitcher data failed: %s", e)
@@ -210,7 +210,7 @@ def run_archetypes(
         from src.data.feature_eng import get_hitter_vulnerability_by_archetype
 
         hitter_vuln_arch = get_hitter_vulnerability_by_archetype(from_season)
-        hitter_vuln_arch.to_parquet(DASHBOARD_DIR / "hitter_vuln_arch.parquet", index=False)
+        save_dashboard_parquet(hitter_vuln_arch, "hitter_vuln_arch.parquet")
         logger.info("Saved hitter vulnerability by archetype: %d rows", len(hitter_vuln_arch))
 
         # Career-aggregated archetype vulnerability
@@ -236,7 +236,7 @@ def run_archetypes(
                 career_arch["chase_rate"] = (
                     career_arch["chase_swings"] / career_arch["out_of_zone_pitches"].clip(lower=1)
                 )
-            career_arch.to_parquet(DASHBOARD_DIR / "hitter_vuln_arch_career.parquet", index=False)
+            save_dashboard_parquet(career_arch, "hitter_vuln_arch_career.parquet")
             logger.info("Saved career hitter archetype vulnerability: %d rows", len(career_arch))
     except Exception as e:
         logger.warning("Archetype hitter data failed: %s", e)

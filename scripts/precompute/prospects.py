@@ -6,7 +6,7 @@ import shutil
 
 import pandas as pd
 
-from precompute import DASHBOARD_DIR, FROM_SEASON, PROJECT_ROOT
+from precompute import DASHBOARD_DIR, FROM_SEASON, PROJECT_ROOT, save_dashboard_parquet
 
 logger = logging.getLogger("precompute.prospects")
 
@@ -89,9 +89,7 @@ def run(
                     rankings[fg_available], on="player_id", how="left",
                 )
 
-            prospect_out.to_parquet(
-                DASHBOARD_DIR / "prospect_readiness.parquet", index=False,
-            )
+            save_dashboard_parquet(prospect_out, "prospect_readiness.parquet")
             logger.info("Saved prospect_readiness.parquet: %d rows", len(prospect_out))
         else:
             logger.warning("No prospect readiness scores generated")
@@ -108,9 +106,7 @@ def run(
 
         prospect_rankings = rank_prospects(projection_season=from_season + 1)
         if not prospect_rankings.empty:
-            prospect_rankings.to_parquet(
-                DASHBOARD_DIR / "prospect_rankings.parquet", index=False,
-            )
+            save_dashboard_parquet(prospect_rankings, "prospect_rankings.parquet")
             logger.info(
                 "Saved prospect_rankings.parquet: %d rows", len(prospect_rankings),
             )
@@ -121,9 +117,7 @@ def run(
             projection_season=from_season + 1,
         )
         if not pitching_prospect_rankings.empty:
-            pitching_prospect_rankings.to_parquet(
-                DASHBOARD_DIR / "pitching_prospect_rankings.parquet", index=False,
-            )
+            save_dashboard_parquet(pitching_prospect_rankings, "pitching_prospect_rankings.parquet")
             logger.info(
                 "Saved pitching_prospect_rankings.parquet: %d rows",
                 len(pitching_prospect_rankings),

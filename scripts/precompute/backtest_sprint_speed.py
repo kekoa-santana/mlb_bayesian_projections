@@ -38,14 +38,10 @@ from scripts.precompute.backtest_harness import (
 )
 from scripts.precompute.backtest_lineup_sim import load_posteriors
 from src.models.game_sim.lineup_simulator import simulate_lineup_game
+from src.evaluation.runner import setup_logging
 from scripts.precompute.precompute_ld_rate import LEAGUE_LD_RATE
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
+logger = setup_logging(__name__)
 # Stats to compare (H is the primary target since sprint speed affects BABIP)
 STATS = ["h", "k", "bb", "r", "rbi"]
 PRIMARY_LINE = {"h": 0.5, "k": 0.5, "bb": 0.5, "r": 0.5, "rbi": 0.5}

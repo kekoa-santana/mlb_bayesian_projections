@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 
 import numpy as np
 import pandas as pd
@@ -19,3 +20,11 @@ _WOBA_WEIGHTS = {
     "triple": 1.62,
     "hr": 2.10,
 }
+
+
+def season_in_clause(seasons: Iterable[int]) -> str:
+    """Build a comma-joined season list for ``WHERE season IN (...)``.
+
+    Coerces each value to int to block SQL injection from untrusted input.
+    """
+    return ", ".join(str(int(s)) for s in seasons)
