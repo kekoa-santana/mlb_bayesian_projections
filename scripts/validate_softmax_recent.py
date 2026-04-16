@@ -23,6 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.db import read_sql
+from src.data.feature_eng import CACHE_DIR
 from src.evaluation.game_sim_validation import build_game_sim_predictions
 from src.evaluation.batter_sim_validation import build_batter_sim_predictions
 
@@ -30,6 +31,36 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _invalidate_stale_game_caches(season: int, min_game_date: date) -> None:
+    """Delete pitcher_game_logs / game_lineups caches whose newest row is
+    older than *min_game_date*. Next access rebuilds from the DB.
+
+    Needed because `_load_or_build` has no mtime/freshness check; a cache
+    built before today's ETL will silently omit yesterday's games from any
+    backtest that extends to the present.
+    """
+    stale_caches = ["pitcher_game_logs", "game_lineups"]
+    for name in stale_caches:
+        path = CACHE_DIR / f"{name}_{season}.parquet"
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_parquet(path, columns=["game_date"])
+            max_date = pd.to_datetime(df["game_date"]).max().date()
+        except Exception as e:
+            logger.warning("Cache freshness check failed for %s (%s); deleting", path.name, e)
+            path.unlink()
+            continue
+        if max_date < min_game_date:
+            logger.info(
+                "Cache %s max game_date %s < required %s; rebuilding",
+                path.name, max_date, min_game_date,
+            )
+            path.unlink()
+        else:
+            logger.info("Cache %s is fresh (max game_date %s)", path.name, max_date)
 
 
 def main() -> None:
@@ -53,6 +84,13 @@ def main() -> None:
     logger.info(
         "Running softmax sim for test_season=%d, last %d days, n_sims=%d",
         args.test_season, args.days, args.n_sims,
+    )
+
+    # Bust stale game-log / lineup caches if they don't cover yesterday.
+    # Prevents silent gaps when the cache was written before today's ETL.
+    _invalidate_stale_game_caches(
+        season=args.test_season,
+        min_game_date=date.today() - timedelta(days=1),
     )
 
     # --- Pitcher side ---
