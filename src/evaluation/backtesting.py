@@ -21,6 +21,7 @@ from src.data.feature_eng import (
     build_multi_season_pitcher_k_data,
 )
 from src.evaluation.baselines import marcel_rate_projection
+from src.utils.constants import LEAGUE_AVG_OVERALL
 from src.models.k_rate_model import (
     check_convergence,
     extract_player_posteriors,
@@ -145,7 +146,7 @@ def marcel_k_rate(
     """
     cfg = _SimpleStatConfig(
         count_col="k", trials_col="pa", rate_col="k_rate",
-        league_avg=league_k_rate if league_k_rate is not None else 0.22,
+        league_avg=league_k_rate if league_k_rate is not None else LEAGUE_AVG_OVERALL["k_rate"],
     )
     result = marcel_rate_projection(
         df_history,
@@ -274,7 +275,7 @@ def walk_forward_backtest(
 # ---------------------------------------------------------------------------
 def compute_metrics(
     comp: pd.DataFrame,
-    league_avg_k: float = 0.22,
+    league_avg_k: float = LEAGUE_AVG_OVERALL["k_rate"],
 ) -> dict[str, Any]:
     """Compute evaluation metrics from a comparison DataFrame.
 
@@ -482,7 +483,7 @@ def marcel_pitcher_k_rate(
     """
     cfg = _SimpleStatConfig(
         count_col="k", trials_col="batters_faced", rate_col="k_rate",
-        league_avg=league_k_rate if league_k_rate is not None else 0.224,
+        league_avg=league_k_rate if league_k_rate is not None else LEAGUE_AVG_OVERALL["k_rate"],
     )
     result = marcel_rate_projection(
         df_history,

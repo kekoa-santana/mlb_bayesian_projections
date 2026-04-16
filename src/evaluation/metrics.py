@@ -481,6 +481,157 @@ def compute_coverage_from_sd(
     return compute_coverage(actual, lo, hi)
 
 
+def compute_coverage_levels(
+    actual: np.ndarray,
+    mean: np.ndarray,
+    sd: np.ndarray,
+    levels: tuple[float, ...] = (0.50, 0.80, 0.90),
+) -> dict[str, float]:
+    """Multi-level normal-approx coverage.
+
+    Returns ``{percent: coverage}`` where ``percent`` is an integer-percent
+    string (e.g. ``"50"``, ``"80"``, ``"90"``) matching the column-naming
+    convention used by the game-level backtests.
+    """
+    return {
+        str(int(round(level * 100))): compute_coverage_from_sd(actual, mean, sd, level=level)
+        for level in levels
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-line binary prop metrics
+# ---------------------------------------------------------------------------
+
+
+def _default_prob_col(line: float) -> str:
+    """Default ``p_over_<line>`` column template used by game prop backtests."""
+    return f"p_over_{line:.1f}".replace(".", "_")
+
+
+def compute_per_line_binary_metrics(
+    predictions: pd.DataFrame,
+    actual_col: str,
+    lines: list[float],
+    prob_col_fn=_default_prob_col,
+    clip: bool = False,
+    skip_degenerate: bool = False,
+) -> dict[str, Any]:
+    """Per-line Brier + log loss for game-prop style predictions.
+
+    For each line, reads ``prob_col_fn(line)`` from ``predictions`` as the
+    model's P(actual > line) and ``predictions[actual_col] > line`` as the
+    binary outcome, then computes Brier score and log loss.
+
+    Parameters
+    ----------
+    predictions : pd.DataFrame
+        Must contain ``actual_col`` and one prob column per line.
+    actual_col : str
+        Column name holding the observed count (e.g. ``"actual_k"``).
+    lines : list[float]
+        Prop lines to evaluate (e.g. ``[3.5, 4.5, 5.5]``).
+    prob_col_fn : callable(line) -> str
+        Maps a line to its prob column name. Defaults to
+        ``"p_over_<line>"`` with a ``.`` → ``_`` substitution.
+    clip : bool
+        If True, clip probability values to ``[0, 1]`` before scoring.
+        Preserves ``game_prop_validation`` defensive behavior.
+    skip_degenerate : bool
+        If True, skip lines where all observed outcomes are the same
+        class (``y_true.std() == 0``), matching ``game_prop_validation``.
+
+    Returns
+    -------
+    dict with keys ``brier_scores`` (per-line), ``log_losses`` (per-line),
+    ``avg_brier``, ``avg_log_loss``.
+    """
+    from sklearn.metrics import brier_score_loss
+
+    brier_scores: dict[float, float] = {}
+    log_losses: dict[float, float] = {}
+
+    for line in lines:
+        col = prob_col_fn(line)
+        if col not in predictions.columns:
+            continue
+        y_true = (predictions[actual_col] > line).astype(float).values
+        y_prob = predictions[col].values
+        if clip:
+            y_prob = np.clip(y_prob, 0, 1)
+        if skip_degenerate and y_true.std() == 0:
+            continue
+        brier_scores[line] = float(brier_score_loss(y_true, y_prob))
+        log_losses[line] = compute_log_loss(y_prob, y_true)
+
+    avg_brier = (
+        float(np.mean(list(brier_scores.values()))) if brier_scores else np.nan
+    )
+    avg_log_loss = (
+        float(np.mean(list(log_losses.values()))) if log_losses else np.nan
+    )
+    return {
+        "brier_scores": brier_scores,
+        "log_losses": log_losses,
+        "avg_brier": avg_brier,
+        "avg_log_loss": avg_log_loss,
+    }
+
+
+def compute_per_line_calibration(
+    predictions: pd.DataFrame,
+    actual_col: str,
+    lines: list[float],
+    prob_col_fn=_default_prob_col,
+    clip: bool = False,
+    skip_degenerate: bool = False,
+    include_mce: bool = False,
+) -> dict[str, Any]:
+    """Per-line ECE / MCE / temperature for game-prop style predictions.
+
+    Parameters mirror ``compute_per_line_binary_metrics``.
+
+    Returns
+    -------
+    dict with keys ``ece_per_line``, ``temperature_per_line``, plus
+    ``mce_per_line`` when ``include_mce=True``. ``all_probs`` and
+    ``all_outcomes`` arrays are also returned so callers can compute
+    pooled diagnostics.
+    """
+    ece_per_line: dict[float, float] = {}
+    mce_per_line: dict[float, float] = {}
+    temp_per_line: dict[float, float] = {}
+    all_probs: list[np.ndarray] = []
+    all_outcomes: list[np.ndarray] = []
+
+    for line in lines:
+        col = prob_col_fn(line)
+        if col not in predictions.columns:
+            continue
+        y_true = (predictions[actual_col] > line).astype(float).values
+        y_prob = predictions[col].values
+        if clip:
+            y_prob = np.clip(y_prob, 0, 1)
+        if skip_degenerate and y_true.std() == 0:
+            continue
+        ece_per_line[line] = compute_ece(y_prob, y_true)
+        if include_mce:
+            mce_per_line[line] = compute_mce(y_prob, y_true)
+        temp_per_line[line] = compute_temperature(y_prob, y_true)
+        all_probs.append(y_prob)
+        all_outcomes.append(y_true)
+
+    result: dict[str, Any] = {
+        "ece_per_line": ece_per_line,
+        "temperature_per_line": temp_per_line,
+        "all_probs": all_probs,
+        "all_outcomes": all_outcomes,
+    }
+    if include_mce:
+        result["mce_per_line"] = mce_per_line
+    return result
+
+
 # ---------------------------------------------------------------------------
 # PPC extraction
 # ---------------------------------------------------------------------------

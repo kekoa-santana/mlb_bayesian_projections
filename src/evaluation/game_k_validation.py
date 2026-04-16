@@ -19,9 +19,12 @@ from scipy.stats import poisson
 from sklearn.metrics import brier_score_loss
 
 from src.evaluation.metrics import (
+    compute_coverage_levels,
     compute_ece,
     compute_log_loss,
     compute_mce,
+    compute_per_line_binary_metrics,
+    compute_per_line_calibration,
     compute_temperature,
 )
 
@@ -295,36 +298,24 @@ def compute_game_k_metrics(
         }
 
     # Brier scores and log loss per line
-    brier_scores: dict[float, float] = {}
-    log_losses: dict[float, float] = {}
-    for line in lines:
-        col = f"p_over_{line:.1f}".replace(".", "_")
-        if col not in predictions.columns:
-            continue
-        y_true = (predictions["actual_k"] > line).astype(float).values
-        y_prob = predictions[col].values
-        brier_scores[line] = float(brier_score_loss(y_true, y_prob))
-        log_losses[line] = compute_log_loss(y_prob, y_true)
-
-    avg_brier = float(np.mean(list(brier_scores.values()))) if brier_scores else np.nan
-    avg_log_loss = float(np.mean(list(log_losses.values()))) if log_losses else np.nan
+    bin_metrics = compute_per_line_binary_metrics(predictions, "actual_k", lines)
+    brier_scores = bin_metrics["brier_scores"]
+    log_losses = bin_metrics["log_losses"]
+    avg_brier = bin_metrics["avg_brier"]
+    avg_log_loss = bin_metrics["avg_log_loss"]
 
     # Calibration
     calibration_df = compute_calibration_by_line(predictions, lines)
 
-    # Coverage: what fraction of actual Ks fall within [expected - z*std, expected + z*std]
+    # Coverage at 50/80/90% credible intervals (normal approximation).
     expected = predictions["expected_k"].values
     std = predictions["std_k"].values
     actual = predictions["actual_k"].values
 
-    def _coverage(z: float) -> float:
-        lo = expected - z * std
-        hi = expected + z * std
-        return float(np.mean((actual >= lo) & (actual <= hi)))
-
-    coverage_50 = _coverage(0.6745)  # 50% CI
-    coverage_80 = _coverage(1.2816)  # 80% CI
-    coverage_90 = _coverage(1.6449)  # 90% CI
+    cov = compute_coverage_levels(actual, expected, std, levels=(0.50, 0.80, 0.90))
+    coverage_50 = cov["50"]
+    coverage_80 = cov["80"]
+    coverage_90 = cov["90"]
 
     # Log score (average negative log probability of actual outcome)
     log_scores = []
@@ -337,21 +328,11 @@ def compute_game_k_metrics(
     log_score = float(np.mean(log_scores)) if log_scores else np.nan
 
     # ECE and temperature per line + pooled
-    ece_per_line: dict[float, float] = {}
-    temperature_per_line: dict[float, float] = {}
-    all_probs = []
-    all_outcomes = []
-
-    for line in lines:
-        col = f"p_over_{line:.1f}".replace(".", "_")
-        if col not in predictions.columns:
-            continue
-        p_over = predictions[col].values
-        actual_over = (predictions["actual_k"] > line).astype(float).values
-        ece_per_line[line] = compute_ece(p_over, actual_over)
-        temperature_per_line[line] = compute_temperature(p_over, actual_over)
-        all_probs.append(p_over)
-        all_outcomes.append(actual_over)
+    cal = compute_per_line_calibration(predictions, "actual_k", lines)
+    ece_per_line = cal["ece_per_line"]
+    temperature_per_line = cal["temperature_per_line"]
+    all_probs = cal["all_probs"]
+    all_outcomes = cal["all_outcomes"]
 
     if all_probs:
         pooled_probs = np.concatenate(all_probs)

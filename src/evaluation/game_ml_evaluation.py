@@ -18,6 +18,8 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+
+from src.utils.constants import LEAGUE_AVG_OVERALL
 from scipy.stats import norm
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error, mean_squared_error
@@ -336,8 +338,9 @@ def build_game_dataset(seasons: list[int] | None = None) -> pd.DataFrame:
     games_df["lineup_rpg_diff"] = (
         games_df["home_team_rpg"].fillna(4.5) - games_df["away_team_rpg"].fillna(4.5)
     )
+    _k_fill = LEAGUE_AVG_OVERALL["k_rate"]
     games_df["lineup_k_diff"] = (
-        games_df["home_team_k_rate"].fillna(0.22) - games_df["away_team_k_rate"].fillna(0.22)
+        games_df["home_team_k_rate"].fillna(_k_fill) - games_df["away_team_k_rate"].fillna(_k_fill)
     )
 
     # Night game flag

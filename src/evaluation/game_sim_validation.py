@@ -16,7 +16,12 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import brier_score_loss
 
-from src.evaluation.metrics import compute_log_loss, compute_sharpness
+from src.evaluation.metrics import (
+    compute_coverage_levels,
+    compute_log_loss,
+    compute_per_line_binary_metrics,
+    compute_sharpness,
+)
 
 from src.data.db import read_sql
 from src.data.feature_eng import (
@@ -1111,43 +1116,30 @@ def compute_game_sim_metrics(
             metrics[f"{stat}_corr"] = float(np.corrcoef(actual, expected)[0, 1])
 
     # K-specific: Brier scores and log loss
-    brier_scores: dict[float, float] = {}
-    k_log_losses: dict[float, float] = {}
-    for line in k_lines:
-        col = f"p_over_{line:.1f}".replace(".", "_")
-        if col not in predictions.columns:
-            continue
-        y_true = (predictions["actual_k"] > line).astype(float).values
-        y_prob = predictions[col].values
-        brier_scores[line] = float(brier_score_loss(y_true, y_prob))
-        k_log_losses[line] = compute_log_loss(y_prob, y_true)
-    metrics["k_brier_scores"] = brier_scores
-    if brier_scores:
-        metrics["k_avg_brier"] = float(np.mean(list(brier_scores.values())))
-    metrics["k_log_losses"] = k_log_losses
-    if k_log_losses:
-        metrics["k_avg_log_loss"] = float(np.mean(list(k_log_losses.values())))
+    k_bin = compute_per_line_binary_metrics(predictions, "actual_k", k_lines)
+    metrics["k_brier_scores"] = k_bin["brier_scores"]
+    if k_bin["brier_scores"]:
+        metrics["k_avg_brier"] = k_bin["avg_brier"]
+    metrics["k_log_losses"] = k_bin["log_losses"]
+    if k_bin["log_losses"]:
+        metrics["k_avg_log_loss"] = k_bin["avg_log_loss"]
 
     # Outs Brier scores and log loss
     outs_lines = [14.5, 15.5, 16.5, 17.5, 18.5]
-    outs_brier: dict[float, float] = {}
-    outs_log_losses: dict[float, float] = {}
-    for line in outs_lines:
-        col = f"p_outs_over_{line:.1f}".replace(".", "_")
-        if col not in predictions.columns:
-            continue
-        if "actual_outs" not in predictions.columns:
-            break
-        y_true = (predictions["actual_outs"] > line).astype(float).values
-        y_prob = predictions[col].values
-        outs_brier[line] = float(brier_score_loss(y_true, y_prob))
-        outs_log_losses[line] = compute_log_loss(y_prob, y_true)
-    metrics["outs_brier_scores"] = outs_brier
-    if outs_brier:
-        metrics["outs_avg_brier"] = float(np.mean(list(outs_brier.values())))
-    metrics["outs_log_losses"] = outs_log_losses
-    if outs_log_losses:
-        metrics["outs_avg_log_loss"] = float(np.mean(list(outs_log_losses.values())))
+    if "actual_outs" in predictions.columns:
+        outs_bin = compute_per_line_binary_metrics(
+            predictions, "actual_outs", outs_lines,
+            prob_col_fn=lambda line: f"p_outs_over_{line:.1f}".replace(".", "_"),
+        )
+        metrics["outs_brier_scores"] = outs_bin["brier_scores"]
+        if outs_bin["brier_scores"]:
+            metrics["outs_avg_brier"] = outs_bin["avg_brier"]
+        metrics["outs_log_losses"] = outs_bin["log_losses"]
+        if outs_bin["log_losses"]:
+            metrics["outs_avg_log_loss"] = outs_bin["avg_log_loss"]
+    else:
+        metrics["outs_brier_scores"] = {}
+        metrics["outs_log_losses"] = {}
 
     # K sharpness
     k_lines_used = [3.5, 4.5, 5.5, 6.5, 7.5]
@@ -1178,29 +1170,21 @@ def compute_game_sim_metrics(
 
     # K coverage
     if "std_k" in predictions.columns:
-        expected_k = predictions["expected_k"].values
-        std_k = predictions["std_k"].values
-        actual_k = predictions["actual_k"].values
-
-        for ci_name, z in [("50", 0.6745), ("80", 1.2816), ("90", 1.6449)]:
-            lo = expected_k - z * std_k
-            hi = expected_k + z * std_k
-            metrics[f"k_coverage_{ci_name}"] = float(
-                np.mean((actual_k >= lo) & (actual_k <= hi))
-            )
+        for pct, val in compute_coverage_levels(
+            predictions["actual_k"].values,
+            predictions["expected_k"].values,
+            predictions["std_k"].values,
+        ).items():
+            metrics[f"k_coverage_{pct}"] = val
 
     # Outs coverage
     if "std_outs" in predictions.columns and "actual_outs" in predictions.columns:
-        expected_outs = predictions["expected_outs"].values
-        std_outs = predictions["std_outs"].values
-        actual_outs_arr = predictions["actual_outs"].values
-
-        for ci_name, z in [("50", 0.6745), ("80", 1.2816), ("90", 1.6449)]:
-            lo = expected_outs - z * std_outs
-            hi = expected_outs + z * std_outs
-            metrics[f"outs_coverage_{ci_name}"] = float(
-                np.mean((actual_outs_arr >= lo) & (actual_outs_arr <= hi))
-            )
+        for pct, val in compute_coverage_levels(
+            predictions["actual_outs"].values,
+            predictions["expected_outs"].values,
+            predictions["std_outs"].values,
+        ).items():
+            metrics[f"outs_coverage_{pct}"] = val
 
     # Run-level metrics (full game, starter + bullpen tail). Requires
     # actual_total_runs joined from fact_game_totals.
@@ -1231,12 +1215,8 @@ def compute_game_sim_metrics(
             # Coverage via std-based CI (Normal approximation)
             if "std_runs" in rdf.columns:
                 std_runs = rdf["std_runs"].values.astype(float)
-                for ci_name, z in [("50", 0.6745), ("80", 1.2816), ("90", 1.6449)]:
-                    lo = expected - z * std_runs
-                    hi = expected + z * std_runs
-                    metrics[f"runs_coverage_{ci_name}"] = float(
-                        np.mean((actual >= lo) & (actual <= hi))
-                    )
+                for pct, val in compute_coverage_levels(actual, expected, std_runs).items():
+                    metrics[f"runs_coverage_{pct}"] = val
 
             # Coverage via empirical quantile bands (q10/q90 = 80%)
             if "runs_q10" in rdf.columns and "runs_q90" in rdf.columns:

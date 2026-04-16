@@ -20,6 +20,8 @@ from scipy.special import expit, logit
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import brier_score_loss
 
+from src.utils.constants import LEAGUE_AVG_OVERALL
+
 from src.data.feature_eng import (
     build_multi_season_hitter_data,
     build_multi_season_pitcher_data,
@@ -35,6 +37,8 @@ from src.evaluation.metrics import (
     compute_ece,
     compute_log_loss,
     compute_mce,
+    compute_per_line_binary_metrics,
+    compute_per_line_calibration,
     compute_sharpness,
     compute_temperature,
 )
@@ -1022,8 +1026,11 @@ def _build_pitcher_prop_predictions(
         if batter_posteriors_for_stat:
             # League average batter rate for this stat
             league_avg_map = {
-                "k_rate": 0.222, "bb_rate": 0.085, "hr_rate": 0.033,
-                "h_rate": 0.250, "hr_per_bf": 0.033,
+                "k_rate": LEAGUE_AVG_OVERALL["k_rate"],
+                "bb_rate": LEAGUE_AVG_OVERALL["bb_rate"],
+                "hr_rate": 0.033,
+                "h_rate": 0.250,
+                "hr_per_bf": 0.033,
             }
             league_avg = league_avg_map.get(
                 batter_stat_key_map.get(config.rate_col, config.rate_col),
@@ -1377,8 +1384,11 @@ def _build_batter_prop_predictions(
         if pitcher_posteriors_for_stat:
             # League average pitcher rate for this stat
             league_avg_pitcher_map = {
-                "k_rate": 0.222, "bb_rate": 0.085, "hr_per_bf": 0.033,
-                "h_per_bf": 0.230, "outs_per_bf": 0.640,
+                "k_rate": LEAGUE_AVG_OVERALL["k_rate"],
+                "bb_rate": LEAGUE_AVG_OVERALL["bb_rate"],
+                "hr_per_bf": 0.033,
+                "h_per_bf": 0.230,
+                "outs_per_bf": 0.640,
             }
             league_avg_pitcher = league_avg_pitcher_map.get(pitcher_key, 0.20)
 
@@ -1568,22 +1578,13 @@ def compute_game_prop_metrics(
         return _empty_metrics()
 
     # Brier scores and log loss per line
-    brier_scores: dict[float, float] = {}
-    log_losses: dict[float, float] = {}
-    for line in lines:
-        col = f"p_over_{line:.1f}".replace(".", "_")
-        if col not in predictions.columns:
-            continue
-        y_true = (predictions[actual_col] > line).astype(float).values
-        y_prob = np.clip(predictions[col].values, 0, 1)
-        # Skip if all same class
-        if y_true.std() == 0:
-            continue
-        brier_scores[line] = float(brier_score_loss(y_true, y_prob))
-        log_losses[line] = compute_log_loss(y_prob, y_true)
-
-    avg_brier = float(np.mean(list(brier_scores.values()))) if brier_scores else np.nan
-    avg_log_loss = float(np.mean(list(log_losses.values()))) if log_losses else np.nan
+    bin_metrics = compute_per_line_binary_metrics(
+        predictions, actual_col, lines, clip=True, skip_degenerate=True,
+    )
+    brier_scores = bin_metrics["brier_scores"]
+    log_losses = bin_metrics["log_losses"]
+    avg_brier = bin_metrics["avg_brier"]
+    avg_log_loss = bin_metrics["avg_log_loss"]
 
     # CRPS (if samples available)
     crps = np.nan
@@ -1598,22 +1599,13 @@ def compute_game_prop_metrics(
             crps = float(np.mean(crps_values))
 
     # ECE, MCE, Temperature — compute for each line and average
-    ece_per_line: dict[float, float] = {}
-    mce_per_line: dict[float, float] = {}
-    temp_per_line: dict[float, float] = {}
-
-    for line in lines:
-        col = f"p_over_{line:.1f}".replace(".", "_")
-        if col not in predictions.columns:
-            continue
-        y_true = (predictions[actual_col] > line).astype(float).values
-        y_prob = np.clip(predictions[col].values, 0, 1)
-        if y_true.std() == 0:
-            continue
-
-        ece_per_line[line] = compute_ece(y_prob, y_true)
-        mce_per_line[line] = compute_mce(y_prob, y_true)
-        temp_per_line[line] = compute_temperature(y_prob, y_true)
+    cal = compute_per_line_calibration(
+        predictions, actual_col, lines,
+        clip=True, skip_degenerate=True, include_mce=True,
+    )
+    ece_per_line = cal["ece_per_line"]
+    mce_per_line = cal["mce_per_line"]
+    temp_per_line = cal["temperature_per_line"]
 
     avg_ece = float(np.mean(list(ece_per_line.values()))) if ece_per_line else np.nan
     avg_mce = float(np.mean(list(mce_per_line.values()))) if mce_per_line else np.nan
