@@ -228,6 +228,7 @@ These are copied (not linked) to the dashboard repo. Sync when function signatur
 - `src/models/in_season_updater.py` → `lib/in_season_updater.py`
 - `src/models/rest_adjustment.py` → `lib/rest_adjustment.py`
 - `src/models/game_sim/*.py` → `lib/game_sim/*.py` (9 files: simulator, batter_simulator, pa_outcome_model, bip_model, exit_model, pitch_count_model, tto_model, batter_pa_model, fantasy_scoring)
+- `src/models/game_predictions.py` → `lib/game_predictions.py`
 - `src/data/schedule.py` → `lib/schedule.py`
 - `src/data/db.py` → `lib/db.py` (subset)
 

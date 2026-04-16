@@ -79,7 +79,7 @@ def run(
         logger.info("=" * 60)
         logger.info("Fitting pitcher composite models (K%%, BB%%)...")
         pitcher_results = fit_pitcher_models(
-            seasons=seasons, min_bf=100,
+            seasons=seasons, min_bf=50,
             draws=draws, tune=tune, chains=chains, random_seed=42,
             extract_season=from_season,
         )
