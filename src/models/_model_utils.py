@@ -12,6 +12,7 @@ StatConfig and PitcherStatConfig.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import arviz as az
@@ -22,6 +23,68 @@ import pymc as pm
 from src.data.feature_eng import N_SKILL_TIERS
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared stat config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StatConfig:
+    """Configuration for a single target stat (hitter or pitcher).
+
+    Consolidates the previously separate ``hitter_model.StatConfig`` and
+    ``pitcher_model.PitcherStatConfig`` dataclasses. All fields from either
+    are present here with default values preserved; domain-specific defaults
+    live in the per-module ``STAT_CONFIGS`` / ``PITCHER_STAT_CONFIGS`` dicts.
+    """
+
+    name: str
+    # Column names in the DataFrame
+    count_col: str         # numerator (e.g. "k", "bb", "hr") or value col for continuous
+    trials_col: str        # denominator (e.g. "pa", "batters_faced") — unused for continuous
+    rate_col: str          # pre-computed rate (e.g. "k_rate")
+    # Likelihood type: "binomial", "beta_binomial", "logit_normal", "normal"
+    likelihood: str
+    # Prior location (league average on natural scale)
+    league_avg: float
+    # Covariate config: list of (col_name, prior_mu, prior_sigma, direction_label)
+    # direction_label is for logging only
+    covariates: list[tuple[str, float, float, str]] = None
+    # sigma_season prior: LogNormal(mu, 0.5) — mode on logit/natural scale
+    # derived from empirical year-to-year volatility
+    sigma_season_mu: float = 0.15
+    # Floor for sigma_season in forward projection — ensures CIs reflect
+    # known empirical year-to-year volatility even when the model under-
+    # estimates it due to short training windows
+    sigma_season_floor: float = 0.0
+    # sigma prior for player intercepts
+    sigma_player_prior: float = 0.5
+    # sigma prior for observation noise (normal / logit_normal likelihood only)
+    sigma_obs_prior: float = 0.05
+    # AR(1) rho prior: Beta(alpha, beta). Higher mean = more year-to-year
+    # persistence. Stat-specific because stability varies.
+    rho_alpha: float = 8.0
+    rho_beta: float = 2.0
+    # AR(2) rho2 prior: Beta(alpha, beta). Stat-specific because lag-2
+    # partial autocorrelation varies.
+    rho2_alpha: float = 3.0
+    rho2_beta: float = 7.0
+    # mu_pop prior width: how far age-bucket × skill-tier cell means can
+    # spread from league average. Default 0.3 works for logit-scale
+    # binomial stats; natural-scale stats (wOBA) need wider.
+    mu_pop_sigma: float = 0.3
+    # Heavy-tailed player intercept prior: if set, use StudentT(nu=alpha_prior_nu)
+    # instead of Normal for alpha_raw. None = Normal.
+    alpha_prior_nu: float | None = None
+    # Recency weighting: weight = decay^(max_season - season).
+    # decay=0.8 ≈ Marcel 5/4/3; decay=1.0 → no weighting (default).
+    # Currently used by pitcher configs only; no-op for hitters at 1.0.
+    season_decay: float = 1.0
+    # Overdispersion: BetaBinomial instead of Binomial for the likelihood.
+    # Requires likelihood="binomial". No-op when False.
+    use_beta_binomial: bool = False
 
 
 # ---------------------------------------------------------------------------

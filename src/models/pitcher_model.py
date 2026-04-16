@@ -21,7 +21,6 @@ captures the signal. See docs/failed_hypotheses.md for details.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Any
 
 import arviz as az
@@ -39,37 +38,10 @@ N_AGE_BUCKETS = 3
 AGE_BUCKET_LABELS = {0: "young (<=25)", 1: "prime (26-30)", 2: "veteran (31+)"}
 
 
-@dataclass
-class PitcherStatConfig:
-    """Configuration for a single pitcher target stat."""
+from src.models._model_utils import StatConfig
 
-    name: str
-    count_col: str         # numerator (e.g. "k", "bb", "hr")
-    trials_col: str        # denominator ("batters_faced")
-    rate_col: str          # pre-computed rate (e.g. "k_rate")
-    likelihood: str        # "binomial"
-    league_avg: float
-    # Covariate config: list of (col_name, prior_mu, prior_sigma, direction_label)
-    covariates: list[tuple[str, float, float, str]] = None
-    # Recency weighting: weight = decay^(max_season - season)
-    # decay=0.8 → 1.0, 0.8, 0.64, 0.51, 0.41 (≈ Marcel 5/4/3)
-    # decay=1.0 → no weighting (all seasons equal)
-    season_decay: float = 1.0
-    # sigma_season prior: LogNormal(mu, 0.5)
-    sigma_season_mu: float = 0.15
-    sigma_season_floor: float = 0.0
-    sigma_player_prior: float = 0.5
-    # AR(1) rho prior: Beta(alpha, beta). Stat-specific persistence.
-    rho_alpha: float = 8.0
-    rho_beta: float = 2.0
-    # AR(2) rho2 prior: stat-specific lag-2 partial autocorrelation
-    rho2_alpha: float = 3.0
-    rho2_beta: float = 7.0
-    mu_pop_sigma: float = 0.3
-    alpha_prior_nu: float | None = None
-    # BetaBinomial overdispersion: if True, uses BetaBinomial instead of
-    # Binomial for the likelihood (requires likelihood="binomial").
-    use_beta_binomial: bool = False
+# Backward-compat alias so existing imports/type hints keep working.
+PitcherStatConfig = StatConfig
 
 
 # Empirical year-to-year volatility (logit scale) from 2018-2025 pitcher data:

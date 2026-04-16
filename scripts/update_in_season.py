@@ -35,8 +35,10 @@ from scipy.special import logit as _scipy_logit
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-DASHBOARD_REPO = Path(r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard")
-DASHBOARD_DIR = DASHBOARD_REPO / "data" / "dashboard"
+from src.data.paths import dashboard_dir, dashboard_repo
+
+DASHBOARD_REPO = dashboard_repo()
+DASHBOARD_DIR = dashboard_dir()
 SNAPSHOT_DIR = DASHBOARD_DIR / "snapshots"
 
 logging.basicConfig(
@@ -263,65 +265,78 @@ def update_k_samples_step() -> dict[str, np.ndarray]:
     return updated
 
 
-def update_rate_samples_step(
+def update_player_rate_samples_step(
+    player_type: str,
     stat_name: str,
     trials_col: str,
     successes_col: str,
     league_avg: float,
 ) -> dict[str, np.ndarray]:
-    """Conjugate-update pitcher BB% or HR/BF samples."""
+    """Conjugate-update per-player rate samples for a given stat.
+
+    Parameters
+    ----------
+    player_type : str
+        ``"pitcher"`` or ``"hitter"`` — controls which preseason loader,
+        observed-totals query, and id column are used.
+    stat_name : str
+        Rate stat key (e.g. ``"bb"``, ``"hr"``, ``"k"``).
+    trials_col, successes_col : str
+        Column names in the observed totals frame.
+    league_avg : float
+        Prior mean for the Beta-Binomial conjugate update.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        ``{player_id_str: samples}``. Empty dict when the preseason
+        samples are missing; the raw preseason samples when no 2026
+        observed data has been seen yet.
+    """
     from src.models.in_season_updater import update_rate_samples
 
-    preseason = load_preseason_rate_samples(stat_name)
+    if player_type == "pitcher":
+        preseason = load_preseason_rate_samples(stat_name)
+        id_col = "pitcher_id"
+        label_noun = "pitchers"
+        missing_label = "%s"
+        fallback_label = "pitcher"
+    elif player_type == "hitter":
+        preseason = load_hitter_preseason_samples(stat_name)
+        id_col = "batter_id"
+        label_noun = "batters"
+        missing_label = "hitter %s"
+        fallback_label = "hitter"
+    else:
+        raise ValueError(f"Unknown player_type: {player_type!r}")
+
     if not preseason:
-        logger.warning("No preseason %s samples — skipping", stat_name)
+        logger.warning("No preseason %s samples — skipping", missing_label % stat_name)
         return {}
 
-    p_obs = get_observed_pitcher_totals()
-    if p_obs.empty:
-        logger.info("No 2026 pitcher data — using preseason %s samples", stat_name)
+    obs = (
+        get_observed_pitcher_totals() if player_type == "pitcher"
+        else get_observed_hitter_totals()
+    )
+    if obs.empty:
+        logger.info(
+            "No 2026 %s data — using preseason %s samples",
+            fallback_label, stat_name,
+        )
         return preseason
 
     updated = update_rate_samples(
-        preseason, p_obs,
-        player_id_col="pitcher_id",
+        preseason, obs,
+        player_id_col=id_col,
         trials_col=trials_col,
         successes_col=successes_col,
         league_avg=league_avg,
         min_trials=10, n_samples=1000,
     )
-    logger.info("Updated %s samples: %d pitchers", stat_name, len(updated))
-    return updated
-
-
-def update_hitter_rate_samples_step(
-    stat_name: str,
-    trials_col: str,
-    successes_col: str,
-    league_avg: float,
-) -> dict[str, np.ndarray]:
-    """Conjugate-update hitter K%, BB%, or HR rate samples."""
-    from src.models.in_season_updater import update_rate_samples
-
-    preseason = load_hitter_preseason_samples(stat_name)
-    if not preseason:
-        logger.warning("No preseason hitter %s samples — skipping", stat_name)
-        return {}
-
-    h_obs = get_observed_hitter_totals()
-    if h_obs.empty:
-        logger.info("No 2026 hitter data — using preseason %s samples", stat_name)
-        return preseason
-
-    updated = update_rate_samples(
-        preseason, h_obs,
-        player_id_col="batter_id",
-        trials_col=trials_col,
-        successes_col=successes_col,
-        league_avg=league_avg,
-        min_trials=10, n_samples=1000,
-    )
-    logger.info("Updated hitter %s samples: %d batters", stat_name, len(updated))
+    if player_type == "hitter":
+        logger.info("Updated hitter %s samples: %d batters", stat_name, len(updated))
+    else:
+        logger.info("Updated %s samples: %d pitchers", stat_name, len(updated))
     return updated
 
 
@@ -1320,16 +1335,16 @@ def main() -> None:
 
     # Step 2b: Update BB% and HR/BF samples
     logger.info("Step 2b: Updating pitcher BB%% and HR/BF samples...")
-    bb_samples = update_rate_samples_step(
-        "bb", trials_col="batters_faced", successes_col="walks",
+    bb_samples = update_player_rate_samples_step(
+        "pitcher", "bb", trials_col="batters_faced", successes_col="walks",
         league_avg=0.08,
     )
     if bb_samples:
         np.savez_compressed(DASHBOARD_DIR / "pitcher_bb_samples.npz", **bb_samples)
         logger.info("Saved updated BB%% samples for %d pitchers", len(bb_samples))
 
-    hr_samples = update_rate_samples_step(
-        "hr", trials_col="batters_faced", successes_col="hr",
+    hr_samples = update_player_rate_samples_step(
+        "pitcher", "hr", trials_col="batters_faced", successes_col="hr",
         league_avg=0.03,
     )
     if hr_samples:
@@ -1338,24 +1353,24 @@ def main() -> None:
 
     # Step 2c: Update hitter K%, BB%, HR samples
     logger.info("Step 2c: Updating hitter K%%, BB%%, HR samples...")
-    h_k_samples = update_hitter_rate_samples_step(
-        "k", trials_col="pa", successes_col="strikeouts",
+    h_k_samples = update_player_rate_samples_step(
+        "hitter", "k", trials_col="pa", successes_col="strikeouts",
         league_avg=0.226,
     )
     if h_k_samples:
         np.savez_compressed(DASHBOARD_DIR / "hitter_k_samples.npz", **h_k_samples)
         logger.info("Saved updated hitter K%% samples for %d batters", len(h_k_samples))
 
-    h_bb_samples = update_hitter_rate_samples_step(
-        "bb", trials_col="pa", successes_col="walks",
+    h_bb_samples = update_player_rate_samples_step(
+        "hitter", "bb", trials_col="pa", successes_col="walks",
         league_avg=0.082,
     )
     if h_bb_samples:
         np.savez_compressed(DASHBOARD_DIR / "hitter_bb_samples.npz", **h_bb_samples)
         logger.info("Saved updated hitter BB%% samples for %d batters", len(h_bb_samples))
 
-    h_hr_samples = update_hitter_rate_samples_step(
-        "hr", trials_col="pa", successes_col="hr",
+    h_hr_samples = update_player_rate_samples_step(
+        "hitter", "hr", trials_col="pa", successes_col="hr",
         league_avg=0.031,
     )
     if h_hr_samples:
