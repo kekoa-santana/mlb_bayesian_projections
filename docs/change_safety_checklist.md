@@ -12,7 +12,7 @@ Use this checklist after modifying any high-risk modeling, simulation, or calibr
   - `pitcher_k_samples.npz`, `pitcher_bb_samples.npz`, `pitcher_hr_samples.npz`
 
 ## 1) If you changed logit math or matchup-lift logic
-- Files: `src/models/matchup.py`, `src/models/game_k_model.py`, `src/models/lineup_adjustments.py`
+- Files: `src/models/matchup.py`, `src/models/game_sim/pa_outcome_model.py`, `src/models/lineup_adjustments.py`
 - Run:
   - `python scripts/run_game_prop_backtest.py`
 - Verify:
@@ -25,18 +25,18 @@ Use this checklist after modifying any high-risk modeling, simulation, or calibr
 ## 2) If you changed BF/PA distributions or sampling bounds
 - Files: `src/models/bf_model.py`
 - Run:
-  - `python scripts/run_game_k_backtest.py`
+  - `python scripts/run_game_sim_backtest.py`
   - `python scripts/run_game_prop_backtest.py`
 - Verify:
   - Expected totals and variance stay realistic:
-    - Pitcher K Brier score and CRPS not materially worse.
+    - Brier score and CRPS not materially worse across Tier 1 props (batter H/K/BB, pitcher K).
     - Coverage (50/80/90/95) does not collapse.
   - Tail behavior sanity:
     - `P(over)` curves are smooth/monotonic by line.
     - No sudden clipping near 0 or 1 across many games.
 
 ## 3) If you changed TTO/slot indexing or lineup-weighting logic
-- Files: `src/models/game_k_model.py`, `src/models/game_sim/simulator.py`, `src/models/lineup_adjustments.py`
+- Files: `src/models/game_sim/simulator.py`, `src/models/game_sim/tto_model.py`, `src/models/lineup_adjustments.py`
 - Run:
   - `python scripts/precompute/validate_lineup_sim.py`
   - `python scripts/run_game_prop_backtest.py`
@@ -49,7 +49,7 @@ Use this checklist after modifying any high-risk modeling, simulation, or calibr
 ## 4) If you changed rest adjustments
 - Files: `src/models/rest_adjustment.py`
 - Run:
-  - `python scripts/run_game_k_backtest.py`
+  - `python scripts/run_game_sim_backtest.py`
   - `python scripts/run_game_prop_backtest.py`
 - Verify:
   - Short-rest starts show lower BF on average, not higher.
@@ -99,7 +99,7 @@ Use this checklist after modifying any high-risk modeling, simulation, or calibr
 - Calibration:
   - No major degradation in `ECE`, `MCE`, temperature, or coverage.
 - Accuracy:
-  - Brier score and CRPS not materially worse on core props (at least pitcher K, BB, HR).
+  - Brier score and CRPS not materially worse on Tier 1 props (batter H/K/BB, pitcher K). See `docs/reliability_matrix.md` for tier definitions.
 - Stability:
   - Confidence tier assignments do not churn wildly without intentional reason.
 - Operational:

@@ -29,15 +29,15 @@ This system is built on **hierarchical Bayesian modeling**, which means:
 
 - **Full posterior distributions, not point estimates.** Every projection is a probability distribution. You get the most likely outcome *and* the range of realistic possibilities.
 - **Partial pooling instead of sample size cutoffs.** Most systems throw out players with fewer than 200 PA. This model borrows strength across similar players, so a rookie with 80 PA still gets a meaningful (if uncertain) projection -- the model knows how much to trust small samples.
-- **Statcast data informs the priors.** A pitcher's raw K% is just the starting point. Whiff rate, barrel rate, and exit velocity feed into the *prior belief* about true talent, not just a regression feature. This is how you identify breakouts before they show up in traditional stats.
+- **Statcast data informs the priors.** Whiff rate, barrel rate, chase rate, and exit velocity feed into the *prior belief* about true talent, not just regression features. This is how you identify breakouts before they show up in traditional stats.
 
 ### Understanding the Uncertainty Ranges
 
-When the model says a pitcher's K% is projected at 24.8% with a 95% credible interval of [18.2%, 31.8%], it means:
+When the model projects a hitter's BB% at 9.2% with a 95% credible interval of [6.8%, 12.1%], it means:
 
-> *"We believe there's a 95% chance his true-talent K rate next season falls between 18.2% and 31.8%, with 24.8% being most likely."*
+> *"We believe there's a 95% chance his true-talent walk rate next season falls between 6.8% and 12.1%, with 9.2% being most likely."*
 
-These ranges might look wide -- but they're honest. Real-world pitcher K% changes by about 2pp per year on average, and 95% of pitchers shift by less than 4.5pp. The model's interval captures both *how much talent actually changes* and *how well we can estimate current talent*. Public systems have the same underlying uncertainty -- they just don't show it to you.
+These ranges might look wide -- but they're honest. The model's interval captures both *how much talent actually changes* and *how well we can estimate current talent*. Public systems have the same underlying uncertainty -- they just don't show it to you.
 
 **The width of the interval is itself informative.** A tight range means the model is confident (lots of data, stable track record). A wide range means genuine uncertainty (young player, volatile history, small sample). That's the whole point.
 
@@ -118,26 +118,33 @@ The dashboard reads these pre-computed files - no runtime dependency on this rep
 
 ---
 
-## Backtest Results
+## Validation Results
 
-Every model is evaluated with strict walk-forward backtesting -- train on data through season N, predict season N+1, roll forward. No future data leakage.
+Every model is evaluated with strict walk-forward backtesting -- train on data through season N, predict season N+1, roll forward. No future data leakage. See [`docs/reliability_matrix.md`](docs/reliability_matrix.md) for the full stat-by-stat breakdown.
 
-### Season Projections vs. Marcel (industry baseline)
-- **Hitter K%/BB%/wOBA:** Beats Marcel on MAE in 2 of 3 folds
-- **All stats (hitter + pitcher):** Beats Marcel on Brier score across every fold -- better calibrated probability estimates
-- **95% credible interval coverage:** 84-94% across all stats (target: 95%, slight undercover is expected with forward projection variance)
+### Season-Level Projections
+- **All core rate stats** (hitter K%/BB%/GB%, pitcher K%/BB%): Bayes beats Marcel on Brier score across every fold
+- **95% credible interval coverage:** 55-73% at 80% CI across stats (slight undercoverage expected with forward projection)
 - **All folds converge cleanly** (r_hat < 1.05, zero divergences)
+- **Known gaps:** Pitcher counting stats (K, BB, Outs) lose to Marcel on MAPE. SB era adjustment too blunt.
 
-### Game Prop Predictions (11,517 games, 3 walk-forward folds)
-- **Pitcher K RMSE:** 2.28 strikeouts
-- **Pitcher K Brier:** 0.187
-- **Calibration:** 50/80/90% confidence levels hit 48/79/89% (near-perfect)
-- **High Confidence Performance:** At 70%+ model confidence on 5.5 K line: **76.4% win rate** (3,340 of 4,371 games)
+### Game-Level Props (11,517 pitcher games, 131K+ batter games)
 
-### Advanced Metrics Performance
-- **CRPS improvements:** 8-15% better than baseline across prop types
-- **ECE calibration:** <0.05 for HIGH confidence props
-- **Ensemble gains:** 3-7% MAE improvement with Bayes-Marcel blending
+**Well-calibrated (Tier 1):**
+- Batter H: ECE=0.018, Brier=0.148 (best-calibrated prop in the system)
+- Batter K: ECE=0.035, Brier=0.147
+- Batter BB: ECE=0.031, Brier=0.120
+- Pitcher K: ECE=0.020, Brier=0.188
+
+**Partially calibrated (Tier 2):** Pitcher BB (ECE=0.072), Pitcher H (slope < 0.30 -- overconfident)
+
+**Unreliable (Tier 3):** HR (both sides), Pitcher Outs
+
+### Evaluation Metrics
+- **Brier score:** Binary outcome calibration
+- **ECE:** Calibration error across probability bins
+- **CRPS:** Full-distribution forecast quality
+- **Calibration slope:** 1.0 = perfect; < 0.5 = overconfident; > 1.5 = underconfident
 
 ---
 
@@ -171,30 +178,23 @@ Built on a PostgreSQL database with comprehensive MLB data (2018-2025):
 
 ---
 
-## Roadmap
+## Status
 
-### v2.0 -- Complete Game Prop System (Current)
-- ✅ Full prop validation framework (all stats, both sides)
-- ✅ Confidence tier system with automated explanations  
-- ✅ Advanced metrics (CRPS, ECE, temperature scaling)
-- ✅ Bayes-Marcel ensemble optimization
-- ✅ Enhanced calibration and decision support
+### Complete
+- Hierarchical Bayesian models for hitter (K%, BB%, GB%, FB%, HR/FB) and pitcher (K%, BB%, HR/BF)
+- AR(1) talent evolution with age-bucket x Statcast skill tier priors
+- PA-by-PA game simulator (pitcher + batter) with matchup, TTO, umpire, park, weather adjustments
+- MiLB translation factors, prospect rankings, MLB readiness model
+- TDD 20-80 scouting grades with Bayesian grade confidence intervals
+- In-season conjugate updating (daily) + rankings refresh (weekly)
+- Team ELO, profiles, power rankings, full-league season simulation
+- Market edge / Kelly sizing framework
 
-### v2.1 -- Minor League Integration  
-- ✅ MiLB translation factors for prospect projections
-- ✅ Cross-level talent estimation
-- ✅ Prospect scouting reports
-- 🔄 Integration with main projection pipeline
-
-### v2.2 -- Enhanced Season Evolution
-- 🔄 AR(1) process replacement for random walk
-- 🔄 Improved aging curve modeling
-- 🔄 Better long-term projection stability
-
-### v2.3 -- In-Season Live Updates
-- 📋 Real-time posterior updating
-- 📋 Daily model refresh pipeline
-- 📋 Live dashboard integration
+### Active
+- Fixing pitcher H calibration (slope << 1.0)
+- Layer 1 K-rate calibration (2pp under-prediction)
+- Game-level BB bias correction
+- Legacy module retirement (game_k_model.py, k_rate_model.py)
 
 ---
 
