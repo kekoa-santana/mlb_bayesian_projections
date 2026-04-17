@@ -15,7 +15,6 @@ import logging
 import warnings
 from pathlib import Path
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
@@ -385,6 +384,8 @@ def walk_forward_evaluate(
     train_end: int,
     test_seasons: list[int],
 ) -> list[dict]:
+    import lightgbm as lgb  # optional dep — install via pip install -e ".[ml]"
+
     """Train on seasons <= train_end, test on each test season."""
     results = []
 
@@ -620,6 +621,8 @@ K_FEATURES = [
 
 def evaluate_k_walk_forward(df: pd.DataFrame) -> list[dict]:
     """Walk-forward K prop evaluation."""
+    import lightgbm as lgb  # optional dep — install via pip install -e ".[ml]"
+
     results = []
     sim_bt_k = _load_sim_k_backtest()
 
