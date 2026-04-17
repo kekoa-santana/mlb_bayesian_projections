@@ -48,3 +48,24 @@ pythonpath = ["."]
 markers = [
     "integration: slower end-to-end tests that sample real PyMC models on synthetic data",
 ]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+# Start permissive — ratchet gradually
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+]
+ignore = [
+    "E501",   # line too long (handled by formatter eventually)
+    "E741",   # ambiguous variable name (common in math-heavy code)
+    "F401",   # unused imports (re-exports in __init__.py)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]

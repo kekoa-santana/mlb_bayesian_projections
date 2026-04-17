@@ -251,7 +251,7 @@ player_profiles/                          # Projection engine only
 │   ├── run_game_prop_backtest.py         # Game prop validation
 │   ├── generate_*_cards.py               # Content generation
 │   └── apply_injury_adjustments.py       # Injury adjustments
-├── tests/                                # 17+ test files, 119+ test functions
+├── tests/                                # 31 test files, 291 tests (278 fast + 13 integration)
 ├── data/cached/                          # Parquet cache (~60 files)
 ├── outputs/                              # Backtest CSVs & content PNGs
 ├── docs/                                 # Documentation
@@ -289,6 +289,15 @@ python scripts/precompute_dashboard_data.py
 
 # Quick development mode (5 minutes)
 python scripts/precompute_dashboard_data.py --quick
+```
+
+### Run Tests
+```bash
+# Fast unit tests (~40s)
+pytest -m "not integration"
+
+# Full suite including PyMC sampling (~70s)
+pytest
 ```
 
 ### Run Backtests
