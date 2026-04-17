@@ -53,7 +53,6 @@ def run(
     from src.models.game_sim.simulator import (
         simulate_game,
         compute_stamina_offset,
-        compute_exit_offset,
     )
     from src.models.game_sim.lineup_simulator import simulate_lineup_game
     from src.models.game_sim.batter_simulator import simulate_batter_game
@@ -551,26 +550,15 @@ def run(
             # Pitcher team ID (needed for bullpen + catcher lookups)
             pitcher_team_id = int(game.get(team_col, 0)) if pd.notna(game.get(team_col)) else 0
 
-            # BF prior for this pitcher
+            # BF prior for BF-anchored exit
             bf_row = bf_priors[bf_priors["pitcher_id"] == pitcher_id]
-            mu_bf_val = (
-                float(bf_row.sort_values("season").iloc[-1]["mu_bf"])
-                if len(bf_row) > 0 else None
-            )
-
-            # Bullpen trailing workload (approximate from bullpen_rates total_bf)
-            bp_ip = None
-
-            # Lineup patience aggregate
-            lineup_ppa_agg = float(np.mean(batter_adjs))
-
-            # Unified exit offset with BF prior + bullpen + lineup patience
-            exit_offset = compute_exit_offset(
-                mu_bf=mu_bf_val,
-                pitcher_avg_ip=avg_ip,
-                bullpen_trailing_ip=bp_ip,
-                lineup_ppa_aggregate=lineup_ppa_agg,
-            )
+            if len(bf_row) > 0:
+                _bf_latest = bf_row.sort_values("season").iloc[-1]
+                mu_bf_val = float(_bf_latest["mu_bf"])
+                sigma_bf_val = float(_bf_latest["sigma_bf"])
+            else:
+                mu_bf_val = None
+                sigma_bf_val = None
 
             # Catcher framing lift (pitcher's own team's catcher)
             catcher_k_lift = 0.0
@@ -617,7 +605,8 @@ def run(
                         catcher_k_lift=catcher_k_lift,
                         form_bb_lift=pit_form.bb_lift,
                     ),
-                    exit_calibration_offset=exit_offset,
+                    mu_bf=mu_bf_val,
+                    sigma_bf=sigma_bf_val,
                     manager_pull_tendency=team_avg_p,
                     bullpen_profile=team_bullpen_profile,
                     lineup_bip_probs=lineup_bip_probs_arr,

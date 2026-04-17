@@ -376,7 +376,6 @@ def simulate_todays_games(
     from src.models.game_sim.simulator import (
         simulate_game,
         compute_stamina_offset,
-        compute_exit_offset,
     )
     from src.models.game_sim.pitch_count_model import build_pitch_count_features
     from src.models.game_sim.tto_model import build_all_tto_lifts
@@ -701,23 +700,15 @@ def simulate_todays_games(
                     avg_pitches = float(tr.get("avg_pitches", 88.0))
                     avg_ip = float(tr.get("avg_ip", 5.28)) if pd.notna(tr.get("avg_ip")) else 5.28
                     team_avg_p = float(tr.get("team_avg_pitches", 88.0)) if pd.notna(tr.get("team_avg_pitches")) else 88.0
-            # BF prior for unified exit offset
+            # BF prior for BF-anchored exit
             mu_bf_val = None
+            sigma_bf_val = None
             if bf_priors is not None and not bf_priors.empty:
                 bf_row = bf_priors[bf_priors["pitcher_id"] == pid]
                 if len(bf_row) > 0:
-                    mu_bf_val = float(
-                        bf_row.sort_values("season").iloc[-1]["mu_bf"]
-                    )
-
-            # Lineup patience aggregate
-            lineup_ppa_agg = float(np.mean(batter_adjs))
-
-            exit_offset = compute_exit_offset(
-                mu_bf=mu_bf_val,
-                pitcher_avg_ip=avg_ip,
-                lineup_ppa_aggregate=lineup_ppa_agg,
-            )
+                    _bf_latest = bf_row.sort_values("season").iloc[-1]
+                    mu_bf_val = float(_bf_latest["mu_bf"])
+                    sigma_bf_val = float(_bf_latest["sigma_bf"])
 
             # Pitcher form lift (BB% only — K% form near-zero for pitchers)
             pit_form = pitcher_form_lifts.get(pid, PitcherFormLifts())
@@ -830,7 +821,8 @@ def simulate_todays_games(
                         form_bb_lift=pit_form.bb_lift,
                         xgb_bb_lift=xgb_bb_delta,
                     ),
-                    exit_calibration_offset=exit_offset,
+                    mu_bf=mu_bf_val,
+                    sigma_bf=sigma_bf_val,
                     manager_pull_tendency=team_avg_p,
                     babip_adj=combined_babip,
                     bullpen_k_rate=bp_k,

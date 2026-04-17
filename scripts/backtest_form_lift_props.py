@@ -35,6 +35,7 @@ from scripts.backtest_form_lifts import (
     lookup_prior_form,
     lookup_prior_hard_hit,
 )
+from src.data.paths import dashboard_dir
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DASHBOARD_DIR = Path(r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard")
+DASHBOARD_DIR = dashboard_dir()
 SNAPSHOT_DIR = DASHBOARD_DIR / "snapshots"
 
 
@@ -240,6 +241,16 @@ def run_pitcher_prop_calibration(
     exit_model = ExitModel()
     exit_model.load(DASHBOARD_DIR / "exit_model.pkl")
 
+    bf_priors_path = DASHBOARD_DIR / "bf_priors.parquet"
+    bf_lookup: dict[int, tuple[float, float]] = {}
+    if bf_priors_path.exists():
+        bf_df = pd.read_parquet(bf_priors_path)
+        bf_latest = bf_df.sort_values("season").groupby("pitcher_id").last().reset_index()
+        bf_lookup = {
+            int(r["pitcher_id"]): (float(r["mu_bf"]), float(r["sigma_bf"]))
+            for _, r in bf_latest.iterrows()
+        }
+
     pitcher_ids = games["pitcher_id"].unique().tolist()
     rolling_data = load_rolling_form_all(pitcher_ids, "pitcher", season)
     logger.info("Rolling form: %d pitchers", len(rolling_data))
@@ -277,6 +288,9 @@ def run_pitcher_prop_calibration(
         else:
             pit_form = PitcherFormLifts()
 
+        bf_prior = bf_lookup.get(pid)
+        bf_kwargs = {"mu_bf": bf_prior[0], "sigma_bf": bf_prior[1]} if bf_prior else {}
+
         shared = dict(
             pitcher_k_rate_samples=k_samp,
             pitcher_bb_rate_samples=bb_samp,
@@ -288,6 +302,7 @@ def run_pitcher_prop_calibration(
             exit_model=exit_model,
             n_sims=n_sims,
             random_seed=random_seed + gpk % 10000,
+            **bf_kwargs,
         )
 
         try:

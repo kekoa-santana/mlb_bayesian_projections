@@ -48,7 +48,6 @@ from src.models.game_sim.pa_outcome_model import GameContext
 from src.models.game_sim.simulator import (
     simulate_game,
     compute_stamina_offset,
-    compute_exit_offset,
 )
 from src.models.game_sim.tto_model import build_all_tto_lifts
 from src.models.matchup import score_matchup_for_stat
@@ -850,14 +849,16 @@ def build_game_sim_predictions(
             avg_ip = 5.2
             team_avg_p = 88.0
 
-        # BF prior for this pitcher (bf_model empirical Bayes)
+        # BF prior for BF-anchored exit
         bf_row = bf_priors_latest[
             bf_priors_latest["pitcher_id"] == pitcher_id
         ]
-        mu_bf = (
-            float(bf_row.iloc[0]["mu_bf"])
-            if len(bf_row) > 0 else None
-        )
+        if len(bf_row) > 0:
+            mu_bf = float(bf_row.iloc[0]["mu_bf"])
+            sigma_bf = float(bf_row.iloc[0]["sigma_bf"])
+        else:
+            mu_bf = None
+            sigma_bf = None
 
         # Bullpen workload: look up pitcher's team for this game
         actual_row_team = actuals[
@@ -905,13 +906,6 @@ def build_game_sim_predictions(
         # Lineup patience: mean of batter P/PA adjustments
         lineup_ppa_agg = float(np.mean(batter_adjs))
 
-        # Unified exit offset with all three signals
-        exit_offset = compute_exit_offset(
-            mu_bf=mu_bf,
-            pitcher_avg_ip=avg_ip,
-            bullpen_trailing_ip=bullpen_ip,
-            lineup_ppa_aggregate=lineup_ppa_agg,
-        )
 
         # Pitching team's bullpen rates — train-only aggregate
         bp_rates = (
@@ -942,7 +936,8 @@ def build_game_sim_predictions(
                 batter_ppa_adjs=batter_adjs,
                 exit_model=exit_model,
                 pitcher_avg_pitches=avg_pitches,
-                exit_calibration_offset=exit_offset,
+                mu_bf=mu_bf,
+                sigma_bf=sigma_bf,
                 game_context=GameContext(
                     umpire_k_lift=ump_k,
                     umpire_bb_lift=ump_bb,

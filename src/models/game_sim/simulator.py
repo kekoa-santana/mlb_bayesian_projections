@@ -1129,6 +1129,8 @@ def predict_game(
     bullpen_k_rate: float = BULLPEN_K_RATE,
     bullpen_bb_rate: float = BULLPEN_BB_RATE,
     bullpen_hr_rate: float = BULLPEN_HR_RATE,
+    mu_bf: float | None = None,
+    sigma_bf: float | None = None,
     lineup_bip_probs: np.ndarray | None = None,
     n_sims: int = 50_000,
     random_seed: int = 42,
@@ -1137,52 +1139,9 @@ def predict_game(
 
     Computes pitch count features, runs simulation, and returns
     comprehensive results including prop line probabilities.
-
-    Parameters
-    ----------
-    pitcher_id : int
-        Pitcher MLB ID.
-    season : int
-        Season for feature lookup.
-    lineup_batter_ids : list[int]
-        9 batter IDs in batting order.
-    pitcher_k_rate_samples : np.ndarray
-        K% posterior samples.
-    pitcher_bb_rate_samples : np.ndarray
-        BB% posterior samples.
-    pitcher_hr_rate_samples : np.ndarray
-        HR/BF posterior samples.
-    lineup_matchup_lifts : dict[str, np.ndarray]
-        Per-stat matchup lifts, shape (9,) each.
-    tto_lifts : dict[str, np.ndarray]
-        TTO lifts, shape (3,) each.
-    pitcher_features : pd.DataFrame
-        Pitcher pitch count features.
-    batter_features : pd.DataFrame
-        Batter pitch count features.
-    exit_model : ExitModel
-        Trained exit model.
-    pitcher_avg_pitches : float
-        Average exit pitch count.
-    babip_adj : float
-        Pitcher BABIP adjustment.
-    game_context : GameContext, optional
-        Per-game environmental lifts (umpire, park, weather, catcher
-        framing, pitcher form).
-    n_sims : int
-        Number of simulations.
-    random_seed : int
-        For reproducibility.
-
-    Returns
-    -------
-    dict[str, Any]
-        Keys: 'result' (SimulationResult), 'summary', 'k_over_probs',
-        'bb_over_probs', 'h_over_probs', 'hr_over_probs'.
     """
     from src.models.game_sim.pitch_count_model import build_pitch_count_features
 
-    # Build pitch count adjustments
     pitcher_ppa_adj, batter_ppa_adjs = build_pitch_count_features(
         pitcher_features=pitcher_features,
         batter_features=batter_features,
@@ -1203,6 +1162,8 @@ def predict_game(
         pitcher_avg_pitches=pitcher_avg_pitches,
         babip_adj=babip_adj,
         game_context=game_context,
+        mu_bf=mu_bf,
+        sigma_bf=sigma_bf,
         manager_pull_tendency=manager_pull_tendency,
         bullpen_k_rate=bullpen_k_rate,
         bullpen_bb_rate=bullpen_bb_rate,
