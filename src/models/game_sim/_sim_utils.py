@@ -18,7 +18,7 @@ from src.utils.math_helpers import safe_logit
 logger = logging.getLogger(__name__)
 
 
-__all__ = ["safe_logit", "resample_posterior"]
+__all__ = ["safe_logit", "resample_posterior", "rates_to_multinomial_logits"]
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +34,51 @@ def resample_posterior(
     if len(arr) == n_sims:
         return arr.copy()
     return rng.choice(arr, size=n_sims, replace=True)
+
+
+# ---------------------------------------------------------------------------
+# Multinomial logit conversion
+# ---------------------------------------------------------------------------
+
+def rates_to_multinomial_logits(
+    k_rate: float | np.ndarray,
+    bb_rate: float | np.ndarray,
+    hr_rate: float | np.ndarray,
+    hbp_rate: float | np.ndarray,
+) -> tuple[np.ndarray | float, ...]:
+    """Convert outcome rates to multinomial logits with BIP as reference.
+
+    Standard binary logit — log(p/(1-p)) — gives the log-odds of an
+    outcome vs *all other outcomes combined*.  A multinomial softmax with
+    BIP as the reference category needs log(p/p_BIP) instead.  Using
+    binary logits in a softmax systematically deflates K/BB/HR
+    probabilities and inflates BIP.
+
+    Parameters
+    ----------
+    k_rate, bb_rate, hr_rate, hbp_rate : float or np.ndarray
+        Per-PA outcome rates (must sum to < 1.0; remainder is BIP).
+
+    Returns
+    -------
+    tuple of (eta_k, eta_bb, eta_hr, eta_hbp)
+        Multinomial logits: log(rate / bip_rate) for each outcome.
+    """
+    bip_rate = 1.0 - k_rate - bb_rate - hr_rate - hbp_rate
+    bip_rate = np.maximum(bip_rate, 0.01)  # safety floor
+
+    # Clip rates to avoid log(0)
+    k_safe = np.maximum(k_rate, 1e-6)
+    bb_safe = np.maximum(bb_rate, 1e-6)
+    hr_safe = np.maximum(hr_rate, 1e-6)
+    hbp_safe = np.maximum(hbp_rate, 1e-6)
+
+    return (
+        np.log(k_safe / bip_rate),
+        np.log(bb_safe / bip_rate),
+        np.log(hr_safe / bip_rate),
+        np.log(hbp_safe / bip_rate),
+    )
 
 
 # ---------------------------------------------------------------------------

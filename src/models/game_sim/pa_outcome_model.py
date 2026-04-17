@@ -28,7 +28,7 @@ from src.models.game_sim.bip_model import (
     BIP_TRIPLE,
     BIPOutcomeModel,
 )
-from src.models.game_sim._sim_utils import safe_logit
+from src.models.game_sim._sim_utils import safe_logit, rates_to_multinomial_logits
 from src.utils.constants import LEAGUE_HBP_RATE
 
 logger = logging.getLogger(__name__)
@@ -43,16 +43,12 @@ PA_TRIPLE = 5
 PA_HOME_RUN = 6
 PA_OUT = 7
 
-# Sim calibration offsets (logit scale).
-# After softmax refactor (2026-04-13), the old offsets tuned for expit+renorm
-# produced systematic biases: K/BB/HR rates shifted lower and runs bias ~-0.5/game.
-# Re-tuned offsets after softmax:
-#   K: removed the -0.02 reduction (softmax already pushes toward BIP)
-#   BB: kept small positive nudge
-#   HR: added +0.08 logit bump to counter softmax-induced runs under-prediction
-_CALIBRATION_K_OFFSET = 0.0     # was -0.02 pre-softmax; softmax no longer needs the cut
-_CALIBRATION_BB_OFFSET = 0.01   # unchanged
-_CALIBRATION_HR_OFFSET = 0.22   # offsets softmax HR suppression (was 0.15; bumped to close -0.35 runs bias)
+# Calibration offsets removed (2026-04-17).
+# The prior offsets were compensating for a binary-vs-multinomial logit
+# mismatch: safe_logit(p) = log(p/(1-p)) was used where the softmax needs
+# log(p/p_BIP).  rates_to_multinomial_logits() fixes the root cause,
+# making these offsets unnecessary.
+# History: K was 0.0, BB was +0.01, HR was +0.22.
 
 # Fatigue adjustment thresholds and slopes (logit scale)
 _FATIGUE_PITCH_THRESHOLD = 90   # Research (Bradbury 2007, Statcast velocity studies): meaningful
@@ -186,35 +182,39 @@ class PAOutcomeModel:
         """
         _ctx = ctx or _EMPTY_CONTEXT
 
-        # K logit (with calibration offset to correct sim bias)
+        # Convert pitcher rates to proper multinomial logits (vs BIP).
+        # This replaces safe_logit(rate) which gives binary log-odds and
+        # systematically deflates K/BB/HR in the softmax.
+        base_k, base_bb, base_hr, base_hbp = rates_to_multinomial_logits(
+            pitcher_k_rate, pitcher_bb_rate, pitcher_hr_rate, self.hbp_rate,
+        )
+
+        # K logit
         eta_k = (
-            self._safe_logit(pitcher_k_rate)
+            base_k
             + matchup_k_lift + tto_k_lift + fatigue_k_lift
             + _ctx.umpire_k_lift + _ctx.park_k_lift + _ctx.weather_k_lift
             + _ctx.catcher_k_lift
-            + _CALIBRATION_K_OFFSET
         )
 
-        # BB logit (with calibration offset + pitcher form + XGB adjustment)
+        # BB logit (+ pitcher form + XGB adjustment)
         eta_bb = (
-            self._safe_logit(pitcher_bb_rate)
+            base_bb
             + matchup_bb_lift + tto_bb_lift + fatigue_bb_lift
             + _ctx.umpire_bb_lift + _ctx.park_bb_lift
             + _ctx.form_bb_lift + _ctx.xgb_bb_lift
             + _ctx.catcher_bb_lift
-            + _CALIBRATION_BB_OFFSET
         )
 
-        # HR logit (with calibration offset to counter softmax suppression)
+        # HR logit
         eta_hr = (
-            self._safe_logit(pitcher_hr_rate)
+            base_hr
             + matchup_hr_lift + tto_hr_lift + fatigue_hr_lift
             + _ctx.park_hr_lift + _ctx.weather_hr_lift
-            + _CALIBRATION_HR_OFFSET
         )
 
-        # HBP logit (fixed)
-        eta_hbp = self._safe_logit(self.hbp_rate)
+        # HBP logit
+        eta_hbp = base_hbp
 
         # BIP is the reference category (eta_bip = 0)
         # Softmax: p_j = exp(eta_j) / sum_k(exp(eta_k))
