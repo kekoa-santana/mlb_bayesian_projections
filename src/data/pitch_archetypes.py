@@ -20,7 +20,6 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-import yaml
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
@@ -28,10 +27,10 @@ from sklearn.preprocessing import StandardScaler
 from src.data.queries import get_pitch_shape_offerings
 from src.utils.constants import PITCH_TO_FAMILY
 
+from src.data.paths import CACHE_DIR, get_clustering_seasons as _get_clustering_seasons
+
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
 # Features used for KMeans clustering (5 shape features).
 SHAPE_FEATURES: tuple[str, ...] = (
@@ -48,16 +47,6 @@ EXTRA_FEATURES: tuple[str, ...] = (
     "release_pos_z",
 )
 
-
-# ---------------------------------------------------------------------------
-# Config helper
-# ---------------------------------------------------------------------------
-def _get_clustering_seasons() -> list[int]:
-    """Read ``seasons.clustering`` from ``config/model.yaml``."""
-    path = CONFIG_DIR / "model.yaml"
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f)
-    return cfg["seasons"]["clustering"]
 
 
 # ---------------------------------------------------------------------------

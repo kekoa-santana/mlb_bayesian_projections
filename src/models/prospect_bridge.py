@@ -16,14 +16,14 @@ The bridge:
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from src.data.paths import CACHE_DIR
+
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
 
 # Recency decay half-life (years) — matches prospect_ranking / mlb_readiness
 _RECENCY_HALF_LIFE = 2.0
@@ -393,9 +393,8 @@ def _get_rookie_batter_ids(season: int) -> set[int]:
     observed_ids = set(observed["batter_id"].astype(int))
 
     # Load preseason snapshot to find who already has projections
-    dashboard_dir = Path(
-        r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard"
-    ) / "data" / "dashboard"
+    from src.data.paths import dashboard_dir as _dashboard_dir
+    dashboard_dir = _dashboard_dir()
     snap_dir = dashboard_dir / "snapshots"
 
     snap_path = snap_dir / f"hitter_projections_{season}_preseason.parquet"
@@ -439,9 +438,8 @@ def _get_rookie_pitcher_ids(season: int) -> set[int]:
 
     observed_ids = set(observed["pitcher_id"].astype(int))
 
-    dashboard_dir = Path(
-        r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard"
-    ) / "data" / "dashboard"
+    from src.data.paths import dashboard_dir as _dashboard_dir
+    dashboard_dir = _dashboard_dir()
     snap_dir = dashboard_dir / "snapshots"
 
     snap_path = snap_dir / f"pitcher_projections_{season}_preseason.parquet"

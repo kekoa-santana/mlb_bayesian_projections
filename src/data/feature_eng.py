@@ -38,9 +38,10 @@ from src.utils.constants import (
     PITCH_TO_FAMILY,
 )
 
+from src.data.paths import CACHE_DIR
+
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
 
 
 # ---------------------------------------------------------------------------

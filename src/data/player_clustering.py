@@ -25,7 +25,6 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-import yaml
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
@@ -39,21 +38,11 @@ from src.data.feature_eng import (
     get_pitcher_arsenal,
 )
 
+from src.data.paths import CACHE_DIR, get_clustering_seasons as _get_clustering_seasons
+
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-def _get_clustering_seasons() -> list[int]:
-    """Read ``seasons.clustering`` from ``config/model.yaml``."""
-    path = CONFIG_DIR / "model.yaml"
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f)
-    return cfg["seasons"]["clustering"]
 
 
 # ---------------------------------------------------------------------------
@@ -742,7 +731,8 @@ def export_for_dashboard(
         Paths to written parquets.
     """
     if output_dir is None:
-        output_dir = Path("C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/data/dashboard")
+        from src.data.paths import dashboard_dir
+        output_dir = dashboard_dir()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

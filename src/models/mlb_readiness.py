@@ -14,7 +14,6 @@ Trained on 2018-2021 MiLB prospects, validated on 2022-2023 debutants.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -22,9 +21,10 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
+from src.data.paths import CACHE_DIR
+
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
 
 # Feature list (must match training order)
 _STAT_FEATURES = [

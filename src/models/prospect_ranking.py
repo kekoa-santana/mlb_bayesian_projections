@@ -32,9 +32,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.data.paths import CACHE_DIR
+from src.models._ranking_utils import percentile_rank as _percentile_rank
+
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
 
 # ---------------------------------------------------------------------------
 # Batter component weights (sum to 1.0)
@@ -141,10 +143,6 @@ _MLB_RELIABILITY_MULTIPLIER = 2.0
 # 2-year half-life: 1yr ago = 71% weight, 2yr ago = 50%, 3yr ago = 35%.
 _RECENCY_HALF_LIFE = 2.0
 
-
-def _percentile_rank(series: pd.Series) -> pd.Series:
-    """Convert a series to 0-1 percentile ranks (higher = better)."""
-    return series.rank(pct=True, method="average")
 
 
 def _compute_batter_rate_quality(df: pd.DataFrame) -> pd.Series:

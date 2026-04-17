@@ -21,12 +21,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.data.paths import CACHE_DIR, dashboard_dir
+
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
-DASHBOARD_DIR = Path(
-    r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard"
-)
+DASHBOARD_DIR = dashboard_dir()
 
 N_COMPS = 5
 

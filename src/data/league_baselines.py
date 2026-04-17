@@ -20,10 +20,10 @@ from src.data.db import load_or_build_parquet
 from src.data.pitch_archetypes import get_pitch_archetype_offerings
 from src.data.queries import get_pitcher_outcomes_by_stand
 
+from src.data.paths import CACHE_DIR, CONFIG_DIR
+
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
 # Rate columns produced by _aggregate_baselines
 RATE_COLS = (

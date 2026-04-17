@@ -16,6 +16,8 @@ import logging
 import numpy as np
 import pandas as pd
 
+from src.models._ranking_utils import percentile_rank as _percentile_rank
+
 logger = logging.getLogger(__name__)
 
 # Round multiplier: deeper runs amplify the deviation from neutral
@@ -28,11 +30,6 @@ _ROUND_MULTIPLIER = {
 
 # Recency weights for multi-season aggregation (most recent = highest)
 _RECENCY_WEIGHTS = {0: 3, 1: 2, 2: 1}  # offset from latest season
-
-
-def _percentile_rank(series: pd.Series) -> pd.Series:
-    """Rank values on 0-1 scale (higher = better)."""
-    return series.rank(pct=True, method="average")
 
 
 def _shrinkage_hitter(ps_pa: pd.Series) -> pd.Series:

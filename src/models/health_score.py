@@ -21,16 +21,15 @@ Scores range from 0.0 (worst) to 1.0 (best/healthy).
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from src.data.db import read_sql
+from src.data.paths import CACHE_DIR
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cached"
 
 # Recency weights: most recent season gets highest weight
 RECENCY_WEIGHTS = [5, 4, 3, 2, 1]
