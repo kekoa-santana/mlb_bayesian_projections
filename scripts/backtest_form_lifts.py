@@ -212,7 +212,7 @@ def run_pitcher_ab_backtest(
       AND dg.season = {season}
       AND dg.game_type = 'R'
       AND fpg.game_date >= '{season}-06-01'
-    ORDER BY RANDOM()
+    ORDER BY fpg.game_pk, fpg.player_id
     LIMIT {max_games}
     """
     games = read_sql(games_query)
@@ -222,7 +222,8 @@ def run_pitcher_ab_backtest(
     logger.info("Loaded %d pitcher-game starts", len(games))
 
     # --- Load precomputed samples (from dashboard snapshots) ---
-    DASHBOARD_DIR = Path(r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard")
+    from src.data.paths import dashboard_dir
+    DASHBOARD_DIR = dashboard_dir()
     SNAPSHOT_DIR = DASHBOARD_DIR / "snapshots"
 
     def _load_npz(name: str) -> dict[str, np.ndarray]:
@@ -244,6 +245,18 @@ def run_pitcher_ab_backtest(
     exit_model_path = DASHBOARD_DIR / "exit_model.pkl"
     if exit_model_path.exists():
         exit_model.load(exit_model_path)
+
+    # --- Load BF priors for BF-anchored exit logic ---
+    bf_priors_path = DASHBOARD_DIR / "bf_priors.parquet"
+    bf_lookup: dict[int, tuple[float, float]] = {}
+    if bf_priors_path.exists():
+        bf_df = pd.read_parquet(bf_priors_path)
+        bf_latest = bf_df.sort_values("season").groupby("pitcher_id").last().reset_index()
+        bf_lookup = {
+            int(r["pitcher_id"]): (float(r["mu_bf"]), float(r["sigma_bf"]))
+            for _, r in bf_latest.iterrows()
+        }
+        logger.info("Loaded BF priors for %d pitchers", len(bf_lookup))
 
     # --- Load rolling form data ---
     pitcher_ids = games["pitcher_id"].unique().tolist()
@@ -279,6 +292,12 @@ def run_pitcher_ab_backtest(
         else:
             pit_form = PitcherFormLifts()
 
+        # BF prior for BF-anchored exit logic
+        bf_prior = bf_lookup.get(pid)
+        bf_kwargs = {}
+        if bf_prior is not None:
+            bf_kwargs = {"mu_bf": bf_prior[0], "sigma_bf": bf_prior[1]}
+
         # Shared sim params (minimal — no matchup/context for clean A/B)
         shared = dict(
             pitcher_k_rate_samples=k_samp,
@@ -291,6 +310,7 @@ def run_pitcher_ab_backtest(
             exit_model=exit_model,
             n_sims=n_sims,
             random_seed=random_seed + gpk % 10000,
+            **bf_kwargs,
         )
 
         try:
@@ -317,6 +337,8 @@ def run_pitcher_ab_backtest(
             "pred_bb_base": sa["bb"]["mean"],
             "pred_hr_base": sa["hr"]["mean"],
             "pred_h_base": sa["h"]["mean"],
+            "pred_bf_base": sa["bf"]["mean"],
+            "pred_outs_base": sa["outs"]["mean"],
             # Form lift predictions
             "pred_k_form": sb["k"]["mean"],
             "pred_bb_form": sb["bb"]["mean"],
@@ -374,7 +396,8 @@ def run_batter_ab_backtest(
     logger.info("Loaded %d batter-game rows", len(games))
 
     # --- Load precomputed samples ---
-    DASHBOARD_DIR = Path(r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard")
+    from src.data.paths import dashboard_dir
+    DASHBOARD_DIR = dashboard_dir()
     SNAPSHOT_DIR = DASHBOARD_DIR / "snapshots"
 
     def _load_npz(name: str) -> dict[str, np.ndarray]:
