@@ -24,13 +24,12 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from src.data.paths import dashboard_dir
 from src.data.queries import get_pitcher_breakout_features
 
 logger = logging.getLogger(__name__)
 
-DASHBOARD_DIR = Path(
-    "C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/data/dashboard"
-)
+DASHBOARD_DIR = dashboard_dir()
 
 # ---------------------------------------------------------------------------
 # Feature columns (T1 + T2 + T3)
@@ -54,7 +53,9 @@ PITCHER_FEATURES = [
 
 def _load_config() -> dict:
     """Load breakout config from model.yaml."""
-    cfg_path = Path("config/model.yaml")
+    from src.data.paths import CONFIG_DIR
+
+    cfg_path = CONFIG_DIR / "model.yaml"
     if cfg_path.exists():
         with open(cfg_path) as f:
             cfg = yaml.safe_load(f)
