@@ -103,7 +103,7 @@ class TestShrinkageLowStarts:
         priors = compute_pitcher_bf_priors(game_logs, min_starts=5)
         p2 = priors[priors["pitcher_id"] == 2].iloc[0]
         assert p2["reliability"] == 0.0
-        assert p2["mu_bf"] == 22.4  # pop_mu default (DEFAULT_POP_BF_MU)
+        assert p2["mu_bf"] == 23.0  # pop_mu default (DEFAULT_POP_BF_MU)
 
 
 class TestDrawBfSamplesBounded:
@@ -142,4 +142,4 @@ class TestGetBfDistribution:
         priors = compute_pitcher_bf_priors(game_logs)
         result = get_bf_distribution(999, 2024, priors)
         assert result["dist_type"] == "population_fallback"
-        assert result["mu_bf"] == 22.4
+        assert result["mu_bf"] == 23.0

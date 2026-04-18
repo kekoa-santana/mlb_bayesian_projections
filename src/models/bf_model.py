@@ -26,8 +26,12 @@ from scipy import stats
 logger = logging.getLogger(__name__)
 
 # Population defaults (validated against 2022-2025 starter data, BF >= 9
-# to exclude openers/bullpen games that drag the mean down)
-DEFAULT_POP_BF_MU = 22.4
+# to exclude openers/bullpen games that drag the mean down).
+# Set to game-weighted mean (not pitcher-weighted) to offset the
+# downward-only asymmetry of the BF-anchor exit model: early exits
+# (blow-ups, pitch caps) can reduce BF below target but nothing
+# inflates it above target.
+DEFAULT_POP_BF_MU = 23.0
 DEFAULT_POP_WITHIN_STD = 3.3
 DEFAULT_SHRINKAGE_K = 3.4  # sigma^2 / tau^2 ≈ 10.97 / 3.26
 
