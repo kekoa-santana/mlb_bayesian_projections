@@ -1,13 +1,15 @@
-"""Precompute: Daily game prop projections from game simulator.
+"""Precompute: Daily game prop projections + game-level predictions.
 
 Runs pitcher and batter game sims for today's (and tomorrow's) games,
-computing P(over) at player-relative lines for each stat.
+computing P(over) at player-relative lines for each stat.  Also runs
+a full-game both-teams sim to produce moneyline, spread, and over/under
+predictions at the game level.
 
-Output: game_props.parquet — one row per player x stat with expected
-value and P(over) at 3 lines centered on the player's projection.
-Includes umpire/weather context, fantasy scoring, and all pitcher stats.
-
-Replaces both the old game_props AND today_sims — single source of truth.
+Output:
+  game_props.parquet — one row per player x stat with expected value
+      and P(over) at standard lines.
+  game_predictions.parquet — one row per game with win probability,
+      spread probabilities, and over/under probabilities.
 
 Requires: pre-computed posterior samples, exit model, matchup data,
 bullpen rates, etc.
@@ -15,6 +17,7 @@ bullpen rates, etc.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date, timedelta
 
 import numpy as np
@@ -33,10 +36,39 @@ BATTER_SIM_STATS = ("tb",)
 BATTER_STATS = LINEUP_SIM_STATS + BATTER_SIM_STATS
 
 
+@dataclass
+class _TeamSimContext:
+    """Per-team batting context stashed during the batter sim loop.
+
+    When ``side == "home"``, the home team is batting — so ``starter_k``
+    is the *away* starter's K-rate (the pitcher home batters face), and
+    ``bp_k`` is the *away* team's bullpen K-rate.
+    """
+
+    lineup_k_samples: list[np.ndarray]
+    lineup_bb_samples: list[np.ndarray]
+    lineup_hr_samples: list[np.ndarray]
+    starter_k: np.ndarray     # opposing starter posterior samples
+    starter_bb: np.ndarray
+    starter_hr: np.ndarray
+    bf_mu: float              # opposing starter BF prior
+    bf_sigma: float
+    bp_k: float               # opposing bullpen rate
+    bp_bb: float
+    bp_hr: float
+    matchup_lifts: dict[str, np.ndarray]  # "k"/"bb"/"hr" → (9,)
+    babip_adjs: np.ndarray                # (9,)
+    bip_probs: np.ndarray                 # (9, 4) per-batter BIP profiles
+    form_k: np.ndarray                    # (9,)
+    form_bb: np.ndarray                   # (9,)
+    form_hr: np.ndarray                   # (9,)
+
+
 def run(
     *,
     game_date: str | None = None,
     n_sims: int = 10_000,
+    run_full_game_sim: bool = True,
 ) -> None:
     """Generate game prop projections for today's and tomorrow's games.
 
@@ -46,6 +78,9 @@ def run(
         Date as 'YYYY-MM-DD'. Defaults to today.
     n_sims : int
         Monte Carlo sims per game/batter.
+    run_full_game_sim : bool
+        If True, also run full-game both-teams sim for game-level
+        predictions (moneyline, spread, over/under).
     """
     from src.data.schedule import fetch_todays_schedule
     from src.models.game_sim.exit_model import ExitModel
@@ -54,7 +89,10 @@ def run(
         simulate_game,
         compute_stamina_offset,
     )
-    from src.models.game_sim.lineup_simulator import simulate_lineup_game
+    from src.models.game_sim.lineup_simulator import (
+        simulate_lineup_game,
+        simulate_full_game_both_teams,
+    )
     from src.models.game_sim.batter_simulator import simulate_batter_game
     from src.models.game_sim.tto_model import build_all_tto_lifts
     from src.models.game_sim.pitch_count_model import build_pitch_count_features
@@ -408,12 +446,14 @@ def run(
     # --- Run sims per game ---
     pitcher_picks = []
     batter_picks = []
+    game_predictions: list[dict] = []
     # Raw posterior distributions per player-game for Layer 4 market edge.
     # Keyed by (game_pk, player_id) → {stat: np.ndarray of MC draws}
     player_posteriors: dict[tuple[int, int], dict[str, np.ndarray]] = {}
 
     for _, game in schedule.iterrows():
         game_pk = int(game["game_pk"])
+        side_contexts: dict[str, _TeamSimContext] = {}
 
         # --- Per-game context lifts ---
         hp_ump_name = game.get("hp_umpire_name", "")
@@ -585,6 +625,12 @@ def run(
                 for bid in lineup_ids[:9]
             ], axis=0).astype(np.float64)
 
+            # Per-batter K/BB/HR posteriors for opposing lineup quality lifts
+            _FB_N = 200
+            opp_bat_k = [hitter_k_npz.get(str(int(b)), np.full(_FB_N, 0.226)) for b in lineup_ids[:9]]
+            opp_bat_bb = [hitter_bb_npz.get(str(int(b)), np.full(_FB_N, 0.082)) for b in lineup_ids[:9]]
+            opp_bat_hr = [hitter_hr_npz.get(str(int(b)), np.full(_FB_N, 0.031)) for b in lineup_ids[:9]]
+
             # Run pitcher sim (with umpire/weather/catcher/form context)
             try:
                 sim = simulate_game(
@@ -610,6 +656,9 @@ def run(
                     manager_pull_tendency=team_avg_p,
                     bullpen_profile=team_bullpen_profile,
                     lineup_bip_probs=lineup_bip_probs_arr,
+                    lineup_batter_k_samples=opp_bat_k,
+                    lineup_batter_bb_samples=opp_bat_bb,
+                    lineup_batter_hr_samples=opp_bat_hr,
                     n_sims=n_sims,
                     random_seed=42 + game_pk % 10000,
                 )
@@ -717,10 +766,10 @@ def run(
             opp_pitcher_id = int(opp_pitcher_id)
             opp_pid_str = str(opp_pitcher_id)
 
-            # Starter quality
-            starter_k = _posterior_mean(pitcher_k_npz, opp_pid_str, 0.226)
-            starter_bb = _posterior_mean(pitcher_bb_npz, opp_pid_str, 0.082)
-            starter_hr = _posterior_mean(pitcher_hr_npz, opp_pid_str, 0.031)
+            # Starter quality — full posteriors for per-sim uncertainty
+            starter_k = _posterior_samples(pitcher_k_npz, opp_pid_str, 0.226)
+            starter_bb = _posterior_samples(pitcher_bb_npz, opp_pid_str, 0.082)
+            starter_hr = _posterior_samples(pitcher_hr_npz, opp_pid_str, 0.031)
 
             # Starter BF distribution
             bf_row = bf_priors[bf_priors["pitcher_id"] == opp_pitcher_id]
@@ -823,6 +872,7 @@ def run(
                     bullpen_bb_rate=bp_bb,
                     bullpen_hr_rate=bp_hr,
                     batter_babip_adjs=lineup_babip_adjs,
+                    batter_bip_probs=lineup_bip_probs_arr,
                     umpire_k_lift=ump_k_lift,
                     umpire_bb_lift=ump_bb_lift,
                     park_k_lift=park_k_lift,
@@ -956,6 +1006,148 @@ def run(
                         ),
                         **p_over_cols,
                     })
+
+            # Stash per-side context for full-game sim
+            side_contexts[side] = _TeamSimContext(
+                lineup_k_samples=lineup_k_samples,
+                lineup_bb_samples=lineup_bb_samples,
+                lineup_hr_samples=lineup_hr_samples,
+                starter_k=starter_k,
+                starter_bb=starter_bb,
+                starter_hr=starter_hr,
+                bf_mu=bf_mu,
+                bf_sigma=bf_sigma,
+                bp_k=bp_k,
+                bp_bb=bp_bb,
+                bp_hr=bp_hr,
+                matchup_lifts=batter_matchup_lifts,
+                babip_adjs=lineup_babip_adjs,
+                bip_probs=lineup_bip_probs_arr,
+                form_k=lineup_form_k,
+                form_bb=lineup_form_bb,
+                form_hr=lineup_form_hr,
+            )
+
+        # --- FULL-GAME SIM (moneyline / spread / over-under) ---
+        if (
+            run_full_game_sim
+            and "home" in side_contexts
+            and "away" in side_contexts
+        ):
+            h = side_contexts["home"]
+            a = side_contexts["away"]
+            # Convention: h.starter_k is the away starter (what home
+            # batters face).  The full-game sim names parameters by
+            # the pitching team, so away_starter_k_rate = h.starter_k.
+            try:
+                fg_result = simulate_full_game_both_teams(
+                    # Away batting vs home pitching
+                    away_batter_k_rate_samples=a.lineup_k_samples,
+                    away_batter_bb_rate_samples=a.lineup_bb_samples,
+                    away_batter_hr_rate_samples=a.lineup_hr_samples,
+                    home_starter_k_rate=a.starter_k,
+                    home_starter_bb_rate=a.starter_bb,
+                    home_starter_hr_rate=a.starter_hr,
+                    home_starter_bf_mu=a.bf_mu,
+                    home_starter_bf_sigma=a.bf_sigma,
+                    # Home batting vs away pitching
+                    home_batter_k_rate_samples=h.lineup_k_samples,
+                    home_batter_bb_rate_samples=h.lineup_bb_samples,
+                    home_batter_hr_rate_samples=h.lineup_hr_samples,
+                    away_starter_k_rate=h.starter_k,
+                    away_starter_bb_rate=h.starter_bb,
+                    away_starter_hr_rate=h.starter_hr,
+                    away_starter_bf_mu=h.bf_mu,
+                    away_starter_bf_sigma=h.bf_sigma,
+                    # Matchup lifts
+                    away_matchup_k_lifts=a.matchup_lifts["k"],
+                    away_matchup_bb_lifts=a.matchup_lifts["bb"],
+                    away_matchup_hr_lifts=a.matchup_lifts["hr"],
+                    home_matchup_k_lifts=h.matchup_lifts["k"],
+                    home_matchup_bb_lifts=h.matchup_lifts["bb"],
+                    home_matchup_hr_lifts=h.matchup_lifts["hr"],
+                    # Bullpen (away batters face home bullpen = a.bp_*)
+                    home_bullpen_k_rate=a.bp_k,
+                    home_bullpen_bb_rate=a.bp_bb,
+                    home_bullpen_hr_rate=a.bp_hr,
+                    away_bullpen_k_rate=h.bp_k,
+                    away_bullpen_bb_rate=h.bp_bb,
+                    away_bullpen_hr_rate=h.bp_hr,
+                    # BABIP + BIP profiles
+                    away_batter_babip_adjs=a.babip_adjs,
+                    home_batter_babip_adjs=h.babip_adjs,
+                    away_batter_bip_probs=a.bip_probs,
+                    home_batter_bip_probs=h.bip_probs,
+                    # Shared context
+                    umpire_k_lift=ump_k_lift,
+                    umpire_bb_lift=ump_bb_lift,
+                    park_k_lift=park_k_lift,
+                    park_hr_lift=park_hr_lift,
+                    weather_k_lift=wx_k_lift,
+                    # Form lifts
+                    away_form_k_lifts=a.form_k,
+                    away_form_bb_lifts=a.form_bb,
+                    away_form_hr_lifts=a.form_hr,
+                    home_form_k_lifts=h.form_k,
+                    home_form_bb_lifts=h.form_bb,
+                    home_form_hr_lifts=h.form_hr,
+                    n_sims=n_sims,
+                    random_seed=42 + game_pk % 10000 + 7777,
+                )
+
+                home_abbr = game.get("home_abbr", "")
+                away_abbr = game.get("away_abbr", "")
+                game_dt = game.get("game_date", game_date)
+
+                total_runs = (
+                    fg_result.home_runs.astype(float)
+                    + fg_result.away_runs.astype(float)
+                )
+                margin = (
+                    fg_result.home_runs.astype(float)
+                    - fg_result.away_runs.astype(float)
+                )
+
+                fg_rec: dict = {
+                    "game_date": game_dt,
+                    "game_pk": game_pk,
+                    "home_abbr": home_abbr,
+                    "away_abbr": away_abbr,
+                    "home_win_prob": round(fg_result.home_win_prob, 4),
+                    "away_win_prob": round(1.0 - fg_result.home_win_prob, 4),
+                    "home_runs_mean": round(float(np.mean(fg_result.home_runs)), 2),
+                    "away_runs_mean": round(float(np.mean(fg_result.away_runs)), 2),
+                    "total_runs_mean": round(float(np.mean(total_runs)), 2),
+                    "total_runs_std": round(float(np.std(total_runs)), 2),
+                    "home_margin_mean": round(float(np.mean(margin)), 2),
+                }
+
+                # O/U probs at standard lines
+                for line in [5.5, 6.5, 7.5, 8.5, 9.5, 10.5]:
+                    fg_rec[f"p_over_{line:.1f}"] = round(
+                        float(np.mean(total_runs > line)), 4,
+                    )
+
+                # Spread probs at standard lines
+                for line in [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5]:
+                    fg_rec[f"p_home_cover_{line:+.1f}"] = round(
+                        float(np.mean(margin > line)), 4,
+                    )
+
+                game_predictions.append(fg_rec)
+            except Exception as e:
+                logger.warning(
+                    "Full-game sim failed: game %d: %s", game_pk, e,
+                )
+
+    # --- Save game-level predictions ---
+    if game_predictions:
+        game_preds_df = pd.DataFrame(game_predictions)
+        save_dashboard_parquet(game_preds_df, "game_predictions.parquet")
+        logger.info(
+            "Saved %d game-level predictions to game_predictions.parquet",
+            len(game_preds_df),
+        )
 
     # --- Combine new predictions ---
     all_props = pd.DataFrame(pitcher_picks + batter_picks)
@@ -1663,6 +1855,22 @@ def _posterior_mean(
     if key in npz:
         return float(np.mean(npz[key]))
     return default
+
+
+def _posterior_samples(
+    npz: np.lib.npyio.NpzFile,
+    key: str,
+    default: float,
+) -> np.ndarray:
+    """Get full posterior samples from NPZ, with scalar fallback.
+
+    Returns the raw posterior array when available so that downstream
+    simulators can propagate pitcher uncertainty per-sim.  Falls back to
+    a 1-element array containing *default* when the key is missing.
+    """
+    if key in npz:
+        return np.asarray(npz[key], dtype=np.float64)
+    return np.array([default], dtype=np.float64)
 
 
 def _lookup_name(

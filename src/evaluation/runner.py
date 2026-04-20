@@ -4,6 +4,10 @@ These helpers capture the repeated patterns across ``scripts/run_*_backtest.py``
 (argparse setup, logging.basicConfig, MCMC sampling dicts, outputs dir creation,
 and CSV writes) so individual runners only contain the domain-specific fold
 logic and verdict printing.
+
+Also provides ``fit_hitter_posteriors()`` — a shared model-fitting utility
+used by batter_sim_validation, full_game_sim_batch, and game_sim_validation
+to avoid triplicating hitter model fitting code.
 """
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ import argparse
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -116,3 +121,106 @@ def add_common_args(
             choices=["hitter", "pitcher"],
             help="Player type to backtest",
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared model-fitting utilities
+# ---------------------------------------------------------------------------
+
+
+def fit_hitter_posteriors(
+    train_seasons: list[int],
+    draws: int = 1000,
+    tune: int = 500,
+    chains: int = 2,
+    min_pa: int = 50,
+    random_seed: int = 42,
+) -> dict[str, dict[int, np.ndarray]]:
+    """Fit hitter K%, BB% models + HR pseudo-posteriors for one fold.
+
+    Imports are deferred to avoid pulling PyMC into lightweight CLI
+    scripts that only use the logging/IO helpers.
+
+    Parameters
+    ----------
+    train_seasons : list[int]
+        Seasons for training models.
+    draws, tune, chains : int
+        MCMC sampling parameters.
+    min_pa : int
+        Minimum PA across training seasons to include a batter.
+    random_seed : int
+        For reproducibility.
+
+    Returns
+    -------
+    dict[str, dict[int, np.ndarray]]
+        ``{"k": {bid: samples}, "bb": {bid: samples}, "hr": {bid: samples}}``
+    """
+    from src.data.feature_eng import build_multi_season_hitter_data
+    from src.models.hitter_model import (
+        extract_rate_samples as extract_hitter_rate_samples,
+        fit_hitter_model,
+        prepare_hitter_data,
+    )
+
+    logger = logging.getLogger(__name__)
+    last_train = max(train_seasons)
+
+    df_hitter = build_multi_season_hitter_data(train_seasons, min_pa=min_pa)
+
+    # --- K% ---
+    logger.info("Fitting hitter K%% model...")
+    data_k = prepare_hitter_data(df_hitter, "k_rate")
+    _, trace_k = fit_hitter_model(
+        data_k, draws=draws, tune=tune, chains=chains,
+        random_seed=random_seed,
+    )
+
+    batter_k: dict[int, np.ndarray] = {}
+    for bid in data_k["df"][data_k["df"]["season"] == last_train]["batter_id"].unique():
+        try:
+            batter_k[int(bid)] = extract_hitter_rate_samples(
+                trace_k, data_k, bid, last_train,
+                project_forward=True, random_seed=random_seed,
+            )
+        except ValueError:
+            continue
+    logger.info("Batter K posteriors: %d", len(batter_k))
+
+    # --- BB% ---
+    logger.info("Fitting hitter BB%% model...")
+    data_bb = prepare_hitter_data(df_hitter, "bb_rate")
+    _, trace_bb = fit_hitter_model(
+        data_bb, draws=draws, tune=tune, chains=chains,
+        random_seed=random_seed + 1,
+    )
+
+    batter_bb: dict[int, np.ndarray] = {}
+    for bid in data_bb["df"][data_bb["df"]["season"] == last_train]["batter_id"].unique():
+        try:
+            batter_bb[int(bid)] = extract_hitter_rate_samples(
+                trace_bb, data_bb, bid, last_train,
+                project_forward=True, random_seed=random_seed + 1,
+            )
+        except ValueError:
+            continue
+    logger.info("Batter BB posteriors: %d", len(batter_bb))
+
+    # --- HR pseudo-posteriors (parametric bootstrap, no MCMC) ---
+    logger.info("Building batter HR pseudo-posteriors...")
+    batter_hr: dict[int, np.ndarray] = {}
+    hr_data = df_hitter[df_hitter["season"].isin(train_seasons)].copy()
+    for bid, grp in hr_data.groupby("batter_id"):
+        total_hr = grp["hr"].sum() if "hr" in grp.columns else 0
+        total_pa = grp["pa"].sum()
+        if total_pa >= min_pa:
+            rate = total_hr / total_pa
+            rng_hr = np.random.default_rng(random_seed + int(bid) % 10000)
+            std = max(0.005, rate * 0.15)
+            samples = rng_hr.normal(rate, std, size=2000)
+            samples = np.clip(samples, 0.001, 0.10)
+            batter_hr[int(bid)] = samples
+    logger.info("Batter HR posteriors: %d", len(batter_hr))
+
+    return {"k": batter_k, "bb": batter_bb, "hr": batter_hr}

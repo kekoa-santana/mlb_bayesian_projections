@@ -84,66 +84,15 @@ def build_batter_sim_predictions(
     logger.info("Building batter sim predictions: train=%s, test=%d",
                 train_seasons, test_season)
 
-    # --- 1. Fit hitter K% model ---
-    logger.info("Fitting hitter K%% model...")
-    df_hitter = build_multi_season_hitter_data(train_seasons, min_pa=50)
-    data_k = prepare_hitter_data(df_hitter, "k_rate")
-    _, trace_k = fit_hitter_model(
-        data_k, draws=draws, tune=tune, chains=chains,
+    # --- 1-3. Fit hitter K%, BB%, HR models ---
+    from src.evaluation.runner import fit_hitter_posteriors
+    hitter_posts = fit_hitter_posteriors(
+        train_seasons, draws=draws, tune=tune, chains=chains,
         random_seed=random_seed,
     )
-
-    df_k = data_k["df"]
-    batter_ids_k = df_k[df_k["season"] == last_train]["batter_id"].unique()
-    batter_k_posteriors: dict[int, np.ndarray] = {}
-    for bid in batter_ids_k:
-        try:
-            samples = extract_hitter_rate_samples(
-                trace_k, data_k, bid, last_train,
-                project_forward=True, random_seed=random_seed,
-            )
-            batter_k_posteriors[bid] = samples
-        except ValueError:
-            continue
-    logger.info("Batter K posteriors: %d", len(batter_k_posteriors))
-
-    # --- 2. Fit hitter BB% model ---
-    logger.info("Fitting hitter BB%% model...")
-    data_bb = prepare_hitter_data(df_hitter, "bb_rate")
-    _, trace_bb = fit_hitter_model(
-        data_bb, draws=draws, tune=tune, chains=chains,
-        random_seed=random_seed + 1,
-    )
-
-    df_bb = data_bb["df"]
-    batter_ids_bb = df_bb[df_bb["season"] == last_train]["batter_id"].unique()
-    batter_bb_posteriors: dict[int, np.ndarray] = {}
-    for bid in batter_ids_bb:
-        try:
-            samples = extract_hitter_rate_samples(
-                trace_bb, data_bb, bid, last_train,
-                project_forward=True, random_seed=random_seed + 1,
-            )
-            batter_bb_posteriors[bid] = samples
-        except ValueError:
-            continue
-    logger.info("Batter BB posteriors: %d", len(batter_bb_posteriors))
-
-    # --- 3. Build batter HR/PA pseudo-posteriors from observed rates ---
-    logger.info("Building batter HR pseudo-posteriors...")
-    batter_hr_posteriors: dict[int, np.ndarray] = {}
-    hr_data = df_hitter[df_hitter["season"].isin(train_seasons)].copy()
-    for bid, grp in hr_data.groupby("batter_id"):
-        total_hr = grp["hr"].sum() if "hr" in grp.columns else 0
-        total_pa = grp["pa"].sum()
-        if total_pa >= 50:
-            rate = total_hr / total_pa
-            rng_hr = np.random.default_rng(random_seed + int(bid) % 10000)
-            std = max(0.005, rate * 0.15)
-            samples = rng_hr.normal(rate, std, size=2000)
-            samples = np.clip(samples, 0.001, 0.10)
-            batter_hr_posteriors[int(bid)] = samples
-    logger.info("Batter HR posteriors: %d", len(batter_hr_posteriors))
+    batter_k_posteriors = hitter_posts["k"]
+    batter_bb_posteriors = hitter_posts["bb"]
+    batter_hr_posteriors = hitter_posts["hr"]
 
     # --- 4. Fit pitcher models (for opposing starter quality lifts) ---
     logger.info("Fitting pitcher K%% model...")

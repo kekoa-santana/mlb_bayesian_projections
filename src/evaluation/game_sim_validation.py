@@ -733,6 +733,23 @@ def build_game_sim_predictions(
     hr_posteriors = posteriors["hr"]
 
     # ---------------------------------------------------------------
+    # 3b. Fit hitter K%, BB%, HR% posteriors for batter quality lifts
+    # ---------------------------------------------------------------
+    from src.evaluation.runner import fit_hitter_posteriors
+    hitter_posts = fit_hitter_posteriors(
+        train_seasons, draws=draws, tune=tune, chains=chains,
+        random_seed=random_seed + 100,
+    )
+    batter_k_posteriors = hitter_posts["k"]
+    batter_bb_posteriors = hitter_posts["bb"]
+    batter_hr_posteriors = hitter_posts["hr"]
+    logger.info(
+        "Batter posteriors for quality lifts: K=%d BB=%d HR=%d",
+        len(batter_k_posteriors), len(batter_bb_posteriors),
+        len(batter_hr_posteriors),
+    )
+
+    # ---------------------------------------------------------------
     # 4-6. Load exit model, pitch count, matchup, and context data
     # ---------------------------------------------------------------
     ctx = _load_game_context(train_seasons, test_season)
@@ -924,6 +941,14 @@ def build_game_sim_predictions(
             batter_ids, batter_bip_lookup,
         )
 
+        # Per-batter K/BB/HR posteriors for quality lifts
+        _FB_K = np.full(200, 0.226)
+        _FB_BB = np.full(200, 0.082)
+        _FB_HR = np.full(200, 0.031)
+        opp_bat_k = [batter_k_posteriors.get(int(b), _FB_K) for b in batter_ids]
+        opp_bat_bb = [batter_bb_posteriors.get(int(b), _FB_BB) for b in batter_ids]
+        opp_bat_hr = [batter_hr_posteriors.get(int(b), _FB_HR) for b in batter_ids]
+
         # Run simulation
         try:
             sim_result = simulate_game(
@@ -957,6 +982,9 @@ def build_game_sim_predictions(
                 bullpen_bb_rate=bp_bb,
                 bullpen_hr_rate=bp_hr,
                 lineup_bip_probs=lineup_bip_probs,
+                lineup_batter_k_samples=opp_bat_k,
+                lineup_batter_bb_samples=opp_bat_bb,
+                lineup_batter_hr_samples=opp_bat_hr,
                 n_sims=n_sims,
                 random_seed=random_seed + game_pk % 10000,
             )

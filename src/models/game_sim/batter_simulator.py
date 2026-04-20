@@ -45,6 +45,7 @@ from src.models.game_sim._sim_utils import (
     safe_logit,
     resample_posterior,
     compute_pitcher_quality_lifts,
+    pitcher_rate_to_lift_array,
 )
 from src.utils.constants import (
     SIM_LEAGUE_K_RATE,
@@ -138,9 +139,9 @@ def simulate_batter_game(
     batter_bb_rate_samples: np.ndarray,
     batter_hr_rate_samples: np.ndarray,
     batting_order: int,
-    starter_k_rate: float,
-    starter_bb_rate: float,
-    starter_hr_rate: float,
+    starter_k_rate: float | np.ndarray,
+    starter_bb_rate: float | np.ndarray,
+    starter_hr_rate: float | np.ndarray,
     starter_bf_mu: float,
     starter_bf_sigma: float,
     matchup_k_lift: float = 0.0,
@@ -180,12 +181,12 @@ def simulate_batter_game(
         Batter HR/PA posterior samples.
     batting_order : int
         Batting order position (1-9).
-    starter_k_rate : float
-        Opposing starter's K% posterior mean.
-    starter_bb_rate : float
-        Opposing starter's BB% posterior mean.
-    starter_hr_rate : float
-        Opposing starter's HR/BF posterior mean.
+    starter_k_rate : float or np.ndarray
+        Opposing starter's K% rate (scalar mean or posterior samples).
+    starter_bb_rate : float or np.ndarray
+        Opposing starter's BB% rate (scalar mean or posterior samples).
+    starter_hr_rate : float or np.ndarray
+        Opposing starter's HR/BF rate (scalar mean or posterior samples).
     starter_bf_mu : float
         Starter's expected BF for this game.
     starter_bf_sigma : float
@@ -274,17 +275,14 @@ def simulate_batter_game(
         total_pa, batting_order, starter_bf,
     )
 
-    # --- 2. Compute per-PA rates ---
-    # Pitcher quality lift: how far is the starter/reliever from league avg?
-    starter_k_lift, starter_bb_lift, starter_hr_lift = compute_pitcher_quality_lifts(
-        starter_k_rate, starter_bb_rate, starter_hr_rate,
-        SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE,
-    )
+    # --- 2. Compute per-sim pitcher quality lifts ---
+    starter_k_lift = pitcher_rate_to_lift_array(starter_k_rate, SIM_LEAGUE_K_RATE, n_sims, rng)
+    starter_bb_lift = pitcher_rate_to_lift_array(starter_bb_rate, SIM_LEAGUE_BB_RATE, n_sims, rng)
+    starter_hr_lift = pitcher_rate_to_lift_array(starter_hr_rate, SIM_LEAGUE_HR_RATE, n_sims, rng)
 
-    bullpen_k_lift, bullpen_bb_lift, bullpen_hr_lift = compute_pitcher_quality_lifts(
-        bullpen_k_rate, bullpen_bb_rate, bullpen_hr_rate,
-        SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE,
-    )
+    bullpen_k_lift = pitcher_rate_to_lift_array(bullpen_k_rate, SIM_LEAGUE_K_RATE, n_sims, rng)
+    bullpen_bb_lift = pitcher_rate_to_lift_array(bullpen_bb_rate, SIM_LEAGUE_BB_RATE, n_sims, rng)
+    bullpen_hr_lift = pitcher_rate_to_lift_array(bullpen_hr_rate, SIM_LEAGUE_HR_RATE, n_sims, rng)
 
     # --- 3. Accumulators ---
     k_total = np.zeros(n_sims, dtype=np.int32)
@@ -321,18 +319,18 @@ def simulate_batter_game(
 
         k_pitcher_lift = np.where(
             vs_starter_active,
-            starter_k_lift + matchup_k_lift,
-            bullpen_k_lift,  # K matchup lift skipped — adds noise for relievers
+            starter_k_lift[active] + matchup_k_lift,
+            bullpen_k_lift[active],  # K matchup lift skipped — adds noise for relievers
         )
         bb_pitcher_lift = np.where(
             vs_starter_active,
-            starter_bb_lift + matchup_bb_lift,
-            bullpen_bb_lift,  # BB matchup lift skipped — adds noise for relievers
+            starter_bb_lift[active] + matchup_bb_lift,
+            bullpen_bb_lift[active],  # BB matchup lift skipped — adds noise for relievers
         )
         hr_pitcher_lift = np.where(
             vs_starter_active,
-            starter_hr_lift + matchup_hr_lift,
-            bullpen_hr_lift + bullpen_matchup_hr_lift,
+            starter_hr_lift[active] + matchup_hr_lift,
+            bullpen_hr_lift[active] + bullpen_matchup_hr_lift,
         )
 
         # Final adjusted rates (including rolling form lifts)

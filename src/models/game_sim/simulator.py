@@ -38,19 +38,28 @@ from src.models.game_sim.pa_outcome_model import (
 )
 from src.models.game_sim.pitch_count_model import PitchCountModel
 from src.models.game_sim.tto_model import BF_PER_TTO, get_tto_for_bf
-from src.models.game_sim._sim_utils import resample_posterior, MATCHUP_DAMPEN
+from src.models.game_sim._sim_utils import resample_posterior, MATCHUP_DAMPEN, safe_logit
 from src.utils.constants import (
     CLIP_LO,
     CLIP_HI,
     BULLPEN_K_RATE,
     BULLPEN_BB_RATE,
     BULLPEN_HR_RATE,
+    SIM_LEAGUE_K_RATE,
+    SIM_LEAGUE_BB_RATE,
+    SIM_LEAGUE_HR_RATE,
 )
 
 logger = logging.getLogger(__name__)
 
 # Maximum PA per game (safety valve)
 MAX_PA_PER_GAME = 45
+
+# Batter quality lift dampening. Matchup lifts from Layer 2 already
+# partially capture batter quality (high-K batters tend to have more
+# vulnerable pitch-type profiles). Applying the full batter quality
+# lift double-counts that signal. This factor scales down the raw lift.
+BATTER_QUALITY_DAMPEN = {"k": 0.35, "bb": 0.50, "hr": 0.50}
 
 # Default exit model calibration offset (logit scale).
 # The exit model over-predicts exit probability, pulling pitchers ~1.4 BF early.
@@ -698,6 +707,9 @@ def simulate_game(
     bullpen_profile: TeamBullpenProfile | None = None,
     opposing_runs_estimate: np.ndarray | None = None,
     lineup_bip_probs: np.ndarray | None = None,
+    lineup_batter_k_samples: list[np.ndarray] | None = None,
+    lineup_batter_bb_samples: list[np.ndarray] | None = None,
+    lineup_batter_hr_samples: list[np.ndarray] | None = None,
     n_sims: int = 50_000,
     random_seed: int = 42,
 ) -> SimulationResult:
@@ -777,6 +789,14 @@ def simulate_game(
     k_rates = resample_posterior(pitcher_k_rate_samples, n_sims, rng)
     bb_rates = resample_posterior(pitcher_bb_rate_samples, n_sims, rng)
     hr_rates = resample_posterior(pitcher_hr_rate_samples, n_sims, rng)
+
+    # Resample opposing batter posteriors → (9, n_sims) for quality lifts
+    if lineup_batter_k_samples is not None:
+        bat_k = np.stack([resample_posterior(s, n_sims, rng) for s in lineup_batter_k_samples])
+        bat_bb = np.stack([resample_posterior(s, n_sims, rng) for s in lineup_batter_bb_samples])
+        bat_hr = np.stack([resample_posterior(s, n_sims, rng) for s in lineup_batter_hr_samples])
+    else:
+        bat_k = bat_bb = bat_hr = None
 
     # Default matchup lifts to zeros if missing stat keys
     for stat in ("k", "bb", "hr"):
@@ -899,6 +919,16 @@ def simulate_game(
         bb_tto = np.array([tto_lifts["bb"][t] for t in tto])
         hr_tto = np.array([tto_lifts["hr"][t] for t in tto])
 
+        # Batter quality lifts — how far each batter's K/BB/HR rate is
+        # from league average, on the logit scale. Dampened because
+        # matchup lifts already partially capture batter quality.
+        if bat_k is not None:
+            bq_k = (safe_logit(bat_k[slot, active_idx]) - safe_logit(SIM_LEAGUE_K_RATE)) * BATTER_QUALITY_DAMPEN["k"]
+            bq_bb = (safe_logit(bat_bb[slot, active_idx]) - safe_logit(SIM_LEAGUE_BB_RATE)) * BATTER_QUALITY_DAMPEN["bb"]
+            bq_hr = (safe_logit(bat_hr[slot, active_idx]) - safe_logit(SIM_LEAGUE_HR_RATE)) * BATTER_QUALITY_DAMPEN["hr"]
+        else:
+            bq_k = bq_bb = bq_hr = 0.0
+
         probs = pa_outcome_model.compute_pa_probs(
             pitcher_k_rate=k_rates[active],
             pitcher_bb_rate=bb_rates[active],
@@ -912,6 +942,9 @@ def simulate_game(
             fatigue_k_lift=fatigue["k"],
             fatigue_bb_lift=fatigue["bb"],
             fatigue_hr_lift=fatigue["hr"],
+            batter_quality_k_lift=bq_k,
+            batter_quality_bb_lift=bq_bb,
+            batter_quality_hr_lift=bq_hr,
             ctx=game_context,
         )
 

@@ -147,6 +147,9 @@ class PAOutcomeModel:
         fatigue_k_lift: float = 0.0,
         fatigue_bb_lift: float = 0.0,
         fatigue_hr_lift: float = 0.0,
+        batter_quality_k_lift: float | np.ndarray = 0.0,
+        batter_quality_bb_lift: float | np.ndarray = 0.0,
+        batter_quality_hr_lift: float | np.ndarray = 0.0,
         ctx: GameContext | None = None,
     ) -> dict[str, float | np.ndarray]:
         """Compute adjusted PA outcome probabilities via softmax.
@@ -193,6 +196,7 @@ class PAOutcomeModel:
         eta_k = (
             base_k
             + matchup_k_lift + tto_k_lift + fatigue_k_lift
+            + batter_quality_k_lift
             + _ctx.umpire_k_lift + _ctx.park_k_lift + _ctx.weather_k_lift
             + _ctx.catcher_k_lift
         )
@@ -201,6 +205,7 @@ class PAOutcomeModel:
         eta_bb = (
             base_bb
             + matchup_bb_lift + tto_bb_lift + fatigue_bb_lift
+            + batter_quality_bb_lift
             + _ctx.umpire_bb_lift + _ctx.park_bb_lift
             + _ctx.form_bb_lift + _ctx.xgb_bb_lift
             + _ctx.catcher_bb_lift
@@ -210,6 +215,7 @@ class PAOutcomeModel:
         eta_hr = (
             base_hr
             + matchup_hr_lift + tto_hr_lift + fatigue_hr_lift
+            + batter_quality_hr_lift
             + _ctx.park_hr_lift + _ctx.weather_hr_lift
         )
 

@@ -13,7 +13,6 @@ import numpy as np
 import pandas as pd
 
 from src.data.feature_eng import (
-    build_multi_season_hitter_data,
     build_multi_season_pitcher_data,
     get_cached_pitcher_game_logs,
     get_hitter_vulnerability,
@@ -23,11 +22,6 @@ from src.data.league_baselines import get_baselines_dict
 from src.data.queries import get_team_bullpen_rates
 from src.models.bf_model import compute_pitcher_bf_priors
 from src.models.game_sim.lineup_simulator import simulate_full_game_both_teams
-from src.models.hitter_model import (
-    extract_rate_samples as extract_hitter_rate_samples,
-    fit_hitter_model,
-    prepare_hitter_data,
-)
 from src.models.matchup import score_matchup_for_stat
 from src.models.pitcher_model import (
     extract_rate_samples as extract_pitcher_rate_samples,
@@ -75,50 +69,14 @@ def fit_full_game_sim_bundle(
     last_train = max(train_seasons)
     logger.info("Fitting full-game bundle: train=%s, last_train=%d", train_seasons, last_train)
 
-    logger.info("Fitting hitter models...")
-    df_hitter = build_multi_season_hitter_data(train_seasons, min_pa=50)
-
-    data_hk = prepare_hitter_data(df_hitter, "k_rate")
-    _, trace_hk = fit_hitter_model(
-        data_hk, draws=draws, tune=tune, chains=chains,
+    from src.evaluation.runner import fit_hitter_posteriors
+    hitter_posts = fit_hitter_posteriors(
+        train_seasons, draws=draws, tune=tune, chains=chains,
         random_seed=random_seed,
     )
-    batter_k_post: dict[int, np.ndarray] = {}
-    for bid in data_hk["df"][data_hk["df"]["season"] == last_train]["batter_id"].unique():
-        try:
-            batter_k_post[int(bid)] = extract_hitter_rate_samples(
-                trace_hk, data_hk, bid, last_train,
-                project_forward=True, random_seed=random_seed,
-            )
-        except ValueError:
-            continue
-
-    data_hbb = prepare_hitter_data(df_hitter, "bb_rate")
-    _, trace_hbb = fit_hitter_model(
-        data_hbb, draws=draws, tune=tune, chains=chains,
-        random_seed=random_seed + 1,
-    )
-    batter_bb_post: dict[int, np.ndarray] = {}
-    for bid in data_hbb["df"][data_hbb["df"]["season"] == last_train]["batter_id"].unique():
-        try:
-            batter_bb_post[int(bid)] = extract_hitter_rate_samples(
-                trace_hbb, data_hbb, bid, last_train,
-                project_forward=True, random_seed=random_seed + 1,
-            )
-        except ValueError:
-            continue
-
-    batter_hr_post: dict[int, np.ndarray] = {}
-    hr_data = df_hitter[df_hitter["season"].isin(train_seasons)].copy()
-    for bid, grp in hr_data.groupby("batter_id"):
-        total_hr = grp["hr"].sum() if "hr" in grp.columns else 0
-        total_pa = grp["pa"].sum()
-        if total_pa >= 50:
-            rate = total_hr / total_pa
-            rng_hr = np.random.default_rng(random_seed + int(bid) % 10000)
-            std = max(0.005, rate * 0.15)
-            samples = rng_hr.normal(rate, std, size=2000)
-            batter_hr_post[int(bid)] = np.clip(samples, 0.001, 0.10)
+    batter_k_post = hitter_posts["k"]
+    batter_bb_post = hitter_posts["bb"]
+    batter_hr_post = hitter_posts["hr"]
 
     valid_batters = set(batter_k_post) & set(batter_bb_post) & set(batter_hr_post)
     logger.info(
@@ -323,12 +281,12 @@ def simulate_full_games(
         away_bb_samples = [batter_bb_post[b] for b in away_bids]
         away_hr_samples = [batter_hr_post[b] for b in away_bids]
 
-        home_sp_k = float(np.mean(pitcher_k_post[home_sp]))
-        home_sp_bb = float(np.mean(pitcher_bb_post[home_sp]))
-        home_sp_hr = float(np.mean(pitcher_hr_post[home_sp]))
-        away_sp_k = float(np.mean(pitcher_k_post[away_sp]))
-        away_sp_bb = float(np.mean(pitcher_bb_post[away_sp]))
-        away_sp_hr = float(np.mean(pitcher_hr_post[away_sp]))
+        home_sp_k = np.asarray(pitcher_k_post[home_sp], dtype=np.float64)
+        home_sp_bb = np.asarray(pitcher_bb_post[home_sp], dtype=np.float64)
+        home_sp_hr = np.asarray(pitcher_hr_post[home_sp], dtype=np.float64)
+        away_sp_k = np.asarray(pitcher_k_post[away_sp], dtype=np.float64)
+        away_sp_bb = np.asarray(pitcher_bb_post[away_sp], dtype=np.float64)
+        away_sp_hr = np.asarray(pitcher_hr_post[away_sp], dtype=np.float64)
 
         home_bf_mu, home_bf_sig = _get_bf(home_sp)
         away_bf_mu, away_bf_sig = _get_bf(away_sp)

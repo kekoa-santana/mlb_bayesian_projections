@@ -150,19 +150,45 @@ MATCHUP_DAMPEN: dict[str, float] = _load_matchup_dampen()
 # ---------------------------------------------------------------------------
 
 def compute_pitcher_quality_lifts(
-    k_rate: float,
-    bb_rate: float,
-    hr_rate: float,
+    k_rate: float | np.ndarray,
+    bb_rate: float | np.ndarray,
+    hr_rate: float | np.ndarray,
     league_k: float,
     league_bb: float,
     league_hr: float,
-) -> tuple[float, float, float]:
-    """Compute logit-scale pitcher quality lifts vs league average."""
+) -> tuple[float | np.ndarray, float | np.ndarray, float | np.ndarray]:
+    """Compute logit-scale pitcher quality lifts vs league average.
+
+    Accepts scalar rates (backward-compatible) or arrays of posterior
+    samples.  When arrays are passed the returned lifts have the same
+    shape — one lift per sample.
+    """
     return (
         safe_logit(k_rate) - safe_logit(league_k),
         safe_logit(bb_rate) - safe_logit(league_bb),
         safe_logit(hr_rate) - safe_logit(league_hr),
     )
+
+
+def pitcher_rate_to_lift_array(
+    rate: float | np.ndarray,
+    league_rate: float,
+    n_sims: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Convert a pitcher rate (scalar or posterior array) to (n_sims,) logit lifts.
+
+    When *rate* is a scalar float the lift is a constant array (backward-
+    compatible with the old float-only path).  When it is a posterior
+    sample array, the samples are resampled to *n_sims* draws and each
+    draw gets its own logit lift — propagating pitcher posterior
+    uncertainty through every sim independently.
+    """
+    if np.ndim(rate) == 0:
+        lift = float(safe_logit(float(rate)) - safe_logit(league_rate))
+        return np.full(n_sims, lift)
+    arr = resample_posterior(np.asarray(rate, dtype=np.float64), n_sims, rng)
+    return safe_logit(arr) - safe_logit(league_rate)
 
 
 # ---------------------------------------------------------------------------

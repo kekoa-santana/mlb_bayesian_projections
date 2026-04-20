@@ -47,6 +47,7 @@ from src.models.game_sim._sim_utils import (
     resample_posterior,
     MATCHUP_DAMPEN,
     compute_pitcher_quality_lifts,
+    pitcher_rate_to_lift_array,
     default_lift_array,
 )
 from src.utils.constants import (
@@ -62,6 +63,13 @@ logger = logging.getLogger(__name__)
 
 # Maximum PAs in a game across the full lineup (safety valve)
 MAX_LINEUP_PA = 55
+
+# Residual home-field advantage logit lifts (after park + umpire already modeled).
+# Applied only to the home team's batting half-innings.
+# Calibrated to produce ~51-52% home win rate on top of park/umpire adjustments.
+HFA_K_LIFT = -0.03    # Home batters K less (comfort, familiarity with ball flight)
+HFA_BB_LIFT = 0.05    # Home batters walk more (crowd noise disrupts pitcher command)
+HFA_HR_LIFT = 0.03    # Marginal HR boost (residual after park factors)
 
 # Number of lineup slots
 LINEUP_SIZE = 9
@@ -407,12 +415,12 @@ def _simulate_half_inning(
     bat_hr: np.ndarray,
     # Pitching context
     starter_bf: np.ndarray,
-    starter_k_lift: float,
-    starter_bb_lift: float,
-    starter_hr_lift: float,
-    bp_k_lift: float,
-    bp_bb_lift: float,
-    bp_hr_lift: float,
+    starter_k_lift: np.ndarray,     # (n_sims,) per-sim pitcher quality lifts
+    starter_bb_lift: np.ndarray,
+    starter_hr_lift: np.ndarray,
+    bp_k_lift: np.ndarray,
+    bp_bb_lift: np.ndarray,
+    bp_hr_lift: np.ndarray,
     # Matchup lifts (9,) arrays
     matchup_k_lifts: np.ndarray,
     matchup_bb_lifts: np.ndarray,
@@ -422,6 +430,7 @@ def _simulate_half_inning(
     bullpen_matchup_hr_lifts: np.ndarray,
     # BABIP and context lifts
     batter_babip_adjs: np.ndarray,
+    batter_bip_probs: np.ndarray | None,   # (9, 4) per-batter BIP profiles
     park_h_babip_adj: float,
     umpire_k_lift: float,
     umpire_bb_lift: float,
@@ -429,6 +438,10 @@ def _simulate_half_inning(
     park_bb_lift: float,
     park_hr_lift: float,
     weather_k_lift: float,
+    # Home-field advantage lifts (non-zero for home batting only)
+    hfa_k_lift: float,
+    hfa_bb_lift: float,
+    hfa_hr_lift: float,
     # Per-batter form lifts (9,) arrays
     form_k_lifts: np.ndarray,
     form_bb_lifts: np.ndarray,
@@ -466,8 +479,8 @@ def _simulate_half_inning(
         Batter rate posteriors, shape ``(9, n_sims)``.
     starter_bf : np.ndarray
         Starter batters-faced draw per sim, shape ``(n_sims,)``.
-    starter_k_lift ... bp_hr_lift : float
-        Pitcher quality lifts on the logit scale.
+    starter_k_lift ... bp_hr_lift : np.ndarray
+        Pitcher quality lifts on the logit scale, shape ``(n_sims,)``.
     matchup_k_lifts ... bullpen_matchup_hr_lifts : np.ndarray
         Per-batter matchup logit lifts, shape ``(9,)``.
     batter_babip_adjs : np.ndarray
@@ -516,29 +529,32 @@ def _simulate_half_inning(
 
         k_pitch = np.where(
             vs_starter,
-            starter_k_lift + matchup_k_lifts[slot],
-            bp_k_lift + bullpen_matchup_k_lifts[slot],
+            starter_k_lift[aidx] + matchup_k_lifts[slot],
+            bp_k_lift[aidx] + bullpen_matchup_k_lifts[slot],
         )
         bb_pitch = np.where(
             vs_starter,
-            starter_bb_lift + matchup_bb_lifts[slot],
-            bp_bb_lift + bullpen_matchup_bb_lifts[slot],
+            starter_bb_lift[aidx] + matchup_bb_lifts[slot],
+            bp_bb_lift[aidx] + bullpen_matchup_bb_lifts[slot],
         )
         hr_pitch = np.where(
             vs_starter,
-            starter_hr_lift + matchup_hr_lifts[slot],
-            bp_hr_lift + bullpen_matchup_hr_lifts[slot],
+            starter_hr_lift[aidx] + matchup_hr_lifts[slot],
+            bp_hr_lift[aidx] + bullpen_matchup_hr_lifts[slot],
         )
 
         k_rate = expit(
             k_logit + k_pitch + umpire_k_lift + park_k_lift + weather_k_lift
-            + form_k_lifts[slot]
+            + form_k_lifts[slot] + hfa_k_lift
         )
         bb_rate = expit(
             bb_logit + bb_pitch + umpire_bb_lift + park_bb_lift
-            + form_bb_lifts[slot]
+            + form_bb_lifts[slot] + hfa_bb_lift
         )
-        hr_rate = expit(hr_logit + hr_pitch + park_hr_lift + form_hr_lifts[slot])
+        hr_rate = expit(
+            hr_logit + hr_pitch + park_hr_lift + form_hr_lifts[slot]
+            + hfa_hr_lift
+        )
 
         # --- Draw PA outcomes ---
         probs = pa_model.compute_pa_probs(
@@ -550,11 +566,14 @@ def _simulate_half_inning(
         # scalar, so use the mean across active sims this PA.
         babip_vals = batter_babip_adjs[slot] + park_h_babip_adj
         babip_for_draw = float(np.mean(babip_vals))
+        # Per-batter BIP profiles: fancy-index (9,4) by slot → (n_act, 4)
+        bip_for_draw = batter_bip_probs[slot] if batter_bip_probs is not None else None
         outcomes = pa_model.draw_outcomes(
             probs=probs,
             rng=rng,
             n_draws=n_act,
             babip_adj=babip_for_draw,
+            batter_bip_probs=bip_for_draw,
         )
 
         # --- Classify ---
@@ -855,9 +874,9 @@ def simulate_lineup_game(
     batter_k_rate_samples: list[np.ndarray],
     batter_bb_rate_samples: list[np.ndarray],
     batter_hr_rate_samples: list[np.ndarray],
-    starter_k_rate: float,
-    starter_bb_rate: float,
-    starter_hr_rate: float,
+    starter_k_rate: float | np.ndarray,
+    starter_bb_rate: float | np.ndarray,
+    starter_hr_rate: float | np.ndarray,
     starter_bf_mu: float,
     starter_bf_sigma: float,
     matchup_k_lifts: np.ndarray | None = None,
@@ -870,6 +889,7 @@ def simulate_lineup_game(
     bullpen_matchup_bb_lifts: np.ndarray | None = None,
     bullpen_matchup_hr_lifts: np.ndarray | None = None,
     batter_babip_adjs: np.ndarray | None = None,
+    batter_bip_probs: np.ndarray | None = None,
     umpire_k_lift: float = 0.0,
     umpire_bb_lift: float = 0.0,
     park_k_lift: float = 0.0,
@@ -877,6 +897,9 @@ def simulate_lineup_game(
     park_hr_lift: float = 0.0,
     park_h_babip_adj: float = 0.0,
     weather_k_lift: float = 0.0,
+    hfa_k_lift: float = 0.0,
+    hfa_bb_lift: float = 0.0,
+    hfa_hr_lift: float = 0.0,
     form_k_lifts: np.ndarray | None = None,
     form_bb_lifts: np.ndarray | None = None,
     form_hr_lifts: np.ndarray | None = None,
@@ -903,8 +926,8 @@ def simulate_lineup_game(
         Length-9 list of BB% posterior sample arrays.
     batter_hr_rate_samples : list of np.ndarray
         Length-9 list of HR/PA posterior sample arrays.
-    starter_k_rate, starter_bb_rate, starter_hr_rate : float
-        Opposing starter's posterior mean rates.
+    starter_k_rate, starter_bb_rate, starter_hr_rate : float or np.ndarray
+        Opposing starter's rates (scalar mean or posterior sample array).
     starter_bf_mu, starter_bf_sigma : float
         Starter's batters-faced distribution parameters.
     matchup_k_lifts, matchup_bb_lifts, matchup_hr_lifts : np.ndarray, optional
@@ -990,16 +1013,14 @@ def simulate_lineup_game(
     bat_bb = np.stack([resample_posterior(s, n_sims, rng) for s in batter_bb_rate_samples])
     bat_hr = np.stack([resample_posterior(s, n_sims, rng) for s in batter_hr_rate_samples])
 
-    # --- Pitcher quality lifts (logit scale) ---
-    starter_k_lift, starter_bb_lift, starter_hr_lift = compute_pitcher_quality_lifts(
-        starter_k_rate, starter_bb_rate, starter_hr_rate,
-        SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE,
-    )
+    # --- Pitcher quality lifts (logit scale, per-sim arrays) ---
+    starter_k_lift = pitcher_rate_to_lift_array(starter_k_rate, SIM_LEAGUE_K_RATE, n_sims, rng)
+    starter_bb_lift = pitcher_rate_to_lift_array(starter_bb_rate, SIM_LEAGUE_BB_RATE, n_sims, rng)
+    starter_hr_lift = pitcher_rate_to_lift_array(starter_hr_rate, SIM_LEAGUE_HR_RATE, n_sims, rng)
 
-    bp_k_lift, bp_bb_lift, bp_hr_lift = compute_pitcher_quality_lifts(
-        bullpen_k_rate, bullpen_bb_rate, bullpen_hr_rate,
-        SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE,
-    )
+    bp_k_lift = pitcher_rate_to_lift_array(bullpen_k_rate, SIM_LEAGUE_K_RATE, n_sims, rng)
+    bp_bb_lift = pitcher_rate_to_lift_array(bullpen_bb_rate, SIM_LEAGUE_BB_RATE, n_sims, rng)
+    bp_hr_lift = pitcher_rate_to_lift_array(bullpen_hr_rate, SIM_LEAGUE_HR_RATE, n_sims, rng)
 
     # --- Draw starter BF for each sim ---
     starter_bf = draw_bf_samples(
@@ -1058,10 +1079,11 @@ def simulate_lineup_game(
             matchup_k_lifts, matchup_bb_lifts, matchup_hr_lifts,
             bullpen_matchup_k_lifts, bullpen_matchup_bb_lifts,
             bullpen_matchup_hr_lifts,
-            batter_babip_adjs, park_h_babip_adj,
+            batter_babip_adjs, batter_bip_probs, park_h_babip_adj,
             umpire_k_lift, umpire_bb_lift,
             park_k_lift, park_bb_lift, park_hr_lift,
             weather_k_lift,
+            hfa_k_lift, hfa_bb_lift, hfa_hr_lift,
             form_k_lifts, form_bb_lifts, form_hr_lifts,
             pa_model, rng,
         )
@@ -1159,9 +1181,9 @@ def simulate_full_game_both_teams(
     away_batter_bb_rate_samples: list[np.ndarray],
     away_batter_hr_rate_samples: list[np.ndarray],
     # Home starter that away batters face
-    home_starter_k_rate: float,
-    home_starter_bb_rate: float,
-    home_starter_hr_rate: float,
+    home_starter_k_rate: float | np.ndarray,
+    home_starter_bb_rate: float | np.ndarray,
+    home_starter_hr_rate: float | np.ndarray,
     home_starter_bf_mu: float,
     home_starter_bf_sigma: float,
     # Home team batting inputs
@@ -1169,9 +1191,9 @@ def simulate_full_game_both_teams(
     home_batter_bb_rate_samples: list[np.ndarray],
     home_batter_hr_rate_samples: list[np.ndarray],
     # Away starter that home batters face
-    away_starter_k_rate: float,
-    away_starter_bb_rate: float,
-    away_starter_hr_rate: float,
+    away_starter_k_rate: float | np.ndarray,
+    away_starter_bb_rate: float | np.ndarray,
+    away_starter_hr_rate: float | np.ndarray,
     away_starter_bf_mu: float,
     away_starter_bf_sigma: float,
     # Per-team matchup lifts (optional)
@@ -1195,9 +1217,11 @@ def simulate_full_game_both_teams(
     home_bullpen_matchup_k_lifts: np.ndarray | None = None,
     home_bullpen_matchup_bb_lifts: np.ndarray | None = None,
     home_bullpen_matchup_hr_lifts: np.ndarray | None = None,
-    # Per-team BABIP
+    # Per-team BABIP and BIP profiles
     away_batter_babip_adjs: np.ndarray | None = None,
     home_batter_babip_adjs: np.ndarray | None = None,
+    away_batter_bip_probs: np.ndarray | None = None,
+    home_batter_bip_probs: np.ndarray | None = None,
     # Shared context (individual kwargs OR GameContext)
     park_k_lift: float = 0.0,
     park_bb_lift: float = 0.0,
@@ -1214,6 +1238,8 @@ def simulate_full_game_both_teams(
     home_form_k_lifts: np.ndarray | None = None,
     home_form_bb_lifts: np.ndarray | None = None,
     home_form_hr_lifts: np.ndarray | None = None,
+    # Home-field advantage
+    apply_hfa: bool = True,
     # Sim params
     n_sims: int = 50_000,
     random_seed: int = 42,
@@ -1235,15 +1261,17 @@ def simulate_full_game_both_teams(
     away_batter_k_rate_samples, away_batter_bb_rate_samples,
     away_batter_hr_rate_samples : list of np.ndarray
         Length-9 lists of posterior sample arrays for the away lineup.
-    home_starter_k_rate, home_starter_bb_rate, home_starter_hr_rate : float
-        Home starting pitcher's posterior mean rates.
+    home_starter_k_rate, home_starter_bb_rate, home_starter_hr_rate : float or np.ndarray
+        Home starting pitcher's rates.  Pass a scalar posterior mean
+        (backward-compatible) or a full posterior sample array to
+        propagate pitcher uncertainty through each sim independently.
     home_starter_bf_mu, home_starter_bf_sigma : float
         Home starter batters-faced distribution parameters.
     home_batter_k_rate_samples, home_batter_bb_rate_samples,
     home_batter_hr_rate_samples : list of np.ndarray
         Length-9 lists of posterior sample arrays for the home lineup.
-    away_starter_k_rate, away_starter_bb_rate, away_starter_hr_rate : float
-        Away starting pitcher's posterior mean rates.
+    away_starter_k_rate, away_starter_bb_rate, away_starter_hr_rate : float or np.ndarray
+        Away starting pitcher's rates (scalar or posterior array).
     away_starter_bf_mu, away_starter_bf_sigma : float
         Away starter batters-faced distribution parameters.
     away_matchup_*_lifts, home_matchup_*_lifts : np.ndarray, optional
@@ -1340,28 +1368,24 @@ def simulate_full_game_both_teams(
     home_bat_bb = np.stack([resample_posterior(s, n_sims, rng) for s in home_batter_bb_rate_samples])
     home_bat_hr = np.stack([resample_posterior(s, n_sims, rng) for s in home_batter_hr_rate_samples])
 
-    # --- Pitcher quality lifts (logit scale) ---
+    # --- Pitcher quality lifts (logit scale, per-sim arrays) ---
     # Home pitching staff (away batters face these)
-    home_starter_k_lift, home_starter_bb_lift, home_starter_hr_lift = compute_pitcher_quality_lifts(
-        home_starter_k_rate, home_starter_bb_rate, home_starter_hr_rate,
-        SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE,
-    )
+    home_starter_k_lift = pitcher_rate_to_lift_array(home_starter_k_rate, SIM_LEAGUE_K_RATE, n_sims, rng)
+    home_starter_bb_lift = pitcher_rate_to_lift_array(home_starter_bb_rate, SIM_LEAGUE_BB_RATE, n_sims, rng)
+    home_starter_hr_lift = pitcher_rate_to_lift_array(home_starter_hr_rate, SIM_LEAGUE_HR_RATE, n_sims, rng)
 
-    home_bp_k_lift, home_bp_bb_lift, home_bp_hr_lift = compute_pitcher_quality_lifts(
-        home_bullpen_k_rate, home_bullpen_bb_rate, home_bullpen_hr_rate,
-        SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE,
-    )
+    home_bp_k_lift = pitcher_rate_to_lift_array(home_bullpen_k_rate, SIM_LEAGUE_K_RATE, n_sims, rng)
+    home_bp_bb_lift = pitcher_rate_to_lift_array(home_bullpen_bb_rate, SIM_LEAGUE_BB_RATE, n_sims, rng)
+    home_bp_hr_lift = pitcher_rate_to_lift_array(home_bullpen_hr_rate, SIM_LEAGUE_HR_RATE, n_sims, rng)
 
     # Away pitching staff (home batters face these)
-    away_starter_k_lift, away_starter_bb_lift, away_starter_hr_lift = compute_pitcher_quality_lifts(
-        away_starter_k_rate, away_starter_bb_rate, away_starter_hr_rate,
-        SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE,
-    )
+    away_starter_k_lift = pitcher_rate_to_lift_array(away_starter_k_rate, SIM_LEAGUE_K_RATE, n_sims, rng)
+    away_starter_bb_lift = pitcher_rate_to_lift_array(away_starter_bb_rate, SIM_LEAGUE_BB_RATE, n_sims, rng)
+    away_starter_hr_lift = pitcher_rate_to_lift_array(away_starter_hr_rate, SIM_LEAGUE_HR_RATE, n_sims, rng)
 
-    away_bp_k_lift, away_bp_bb_lift, away_bp_hr_lift = compute_pitcher_quality_lifts(
-        away_bullpen_k_rate, away_bullpen_bb_rate, away_bullpen_hr_rate,
-        SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE,
-    )
+    away_bp_k_lift = pitcher_rate_to_lift_array(away_bullpen_k_rate, SIM_LEAGUE_K_RATE, n_sims, rng)
+    away_bp_bb_lift = pitcher_rate_to_lift_array(away_bullpen_bb_rate, SIM_LEAGUE_BB_RATE, n_sims, rng)
+    away_bp_hr_lift = pitcher_rate_to_lift_array(away_bullpen_hr_rate, SIM_LEAGUE_HR_RATE, n_sims, rng)
 
     # --- Draw starter BF for each side ---
     home_starter_bf = draw_bf_samples(
@@ -1405,10 +1429,11 @@ def simulate_full_game_both_teams(
             away_matchup_k_lifts, away_matchup_bb_lifts, away_matchup_hr_lifts,
             home_bullpen_matchup_k_lifts, home_bullpen_matchup_bb_lifts,
             home_bullpen_matchup_hr_lifts,
-            away_batter_babip_adjs, park_h_babip_adj,
+            away_batter_babip_adjs, away_batter_bip_probs, park_h_babip_adj,
             umpire_k_lift, umpire_bb_lift,
             park_k_lift, park_bb_lift, park_hr_lift,
             weather_k_lift,
+            0.0, 0.0, 0.0,  # no HFA for away batting
             away_form_k_lifts, away_form_bb_lifts, away_form_hr_lifts,
             pa_model, rng,
         )
@@ -1441,10 +1466,13 @@ def simulate_full_game_both_teams(
             home_matchup_k_lifts, home_matchup_bb_lifts, home_matchup_hr_lifts,
             away_bullpen_matchup_k_lifts, away_bullpen_matchup_bb_lifts,
             away_bullpen_matchup_hr_lifts,
-            home_batter_babip_adjs, park_h_babip_adj,
+            home_batter_babip_adjs, home_batter_bip_probs, park_h_babip_adj,
             umpire_k_lift, umpire_bb_lift,
             park_k_lift, park_bb_lift, park_hr_lift,
             weather_k_lift,
+            HFA_K_LIFT if apply_hfa else 0.0,
+            HFA_BB_LIFT if apply_hfa else 0.0,
+            HFA_HR_LIFT if apply_hfa else 0.0,
             home_form_k_lifts, home_form_bb_lifts, home_form_hr_lifts,
             pa_model, rng,
         )
