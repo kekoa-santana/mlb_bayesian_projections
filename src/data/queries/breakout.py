@@ -274,11 +274,10 @@ def get_hitter_breakout_features(
 
     # --- T3: MiLB features (young/new players) ---
     # Only attach for players with <= 3 MLB seasons or age <= 26
-    cache_dir = Path("data/cached")
-    milb_path = cache_dir / "milb_translated_batters.parquet"
-    if milb_path.exists():
+    from src.data.feature_eng import load_milb_translated
+    milb = load_milb_translated("batters")
+    if not milb.empty:
         try:
-            milb = pd.read_parquet(milb_path)
             # Take the most recent MiLB season per player
             milb_latest = (
                 milb.sort_values("season", ascending=False)
@@ -528,11 +527,9 @@ def get_pitcher_breakout_features(
             box[col] = np.nan
 
     # --- T3: MiLB features (young pitchers) ---
-    cache_dir = Path("data/cached")
-    milb_path = cache_dir / "milb_translated_pitchers.parquet"
-    if milb_path.exists():
+    milb = load_milb_translated("pitchers")
+    if not milb.empty:
         try:
-            milb = pd.read_parquet(milb_path)
             milb_latest = (
                 milb.sort_values("season", ascending=False)
                 .drop_duplicates("player_id", keep="first")

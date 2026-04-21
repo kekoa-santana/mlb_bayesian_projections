@@ -25,12 +25,12 @@ import logging
 import sys
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
 import pandas as pd
 from src.evaluation.runner import setup_logging
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.precompute import DASHBOARD_DIR
 from scripts.precompute.backtest_harness import (
@@ -44,6 +44,12 @@ from scripts.precompute.backtest_harness import (
 )
 from scripts.precompute.backtest_lineup_sim import (
     load_posteriors as _load_base_posteriors,
+)
+from src.utils.constants import (
+    BABIP_LD_COEFF,
+    BABIP_LEAGUE_LD_RATE,
+    BABIP_LEAGUE_SPEED,
+    BABIP_SPEED_COEFF,
 )
 
 logger = setup_logging(__name__)
@@ -77,8 +83,6 @@ def load_posteriors() -> dict:
 
     # LD% BABIP adjustments
     data["ld_babip_lookup"] = {}
-    _LD_COEFF = 0.25
-    _LEAGUE_LD = 0.22
     try:
         ld_df = pd.read_parquet(DASHBOARD_DIR / "batter_ld_rate.parquet")
         if not ld_df.empty:
@@ -88,15 +92,13 @@ def load_posteriors() -> dict:
                 .reset_index()
             )
             for _, lr in ld_latest.iterrows():
-                ld_dev = float(lr["ld_rate_regressed"]) - _LEAGUE_LD
-                data["ld_babip_lookup"][int(lr["player_id"])] = ld_dev * _LD_COEFF
+                ld_dev = float(lr["ld_rate_regressed"]) - BABIP_LEAGUE_LD_RATE
+                data["ld_babip_lookup"][int(lr["player_id"])] = ld_dev * BABIP_LD_COEFF
     except FileNotFoundError:
         pass
 
     # Sprint speed BABIP adjustments
     data["speed_babip_lookup"] = {}
-    _LEAGUE_SPEED = 27.0
-    _SPEED_COEFF = 0.010
     try:
         speed_df = pd.read_parquet(DASHBOARD_DIR / "batter_sprint_speed.parquet")
         if not speed_df.empty:
@@ -106,9 +108,9 @@ def load_posteriors() -> dict:
                 .reset_index()
             )
             for _, sr in speed_latest.iterrows():
-                speed_dev = float(sr["sprint_speed_regressed"]) - _LEAGUE_SPEED
+                speed_dev = float(sr["sprint_speed_regressed"]) - BABIP_LEAGUE_SPEED
                 data["speed_babip_lookup"][int(sr["player_id"])] = (
-                    speed_dev * _SPEED_COEFF
+                    speed_dev * BABIP_SPEED_COEFF
                 )
     except FileNotFoundError:
         pass

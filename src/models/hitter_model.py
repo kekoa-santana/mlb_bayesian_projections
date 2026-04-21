@@ -151,13 +151,10 @@ STAT_CONFIGS: dict[str, StatConfig] = {
         likelihood="logit_normal",  # Normal on logit scale → bounded [0,1] projections
         league_avg=LEAGUE_AVG_OVERALL["woba"],  # 0.315 (stored on natural scale, logit-transformed internally)
         covariates=[
-            ("hard_hit_pct", 0.0, 0.2, "hard_hit% → wOBA"),
-            # barrel_pct replaced by xslg: xSLG YoY r=0.765 vs barrel r=0.425,
-            # predicts next-year wOBA better (0.409 vs 0.255).
-            ("xslg", 0.0, 0.2, "xSLG → wOBA"),
-            # xwOBA strips BABIP luck; +2-3% R² beyond hard_hit alone.
-            # Catches lucky/unlucky hitters the model would otherwise miss.
-            ("xwoba_avg", 0.0, 0.15, "xwOBA → wOBA"),
+            # Single composite replaces 3 collinear covariates (hard_hit_pct,
+            # xslg, xwoba_avg; pairwise r~0.75) that caused partial beta
+            # cancellation. Composite is within-season z-scored in feature_eng.
+            ("contact_quality_composite", 0.0, 0.3, "contact_quality_z → wOBA"),
         ],
         sigma_season_mu=0.15,
         sigma_season_floor=0.14,

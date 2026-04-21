@@ -2,9 +2,10 @@
 """
 Pre-compute all data needed by the Streamlit dashboard.
 
-Fits composite hitter + pitcher models (K% and BB% only), enriches with
-observed profiles, extracts posterior K% samples, computes BF priors,
-and saves everything to tdd-dashboard/data/dashboard/.
+Runs 15+ stages: Bayesian model fitting (K%, BB%, GB%, FB%, HR/FB, HR/BF),
+posterior samples, BF priors, projections, rankings, scouting grades, prospects,
+team ELO/profiles/power rankings, game simulations, and prop confidence picks.
+Saves 70+ parquets to tdd-dashboard/data/dashboard/.
 
 Usage
 -----
@@ -404,9 +405,12 @@ def main() -> None:
         )
 
     # =================================================================
-    # 8. Backtest summaries (always runs)
+    # 8. Backtest summaries
     # =================================================================
-    snapshots.run_backtest_summaries()
+    if should_run("backtest_summaries"):
+        snapshots.run_backtest_summaries()
+    else:
+        logger.info("Skipping backtest_summaries (not in --include list)")
 
     # =================================================================
     # 9a. Hitter posterior samples

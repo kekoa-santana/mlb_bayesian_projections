@@ -37,6 +37,7 @@ from src.data.queries.game import (  # noqa: F401
 from src.data.queries.environment import (  # noqa: F401
     get_park_factors,
     get_hitter_team_venue,
+    get_pitcher_team_venue,
     get_umpire_tendencies,
     get_umpire_k_tendencies,
     get_weather_effects,
@@ -64,6 +65,18 @@ from src.data.queries.breakout import (  # noqa: F401
     get_postseason_pitcher_stats,
     get_rolling_form,
     get_rolling_hard_hit,
+)
+from src.data.queries.prospect import (  # noqa: F401
+    get_prospect_snapshots_for_org_depth,
+    get_mlb_batter_first_seasons,
+    get_mlb_batters_with_min_pa_season,
+    get_mlb_pitchers_with_min_bf,
+    get_established_mlb_pitcher_ids,
+    get_fg_prospect_rankings,
+    get_prospect_fv_grades,
+    get_pitcher_player_ids,
+    get_mlb_debut_pitcher_rates,
+    get_mlb_debut_batter_rates,
 )
 from src.data.queries.traditional import (  # noqa: F401
     get_hitter_traditional_stats,

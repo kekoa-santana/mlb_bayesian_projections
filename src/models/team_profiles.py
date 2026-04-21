@@ -19,9 +19,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.data.paths import dashboard_dir
+
 logger = logging.getLogger(__name__)
 
-DASHBOARD_DIR = Path("C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/data/dashboard")
+DASHBOARD_DIR = dashboard_dir()
 
 # When a player is on IL, their roster slot is filled by a replacement.
 # Effective contribution = availability * their_score + (1-avail) * replacement.
@@ -993,10 +995,7 @@ def _build_health_depth(
     the ``roster_continuity`` percentile is blended into the composite
     with a small weight (15%) as a confidence modifier.
     """
-    from pathlib import Path
-    DASHBOARD_DIR = Path(
-        "C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/data/dashboard"
-    )
+    DASHBOARD_DIR = dashboard_dir()
 
     # ── 1. Aggregate player-level health scores per team ──
     # Load rankings + player-team mapping

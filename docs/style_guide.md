@@ -198,7 +198,7 @@ On individual cards, the name is split:
 
 ## Implementation
 
-The canonical theme lives in the shared **`tdd_theme`** package (`C:\Users\kekoa\Documents\data_analytics\tdd_theme\`):
+The canonical theme lives in the shared **`tdd_theme`** package (installed via pip):
 
 - **`tdd_theme/palette.py`** — GOLD, EMBER, SAGE, SLATE, CREAM, DARK
 - **`tdd_theme/theme.py`** — `apply_theme()` rcParams
@@ -212,7 +212,7 @@ Each project has a thin wrapper that re-exports from `tdd_theme` and adds projec
 
 To use in a new project:
 ```bash
-pip install -e C:\Users\kekoa\Documents\data_analytics\tdd_theme
+pip install -e path/to/tdd_theme
 ```
 ```python
 from tdd_theme import apply_theme, add_watermark, add_brand_footer, save_card

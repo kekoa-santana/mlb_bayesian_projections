@@ -35,10 +35,9 @@ logger = logging.getLogger(__name__)
 def crps_sample(samples: np.ndarray, observed: float) -> float:
     """Compute CRPS for a set of forecast samples against an observation.
 
-    Uses the representation:
-        CRPS = E|X - y| - 0.5 * E|X - X'|
-
-    where X, X' are independent draws from the forecast distribution.
+    Delegates to ``src.evaluation.metrics.compute_crps_single`` (canonical
+    implementation). This wrapper preserves the ``(samples, observed)``
+    argument order used by callers in this module.
 
     Parameters
     ----------
@@ -52,24 +51,12 @@ def crps_sample(samples: np.ndarray, observed: float) -> float:
     float
         CRPS value (lower is better, 0 = perfect).
     """
+    from src.evaluation.metrics import compute_crps_single
+
     samples = np.asarray(samples, dtype=np.float64)
-    n = len(samples)
-    if n == 0:
+    if len(samples) == 0:
         return np.nan
-
-    # E|X - y|
-    term1 = np.mean(np.abs(samples - observed))
-
-    # E|X - X'| via the CDF-based formula:
-    # CRPS = E|X-y| - 0.5 * E|X-X'|
-    # For the spread term, use: E|X-X'| = (2/(n^2)) * sum_{i<j} (x_(j) - x_(i))
-    # which simplifies to: (2/(n^2)) * sum_i (2i - n - 1) * x_(i)  [1-indexed]
-    # This is always non-negative for sorted samples.
-    sorted_s = np.sort(samples)
-    idx = np.arange(1, n + 1, dtype=np.float64)
-    spread = (2.0 / (n * n)) * np.sum((2 * idx - n - 1) * sorted_s)
-
-    return float(term1 - 0.5 * spread)
+    return compute_crps_single(observed, samples)
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Hitter daily standouts
 # ---------------------------------------------------------------------------
+# Dashboard-facing schema: columns the "The Diamond Daily" page reads directly.
+# Keep in sync with views/diamond_daily.py in tdd-dashboard.
+_HITTER_DAILY_EMPTY_COLUMNS = [
+    "batter_id", "batter_name", "game_pk", "game_date", "game_label",
+    "pa", "ab", "hits", "doubles", "triples", "hr",
+    "runs", "rbi", "bb", "k", "sb",
+    "avg", "obp", "slg", "ops", "iso", "woba",
+    "daily_standout_score", "daily_standout_rank",
+    "daily_production", "daily_counting", "daily_power", "daily_discipline",
+    "xwoba", "hard_hit_pct", "barrel_pct", "bip",
+    "max_hr_distance",
+]
+
+
 def score_hitter_daily(
     daily_df: pd.DataFrame,
     min_pa: int = 3,
@@ -39,21 +53,11 @@ def score_hitter_daily(
         Minimum PA to qualify.  Pinch-hit 1-PA games are excluded.
     """
     if daily_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "batter_id", "batter_name", "game_pk", "game_date",
-                "pa", "daily_standout_score", "daily_standout_rank",
-            ],
-        )
+        return pd.DataFrame(columns=_HITTER_DAILY_EMPTY_COLUMNS)
 
     df = daily_df.loc[daily_df["pa"] >= min_pa].copy()
     if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "batter_id", "batter_name", "game_pk", "game_date",
-                "pa", "daily_standout_score", "daily_standout_rank",
-            ],
-        )
+        return pd.DataFrame(columns=_HITTER_DAILY_EMPTY_COLUMNS)
 
     # --- Production (45%): the offensive bottom line ---
     production = (
@@ -114,6 +118,7 @@ def score_hitter_daily(
         "daily_production", "daily_counting", "daily_power", "daily_discipline",
         # Statcast bonus columns (display only)
         "xwoba", "hard_hit_pct", "barrel_pct", "bip",
+        "max_hr_distance",
     ]
     cols = [c for c in cols if c in df.columns]
     return df[cols].sort_values("daily_standout_rank")
@@ -122,6 +127,19 @@ def score_hitter_daily(
 # ---------------------------------------------------------------------------
 # Pitcher daily standouts
 # ---------------------------------------------------------------------------
+# Dashboard-facing schema: columns the "The Diamond Daily" page reads directly.
+# Keep in sync with views/diamond_daily.py in tdd-dashboard.
+_PITCHER_DAILY_EMPTY_COLUMNS = [
+    "pitcher_id", "pitcher_name", "role", "game_pk", "game_date", "game_label",
+    "bf", "ip", "k", "bb", "hr", "hits", "er", "runs",
+    "w", "l", "sv", "hld", "qs", "pitches",
+    "k_rate", "bb_rate", "k_minus_bb", "era", "whip",
+    "daily_standout_score", "daily_standout_rank",
+    "daily_run_prevention", "daily_k_dominance",
+    "daily_innings_depth", "daily_win_contribution",
+]
+
+
 def score_pitcher_daily(
     daily_df: pd.DataFrame,
     min_bf: int = 6,
@@ -143,21 +161,11 @@ def score_pitcher_daily(
         Minimum BF to qualify.  Removes 1-batter mop-up appearances.
     """
     if daily_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "pitcher_id", "pitcher_name", "role", "game_pk", "game_date",
-                "bf", "daily_standout_score", "daily_standout_rank",
-            ],
-        )
+        return pd.DataFrame(columns=_PITCHER_DAILY_EMPTY_COLUMNS)
 
     df = daily_df.loc[daily_df["bf"] >= min_bf].copy()
     if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "pitcher_id", "pitcher_name", "role", "game_pk", "game_date",
-                "bf", "daily_standout_score", "daily_standout_rank",
-            ],
-        )
+        return pd.DataFrame(columns=_PITCHER_DAILY_EMPTY_COLUMNS)
 
     # --- Run prevention (35%): kept runs off the board ---
     era_safe = df["era"].replace(0, np.nan).fillna(df["era"].median())
@@ -230,14 +238,23 @@ def build_daily_standout_boards(
     game_date: str | None = None,
     core_hitters: pd.DataFrame | None = None,
     core_pitchers: pd.DataFrame | None = None,
+    live_hitters: pd.DataFrame | None = None,
+    live_pitchers: pd.DataFrame | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Build hitter + pitcher daily standout leaderboards.
 
     Optionally merges core (power) rankings to show ``delta_vs_core``
     so the dashboard can highlight unexpected standouts.
+
+    Parameters
+    ----------
+    live_hitters, live_pitchers : pd.DataFrame or None
+        Pre-fetched API boxscore lines (from ``live_boxscores`` module).
+        When provided, bypasses the DB query so today's completed games
+        can be scored before the ETL has run.
     """
-    hitter_raw = get_hitter_daily_standouts(game_date=game_date)
-    pitcher_raw = get_pitcher_daily_standouts(game_date=game_date)
+    hitter_raw = live_hitters if live_hitters is not None else get_hitter_daily_standouts(game_date=game_date)
+    pitcher_raw = live_pitchers if live_pitchers is not None else get_pitcher_daily_standouts(game_date=game_date)
 
     hitters = score_hitter_daily(hitter_raw)
     pitchers = score_pitcher_daily(pitcher_raw)

@@ -10,14 +10,16 @@ Output: data/rankings_descriptions/hitters.parquet
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-RANKINGS_PARQUET = Path(
-    "C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/data/dashboard/hitters_rankings.parquet"
-)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.data.paths import dashboard_dir
+
+RANKINGS_PARQUET = dashboard_dir() / "hitters_rankings.parquet"
 FG_CSV = Path("outputs/fangraphs_comparison_hitters.csv")
 OUT = Path("data/rankings_descriptions/hitters.parquet")
 

@@ -40,7 +40,9 @@ from src.models.game_sim.pa_outcome_model import (
     PA_WALK,
     GameContext,
     PAOutcomeModel,
+    compute_fatigue_adjustments,
 )
+from src.models.game_sim.tto_model import LEAGUE_TTO_LOGIT_LIFTS, BF_PER_TTO
 from src.models.bf_model import draw_bf_samples
 from src.models.game_sim._sim_utils import (
     safe_logit,
@@ -110,9 +112,7 @@ P_ADVANCE_2B_TO_3B_ON_OUT = 0.41  # runner on 2B goes to 3B on out
 P_ADVANCE_1B_TO_2B_ON_OUT = 0.14  # runner on 1B goes to 2B on out
 
 
-def _safe_logit(p: float | np.ndarray) -> float | np.ndarray:
-    """Logit with clipping to avoid infinities."""
-    return safe_logit(p)
+_safe_logit = safe_logit  # alias for backward compat
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +521,19 @@ def _simulate_half_inning(
         global_bf[aidx] += 1
         vs_starter = global_bf[aidx] <= starter_bf[aidx]
 
+        # --- TTO adjustment (starter only; bullpen resets TTO) ---
+        tto_bucket = np.minimum(global_bf[aidx] // BF_PER_TTO, 2)
+        tto_k = np.where(vs_starter, LEAGUE_TTO_LOGIT_LIFTS["k"][tto_bucket], 0.0)
+        tto_bb = np.where(vs_starter, LEAGUE_TTO_LOGIT_LIFTS["bb"][tto_bucket], 0.0)
+        tto_hr = np.where(vs_starter, LEAGUE_TTO_LOGIT_LIFTS["hr"][tto_bucket], 0.0)
+
+        # --- Fatigue adjustment (starter only; estimate pitches as ~3.9 per BF) ---
+        est_pitches = (global_bf[aidx].astype(np.float64) * 3.9).astype(np.int32)
+        fatigue = compute_fatigue_adjustments(est_pitches)
+        fatigue_k = np.where(vs_starter, fatigue["k"], 0.0)
+        fatigue_bb = np.where(vs_starter, fatigue["bb"], 0.0)
+        fatigue_hr = np.where(vs_starter, fatigue["hr"], 0.0)
+
         # --- Compute adjusted rates ---
         # bat_k has shape (9, n_sims_total); index by (per-sim slot, global idx)
         k_logit = _safe_logit(bat_k[slot, aidx])
@@ -545,15 +558,15 @@ def _simulate_half_inning(
 
         k_rate = expit(
             k_logit + k_pitch + umpire_k_lift + park_k_lift + weather_k_lift
-            + form_k_lifts[slot] + hfa_k_lift
+            + form_k_lifts[slot] + hfa_k_lift + tto_k + fatigue_k
         )
         bb_rate = expit(
             bb_logit + bb_pitch + umpire_bb_lift + park_bb_lift
-            + form_bb_lifts[slot] + hfa_bb_lift
+            + form_bb_lifts[slot] + hfa_bb_lift + tto_bb + fatigue_bb
         )
         hr_rate = expit(
             hr_logit + hr_pitch + park_hr_lift + form_hr_lifts[slot]
-            + hfa_hr_lift
+            + hfa_hr_lift + tto_hr + fatigue_hr
         )
 
         # --- Draw PA outcomes ---
@@ -562,17 +575,16 @@ def _simulate_half_inning(
             pitcher_bb_rate=bb_rate,
             pitcher_hr_rate=hr_rate,
         )
-        # BABIP adj: per-sim slot -> per-sim float; draw_outcomes expects a
-        # scalar, so use the mean across active sims this PA.
+        # BABIP adj: per-sim values passed directly (draw_outcomes now
+        # accepts array babip_adj to preserve per-sim variance).
         babip_vals = batter_babip_adjs[slot] + park_h_babip_adj
-        babip_for_draw = float(np.mean(babip_vals))
         # Per-batter BIP profiles: fancy-index (9,4) by slot → (n_act, 4)
         bip_for_draw = batter_bip_probs[slot] if batter_bip_probs is not None else None
         outcomes = pa_model.draw_outcomes(
             probs=probs,
             rng=rng,
             n_draws=n_act,
-            babip_adj=babip_for_draw,
+            babip_adj=babip_vals,
             batter_bip_probs=bip_for_draw,
         )
 

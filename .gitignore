@@ -13,12 +13,23 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+dist/
+build/
 
-# Tools
+# Model artifacts
+*.pkl
+*.npz
+
+# Tools / IDE
 .pytest_cache/
 .claude/
 .codex/
+.vscode/
+.idea/
 
+# Notebooks / scratch
 *.ipynb
+notebooks/*.csv
 output.md
 TODO.md
+test_results.txt

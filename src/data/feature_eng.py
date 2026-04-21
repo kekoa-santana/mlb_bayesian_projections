@@ -83,6 +83,26 @@ def _load_or_build(
     return load_or_build_parquet(path, lambda: builder(season), force_rebuild)
 
 
+def load_milb_translated(player_type: str = "batters") -> pd.DataFrame:
+    """Load cached MiLB translated stats.
+
+    Parameters
+    ----------
+    player_type : str
+        Either ``"batters"`` or ``"pitchers"``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Translated MiLB stats, or empty DataFrame if cache is missing.
+    """
+    path = CACHE_DIR / f"milb_translated_{player_type}.parquet"
+    if not path.exists():
+        logger.warning("MiLB translated %s not found at %s", player_type, path)
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
 # ---------------------------------------------------------------------------
 # Hitter vulnerability profile
 # ---------------------------------------------------------------------------
@@ -335,44 +355,6 @@ def get_cached_pitcher_season_totals(
 
 
 # ---------------------------------------------------------------------------
-# Multi-season player data for Bayesian model
-# ---------------------------------------------------------------------------
-def build_multi_season_k_data(
-    seasons: list[int], min_pa: int = 1
-) -> pd.DataFrame:
-    """Stack hitter season totals across multiple seasons for the K% model.
-
-    Parameters
-    ----------
-    seasons : list[int]
-        Seasons to include.
-    min_pa : int
-        Minimum PA per player-season (no hard cutoff per CLAUDE.md — the
-        Bayesian model handles small samples, but this filters out ghost
-        rows with 0 PA).
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: batter_id, batter_name, batter_stand, season, pa, k,
-        k_rate, plus Statcast quality metrics.
-    """
-    frames = []
-    for s in seasons:
-        df = get_cached_season_totals(s, force_rebuild=False)
-        if min_pa > 1:
-            df = df[df["pa"] >= min_pa]
-        frames.append(df)
-
-    combined = pd.concat(frames, ignore_index=True)
-    logger.info(
-        "Multi-season K data: %d player-seasons across %s",
-        len(combined), seasons,
-    )
-    return combined
-
-
-# ---------------------------------------------------------------------------
 # Season totals by pitcher hand (cached)
 # ---------------------------------------------------------------------------
 def get_cached_season_totals_by_pitcher_hand(
@@ -397,123 +379,6 @@ def get_cached_season_totals_by_pitcher_hand(
         "season_totals_by_hand", season,
         get_season_totals_by_pitcher_hand, force_rebuild,
     )
-
-
-# ---------------------------------------------------------------------------
-# Multi-season platoon data for Bayesian model
-# ---------------------------------------------------------------------------
-def build_multi_season_k_data_platoon(
-    seasons: list[int], min_pa: int = 1
-) -> pd.DataFrame:
-    """Stack platoon-split season totals across multiple seasons.
-
-    Returns ~2x rows vs ``build_multi_season_k_data`` (two rows per
-    player-season: one vs LHP, one vs RHP).
-
-    Parameters
-    ----------
-    seasons : list[int]
-        Seasons to include.
-    min_pa : int
-        Minimum PA per player-season-hand row.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: batter_id, batter_name, batter_stand, pitch_hand,
-        season, pa, k, k_rate, same_side, plus Statcast quality metrics.
-    """
-    frames = []
-    for s in seasons:
-        df = get_cached_season_totals_by_pitcher_hand(s, force_rebuild=False)
-        if min_pa > 1:
-            df = df[df["pa"] >= min_pa]
-        frames.append(df)
-
-    combined = pd.concat(frames, ignore_index=True)
-    logger.info(
-        "Multi-season platoon K data: %d player-season-hand rows across %s",
-        len(combined), seasons,
-    )
-    return combined
-
-
-# ---------------------------------------------------------------------------
-# Multi-season pitcher data for Bayesian model
-# ---------------------------------------------------------------------------
-def build_multi_season_pitcher_k_data(
-    seasons: list[int], min_bf: int = 9
-) -> pd.DataFrame:
-    """Stack pitcher season totals with arsenal-derived covariates.
-
-    Per season:
-    1. Load cached pitcher season totals (K/BF/IP from boxscores).
-    2. Load cached pitcher arsenal, aggregate to pitcher-level:
-       ``whiff_rate = sum(whiffs)/sum(swings)``,
-       ``barrel_rate_against = sum(barrels_proxy)/sum(bip)``.
-    3. Left-merge on pitcher_id.
-    4. Filter by min_bf and stack across seasons.
-
-    Parameters
-    ----------
-    seasons : list[int]
-        Seasons to include.
-    min_bf : int
-        Minimum batters faced per player-season.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: pitcher_id, pitcher_name, pitch_hand, season,
-        batters_faced, k, k_rate, bb, bb_rate, ip, games,
-        whiff_rate, barrel_rate_against, is_starter.
-    """
-    frames = []
-    for s in seasons:
-        totals = get_cached_pitcher_season_totals(s, force_rebuild=False)
-        arsenal = get_pitcher_arsenal(s, force_rebuild=False)
-
-        # Aggregate arsenal from per-pitch-type to pitcher-level
-        pitcher_agg = arsenal.groupby("pitcher_id").agg(
-            whiffs=("whiffs", "sum"),
-            swings=("swings", "sum"),
-            barrels_proxy=("barrels_proxy", "sum"),
-            bip=("bip", "sum"),
-        ).reset_index()
-        pitcher_agg["whiff_rate"] = (
-            pitcher_agg["whiffs"] / pitcher_agg["swings"].replace(0, np.nan)
-        )
-        pitcher_agg["barrel_rate_against"] = (
-            pitcher_agg["barrels_proxy"] / pitcher_agg["bip"].replace(0, np.nan)
-        )
-
-        merged = totals.merge(
-            pitcher_agg[["pitcher_id", "whiff_rate", "barrel_rate_against"]],
-            on="pitcher_id",
-            how="left",
-        )
-
-        # Derive starter/reliever role: IP/game >= 3.0 → starter
-        merged["is_starter"] = (
-            (merged["ip"] / merged["games"].replace(0, np.nan)) >= 3.0
-        ).astype(int).fillna(0).astype(int)
-
-        if min_bf > 1:
-            merged = merged[merged["batters_faced"] >= min_bf]
-
-        keep_cols = [
-            "pitcher_id", "pitcher_name", "pitch_hand", "season",
-            "batters_faced", "k", "k_rate", "bb", "bb_rate", "ip", "games",
-            "whiff_rate", "barrel_rate_against", "is_starter",
-        ]
-        frames.append(merged[keep_cols])
-
-    combined = pd.concat(frames, ignore_index=True)
-    logger.info(
-        "Multi-season pitcher K data: %d player-seasons across %s",
-        len(combined), seasons,
-    )
-    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +579,8 @@ def build_multi_season_hitter_data(
     # avg_ev_fb (r=0.601 → next-year HR/FB) is the strongest single HR/FB
     # predictor, adding r=0.203 beyond hard_hit% alone. barrel_pct weight
     # reduced (r=0.425 YoY, weakest ingredient).
-    # Z-scored within the combined data so it's season-normalized.
+    # Z-scored WITHIN each season to remove era effects (deadened ball 2020-21),
+    # then combined with weights.
     _pow_cols = ["iso", "barrel_pct", "hard_hit_pct", "avg_exit_velo", "avg_ev_fb"]
     _pow_weights = [0.30, 0.15, 0.15, 0.15, 0.25]
     available_pow = [(c, w) for c, w in zip(_pow_cols, _pow_weights) if c in combined.columns]
@@ -722,11 +588,18 @@ def build_multi_season_hitter_data(
         power_z = np.zeros(len(combined))
         total_w = 0.0
         for col, w in available_pow:
-            vals = combined[col].astype(float)
-            mu, sd = vals.mean(), vals.std()
-            if sd > 1e-9:
-                power_z += w * (vals.fillna(mu) - mu) / sd
-                total_w += w
+            vals = combined[col].astype(float).copy()
+            # Z-score within each season to remove era effects
+            for season in combined["season"].unique():
+                mask = combined["season"] == season
+                season_vals = vals[mask]
+                mu_s, sd_s = season_vals.mean(), season_vals.std()
+                if sd_s > 1e-9:
+                    vals.loc[mask] = (season_vals.fillna(mu_s) - mu_s) / sd_s
+                else:
+                    vals.loc[mask] = 0.0
+            power_z += w * vals.fillna(0.0)
+            total_w += w
         if total_w > 0:
             combined["power_composite"] = power_z / total_w
         else:
@@ -734,6 +607,36 @@ def build_multi_season_hitter_data(
         logger.info("Power composite computed from %d metrics", len(available_pow))
     else:
         combined["power_composite"] = 0.0
+
+    # Contact quality composite — single covariate for wOBA model replacing
+    # 3 collinear covariates (hard_hit_pct, xslg, xwoba_avg; pairwise r~0.75).
+    # xwoba_avg weighted highest (most downstream, strips BABIP luck).
+    # Z-scored WITHIN each season to remove era effects.
+    _cq_cols = ["hard_hit_pct", "xslg", "xwoba_avg"]
+    _cq_weights = [0.30, 0.30, 0.40]
+    available_cq = [(c, w) for c, w in zip(_cq_cols, _cq_weights) if c in combined.columns]
+    if available_cq:
+        cq_z = np.zeros(len(combined))
+        total_w = 0.0
+        for col, w in available_cq:
+            vals = combined[col].astype(float).copy()
+            for season in combined["season"].unique():
+                mask = combined["season"] == season
+                season_vals = vals[mask]
+                mu_s, sd_s = season_vals.mean(), season_vals.std()
+                if sd_s > 1e-9:
+                    vals.loc[mask] = (season_vals.fillna(mu_s) - mu_s) / sd_s
+                else:
+                    vals.loc[mask] = 0.0
+            cq_z += w * vals.fillna(0.0)
+            total_w += w
+        if total_w > 0:
+            combined["contact_quality_composite"] = cq_z / total_w
+        else:
+            combined["contact_quality_composite"] = 0.0
+        logger.info("Contact quality composite computed from %d metrics", len(available_cq))
+    else:
+        combined["contact_quality_composite"] = 0.0
 
     combined = assign_skill_tier(combined, player_type="hitter")
 
@@ -957,6 +860,44 @@ def build_multi_season_pitcher_data(
             if col not in merged.columns:
                 merged[col] = np.nan
 
+        # Park-adjust HR counts for the HR/BF model.
+        # Divides observed HR by half-weight park factor (half home, half road)
+        # so a Coors pitcher's HR count is deflated to park-neutral.
+        try:
+            from src.data.queries.environment import get_pitcher_team_venue
+            from src.data.park_factors import compute_multi_stat_park_factors
+
+            pitcher_venues = get_pitcher_team_venue(s)
+            pf_seasons = [y for y in range(s - 2, s + 1) if y >= 2020]
+            pf = compute_multi_stat_park_factors(seasons=pf_seasons, min_games=30)
+            if not pf.empty and not pitcher_venues.empty:
+                pf_hr_map = dict(zip(pf["venue_id"], pf["pf_hr"]))
+                venue_map = dict(zip(
+                    pitcher_venues["pitcher_id"], pitcher_venues["venue_id"],
+                ))
+                # Half-weight: pitcher plays ~half home, half road
+                hr_pf = merged["pitcher_id"].map(
+                    lambda pid: 0.5 * pf_hr_map.get(venue_map.get(pid, -1), 1.0) + 0.5
+                )
+                merged["hr_park_factor"] = hr_pf
+                merged["hr_raw"] = merged["hr"]
+                merged["hr"] = (merged["hr"] / hr_pf).round().astype(int)
+                merged["hr_per_bf"] = (
+                    merged["hr"] / merged["batters_faced"].replace(0, np.nan)
+                )
+                merged["hr_per_9"] = (
+                    merged["hr"] / merged["ip"].replace(0, np.nan) * 9
+                )
+                logger.info(
+                    "Park-adjusted pitcher HR for season %d: "
+                    "mean pf=%.3f, adjusted %d pitchers",
+                    s, hr_pf.mean(), len(pitcher_venues),
+                )
+        except Exception:
+            logger.warning(
+                "Park adjustment for pitcher HR failed (season %d), using raw", s,
+            )
+
         # Derive starter/reliever role
         merged["is_starter"] = (
             (merged["ip"] / merged["games"].replace(0, np.nan)) >= 3.0
@@ -1063,10 +1004,8 @@ def augment_hitters_with_milb_priors(
         MLB data + synthetic rookie rows, with ``_from_milb`` flag.
     """
     if milb_df is None:
-        try:
-            milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_batters.parquet")
-        except FileNotFoundError:
-            logger.warning("No MiLB translated batters cache found, skipping augmentation")
+        milb_df = load_milb_translated("batters")
+        if milb_df.empty:
             mlb_df["_from_milb"] = False
             return mlb_df
 
@@ -1207,10 +1146,8 @@ def augment_pitchers_with_milb_priors(
         MLB data + synthetic rookie rows, with ``_from_milb`` flag.
     """
     if milb_df is None:
-        try:
-            milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_pitchers.parquet")
-        except FileNotFoundError:
-            logger.warning("No MiLB translated pitchers cache found, skipping augmentation")
+        milb_df = load_milb_translated("pitchers")
+        if milb_df.empty:
             mlb_df["_from_milb"] = False
             return mlb_df
 
@@ -1353,15 +1290,9 @@ def compute_milb_prior_offsets(
 
     # Load MiLB translated data
     if milb_df is None:
-        cache_file = (
-            CACHE_DIR / "milb_translated_batters.parquet"
-            if player_type == "hitter"
-            else CACHE_DIR / "milb_translated_pitchers.parquet"
-        )
-        try:
-            milb_df = pd.read_parquet(cache_file)
-        except FileNotFoundError:
-            logger.warning("No MiLB translated %s cache found", player_type)
+        ptype = "batters" if player_type == "hitter" else "pitchers"
+        milb_df = load_milb_translated(ptype)
+        if milb_df.empty:
             return {}
 
     # Identify early-career players: total MLB PA/BF < max_mlb_pa

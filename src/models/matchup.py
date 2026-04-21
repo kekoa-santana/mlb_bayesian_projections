@@ -1150,8 +1150,8 @@ def _compute_platoon_lift(
     if hand_data is None:
         return 0.0
 
-    overall_k = batter_platoon_splits.get("overall_k_rate", 0.224)
-    overall_bb = batter_platoon_splits.get("overall_bb_rate", 0.083)
+    overall_k = batter_platoon_splits.get("overall_k_rate", LEAGUE_AVG_OVERALL["k_rate"])
+    overall_bb = batter_platoon_splits.get("overall_bb_rate", LEAGUE_AVG_OVERALL["bb_rate"])
     k_vs_hand = hand_data.get("k_rate", overall_k)
     bb_vs_hand = hand_data.get("bb_rate", overall_bb)
     pa_vs_hand = hand_data.get("pa", 0)

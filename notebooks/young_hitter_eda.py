@@ -1,6 +1,7 @@
 import sys, warnings, numpy as np, pandas as pd
+from pathlib import Path
 warnings.filterwarnings("ignore")
-sys.path.insert(0, "C:/Users/kekoa/Documents/data_analytics/player_profiles")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.data.db import read_sql
 
 D = "=" * 70

@@ -292,9 +292,33 @@ def fit_all_models_generic(
                     )
                 except ValueError:
                     continue
+
+            # Fallback: players in prior season but NOT in extract_season.
+            # Extract from their last observed season with project_forward=True
+            # so they get a one-step-ahead projection with wider uncertainty.
+            prior_season = extract_season - 1
+            prior_ids = stat_df[
+                stat_df["season"] == prior_season
+            ][id_col].unique()
+            fallback_ids = set(prior_ids) - set(active_ids)
+            n_fallback = 0
+            for pid in fallback_ids:
+                try:
+                    rate_samples[int(pid)] = extract_samples_fn(
+                        trace, data,
+                        **{id_col: int(pid)},
+                        season=prior_season,
+                        project_forward=True,
+                        random_seed=random_seed,
+                    )
+                    n_fallback += 1
+                except ValueError:
+                    continue
             logger.info(
-                "Pre-extracted %s samples for %d %ss",
+                "Pre-extracted %s samples for %d %ss (%d from %d, %d fallback from %d)",
                 stat, len(rate_samples), player_type,
+                len(rate_samples) - n_fallback, extract_season,
+                n_fallback, prior_season,
             )
 
         results[stat] = {

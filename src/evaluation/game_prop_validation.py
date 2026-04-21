@@ -48,7 +48,7 @@ from src.models.bf_model import (
     get_bf_distribution,
     get_pa_distribution,
 )
-from src.models.game_k_model import (
+from src.models.posterior_utils import (
     compute_over_probs,
     predict_batter_game,
     predict_game_batch_stat,

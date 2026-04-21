@@ -26,7 +26,6 @@ from src.evaluation.metrics import (
 from src.data.db import read_sql
 from src.data.feature_eng import (
     build_multi_season_pitcher_data,
-    build_multi_season_pitcher_k_data,
     get_cached_game_lineups,
     get_cached_pitcher_game_logs,
     get_hitter_vulnerability,
@@ -51,16 +50,11 @@ from src.models.game_sim.simulator import (
 )
 from src.models.game_sim.tto_model import build_all_tto_lifts
 from src.models.matchup import score_matchup_for_stat
-from src.models.pitcher_k_rate_model import (
-    fit_pitcher_k_rate_model,
-    prepare_pitcher_model_data,
-)
 from src.models.pitcher_model import (
     extract_rate_samples as extract_generalized_rate_samples,
     fit_pitcher_model,
     prepare_pitcher_data,
 )
-from src.models.posterior_utils import extract_pitcher_k_rate_samples
 
 from src.data.league_baselines import get_baselines_dict
 from src.models.bf_model import compute_pitcher_bf_priors
@@ -93,11 +87,11 @@ def _fit_pitcher_posteriors(
     """
     last_train = max(train_seasons)
 
-    # -- K% dedicated model --
+    # -- K% model (generalized, same as production pipeline) --
     logger.info("Fitting pitcher K%% model...")
-    df_k = build_multi_season_pitcher_k_data(train_seasons, min_bf=10)
-    data_k = prepare_pitcher_model_data(df_k)
-    _, trace_k = fit_pitcher_k_rate_model(
+    df_k = build_multi_season_pitcher_data(train_seasons, min_bf=10)
+    data_k = prepare_pitcher_data(df_k, "k_rate")
+    _, trace_k = fit_pitcher_model(
         data_k, draws=draws, tune=tune, chains=chains,
         random_seed=random_seed,
     )
@@ -107,7 +101,7 @@ def _fit_pitcher_posteriors(
     k_posteriors: dict[int, np.ndarray] = {}
     for pid in pids_k:
         try:
-            samples = extract_pitcher_k_rate_samples(
+            samples = extract_generalized_rate_samples(
                 trace_k, data_k, pid, last_train,
                 project_forward=True, random_seed=random_seed,
             )

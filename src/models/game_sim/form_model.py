@@ -53,9 +53,7 @@ MIN_HH_BIP = 15
 LEAGUE_HH_PCT = 0.395
 
 
-def _safe_logit(p: float | np.ndarray) -> float | np.ndarray:
-    """Logit with clipping to avoid infinities."""
-    return safe_logit(p)
+_safe_logit = safe_logit  # alias for backward compat
 
 
 @dataclass

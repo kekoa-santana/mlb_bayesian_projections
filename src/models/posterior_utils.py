@@ -12,98 +12,7 @@ import numpy as np
 import pandas as pd
 from scipy.special import expit
 
-from src.utils.math_helpers import safe_logit as _safe_logit
-
 logger = logging.getLogger(__name__)
-
-
-def extract_pitcher_k_rate_samples(
-    trace: Any,
-    data: dict[str, Any],
-    pitcher_id: int,
-    season: int,
-    project_forward: bool = True,
-    random_seed: int = 42,
-) -> np.ndarray:
-    """Extract raw K% posterior samples for one pitcher.
-
-    Parameters
-    ----------
-    trace : az.InferenceData
-        Fitted pitcher K% model trace.
-    data : dict
-        Model data dict from ``prepare_pitcher_model_data``.
-    pitcher_id : int
-        Target pitcher.
-    season : int
-        Season whose posterior to extract.
-    project_forward : bool
-        If True, add AR(1) forward projection noise (for out-of-sample
-        prediction). Uses rho dampening on the season effect.
-    random_seed : int
-        For reproducibility of forward projection noise.
-
-    Returns
-    -------
-    np.ndarray
-        K% posterior samples (1D array, values in [0, 1]).
-
-    Raises
-    ------
-    ValueError
-        If pitcher not found in the data for the given season.
-    """
-    df = data["df"]
-    mask = (df["pitcher_id"] == pitcher_id) & (df["season"] == season)
-    positions = df.index[mask].tolist()
-
-    if not positions:
-        raise ValueError(
-            f"Pitcher {pitcher_id} not found in season {season}"
-        )
-
-    pos = positions[0]
-    iloc_pos = df.index.get_loc(pos)
-
-    # Extract posterior samples: (chains, draws, n_obs)
-    k_rate_post = trace.posterior["k_rate"].values
-    k_rate_flat = k_rate_post.reshape(-1, k_rate_post.shape[-1])
-    samples = k_rate_flat[:, iloc_pos].copy()
-
-    if project_forward and "sigma_season" in trace.posterior:
-        rng = np.random.default_rng(random_seed)
-        sigma_samples = trace.posterior["sigma_season"].values.flatten()
-        if len(sigma_samples) != len(samples):
-            sigma_draws = rng.choice(sigma_samples, size=len(samples), replace=True)
-        else:
-            sigma_draws = sigma_samples
-
-        # Get rho for AR(1) dampening
-        if "rho" in trace.posterior:
-            rho_samples = trace.posterior["rho"].values.flatten()
-            if len(rho_samples) != len(samples):
-                rho_draws = rng.choice(rho_samples, size=len(samples), replace=True)
-            else:
-                rho_draws = rho_samples
-        else:
-            rho_draws = np.ones(len(samples))
-
-        # AR(1) forward projection on logit scale
-        logit_samples = _safe_logit(samples)
-        innovation = rng.normal(0, sigma_draws)
-
-        alpha_post = trace.posterior["alpha"].values
-        alpha_flat = alpha_post.reshape(-1, alpha_post.shape[-1])
-        pidx = data["player_map"][pitcher_id]
-        alpha_draws = alpha_flat[:, pidx]
-        if len(alpha_draws) != len(samples):
-            alpha_draws = rng.choice(alpha_draws, size=len(samples), replace=True)
-
-        season_effect_last = logit_samples - alpha_draws
-        new_effect = rho_draws * season_effect_last + innovation
-        samples = expit(alpha_draws + new_effect)
-
-    return samples
 
 
 def compute_over_probs(
@@ -185,3 +94,14 @@ def compute_k_over_probs(
         })
 
     return pd.DataFrame(records)
+
+
+# Re-exports from game_stat_model for backward compatibility.
+# Validation scripts (game_k_validation, game_prop_validation) import these
+# from posterior_utils after the game_k_model.py deletion.
+from src.models.game_stat_model import (  # noqa: F401, E402
+    predict_batter_game as predict_batter_game,
+    predict_game_batch as predict_game_batch,
+    predict_game_batch_stat as predict_game_batch_stat,
+    simulate_game_ks as simulate_game_ks,
+)

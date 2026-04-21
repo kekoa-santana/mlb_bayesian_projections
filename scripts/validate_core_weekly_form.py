@@ -2,12 +2,15 @@
 """Validate frozen core rankings and weekly-form artifact contracts."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.data.paths import dashboard_dir
 
-DASHBOARD_DIR = Path(r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard")
+DASHBOARD_DIR = dashboard_dir()
 
 
 def _require_columns(df: pd.DataFrame, required: set[str], name: str) -> list[str]:

@@ -29,9 +29,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
+
+
 import numpy as np
 import pandas as pd
 
+from src.data.feature_eng import load_milb_translated
 from src.data.paths import CACHE_DIR
 from src.models._ranking_utils import percentile_rank as _percentile_rank
 
@@ -488,14 +491,8 @@ def _load_fg_rankings(season: int) -> pd.DataFrame:
     fg_org_rank, fg_risk, fg_eta.
     """
     try:
-        from src.data.db import read_sql
-        rankings = read_sql(
-            "SELECT player_id, future_value, overall_rank, org_rank, "
-            "risk, eta, source "
-            "FROM production.dim_prospect_ranking "
-            f"WHERE season = {season}",
-            {},
-        )
+        from src.data.queries.prospect import get_fg_prospect_rankings
+        rankings = get_fg_prospect_rankings(season)
     except Exception:
         logger.warning("Could not load FG rankings for season %d", season)
         return pd.DataFrame()
@@ -623,14 +620,8 @@ def _get_prospect_fv_map(player_ids: set[int]) -> dict[int, float]:
     if not player_ids:
         return {}
     try:
-        from src.data.db import read_sql
-        df = read_sql("""
-            SELECT DISTINCT ON (player_id)
-                   player_id, future_value
-            FROM production.dim_prospect_ranking
-            WHERE future_value IS NOT NULL
-            ORDER BY player_id, season DESC, source
-        """, {})
+        from src.data.queries.prospect import get_prospect_fv_grades
+        df = get_prospect_fv_grades()
         df = df[df["player_id"].isin(player_ids)]
         return dict(zip(df["player_id"].astype(int), df["future_value"]))
     except Exception:
@@ -649,12 +640,8 @@ def _get_pitcher_player_ids() -> set[int]:
     batter prospect rankings when they still have MiLB batting data.
     """
     try:
-        from src.data.db import read_sql
-        df = read_sql(
-            "SELECT player_id FROM production.dim_player "
-            "WHERE primary_position = 'P'",
-            {},
-        )
+        from src.data.queries.prospect import get_pitcher_player_ids
+        df = get_pitcher_player_ids()
         return set(df["player_id"].astype(int))
     except Exception:
         logger.warning("Could not query pitcher IDs from dim_player")
@@ -691,20 +678,8 @@ def _get_mlb_debut_pitcher_rates(
         return pd.DataFrame()
 
     try:
-        from src.data.db import read_sql
-        df = read_sql("""
-            SELECT
-                pb.pitcher_id  AS player_id,
-                SUM(pb.batters_faced) AS mlb_bf,
-                SUM(pb.strike_outs)   AS mlb_k,
-                SUM(pb.walks)         AS mlb_bb,
-                SUM(pb.home_runs)     AS mlb_hr
-            FROM staging.pitching_boxscores pb
-            JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
-            WHERE dg.game_type = 'R'
-            GROUP BY pb.pitcher_id
-            HAVING SUM(pb.batters_faced) BETWEEN :min_bf AND :max_bf
-        """, {"min_bf": min_bf, "max_bf": max_bf})
+        from src.data.queries.prospect import get_mlb_debut_pitcher_rates
+        df = get_mlb_debut_pitcher_rates(min_bf=min_bf, max_bf=max_bf)
     except Exception:
         logger.warning("Could not fetch MLB debut pitcher rates")
         return pd.DataFrame()
@@ -812,23 +787,8 @@ def _get_mlb_debut_batter_rates(
         return pd.DataFrame()
 
     try:
-        from src.data.db import read_sql
-        df = read_sql("""
-            SELECT
-                bb.batter_id  AS player_id,
-                SUM(bb.plate_appearances) AS mlb_pa,
-                SUM(bb.strikeouts)        AS mlb_k,
-                SUM(bb.walks)             AS mlb_bb,
-                SUM(bb.home_runs)         AS mlb_hr,
-                SUM(bb.hits)              AS mlb_h,
-                SUM(bb.at_bats)           AS mlb_ab,
-                SUM(bb.total_bases)       AS mlb_tb
-            FROM staging.batting_boxscores bb
-            JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
-            WHERE dg.game_type = 'R'
-            GROUP BY bb.batter_id
-            HAVING SUM(bb.plate_appearances) BETWEEN :min_pa AND :max_pa
-        """, {"min_pa": min_pa, "max_pa": max_pa})
+        from src.data.queries.prospect import get_mlb_debut_batter_rates
+        df = get_mlb_debut_batter_rates(min_pa=min_pa, max_pa=max_pa)
     except Exception:
         logger.warning("Could not fetch MLB debut batter rates")
         return pd.DataFrame()
@@ -1063,7 +1023,7 @@ def rank_prospects(
 
     # Load data
     if milb_df is None:
-        milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_batters.parquet")
+        milb_df = load_milb_translated("batters")
 
     # No FV-conditioned adjustments — translations stand on their own stats.
 
@@ -1280,7 +1240,7 @@ def rank_pitching_prospects(
         weights = _WEIGHTS
 
     if milb_df is None:
-        milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_pitchers.parquet")
+        milb_df = load_milb_translated("pitchers")
 
     # Filter to recent prospects (active in last 2 seasons)
     recent_seasons = [projection_season - 2, projection_season - 1]
@@ -1294,11 +1254,8 @@ def rank_pitching_prospects(
     # Prospects with brief callups (e.g. McLean's 8-start debut) should
     # remain in prospect rankings.
     try:
-        from src.data.db import read_sql
-        mlb_pitchers = read_sql(f"""
-            SELECT DISTINCT pitcher_id FROM production.fact_pitching_advanced
-            WHERE batters_faced >= {_MAX_MLB_BF_PROSPECT}
-        """, {})
+        from src.data.queries.prospect import get_established_mlb_pitcher_ids
+        mlb_pitchers = get_established_mlb_pitcher_ids(min_bf=_MAX_MLB_BF_PROSPECT)
         mlb_ids = set(mlb_pitchers["pitcher_id"].astype(int))
     except Exception:
         mlb_ids = set()

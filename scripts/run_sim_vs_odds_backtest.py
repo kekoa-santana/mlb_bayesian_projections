@@ -37,6 +37,7 @@ from src.data.paths import dashboard_dir
 from src.evaluation.metrics import compute_ece, compute_temperature
 from src.models.game_sim.lineup_simulator import simulate_full_game_both_teams
 from src.models.matchup import score_matchup_for_stat
+from src.utils.weather import parse_temp_bucket, wind_category
 
 logging.basicConfig(
     level=logging.INFO,
@@ -419,26 +420,9 @@ def _pivot_odds(matched: pd.DataFrame) -> pd.DataFrame:
 # 4. Sim runner using preseason posteriors
 # ---------------------------------------------------------------------------
 
-def _parse_temp_bucket(temp) -> str:
-    """Categorise temperature into a weather effects bucket."""
-    if pd.isna(temp):
-        return "mild"
-    t = float(temp)
-    if t < 50:
-        return "cold"
-    elif t < 65:
-        return "cool"
-    elif t < 80:
-        return "mild"
-    return "hot"
-
-
-def _wind_category(game: pd.Series) -> str:
-    """Return wind category for a game row."""
-    wc = game.get("wind_category")
-    if pd.notna(wc) and str(wc).strip():
-        return str(wc).strip().lower()
-    return "calm"
+# Weather helpers imported from src.utils.weather (canonical thresholds)
+_parse_temp_bucket = parse_temp_bucket
+_wind_category = wind_category
 
 
 def _run_full_game_sims(

@@ -1257,7 +1257,8 @@ def get_hitter_daily_standouts(game_date: str | None = None) -> pd.DataFrame:
                     ELSE 0.0
                 END
             ) AS barrel_pct,
-            AVG(CASE WHEN sbb.xwoba != 'NaN' THEN sbb.xwoba END) AS xwoba
+            AVG(CASE WHEN sbb.xwoba != 'NaN' THEN sbb.xwoba END) AS xwoba,
+            MAX(CASE WHEN sbb.is_homerun THEN sbb.hit_distance_sc END) AS max_hr_distance
         FROM production.sat_batted_balls sbb
         JOIN production.fact_pa fp ON sbb.pa_id = fp.pa_id
         JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
@@ -1272,7 +1273,8 @@ def get_hitter_daily_standouts(game_date: str | None = None) -> pd.DataFrame:
         bt.bip,
         bt.hard_hit_pct,
         bt.barrel_pct,
-        bt.xwoba
+        bt.xwoba,
+        bt.max_hr_distance
     FROM box b
     LEFT JOIN sac_flies sf ON b.batter_id = sf.batter_id AND b.game_pk = sf.game_pk
     LEFT JOIN batted bt ON b.batter_id = bt.batter_id AND b.game_pk = bt.game_pk
@@ -1315,6 +1317,10 @@ def get_hitter_daily_standouts(game_date: str | None = None) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
     if "bip" in df.columns:
         df["bip"] = df["bip"].fillna(0).astype(int)
+    # Keep NaN for players who didn't hit a HR -- downstream (dashboard) uses
+    # "first non-null" semantics so missing distance shouldn't look like 0 ft.
+    if "max_hr_distance" in df.columns:
+        df["max_hr_distance"] = pd.to_numeric(df["max_hr_distance"], errors="coerce")
 
     return df
 

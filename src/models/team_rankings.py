@@ -17,9 +17,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.data.paths import dashboard_dir
+
 logger = logging.getLogger(__name__)
 
-DASHBOARD_DIR = Path("C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/data/dashboard")
+DASHBOARD_DIR = dashboard_dir()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -28,7 +30,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # ---------------------------------------------------------------------------
 # Scouting grade component weights (sum to 0.55 — the talent portion)
 _TALENT_WEIGHTS = {
-    # Walk-forward validated 2022-2025 (team_ranking_validation.py).
+    # Walk-forward validated 2022-2025.
     # Rotation and defense were massively underweighted; offense overweighted.
     # Depth signal is real but noisy — keeps a modest weight.
     "offense": 0.25,     # Lineup diamond (starters + bench)

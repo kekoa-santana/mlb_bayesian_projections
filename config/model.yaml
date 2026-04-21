@@ -1,11 +1,11 @@
 seasons:
   # Unsupervised models (pitch archetypes): use all data for stable clusters
-  clustering: [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
-  # Predictive models: train on all complete seasons, project into 2026
-  train: [2020, 2021, 2022, 2023, 2024, 2025]
-  # Backtesting used walk-forward folds; 2025 is now fully available for training
+  clustering: [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
+  # Predictive models: train on all available seasons incl. partial 2026
+  train: [2020, 2021, 2022, 2023, 2024, 2025, 2026]
+  # In-season projection target: 2026 (partial season in training, project forward)
   projection_target: 2026
-  all_available: [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+  all_available: [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
 
 sampling:
   draws: 2000
@@ -41,7 +41,7 @@ clustering:
   hitter_k: 6
   pitcher_k: 6
   archetype_matchup_min_pa: 100
-  archetype_matchup_seasons: [2020, 2021, 2022, 2023, 2024, 2025]
+  archetype_matchup_seasons: [2020, 2021, 2022, 2023, 2024, 2025, 2026]
 
 # Posterior calibration T per stat.
 # T < 1.0 narrows CIs (if backtests show over-coverage at 80% level).

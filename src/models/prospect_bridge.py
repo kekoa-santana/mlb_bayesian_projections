@@ -20,7 +20,9 @@ import logging
 import numpy as np
 import pandas as pd
 
+from src.data.feature_eng import load_milb_translated
 from src.data.paths import CACHE_DIR
+from src.utils.constants import SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +41,9 @@ _MIN_EFFECTIVE_TRIALS = 20
 
 # League-average rates (fallback when translated rates are unavailable)
 _LEAGUE_AVG = {
-    "k_rate": 0.226,
-    "bb_rate": 0.082,
-    "hr_per_bf": 0.031,
+    "k_rate": SIM_LEAGUE_K_RATE,
+    "bb_rate": SIM_LEAGUE_BB_RATE,
+    "hr_per_bf": SIM_LEAGUE_HR_RATE,
 }
 
 
@@ -486,9 +488,8 @@ def build_rookie_priors(
 
     hitter_priors = pd.DataFrame()
     if h_rookie_ids:
-        milb_bat_path = CACHE_DIR / "milb_translated_batters.parquet"
-        if milb_bat_path.exists():
-            milb_bat = pd.read_parquet(milb_bat_path)
+        milb_bat = load_milb_translated("batters")
+        if not milb_bat.empty:
             agg = _aggregate_batter_milb(milb_bat, h_rookie_ids)
 
             if not agg.empty:
@@ -531,9 +532,8 @@ def build_rookie_priors(
 
     pitcher_priors = pd.DataFrame()
     if p_rookie_ids:
-        milb_pit_path = CACHE_DIR / "milb_translated_pitchers.parquet"
-        if milb_pit_path.exists():
-            milb_pit = pd.read_parquet(milb_pit_path)
+        milb_pit = load_milb_translated("pitchers")
+        if not milb_pit.empty:
             agg = _aggregate_pitcher_milb(milb_pit, p_rookie_ids)
 
             if not agg.empty:

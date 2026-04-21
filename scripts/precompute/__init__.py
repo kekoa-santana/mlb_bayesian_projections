@@ -11,8 +11,10 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-DASHBOARD_REPO = Path(r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard")
-DASHBOARD_DIR = DASHBOARD_REPO / "data" / "dashboard"
+from src.data.paths import dashboard_dir, dashboard_repo
+
+DASHBOARD_REPO = dashboard_repo()
+DASHBOARD_DIR = dashboard_dir()
 
 SEASONS = list(range(2018, 2026))
 FROM_SEASON = 2025

@@ -21,6 +21,7 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
+from src.data.feature_eng import load_milb_translated
 from src.data.paths import CACHE_DIR
 
 logger = logging.getLogger(__name__)
@@ -77,14 +78,9 @@ def _load_org_depth() -> pd.DataFrame:
         return pd.read_parquet(cache_path)
 
     logger.info("Building org depth from fact_prospect_snapshot (first run)")
-    from src.data.db import read_sql
+    from src.data.queries.prospect import get_prospect_snapshots_for_org_depth
 
-    snap = read_sql("""
-        SELECT player_id, season, primary_position, level,
-               parent_org_id, parent_org_name
-        FROM production.fact_prospect_snapshot
-        WHERE primary_position NOT IN ('P', 'PH', 'PR')
-    """, {})
+    snap = get_prospect_snapshots_for_org_depth()
 
     pos_gmap = {
         "C": "C", "SS": "MI", "2B": "MI", "3B": "CI", "1B": "CI",
@@ -330,18 +326,8 @@ def _get_mlb_first_seasons(seasons: list[int] | None = None) -> dict[int, int]:
     if the DB query fails.
     """
     try:
-        from src.data.db import read_sql
-        df = read_sql(
-            """
-            SELECT bb.batter_id, MIN(dg.season) AS first_season
-            FROM staging.batting_boxscores bb
-            JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
-            WHERE dg.game_type = 'R'
-              AND bb.plate_appearances > 0
-            GROUP BY bb.batter_id
-            """,
-            {},
-        )
+        from src.data.queries.prospect import get_mlb_batter_first_seasons
+        df = get_mlb_batter_first_seasons()
         return dict(zip(df["batter_id"].astype(int), df["first_season"].astype(int)))
     except Exception:
         logger.warning("DB query for MLB first seasons failed; falling back to parquets")
@@ -371,18 +357,8 @@ def _get_mlb_stuck_ids(
     query fails.
     """
     try:
-        from src.data.db import read_sql
-        df = read_sql(
-            """
-            SELECT bb.batter_id
-            FROM staging.batting_boxscores bb
-            JOIN production.dim_game dg ON bb.game_pk = dg.game_pk
-            WHERE dg.game_type = 'R'
-            GROUP BY bb.batter_id, dg.season
-            HAVING SUM(bb.plate_appearances) >= :min_pa
-            """,
-            {"min_pa": min_pa},
-        )
+        from src.data.queries.prospect import get_mlb_batters_with_min_pa_season
+        df = get_mlb_batters_with_min_pa_season(min_pa=min_pa)
         return set(df["batter_id"].astype(int).unique())
     except Exception:
         logger.warning("DB query for MLB stuck IDs failed; falling back to parquets")
@@ -428,7 +404,7 @@ def train_readiness_model(
         n_positive (int).
     """
     if milb_df is None:
-        milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_batters.parquet")
+        milb_df = load_milb_translated("batters")
 
     mlb_first = _get_mlb_first_seasons()
     stuck_ids = _get_mlb_stuck_ids()
@@ -496,7 +472,7 @@ def score_prospects(
         sorted by score descending.
     """
     if milb_df is None:
-        milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_batters.parquet")
+        milb_df = load_milb_translated("batters")
 
     if model_bundle is None:
         model_bundle = train_readiness_model(milb_df)
@@ -568,12 +544,8 @@ def _get_mlb_pitcher_stuck_ids(
         seasons = list(range(2018, 2026))
     stuck: set[int] = set()
     try:
-        from src.data.db import read_sql
-        df = read_sql(
-            "SELECT DISTINCT pitcher_id FROM production.fact_pitching_advanced "
-            "WHERE batters_faced >= :min_bf",
-            {"min_bf": min_bf},
-        )
+        from src.data.queries.prospect import get_mlb_pitchers_with_min_bf
+        df = get_mlb_pitchers_with_min_bf(min_bf=min_bf)
         stuck.update(df["pitcher_id"].astype(int).unique())
     except Exception:
         logger.warning("Could not load MLB pitcher IDs from fact_pitching_advanced")
@@ -625,7 +597,7 @@ def train_pitcher_readiness_model(
         n_positive (int).
     """
     if milb_df is None:
-        milb_df = pd.read_parquet(CACHE_DIR / "milb_translated_pitchers.parquet")
+        milb_df = load_milb_translated("pitchers")
 
     mlb_first = _get_mlb_pitcher_first_seasons()
     stuck_ids = _get_mlb_pitcher_stuck_ids()

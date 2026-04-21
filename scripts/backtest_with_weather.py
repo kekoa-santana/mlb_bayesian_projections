@@ -35,6 +35,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.data.db import read_sql
+from src.data.paths import dashboard_dir
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,9 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DASHBOARD_DIR = Path(
-    r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard"
-)
+DASHBOARD_DIR = dashboard_dir()
 
 
 def _temp_bucket(temp) -> str:

@@ -21,12 +21,12 @@ import logging
 import sys
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
 import pandas as pd
 from src.evaluation.runner import setup_logging
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.precompute import DASHBOARD_DIR
 from scripts.precompute.backtest_harness import (

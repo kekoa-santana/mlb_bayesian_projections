@@ -75,69 +75,11 @@ def run_pitcher_samples(
         pitcher_results[stat_key].pop("rate_samples", None)
     gc.collect()
 
-    # -- Legacy pitcher K% fallback -----------------------------------------
-    # Only runs if the generalized pitcher_model above didn't produce k_rate
-    # samples (defensive: keeps the daily pipeline unblocked if the upstream
-    # fitter misfires or is skipped). Parity with the generalized output is
-    # not guaranteed.
     if not k_samples_from_generalized:
-        logger.warning(
-            "Falling back to legacy pitcher_k_rate_model for pitcher_k_samples.npz"
+        raise RuntimeError(
+            "Generalized pitcher_model did not produce K-rate samples. "
+            "Check pitcher_results['k_rate']['rate_samples'] from models.py."
         )
-        from src.data.feature_eng import build_multi_season_pitcher_k_data
-        from src.models.posterior_utils import extract_pitcher_k_rate_samples
-        from src.models.pitcher_k_rate_model import (
-            check_pitcher_convergence,
-            fit_pitcher_k_rate_model,
-            prepare_pitcher_model_data,
-        )
-
-        logger.info("Fitting legacy pitcher K%% model (fallback)...")
-        df_pitcher = build_multi_season_pitcher_k_data(seasons, min_bf=9)
-        pitcher_data = prepare_pitcher_model_data(df_pitcher)
-        _model, pitcher_trace = fit_pitcher_k_rate_model(
-            pitcher_data, draws=draws, tune=tune, chains=chains,
-        )
-        del _model
-        gc.collect()
-        conv = check_pitcher_convergence(pitcher_trace)
-        logger.info("Pitcher K%% convergence: %s (r_hat=%.4f)",
-                    "OK" if conv["converged"] else "ISSUES", conv["max_rhat"])
-
-        active = df_pitcher[
-            (df_pitcher["season"] == from_season) & (df_pitcher["batters_faced"] >= 50)
-        ]["pitcher_id"].unique()
-
-        k_samples_dict: dict[str, np.ndarray] = {}
-        for pid in active:
-            try:
-                samples = extract_pitcher_k_rate_samples(
-                    pitcher_trace, pitcher_data,
-                    pitcher_id=int(pid),
-                    season=from_season,
-                    project_forward=True,
-                )
-                k_samples_dict[str(int(pid))] = _downsample(samples)
-            except ValueError:
-                continue
-
-        np.savez_compressed(
-            DASHBOARD_DIR / "pitcher_k_samples.npz",
-            **k_samples_dict,
-        )
-        logger.info(
-            "Saved K%% posterior samples for %d pitchers (source=legacy_pitcher_k_rate_model)",
-            len(k_samples_dict),
-        )
-
-        np.savez_compressed(
-            snapshot_dir / "pitcher_k_samples_preseason.npz",
-            **k_samples_dict,
-        )
-        logger.info("Saved preseason K%% samples snapshot")
-
-        del pitcher_trace, pitcher_data, df_pitcher
-        gc.collect()
 
 
 def run_hitter_samples(

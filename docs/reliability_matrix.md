@@ -1,6 +1,6 @@
 # Stat Reliability Matrix
 
-_Last updated: 2026-04-17. Based on walk-forward backtesting (2018-2025 training, 2023-2025 test folds, 11,517 pitcher games, 131K+ batter games)._
+_Last updated: 2026-04-17. Based on walk-forward backtesting (2018-2025 training, 2023-2025 test folds, 11,517 pitcher games, 131K+ batter games). All metrics produced by the **legacy** engine (`run_game_prop_backtest.py --engine legacy`)._
 
 This document is the canonical source of truth for what this system does well and where it falls short. Every claim here is backed by validation artifacts in `outputs/`. When documentation or dashboard messaging conflicts with this matrix, the matrix wins.
 
@@ -13,23 +13,23 @@ This document is the canonical source of truth for what this system does well an
 | Prop | Brier | ECE | Calib Slope | Notes |
 |------|-------|-----|-------------|-------|
 | **Batter H** | 0.148 | 0.018 | 1.12 | Best-calibrated prop in the system. BABIP-dominated at game level but shrinkage captures signal. |
-| **Batter K** | 0.147 | 0.035 | 1.21 | Hitter K% is r=0.795 YoY stable. Whiff-rate matchup scoring adds signal even with 3-5 PA/game. |
-| **Batter BB** | 0.120 | 0.031 | 0.98 | Near-perfect calibration. Chase rate (r=0.84 YoY) drives the signal. Walks are rare (0-1/game) so binary outcomes are inherently noisy. |
-| **Pitcher K** | 0.188 | 0.020 | 1.08 | Good ECE, but game-to-game correlation is only r=0.34. Well-calibrated at the distribution level; individual game predictions are still noisy. |
+| **Batter K** | 0.147 | 0.037 | 1.22 | Hitter K% is r=0.795 YoY stable. Whiff-rate matchup scoring adds signal even with 3-5 PA/game. |
+| **Batter BB** | 0.120 | 0.030 | 0.98 | Near-perfect calibration. Chase rate (r=0.84 YoY) drives the signal. Walks are rare (0-1/game) so binary outcomes are inherently noisy. |
+| **Pitcher K** | 0.189 | 0.038 | 1.14 | ECE varies by fold (0.024-0.048). Well-calibrated at the distribution level; game-to-game correlation is only r=0.33. |
 
 ### Tier 2 -- Partially Calibrated (use with caution)
 
 | Prop | Brier | ECE | Calib Slope | Notes |
 |------|-------|-----|-------------|-------|
-| **Pitcher BB** | 0.171 | 0.072 | 0.68-0.73 | ECE elevated. Slope < 1.0 at key lines (1.5, 2.5) means the model is underconfident. XGB BB adjustment helps (+5% RMSE) but bias remains. |
+| **Pitcher BB** | 0.168 | 0.058 | 0.68-0.73 | ECE varies by fold (0.037-0.078). Slope < 1.0 at key lines (1.5, 2.5) means the model is overconfident (probability estimates too extreme). XGB BB adjustment helps (+5% RMSE) but bias remains. |
 | **Pitcher H** | 0.199 | 0.049 | 0.15-0.30 | **Severely overconfident.** Slope << 1.0 across all lines. The model's probability estimates are far too narrow. Population-based approach, no Bayesian posterior. Needs fundamental rework. |
 
 ### Tier 3 -- Unreliable (do not action)
 
 | Prop | Brier | ECE | Calib Slope | Notes |
 |------|-------|-----|-------------|-------|
-| **Pitcher HR** | 0.211 | 0.120 | 0.25-0.50 | Rare event (~3% of BF). HR/BF has r=0.267 YoY (weakest rate stat). Calibration is broken. |
-| **Pitcher Outs** | 0.233 | 0.306 | 2.60 | Driven by manager decisions, not statistical patterns. MCE=0.306 shows poor reliability. Not meaningfully a rate stat. |
+| **Pitcher HR** | 0.210 | 0.116 | 0.25-0.50 | Rare event (~3% of BF). HR/BF has r=0.267 YoY (weakest rate stat). Calibration is broken. |
+| **Pitcher Outs** | 0.232 | 0.124 | 2.58 | Driven by manager decisions, not statistical patterns. Not meaningfully a rate stat. |
 | **Batter HR** | -- | -- | -- | Too rare at game level (85% of batters hit 0 HR/game). Essentially a binary coin flip. |
 
 ---

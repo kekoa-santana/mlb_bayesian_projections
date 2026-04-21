@@ -81,6 +81,8 @@ class GameContext:
     catcher_k_lift: float = 0.0
     catcher_bb_lift: float = 0.0
     xgb_bb_lift: float = 0.0
+    rest_k_lift: float = 0.0
+    rest_bb_lift: float = 0.0
 
 
 _EMPTY_CONTEXT = GameContext()
@@ -128,10 +130,7 @@ class PAOutcomeModel:
         self.bip_model = bip_model or BIPOutcomeModel()
         self.hbp_rate = hbp_rate
 
-    @staticmethod
-    def _safe_logit(p: np.ndarray | float) -> np.ndarray | float:
-        """Logit with clipping."""
-        return safe_logit(p)
+    _safe_logit = staticmethod(safe_logit)  # alias for backward compat
 
     def compute_pa_probs(
         self,
@@ -198,7 +197,7 @@ class PAOutcomeModel:
             + matchup_k_lift + tto_k_lift + fatigue_k_lift
             + batter_quality_k_lift
             + _ctx.umpire_k_lift + _ctx.park_k_lift + _ctx.weather_k_lift
-            + _ctx.catcher_k_lift
+            + _ctx.catcher_k_lift + _ctx.rest_k_lift
         )
 
         # BB logit (+ pitcher form + XGB adjustment)
@@ -208,7 +207,7 @@ class PAOutcomeModel:
             + batter_quality_bb_lift
             + _ctx.umpire_bb_lift + _ctx.park_bb_lift
             + _ctx.form_bb_lift + _ctx.xgb_bb_lift
-            + _ctx.catcher_bb_lift
+            + _ctx.catcher_bb_lift + _ctx.rest_bb_lift
         )
 
         # HR logit
@@ -259,7 +258,7 @@ class PAOutcomeModel:
         probs: dict[str, float | np.ndarray],
         rng: np.random.Generator,
         n_draws: int = 1,
-        babip_adj: float = 0.0,
+        babip_adj: float | np.ndarray = 0.0,
         batter_bip_probs: np.ndarray | None = None,
     ) -> np.ndarray:
         """Draw PA outcomes from computed probabilities.
@@ -272,8 +271,9 @@ class PAOutcomeModel:
             Random number generator.
         n_draws : int
             Number of draws.
-        babip_adj : float
-            Pitcher BABIP adjustment for BIP outcomes.
+        babip_adj : float or np.ndarray
+            Pitcher BABIP adjustment for BIP outcomes. Scalar applies
+            uniformly; array shape ``(n_draws,)`` gives per-sim values.
         batter_bip_probs : np.ndarray, optional
             Shape (n_draws, 4) per-sample BIP probability vectors
             [out, single, double, triple]. When provided, BIP outcomes
@@ -322,16 +322,22 @@ class PAOutcomeModel:
         n_bip = bip_mask.sum()
 
         if n_bip > 0:
+            # Resolve per-BIP BABIP adjustment (scalar or per-sim array)
+            if isinstance(babip_adj, np.ndarray):
+                bip_babip = babip_adj[bip_mask]
+            else:
+                bip_babip = babip_adj
+
             if batter_bip_probs is not None:
                 # Per-sample BIP probs (batter-specific)
                 bip_outcomes = self.bip_model.draw_outcomes_per_sample(
                     rng=rng,
                     probs=batter_bip_probs[bip_mask],
-                    babip_adj=babip_adj,
+                    babip_adj=bip_babip,
                 )
             else:
                 bip_outcomes = self.bip_model.draw_outcomes(
-                    rng=rng, n_draws=n_bip, babip_adj=babip_adj
+                    rng=rng, n_draws=n_bip, babip_adj=bip_babip
                 )
             # Map BIP codes to PA codes
             bip_to_pa = {

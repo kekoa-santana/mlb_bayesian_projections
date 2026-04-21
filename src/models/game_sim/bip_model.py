@@ -242,7 +242,7 @@ class BIPOutcomeModel:
         self,
         rng: np.random.Generator,
         n_draws: int,
-        babip_adj: float = 0.0,
+        babip_adj: float | np.ndarray = 0.0,
     ) -> np.ndarray:
         """Draw BIP outcomes.
 
@@ -252,8 +252,9 @@ class BIPOutcomeModel:
             Random number generator.
         n_draws : int
             Number of draws.
-        babip_adj : float
-            BABIP adjustment.
+        babip_adj : float or np.ndarray
+            BABIP adjustment. Scalar applies uniformly; array shape
+            ``(n_draws,)`` gives per-sim values.
 
         Returns
         -------
@@ -261,16 +262,35 @@ class BIPOutcomeModel:
             Integer outcome codes, shape (n_draws,).
             0 = out, 1 = single, 2 = double, 3 = triple.
         """
-        probs = self.get_adjusted_probs(babip_adj)
-        # Ensure exact sum to 1.0 for numpy multinomial
-        probs = probs / probs.sum()
-        return rng.choice(4, size=n_draws, p=probs)
+        if isinstance(babip_adj, np.ndarray) and babip_adj.ndim >= 1:
+            # Per-sim BABIP: build per-sample probs and use inverse CDF
+            base = self.get_adjusted_probs(0.0)  # (4,)
+            p = np.broadcast_to(base, (n_draws, 4)).copy()
+            nonzero = np.abs(babip_adj) >= 0.001
+            if nonzero.any():
+                hit_p = p[nonzero, 1:].sum(axis=1)
+                safe_hit = np.where(hit_p > 1e-9, hit_p, 1e-9)
+                new_hit = np.clip(hit_p + babip_adj[nonzero], 0.05, 0.50)
+                scale = new_hit / safe_hit
+                p[nonzero, 1:] = p[nonzero, 1:] * scale[:, None]
+                p[nonzero, 0] = 1.0 - p[nonzero, 1:].sum(axis=1)
+            p = np.clip(p, 1e-9, 1.0)
+            p = p / p.sum(axis=1, keepdims=True)
+            # Inverse CDF sampling
+            u = rng.random(n_draws)
+            cum = np.cumsum(p[:, :-1], axis=1)
+            outcomes = (u[:, None] >= cum).sum(axis=1).astype(np.int8)
+            return outcomes
+        else:
+            probs = self.get_adjusted_probs(babip_adj)
+            probs = probs / probs.sum()
+            return rng.choice(4, size=n_draws, p=probs)
 
     def draw_outcomes_per_sample(
         self,
         rng: np.random.Generator,
         probs: np.ndarray,
-        babip_adj: float = 0.0,
+        babip_adj: float | np.ndarray = 0.0,
     ) -> np.ndarray:
         """Draw BIP outcomes where each sample has its own probability vector.
 

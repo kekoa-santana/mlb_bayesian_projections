@@ -1,6 +1,6 @@
 # MLB Fantasy ETL — Full Schema Reference
 
-> Generated 2026-03-13. Database: `mlb_fantasy` on `localhost:5433`.
+> Generated 2026-03-13. Database configured via `.env` (see project root).
 
 ---
 
@@ -1475,9 +1475,9 @@ Cleaned and typed versions of raw data. Statcast tables are loaded from parquet 
 ## Connection Details
 
 ```
-Host: localhost
-Port: 5433
-Database: mlb_fantasy
+Host: (see .env)
+Port: (see .env)
+Database: (see .env)
 Driver: postgresql+psycopg
 Schemas: raw, staging, production, fantasy
 ```

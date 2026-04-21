@@ -83,6 +83,46 @@ def test_empty_input_returns_empty_df():
     assert "daily_standout_score" in p.columns
 
 
+def test_empty_hitter_daily_has_dashboard_required_columns():
+    """Empty hitter daily output must carry the columns the dashboard reads."""
+    out = daily_standouts.score_hitter_daily(pd.DataFrame())
+    required = {
+        "batter_id", "batter_name", "daily_standout_score",
+        "hits", "hr", "rbi", "ops", "woba",
+    }
+    assert required.issubset(set(out.columns))
+
+
+def test_empty_pitcher_daily_has_dashboard_required_columns():
+    """Empty pitcher daily output must carry the columns the dashboard reads."""
+    out = daily_standouts.score_pitcher_daily(pd.DataFrame())
+    required = {
+        "pitcher_id", "pitcher_name", "role", "daily_standout_score",
+        "k", "era", "whip",
+    }
+    assert required.issubset(set(out.columns))
+
+
+def test_empty_hitter_daily_exposes_farthest_hr_column():
+    """Nice-to-have: farthest HR candidate column is advertised in empty schema."""
+    out = daily_standouts.score_hitter_daily(pd.DataFrame())
+    assert "max_hr_distance" in out.columns
+
+
+def test_hitter_daily_passes_through_max_hr_distance():
+    df = pd.DataFrame([
+        _make_hitter_row(batter_id=1, batter_name="Bomber", hr=2,
+                         **{"max_hr_distance": 445.0}),
+        _make_hitter_row(batter_id=2, batter_name="NoHR", hr=0,
+                         **{"max_hr_distance": None}),
+    ])
+    out = daily_standouts.score_hitter_daily(df)
+    bomber = out.loc[out["batter_id"] == 1].iloc[0]
+    no_hr = out.loc[out["batter_id"] == 2].iloc[0]
+    assert bomber["max_hr_distance"] == 445.0
+    assert pd.isna(no_hr["max_hr_distance"])
+
+
 def test_build_daily_standout_boards_adds_core_delta(monkeypatch):
     monkeypatch.setattr(
         daily_standouts,

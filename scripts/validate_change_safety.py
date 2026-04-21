@@ -26,11 +26,9 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-DASHBOARD_DIR = (
-    Path(r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard")
-    / "data"
-    / "dashboard"
-)
+from src.data.paths import dashboard_dir
+
+DASHBOARD_DIR = dashboard_dir()
 
 logging.basicConfig(
     level=logging.INFO,

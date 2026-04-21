@@ -104,6 +104,62 @@ def get_hitter_team_venue(season: int) -> pd.DataFrame:
     return read_sql(query, {"season": season})
 
 
+def get_pitcher_team_venue(season: int) -> pd.DataFrame:
+    """Map each pitcher to their primary team and home venue for a season.
+
+    Uses pitching boxscores to find the team where each pitcher played the
+    most games, then maps that team to its home venue via dim_game.
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: pitcher_id, team_id, venue_id.
+    """
+    query = """
+    WITH pitcher_teams AS (
+        SELECT
+            pb.pitcher_id,
+            pb.team_id,
+            COUNT(*) AS games,
+            ROW_NUMBER() OVER (
+                PARTITION BY pb.pitcher_id ORDER BY COUNT(*) DESC
+            ) AS rn
+        FROM staging.pitching_boxscores pb
+        JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
+        WHERE dg.season = :season
+          AND dg.game_type = 'R'
+        GROUP BY pb.pitcher_id, pb.team_id
+    ),
+    team_venue AS (
+        SELECT
+            home_team_id AS team_id,
+            venue_id,
+            ROW_NUMBER() OVER (
+                PARTITION BY home_team_id ORDER BY COUNT(*) DESC
+            ) AS rn
+        FROM production.dim_game
+        WHERE season = :season
+          AND game_type = 'R'
+        GROUP BY home_team_id, venue_id
+    )
+    SELECT
+        pt.pitcher_id,
+        pt.team_id,
+        tv.venue_id
+    FROM pitcher_teams pt
+    JOIN team_venue tv ON pt.team_id = tv.team_id AND tv.rn = 1
+    WHERE pt.rn = 1
+    ORDER BY pt.pitcher_id
+    """
+    logger.info("Fetching pitcher team-venue mapping for %d", season)
+    return read_sql(query, {"season": season})
+
+
 # ---------------------------------------------------------------------------
 # Umpire tendencies (K, BB, HR rate)
 # ---------------------------------------------------------------------------

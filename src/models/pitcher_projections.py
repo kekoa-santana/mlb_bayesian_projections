@@ -302,6 +302,25 @@ def project_forward(
         (first_df["season"] == from_season) & (first_df["batters_faced"] >= min_bf)
     ][keep_cols].copy()
 
+    # Fallback: players from prior season who aren't in from_season yet.
+    # These get preseason-style projections with wider uncertainty.
+    prior_season = from_season - 1
+    current_ids = set(base["pitcher_id"])
+    prior_df = first_df[
+        (first_df["season"] == prior_season)
+        & (first_df["batters_faced"] >= min_bf)
+        & ~first_df["pitcher_id"].isin(current_ids)
+    ][keep_cols].copy()
+    if len(prior_df) > 0:
+        # Adjust age +1 for the projection year
+        prior_df["age"] = prior_df["age"] + 1
+        prior_df["season"] = from_season
+        base = pd.concat([base, prior_df], ignore_index=True)
+        logger.info(
+            "Added %d fallback pitchers from %d (not yet in %d)",
+            len(prior_df), prior_season, from_season,
+        )
+
     if len(base) == 0:
         logger.warning("No pitchers found in season %d with >= %d BF",
                         from_season, min_bf)

@@ -320,12 +320,12 @@ def simulate_batter_game(
         k_pitcher_lift = np.where(
             vs_starter_active,
             starter_k_lift[active] + matchup_k_lift,
-            bullpen_k_lift[active],  # K matchup lift skipped — adds noise for relievers
+            bullpen_k_lift[active] + bullpen_matchup_k_lift,
         )
         bb_pitcher_lift = np.where(
             vs_starter_active,
             starter_bb_lift[active] + matchup_bb_lift,
-            bullpen_bb_lift[active],  # BB matchup lift skipped — adds noise for relievers
+            bullpen_bb_lift[active] + bullpen_matchup_bb_lift,
         )
         hr_pitcher_lift = np.where(
             vs_starter_active,

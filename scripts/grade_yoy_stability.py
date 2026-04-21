@@ -7,7 +7,8 @@ grades are projectable (high r) vs volatile (low r).
 Also tests: is the grade composite more stable than its individual components?
 """
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import logging
 logging.basicConfig(level=logging.WARNING)

@@ -239,6 +239,24 @@ def project_forward(
         (first_df["season"] == from_season) & (first_df["pa"] >= min_pa)
     ][keep_cols].copy()
 
+    # Fallback: players from prior season who aren't in from_season yet.
+    # These get preseason-style projections with wider uncertainty.
+    prior_season = from_season - 1
+    current_ids = set(base["batter_id"])
+    prior_df = first_df[
+        (first_df["season"] == prior_season)
+        & (first_df["pa"] >= min_pa)
+        & ~first_df["batter_id"].isin(current_ids)
+    ][keep_cols].copy()
+    if len(prior_df) > 0:
+        prior_df["age"] = prior_df["age"] + 1
+        prior_df["season"] = from_season
+        base = pd.concat([base, prior_df], ignore_index=True)
+        logger.info(
+            "Added %d fallback hitters from %d (not yet in %d)",
+            len(prior_df), prior_season, from_season,
+        )
+
     if len(base) == 0:
         logger.warning("No players found in season %d with >= %d PA",
                        from_season, min_pa)

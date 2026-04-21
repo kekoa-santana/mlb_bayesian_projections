@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from src.models.reliever_roles import RelieverRolePriors, get_role_priors
+from src.utils.constants import SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -916,9 +917,9 @@ def simulate_hitter_season(
         batter_bb_rate_samples=bb_rate_samples,
         batter_hr_rate_samples=hr_rate_samples,
         batting_order=batting_order,
-        starter_k_rate=0.226,   # league average
-        starter_bb_rate=0.082,
-        starter_hr_rate=0.031,
+        starter_k_rate=SIM_LEAGUE_K_RATE,   # league average
+        starter_bb_rate=SIM_LEAGUE_BB_RATE,
+        starter_hr_rate=SIM_LEAGUE_HR_RATE,
         starter_bf_mu=22.0,
         starter_bf_sigma=4.5,
         bullpen_k_rate=0.253,

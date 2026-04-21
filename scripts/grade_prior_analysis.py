@@ -6,7 +6,8 @@ raw stat_Y in year N -> stat_Y in year N+1, then the grade composite
 contains more signal about true talent and should inform the Bayesian prior.
 """
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import logging
 logging.basicConfig(level=logging.WARNING)

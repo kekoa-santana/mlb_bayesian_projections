@@ -25,6 +25,13 @@ import pandas as pd
 from scipy.special import logit as _logit
 
 from precompute import DASHBOARD_DIR, FROM_SEASON, SEASONS, save_dashboard_parquet
+from src.utils.constants import (
+    BABIP_LD_COEFF,
+    BABIP_LEAGUE_LD_RATE,
+    BABIP_LEAGUE_SPEED,
+    BABIP_SPEED_COEFF,
+)
+from src.utils.weather import parse_temp_bucket, wind_category
 
 logger = logging.getLogger("precompute.confident_picks")
 
@@ -215,8 +222,6 @@ def run(
 
     # LD%-based BABIP adjustments for batter sim
     ld_babip_lookup: dict[int, float] = {}
-    _LD_BABIP_COEFFICIENT = 0.25
-    _LEAGUE_LD_RATE = 0.22
     try:
         ld_df = pd.read_parquet(DASHBOARD_DIR / "batter_ld_rate.parquet")
         if not ld_df.empty:
@@ -225,8 +230,8 @@ def run(
                 .groupby("player_id").last().reset_index()
             )
             for _, lr in ld_latest.iterrows():
-                ld_dev = float(lr["ld_rate_regressed"]) - _LEAGUE_LD_RATE
-                ld_babip_lookup[int(lr["player_id"])] = ld_dev * _LD_BABIP_COEFFICIENT
+                ld_dev = float(lr["ld_rate_regressed"]) - BABIP_LEAGUE_LD_RATE
+                ld_babip_lookup[int(lr["player_id"])] = ld_dev * BABIP_LD_COEFF
             logger.info(
                 "Loaded LD%% BABIP adjustments for %d batters",
                 len(ld_babip_lookup),
@@ -279,8 +284,6 @@ def run(
 
     # Sprint speed BABIP adjustments (stacks with LD%)
     speed_babip_lookup: dict[int, float] = {}
-    _LEAGUE_SPRINT_SPEED = 27.0
-    _SPEED_BABIP_COEFFICIENT = 0.010
     try:
         speed_df = pd.read_parquet(DASHBOARD_DIR / "batter_sprint_speed.parquet")
         if not speed_df.empty:
@@ -289,9 +292,9 @@ def run(
                 .groupby("player_id").last().reset_index()
             )
             for _, sr in speed_latest.iterrows():
-                speed_dev = float(sr["sprint_speed_regressed"]) - _LEAGUE_SPRINT_SPEED
+                speed_dev = float(sr["sprint_speed_regressed"]) - BABIP_LEAGUE_SPEED
                 speed_babip_lookup[int(sr["player_id"])] = (
-                    speed_dev * _SPEED_BABIP_COEFFICIENT
+                    speed_dev * BABIP_SPEED_COEFF
                 )
             logger.info(
                 "Loaded sprint speed BABIP adjustments for %d batters",
@@ -1888,45 +1891,6 @@ def _lookup_name(
     return str(player_id)
 
 
-def _parse_temp_bucket(temp) -> str:
-    """Convert temperature to bucket string.
-
-    Bucket cutoffs and labels MUST match the SQL in
-    src/data/queries/environment.py:291-296 so lookups against
-    weather_effects.parquet actually resolve. Returns "unknown" when
-    input is missing so the downstream lookup falls through to neutral
-    lift (previously returned "moderate" which never matched any bucket
-    in the table — silent zero-lift, but for the wrong reason).
-    """
-    if temp is None or (isinstance(temp, float) and np.isnan(temp)):
-        return "unknown"
-    try:
-        t = float(temp)
-    except (TypeError, ValueError):
-        return "unknown"
-    if t < 55:
-        return "cold"
-    if t <= 69:
-        return "cool"
-    if t <= 84:
-        return "warm"
-    return "hot"
-
-
-def _wind_category(game: dict) -> str:
-    """Return the weather direction bucket for a game row.
-
-    Reads pre-parsed ``weather_wind_direction`` (populated by
-    ``fetch_todays_schedule`` via ``parse_wind_string``). Falls back
-    to "unknown" if the field is missing or empty so the
-    ``weather_effects.parquet`` lookup safely returns None → zero
-    lift. Matches categories in ``production.dim_weather``:
-    ``in``/``out``/``cross``/``none``/``unknown``.
-    """
-    direction = game.get("weather_wind_direction")
-    if direction is None or (isinstance(direction, float) and np.isnan(direction)):
-        return "unknown"
-    direction = str(direction).strip().lower()
-    if direction in ("in", "out", "cross", "none"):
-        return direction
-    return "unknown"
+# Weather helpers imported from src.utils.weather
+_parse_temp_bucket = parse_temp_bucket
+_wind_category = wind_category

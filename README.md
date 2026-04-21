@@ -53,8 +53,8 @@ Hierarchical Bayesian models (PyMC) estimate true-talent rates for every player 
 
 | | Hitters | Pitchers |
 |---|---|---|
-| **Stats** | K%, BB%, HR/PA, wOBA | K%, BB%, HR/BF |
-| **Structure** | Partial pooling across players, AR(1) process for year-to-year evolution, age-bucket priors, Statcast skill covariates | Same + starter/reliever role adjustment |
+| **Stats** | K%, BB%, GB%, FB%, HR/FB | K%, BB%, HR/BF |
+| **Structure** | Partial pooling across players, AR(2) process for year-to-year evolution, age-bucket priors (4 buckets), Statcast skill covariates | Same (3 age buckets) + starter/reliever role adjustment |
 | **Output** | Full posterior per player per stat | Full posterior per player per stat |
 
 ### Layer 2: Pitch-Type Matchup Model
@@ -182,7 +182,7 @@ Built on a PostgreSQL database with comprehensive MLB data (2018-2025):
 
 ### Complete
 - Hierarchical Bayesian models for hitter (K%, BB%, GB%, FB%, HR/FB) and pitcher (K%, BB%, HR/BF)
-- AR(1) talent evolution with age-bucket x Statcast skill tier priors
+- AR(2) talent evolution with age-bucket x Statcast skill tier priors
 - PA-by-PA game simulator (pitcher + batter) with matchup, TTO, umpire, park, weather adjustments
 - MiLB translation factors, prospect rankings, MLB readiness model
 - TDD 20-80 scouting grades with Bayesian grade confidence intervals
@@ -206,7 +206,7 @@ player_profiles/                          # Projection engine only
 ├── src/
 │   ├── data/
 │   │   ├── db.py                         # Database connection
-│   │   ├── queries.py                    # SQL query functions
+│   │   ├── queries/                      # SQL query package (hitter, pitcher, game, etc.)
 │   │   ├── feature_eng.py                # Pitch-type profiles & caching
 │   │   ├── milb_translation.py           # MiLB-to-MLB translation factors
 │   │   ├── league_baselines.py          # Per-pitch-type population baselines
@@ -255,8 +255,7 @@ player_profiles/                          # Projection engine only
 ├── data/cached/                          # Parquet cache (~60 files)
 ├── outputs/                              # Backtest CSVs & content PNGs
 ├── docs/                                 # Documentation
-├── pyproject.toml                        # Dependencies & config
-└── swe_plan.md                           # Enhancement roadmap
+└── pyproject.toml                        # Dependencies & config
 ```
 
 ---
@@ -265,7 +264,7 @@ player_profiles/                          # Projection engine only
 
 ### Prerequisites
 - Python 3.11+
-- PostgreSQL database (`mlb_fantasy` on `localhost:5433`)
+- PostgreSQL database (configured via `.env`; see Database section in CLAUDE.md)
 - PyMC, ArviZ, pandas, numpy (see `pyproject.toml`)
 
 ### Installation
@@ -277,9 +276,9 @@ cd player_profiles
 # Install dependencies
 pip install -e .
 
-# Set up database connection (copy .env.example to .env)
-cp .env.example .env
-# Edit .env with your database credentials
+# Set up database connection
+# Create a .env file with your database credentials (see CLAUDE.md for schema details)
+cp .env .env.bak  # back up if editing an existing .env
 ```
 
 ### Run Projections
@@ -314,7 +313,7 @@ python scripts/run_game_prop_backtest.py --side pitcher --stat k bb
 
 ## License
 
-This project is proprietary. All rights reserved.
+This project is licensed under the [MIT License](LICENSE).
 
 ---
 

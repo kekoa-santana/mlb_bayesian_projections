@@ -27,6 +27,7 @@ from sklearn.metrics import brier_score_loss
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.data.paths import dashboard_dir
 from src.evaluation.metrics import compute_ece, compute_temperature
 
 logging.basicConfig(
@@ -35,9 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DASHBOARD_DIR = Path(
-    r"C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard"
-)
+DASHBOARD_DIR = dashboard_dir()
 
 # game_props.parquet uses generic "expected" / "actual" / "p_over" columns
 # with a "stat" column to distinguish K, BB, HR, H, Outs, TB, etc.

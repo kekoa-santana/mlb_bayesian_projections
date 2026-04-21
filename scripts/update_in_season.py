@@ -36,6 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.paths import dashboard_dir, dashboard_repo
+from src.utils.weather import parse_temp_bucket, wind_category
 
 DASHBOARD_REPO = dashboard_repo()
 DASHBOARD_DIR = dashboard_dir()
@@ -50,32 +51,9 @@ logger = logging.getLogger(__name__)
 SEASON = 2026
 
 
-def _parse_temp_bucket(temp) -> str:
-    """Convert temperature to dim_weather bucket. Mirrors confident_picks."""
-    if temp is None or (isinstance(temp, float) and np.isnan(temp)):
-        return "unknown"
-    try:
-        t = float(temp)
-    except (TypeError, ValueError):
-        return "unknown"
-    if t < 55:
-        return "cold"
-    if t <= 69:
-        return "cool"
-    if t <= 84:
-        return "warm"
-    return "hot"
-
-
-def _wind_category(game) -> str:
-    """Read pre-parsed weather_wind_direction from a schedule row."""
-    direction = game.get("weather_wind_direction") if hasattr(game, "get") else None
-    if direction is None or (isinstance(direction, float) and np.isnan(direction)):
-        return "unknown"
-    direction = str(direction).strip().lower()
-    if direction in ("in", "out", "cross", "none"):
-        return direction
-    return "unknown"
+# Weather helpers imported from src.utils.weather
+_parse_temp_bucket = parse_temp_bucket
+_wind_category = wind_category
 
 
 # Rate stats to update via conjugate updating
@@ -502,6 +480,44 @@ def simulate_todays_games(
             "Loaded team defense lifts for %d teams", len(defense_babip_lookup),
         )
 
+    # Days-rest data for rest adjustments. Build a (pitcher_id, game_date)
+    # lookup from the schedule: difference between today's start and the
+    # pitcher's most recent prior start.
+    from src.models.rest_adjustment import get_rest_adjustment
+    rest_lift_lookup: dict[int, dict[str, float]] = {}
+    try:
+        from src.data.queries.environment import get_days_rest
+        _rest_df = get_days_rest(seasons=[SEASON - 1, SEASON])
+        if not _rest_df.empty:
+            # Keep most recent entry per pitcher (closest to today)
+            _rest_df = _rest_df.sort_values("game_date").drop_duplicates(
+                "pitcher_id", keep="last"
+            )
+            for _, rr in _rest_df.iterrows():
+                rest_lift_lookup[int(rr["pitcher_id"])] = get_rest_adjustment(
+                    int(rr["days_rest"])
+                )
+            logger.info("Loaded rest data for %d pitchers", len(rest_lift_lookup))
+    except Exception as e:
+        logger.warning("Failed to load days-rest data: %s", e)
+
+    # Catcher framing lifts. Pre-computed per (catcher_id, season) logit
+    # lifts applied through GameContext.catcher_k_lift/catcher_bb_lift.
+    from src.data.catcher_framing import get_catcher_framing_lift
+    catcher_framing_df: pd.DataFrame | None = None
+    try:
+        from src.data.queries.environment import get_catcher_framing_effects
+        catcher_framing_df = get_catcher_framing_effects(
+            seasons=list(range(2020, SEASON + 1))
+        )
+        if catcher_framing_df is not None and not catcher_framing_df.empty:
+            logger.info(
+                "Loaded catcher framing data: %d catcher-seasons",
+                len(catcher_framing_df),
+            )
+    except Exception as e:
+        logger.warning("Failed to load catcher framing data: %s", e)
+
     # Hitter BB samples for lineup BB rate computation
     hitter_bb_npz: dict[str, np.ndarray] = {}
     _hbb_path = DASHBOARD_DIR / "hitter_bb_samples.npz"
@@ -713,6 +729,11 @@ def simulate_todays_games(
             # Pitcher form lift (BB% only — K% form near-zero for pitchers)
             pit_form = pitcher_form_lifts.get(pid, PitcherFormLifts())
 
+            # Rest adjustments for this pitcher
+            _rest_adj = rest_lift_lookup.get(pid, {})
+            _rest_k_lift = float(_rest_adj.get("k_lift", 0.0))
+            _rest_bb_lift = float(_rest_adj.get("bb_lift", 0.0))
+
             # XGBoost game-level BB adjustment
             xgb_bb_delta = 0.0
             if bb_adj_bundle is not None and bb_adj_bundle.get("model") is not None:
@@ -737,7 +758,7 @@ def simulate_todays_games(
                     umpire_bb_lift=ump_bb,
                     lineup_avg_bb_rate=lineup_avg_bb,
                     is_home=int(side == "home"),
-                    days_rest=5,
+                    days_rest=int(_rest_adj.get("days_rest", 5) or 5),
                 )
 
             # Park + umpire lifts for this game. venue_id and hp_umpire_name
@@ -797,6 +818,18 @@ def simulate_todays_games(
                     BULLPEN_K_RATE, BULLPEN_BB_RATE, BULLPEN_HR_RATE,
                 )
 
+            # Catcher framing for the opposing team's catcher
+            _catcher_k_lift = 0.0
+            _catcher_bb_lift = 0.0
+            opp_side = "home" if side == "away" else "away"
+            opp_catcher_id = game.get(f"{opp_side}_catcher_id")
+            if opp_catcher_id and pd.notna(opp_catcher_id) and catcher_framing_df is not None:
+                _cf = get_catcher_framing_lift(
+                    int(opp_catcher_id), SEASON, catcher_framing_df,
+                )
+                _catcher_k_lift = _cf["k_logit_lift"]
+                _catcher_bb_lift = _cf["bb_logit_lift"]
+
             # Run PA-by-PA simulation
             try:
                 sim = simulate_game(
@@ -819,7 +852,11 @@ def simulate_todays_games(
                         weather_k_lift=wx_k_lift,
                         weather_hr_lift=wx_hr_lift,
                         form_bb_lift=pit_form.bb_lift,
+                        catcher_k_lift=_catcher_k_lift,
+                        catcher_bb_lift=_catcher_bb_lift,
                         xgb_bb_lift=xgb_bb_delta,
+                        rest_k_lift=_rest_k_lift,
+                        rest_bb_lift=_rest_bb_lift,
                     ),
                     mu_bf=mu_bf_val,
                     sigma_bf=sigma_bf_val,
@@ -965,6 +1002,87 @@ def update_season_stats_step() -> tuple[pd.DataFrame, pd.DataFrame]:
         logger.warning("Pitcher traditional stats failed: %s", e)
 
     return h_trad, p_trad
+
+
+def update_advanced_stats_step() -> None:
+    """Save observed advanced/Statcast stats for hitters and pitchers.
+
+    Queries fact_batting_advanced, fact_pitching_advanced, and pitch-level
+    observed profiles to build population-level parquets suitable for
+    percentile ranking on the dashboard.
+    """
+    from src.data.db import read_sql
+    from src.data.queries.hitter import get_hitter_observed_profile
+    from src.data.queries.pitcher import get_pitcher_observed_profile
+
+    # ---- Hitter advanced ----
+    try:
+        h_adv = read_sql("""
+            SELECT batter_id, season, pa, xba, xslg, xwoba, wrc_plus,
+                   barrel_pct, hard_hit_pct, sweet_spot_pct, k_pct, bb_pct
+            FROM production.fact_batting_advanced
+            WHERE season = :season AND pa >= 10
+        """, {"season": SEASON})
+
+        h_obs = get_hitter_observed_profile(SEASON)
+        if not h_adv.empty and not h_obs.empty:
+            obs_cols = ["batter_id", "whiff_rate", "chase_rate",
+                        "z_contact_pct", "avg_exit_velo", "fb_pct",
+                        "hard_hit_pct"]
+            obs_avail = [c for c in obs_cols if c in h_obs.columns]
+            h_merged = h_adv.merge(h_obs[obs_avail], on="batter_id", how="left",
+                                   suffixes=("", "_obs"))
+            # Prefer pitch-level hard_hit if available
+            if "hard_hit_pct_obs" in h_merged.columns:
+                h_merged["hard_hit_pct"] = h_merged["hard_hit_pct"].fillna(
+                    h_merged.pop("hard_hit_pct_obs"))
+        elif not h_adv.empty:
+            h_merged = h_adv
+        else:
+            h_merged = pd.DataFrame()
+
+        if not h_merged.empty:
+            h_merged.to_parquet(
+                DASHBOARD_DIR / "hitter_advanced.parquet", index=False)
+            logger.info("Saved hitter_advanced.parquet: %d rows", len(h_merged))
+        else:
+            logger.info("No 2026 hitter advanced stats yet")
+    except Exception as e:
+        logger.warning("Hitter advanced stats failed: %s", e)
+
+    # ---- Pitcher advanced ----
+    try:
+        p_adv = read_sql("""
+            SELECT pitcher_id, season, batters_faced, k_pct, bb_pct,
+                   swstr_pct, csw_pct, zone_pct, chase_pct, contact_pct,
+                   xwoba_against, barrel_pct_against, hard_hit_pct_against
+            FROM production.fact_pitching_advanced
+            WHERE season = :season AND batters_faced >= 10
+        """, {"season": SEASON})
+
+        p_obs = get_pitcher_observed_profile(SEASON)
+        if not p_adv.empty and not p_obs.empty:
+            obs_cols = ["pitcher_id", "whiff_rate", "avg_velo",
+                        "release_extension", "zone_pct", "gb_pct"]
+            obs_avail = [c for c in obs_cols if c in p_obs.columns]
+            p_merged = p_adv.merge(p_obs[obs_avail], on="pitcher_id", how="left",
+                                   suffixes=("", "_obs"))
+            if "zone_pct_obs" in p_merged.columns:
+                p_merged["zone_pct"] = p_merged["zone_pct"].fillna(
+                    p_merged.pop("zone_pct_obs"))
+        elif not p_adv.empty:
+            p_merged = p_adv
+        else:
+            p_merged = pd.DataFrame()
+
+        if not p_merged.empty:
+            p_merged.to_parquet(
+                DASHBOARD_DIR / "pitcher_advanced.parquet", index=False)
+            logger.info("Saved pitcher_advanced.parquet: %d rows", len(p_merged))
+        else:
+            logger.info("No 2026 pitcher advanced stats yet")
+    except Exception as e:
+        logger.warning("Pitcher advanced stats failed: %s", e)
 
 
 def refresh_prospect_rankings() -> None:
@@ -1411,6 +1529,10 @@ def main() -> None:
     # Step 5: Update 2026 season stats (traditional stats for leaders page)
     logger.info("Step 5: Updating 2026 season stats...")
     h_trad, p_trad = update_season_stats_step()
+
+    # Step 5b: Update advanced/Statcast stats for percentile populations
+    logger.info("Step 5b: Updating advanced stats (Statcast + observed profiles)...")
+    update_advanced_stats_step()
 
     # Step 6 (weekly only): Refresh player + team + prospect rankings
     if args.weekly:

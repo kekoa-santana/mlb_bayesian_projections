@@ -200,17 +200,17 @@ def run_weekly_form(
         hitters = boards.get("hitters", pd.DataFrame())
         pitchers = boards.get("pitchers", pd.DataFrame())
 
-        if not hitters.empty:
-            save_dashboard_parquet(hitters, "hitters_weekly_form.parquet")
-            logger.info("Saved hitters_weekly_form.parquet: %d rows", len(hitters))
-        else:
-            logger.warning("No hitter weekly form rows generated")
+        # Write even when empty: the empty DataFrames carry the dashboard-facing
+        # schema so downstream readers stay deterministic.
+        save_dashboard_parquet(hitters, "hitters_weekly_form.parquet")
+        logger.info("Saved hitters_weekly_form.parquet: %d rows", len(hitters))
+        if hitters.empty:
+            logger.warning("No hitter weekly form rows generated (empty schema written)")
 
-        if not pitchers.empty:
-            save_dashboard_parquet(pitchers, "pitchers_weekly_form.parquet")
-            logger.info("Saved pitchers_weekly_form.parquet: %d rows", len(pitchers))
-        else:
-            logger.warning("No pitcher weekly form rows generated")
+        save_dashboard_parquet(pitchers, "pitchers_weekly_form.parquet")
+        logger.info("Saved pitchers_weekly_form.parquet: %d rows", len(pitchers))
+        if pitchers.empty:
+            logger.warning("No pitcher weekly form rows generated (empty schema written)")
     except Exception:
         logger.exception("Failed to build weekly form leaderboards")
 
@@ -243,16 +243,82 @@ def run_daily_standouts(
         hitters = boards.get("hitters", pd.DataFrame())
         pitchers = boards.get("pitchers", pd.DataFrame())
 
-        if not hitters.empty:
-            save_dashboard_parquet(hitters, "hitters_daily_standouts.parquet")
-            logger.info("Saved hitters_daily_standouts.parquet: %d rows", len(hitters))
-        else:
-            logger.warning("No hitter daily standout rows generated")
+        # Write even when empty: the empty DataFrames carry the dashboard-facing
+        # schema so downstream readers stay deterministic.
+        save_dashboard_parquet(hitters, "hitters_daily_standouts.parquet")
+        logger.info("Saved hitters_daily_standouts.parquet: %d rows", len(hitters))
+        if hitters.empty:
+            logger.warning("No hitter daily standout rows generated (empty schema written)")
 
-        if not pitchers.empty:
-            save_dashboard_parquet(pitchers, "pitchers_daily_standouts.parquet")
-            logger.info("Saved pitchers_daily_standouts.parquet: %d rows", len(pitchers))
-        else:
-            logger.warning("No pitcher daily standout rows generated")
+        save_dashboard_parquet(pitchers, "pitchers_daily_standouts.parquet")
+        logger.info("Saved pitchers_daily_standouts.parquet: %d rows", len(pitchers))
+        if pitchers.empty:
+            logger.warning("No pitcher daily standout rows generated (empty schema written)")
     except Exception:
         logger.exception("Failed to build daily standout leaderboards")
+
+
+def run_live_standouts(
+    *,
+    game_date: "str | None" = None,
+) -> None:
+    """Build daily standouts + weekly form from live MLB API boxscores.
+
+    Intended for the 10-minute schedule-only refresh so the dashboard
+    shows today's completed games before the ETL loads them into the DB.
+    """
+    logger.info("=" * 60)
+    logger.info("Building live standouts from MLB API...")
+    try:
+        import pandas as pd
+        from src.data.live_boxscores import fetch_live_boxscores
+        from src.models.daily_standouts import build_daily_standout_boards
+        from src.models.weekly_form import build_weekly_form_boards
+
+        live = fetch_live_boxscores(game_date=game_date)
+        live_h = live["hitters"]
+        live_p = live["pitchers"]
+
+        if live_h.empty and live_p.empty:
+            logger.info("No completed games yet — skipping live standouts")
+            return
+
+        core_hitters = pd.DataFrame()
+        core_pitchers = pd.DataFrame()
+        h_core_path = DASHBOARD_DIR / "hitters_core_rankings.parquet"
+        p_core_path = DASHBOARD_DIR / "pitchers_core_rankings.parquet"
+        if h_core_path.exists():
+            core_hitters = pd.read_parquet(h_core_path)
+        if p_core_path.exists():
+            core_pitchers = pd.read_parquet(p_core_path)
+
+        # Daily standouts — today's completed games only
+        daily = build_daily_standout_boards(
+            game_date=game_date,
+            core_hitters=core_hitters,
+            core_pitchers=core_pitchers,
+            live_hitters=live_h,
+            live_pitchers=live_p,
+        )
+        for key, fname in (("hitters", "hitters_daily_standouts.parquet"),
+                           ("pitchers", "pitchers_daily_standouts.parquet")):
+            df = daily.get(key, pd.DataFrame())
+            save_dashboard_parquet(df, fname)
+            logger.info("Saved %s: %d rows", fname, len(df))
+
+        # Weekly form — 13 days from DB + today's live data
+        weekly = build_weekly_form_boards(
+            days=14,
+            core_hitters=core_hitters,
+            core_pitchers=core_pitchers,
+            live_hitters=live_h,
+            live_pitchers=live_p,
+        )
+        for key, fname in (("hitters", "hitters_weekly_form.parquet"),
+                           ("pitchers", "pitchers_weekly_form.parquet")):
+            df = weekly.get(key, pd.DataFrame())
+            save_dashboard_parquet(df, fname)
+            logger.info("Saved %s: %d rows", fname, len(df))
+
+    except Exception:
+        logger.exception("Failed to build live standouts")

@@ -6,13 +6,16 @@ Usage:
     myenv/Scripts/python scripts/run_statcast_projections.py
 """
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import logging
 import time
 
 import pandas as pd
-from pathlib import Path
+
+from src.data.paths import dashboard_dir
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("statcast_projections")
 
-DASHBOARD_DIR = Path("C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/data/dashboard")
+DASHBOARD_DIR = dashboard_dir()
 
 
 def main():

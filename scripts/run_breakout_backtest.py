@@ -19,10 +19,11 @@ from pathlib import Path
 
 import pandas as pd
 import yaml
-from src.evaluation.runner import setup_logging
 
 # Project root on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.evaluation.runner import setup_logging
 
 logger = setup_logging("breakout_backtest")
 def _load_config() -> dict:

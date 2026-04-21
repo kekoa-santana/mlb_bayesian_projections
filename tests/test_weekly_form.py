@@ -77,6 +77,26 @@ def test_compute_pitcher_weekly_form_shrinks_low_bf_to_neutral():
     assert low["weekly_form_reliability"] < high["weekly_form_reliability"]
 
 
+def test_empty_hitter_weekly_has_dashboard_required_columns():
+    """Empty hitter weekly output must carry the columns the dashboard reads."""
+    out = weekly_form.compute_hitter_weekly_form(pd.DataFrame())
+    required = {
+        "batter_id", "batter_name", "weekly_form_score",
+        "hits_14d", "hr_14d", "woba_14d", "xwoba_14d", "k_rate_14d",
+    }
+    assert required.issubset(set(out.columns))
+
+
+def test_empty_pitcher_weekly_has_dashboard_required_columns():
+    """Empty pitcher weekly output must carry the columns the dashboard reads."""
+    out = weekly_form.compute_pitcher_weekly_form(pd.DataFrame())
+    required = {
+        "pitcher_id", "pitcher_name", "role_14d", "weekly_form_score",
+        "k_minus_bb_14d", "era_14d", "whip_14d",
+    }
+    assert required.issubset(set(out.columns))
+
+
 def test_build_weekly_form_boards_adds_core_delta(monkeypatch):
     monkeypatch.setattr(
         weekly_form,

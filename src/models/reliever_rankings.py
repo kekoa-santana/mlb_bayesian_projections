@@ -13,9 +13,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.data.paths import dashboard_dir
+
 logger = logging.getLogger(__name__)
 
-DASHBOARD_DIR = Path("C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/data/dashboard")
+DASHBOARD_DIR = dashboard_dir()
 
 # ---------------------------------------------------------------------------
 # Role-specific composite weights (sum to 1.0 per role)

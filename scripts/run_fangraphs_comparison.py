@@ -22,9 +22,13 @@ import logging
 import sys
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import pandas as pd
 
 from src.data.fangraphs import load_hitter_projections, load_pitcher_projections
+from src.data.paths import dashboard_dir
 from src.evaluation.fangraphs_comparison import (
     compare_hitter_rankings,
     compare_pitcher_rankings,
@@ -38,7 +42,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DASHBOARD_DIR = Path("C:/Users/kekoa/Documents/data_analytics/tdd-dashboard/data/dashboard")
+DASHBOARD_DIR = dashboard_dir()
 
 
 def _load_tdd_rankings() -> dict[str, pd.DataFrame]:

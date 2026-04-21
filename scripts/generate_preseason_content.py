@@ -24,20 +24,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.feature_eng import (
-    build_multi_season_k_data,
-    build_multi_season_pitcher_k_data,
+    build_multi_season_hitter_data,
+    build_multi_season_pitcher_data,
 )
-from src.models.posterior_utils import extract_pitcher_k_rate_samples
-from src.models.k_rate_model import (
-    extract_player_posteriors,
-    fit_k_rate_model,
-    prepare_model_data,
+from src.models.hitter_model import (
+    extract_posteriors as extract_hitter_posteriors,
+    extract_rate_samples as extract_hitter_rate_samples,
+    fit_hitter_model,
+    prepare_hitter_data,
 )
-from src.models.pitcher_k_rate_model import (
-    check_pitcher_convergence,
-    extract_pitcher_posteriors,
-    fit_pitcher_k_rate_model,
-    prepare_pitcher_model_data,
+from src.models.pitcher_model import (
+    check_convergence as check_pitcher_convergence,
+    extract_posteriors as extract_pitcher_posteriors,
+    extract_rate_samples as extract_pitcher_rate_samples,
+    fit_pitcher_model,
+    prepare_pitcher_data,
 )
 from src.viz.projections import (
     enrich_with_team_info,
@@ -92,16 +93,16 @@ def main() -> None:
     # 1. Pitcher K% model
     # =================================================================
     logger.info("Building pitcher data for %s", TRAIN_SEASONS)
-    df_pitcher = build_multi_season_pitcher_k_data(TRAIN_SEASONS, min_bf=9)
+    df_pitcher = build_multi_season_pitcher_data(TRAIN_SEASONS, min_bf=9)
 
     logger.info("Preparing and fitting pitcher K%% model (%d player-seasons)",
                 len(df_pitcher))
-    pitcher_data = prepare_pitcher_model_data(df_pitcher)
-    _pitcher_model, pitcher_trace = fit_pitcher_k_rate_model(
+    pitcher_data = prepare_pitcher_data(df_pitcher, "k_rate")
+    _pitcher_model, pitcher_trace = fit_pitcher_model(
         pitcher_data, draws=draws, tune=tune, chains=chains,
     )
 
-    convergence = check_pitcher_convergence(pitcher_trace)
+    convergence = check_pitcher_convergence(pitcher_trace, "k_rate")
     logger.info("Pitcher convergence: %s", "OK" if convergence["converged"] else "ISSUES")
 
     # Project forward
@@ -147,12 +148,12 @@ def main() -> None:
     # 2. Hitter K% model
     # =================================================================
     logger.info("Building hitter data for %s", TRAIN_SEASONS)
-    df_hitter = build_multi_season_k_data(TRAIN_SEASONS, min_pa=1)
+    df_hitter = build_multi_season_hitter_data(TRAIN_SEASONS, min_pa=1)
 
     logger.info("Preparing and fitting hitter K%% model (%d player-seasons)",
                 len(df_hitter))
-    hitter_data = prepare_model_data(df_hitter)
-    _hitter_model, hitter_trace = fit_k_rate_model(
+    hitter_data = prepare_hitter_data(df_hitter, "k_rate")
+    _hitter_model, hitter_trace = fit_hitter_model(
         hitter_data, draws=draws, tune=tune, chains=chains,
     )
 
@@ -210,7 +211,7 @@ def main() -> None:
         logger.info("Generating card for %s (id=%d)", name, pitcher_id)
 
         try:
-            samples = extract_pitcher_k_rate_samples(
+            samples = extract_pitcher_rate_samples(
                 pitcher_trace, pitcher_data,
                 pitcher_id=pitcher_id,
                 season=PROJECT_FROM,

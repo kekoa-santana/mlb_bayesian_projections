@@ -21,10 +21,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import yaml
 
 from src.data.paths import dashboard_dir
 from src.data.queries import get_hitter_breakout_features
+from src.models.breakout_utils import build_breakout_folds, load_breakout_config
 
 logger = logging.getLogger(__name__)
 
@@ -48,30 +48,6 @@ HITTER_FEATURES = [
 ]
 
 
-def _load_config() -> dict:
-    """Load breakout config from model.yaml."""
-    from src.data.paths import CONFIG_DIR
-
-    cfg_path = CONFIG_DIR / "model.yaml"
-    if cfg_path.exists():
-        with open(cfg_path) as f:
-            cfg = yaml.safe_load(f)
-        return cfg.get("breakout", {})
-    return {}
-
-
-def _build_folds(cfg: dict) -> list[tuple[int, int]]:
-    """Build training fold list from config, skipping COVID seasons."""
-    start = cfg.get("folds_start", 2001)
-    end = cfg.get("folds_end", 2025)
-    skip_covid = cfg.get("skip_covid_deltas", True)
-
-    folds = []
-    for y in range(start, end):
-        if skip_covid and y in (2019, 2020):
-            continue
-        folds.append((y, y + 1))
-    return folds
 
 
 def _hitter_outcome_loader(season: int, min_pa: int) -> pd.DataFrame:
@@ -112,7 +88,7 @@ def score_breakout_candidates(
         train_breakout_model,
     )
 
-    cfg = _load_config()
+    cfg = load_breakout_config()
     hitter_cfg = cfg.get("hitter", {})
     xgb_cfg = cfg.get("xgb", {})
 
@@ -131,7 +107,7 @@ def score_breakout_candidates(
         xgb_params=xgb_cfg,
     )
 
-    folds = _build_folds(cfg)
+    folds = build_breakout_folds(cfg)
 
     # --- 1. Build training data ---
     logger.info("Building hitter breakout training data (%d folds)...", len(folds))
