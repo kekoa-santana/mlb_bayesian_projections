@@ -441,65 +441,13 @@ def run_league_sim(
                 tp, waa_deltas=waa_deltas, talent_scores=_talent_scores,
                 team_history=_team_hist,
             )
-        # ── Breakout model trajectory adjustment ──
-        # Uses the full XGBoost breakout model scores (Power Surge, Diamond
-        # in the Rough, Stuff Dominant, ERA Correction, Command Leap)
-        # weighted by projected PA/IP.  Each team gets a net breakout upside
-        # adjustment relative to league average.
-        _TRAJ_SCALE = 1.5   # wins per unit of above-average breakout score
-        _TRAJ_CAP = 3.0     # max ±wins adjustment
-        try:
-            _hr = pd.read_parquet(DASHBOARD_DIR / "hitters_rankings.parquet")
-            _pr = pd.read_parquet(DASHBOARD_DIR / "pitchers_rankings.parquet")
-            _hcs = pd.read_parquet(DASHBOARD_DIR / "hitter_counting_sim.parquet")
-            _pcs = pd.read_parquet(DASHBOARD_DIR / "pitcher_counting_sim.parquet")
-            _rost = pd.read_parquet(DASHBOARD_DIR / "roster.parquet")
-
-            # Hitter: PA-weighted breakout score
-            _hb = _hr[["batter_id", "breakout_score"]].merge(
-                _hcs[["batter_id", "total_pa_mean"]], on="batter_id", how="left",
-            ).merge(
-                _rost[["player_id", "org_id"]], left_on="batter_id",
-                right_on="player_id", how="left",
-            )
-            _hb["weighted_brk"] = (
-                _hb["breakout_score"] * _hb["total_pa_mean"].fillna(200) / 600
-            )
-
-            # Pitcher: IP-weighted breakout score
-            _pb = _pr[["pitcher_id", "breakout_score"]].merge(
-                _pcs[["pitcher_id", "projected_ip_mean"]], on="pitcher_id", how="left",
-            ).merge(
-                _rost[["player_id", "org_id"]], left_on="pitcher_id",
-                right_on="player_id", how="left",
-            )
-            _pb["weighted_brk"] = (
-                _pb["breakout_score"] * _pb["projected_ip_mean"].fillna(50) / 180
-            )
-
-            # Sum per team
-            team_brk: dict[int, float] = {}
-            for tid, grp in _hb.groupby("org_id"):
-                team_brk[int(tid)] = grp["weighted_brk"].sum()
-            for tid, grp in _pb.groupby("org_id"):
-                team_brk[int(tid)] = team_brk.get(int(tid), 0) + grp["weighted_brk"].sum()
-
-            # Convert to win adjustment relative to league average
-            lg_avg_brk = np.mean(list(team_brk.values())) if team_brk else 0
-            for tid in team_strength:
-                raw = (team_brk.get(tid, lg_avg_brk) - lg_avg_brk) * _TRAJ_SCALE
-                capped = max(-_TRAJ_CAP, min(_TRAJ_CAP, raw))
-                team_strength[tid] += capped / 162.0
-                team_strength[tid] = max(0.250, min(0.750, team_strength[tid]))
-            logger.info(
-                "Breakout trajectory applied: lg_avg=%.2f, range [%.2f, %.2f], "
-                "win adj range [%+.1f, %+.1f]",
-                lg_avg_brk, min(team_brk.values()), max(team_brk.values()),
-                (min(team_brk.values()) - lg_avg_brk) * _TRAJ_SCALE,
-                (max(team_brk.values()) - lg_avg_brk) * _TRAJ_SCALE,
-            )
-        except Exception:
-            logger.warning("Could not compute breakout trajectory", exc_info=True)
+        # NOTE: Breakout trajectory adjustment removed from league sim.
+        # The same PA/IP-weighted breakout_score signal is already captured
+        # by trajectory_component (12%) in build_power_rankings(). Including
+        # it here double-counted the signal: once via ±3 win adjustment to
+        # sim_wins_mean (which feeds wins_component at 70%), and again via
+        # trajectory_component directly. The league sim should be a pure
+        # schedule-aware RS/RA projection.
 
         logger.info(
             "Team strengths: min=%.3f, max=%.3f, spread=%.3f",
