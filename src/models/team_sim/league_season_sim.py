@@ -592,7 +592,6 @@ def simulate_league_season(
     if use_poisson:
         # ── Poisson mode (v2/v3) ──
         # Track rotation position per team: resets each sim
-        lg_ra9 = LG_AVG_RPG
 
         for sim in range(n_sims):
             # Reset rotation counters each season
@@ -605,6 +604,13 @@ def simulate_league_season(
                 )
             else:
                 sim_profiles = team_profiles
+
+            # Compute league-average RA/G from this sim's profiles so the
+            # odds-ratio interaction uses the correct denominator.  Using a
+            # hardcoded constant (e.g. 4.50) causes double-inflation when the
+            # injury cascade shifts the league-wide RS/RA level.
+            _ra_vals = [p["ra_per_game"] for p in sim_profiles.values() if p["ra_per_game"] > 0]
+            lg_ra9 = float(np.mean(_ra_vals)) if _ra_vals else LG_AVG_RPG
 
             for g in range(n_games):
                 h_tid = home_ids[g]
