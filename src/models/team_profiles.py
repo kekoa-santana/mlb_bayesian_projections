@@ -1712,39 +1712,75 @@ def build_all_team_profiles(
             logger.info("BaseRuns RS computed for %d teams (mean=%.0f runs)",
                         len(team_rs), team_rs["baseruns_rs"].mean())
 
-        # Pitcher side: use simulated runs directly (already calibrated)
-        # Pad missing IP to a full 162-game season with replacement-level pitching
-        # so that teams with fewer projected arms aren't artificially deflated.
-        if pitcher_counting is not None and "total_runs_mean" in pitcher_counting.columns:
-            SEASON_IP = 162.0 * 9  # 1458 innings per team-season
-            REPLACEMENT_RA_PER_9 = 5.50  # replacement-level total runs/9 IP
+        # Pitcher side: use BaseRuns from pitching counting stats (same
+        # estimator as offense) so RS and RA are on the same scale.
+        # Previously used total_runs_mean (sim-based), which produced ~6.8
+        # RA/G vs ~4.8 RS/G from BaseRuns, causing a 30% blanket normalization
+        # that compressed team spread and inflated good pitching staffs.
+        _pit_br_cols = ["total_h_mean", "total_hr_mean", "total_bb_mean", "total_bf_mean"]
+        if pitcher_counting is not None and all(
+            c in pitcher_counting.columns for c in _pit_br_cols
+        ):
+            SEASON_BF = 6100.0  # ~37.65 BF/game × 162
+            REPLACEMENT_RA_PER_9 = 5.50
 
             p_id = "pitcher_id" if "pitcher_id" in pitcher_counting.columns else "player_id"
             pc = pitcher_counting.merge(
                 player_teams[[pt_pid, "team_id"]].rename(columns={pt_pid: p_id}),
                 on=p_id, how="inner",
             )
+
+            # Aggregate to team level
+            agg_cols = {
+                "h": ("total_h_mean", "sum"),
+                "hr": ("total_hr_mean", "sum"),
+                "bb": ("total_bb_mean", "sum"),
+                "bf": ("total_bf_mean", "sum"),
+            }
+            if "total_hbp_mean" in pc.columns:
+                agg_cols["hbp"] = ("total_hbp_mean", "sum")
             ip_col = "projected_ip_mean" if "projected_ip_mean" in pc.columns else None
-            team_ra = pc.groupby("team_id").agg(
-                runs_allowed=("total_runs_mean", "sum"),
-                ip=(ip_col, "sum") if ip_col else ("total_outs_mean", lambda x: x.sum() / 3),
-            ).reset_index()
+            if ip_col:
+                agg_cols["ip"] = (ip_col, "sum")
 
-            # Pad missing innings with replacement-level pitching
-            missing_ip = (SEASON_IP - team_ra["ip"]).clip(lower=0)
-            team_ra["runs_allowed"] += missing_ip / 9 * REPLACEMENT_RA_PER_9
-            team_ra["ip"] = team_ra["ip"].clip(lower=SEASON_IP)
+            team_ra = pc.groupby("team_id").agg(**agg_cols).reset_index()
+            if "hbp" not in team_ra.columns:
+                team_ra["hbp"] = team_ra["bf"] * 0.008
 
-            team_ra["proj_ra_per_game"] = team_ra["runs_allowed"] / 162.0
+            # Estimate TB allowed: no total_tb column for pitchers, so derive
+            # from H/HR using league-average extra-base distribution.
+            # League avg: ~65% of non-HR hits are singles, ~25% doubles, ~10% triples
+            non_hr_h = (team_ra["h"] - team_ra["hr"]).clip(0)
+            est_1b = non_hr_h * 0.65
+            est_2b = non_hr_h * 0.25
+            est_3b = non_hr_h * 0.10
+            team_ra["tb"] = est_1b + 2 * est_2b + 3 * est_3b + 4 * team_ra["hr"]
+
+            # Scale to standard season BF, then compute BaseRuns
+            bf_scale = SEASON_BF / team_ra["bf"].clip(1)
+            for col in ["h", "hr", "bb", "hbp", "tb"]:
+                team_ra[f"s_{col}"] = team_ra[col] * bf_scale
+
+            from src.models.team_sim.team_season_sim import (
+                _baseruns_from_counting,
+            )
+            team_ra["baseruns_ra"] = team_ra.apply(
+                lambda r: _baseruns_from_counting(
+                    r["s_h"], r["s_bb"], r["s_hbp"], r["s_hr"], r["s_tb"], SEASON_BF,
+                ),
+                axis=1,
+            )
+            team_ra["proj_ra_per_game"] = team_ra["baseruns_ra"] / 162.0
 
             # Force league-mean RA to equal league-mean RS so total W sums to 2430
             if "proj_rs_per_game" in offense.columns:
                 lg_rs = offense["proj_rs_per_game"].mean()
                 lg_ra = team_ra["proj_ra_per_game"].mean()
                 if lg_ra > 0 and lg_rs > 0:
-                    team_ra["proj_ra_per_game"] *= lg_rs / lg_ra
+                    scale_factor = lg_rs / lg_ra
+                    team_ra["proj_ra_per_game"] *= scale_factor
                     logger.info("Normalized RA/game: lg_rs=%.3f, raw_ra=%.3f, scale=%.3f",
-                                lg_rs, lg_ra, lg_rs / lg_ra)
+                                lg_rs, lg_ra, scale_factor)
 
             pitching = pitching.merge(
                 team_ra[["team_id", "proj_ra_per_game"]],

@@ -316,18 +316,31 @@ def _precompute_roster_data(
             }
 
         # --- Pitcher counting stat lookup ---
+        # Store H/HR/BB/HBP/BF for BaseRuns calculation (same estimator as
+        # offense). Falls back to total_runs_mean if counting stats missing.
         p_stats: dict[int, dict] = {}
+        _has_pit_counts = all(
+            c in pitchers.columns
+            for c in ("total_h_mean", "total_hr_mean", "total_bb_mean", "total_bf_mean")
+        )
         for _, row in pitchers.iterrows():
             pid = int(row["player_id"])
             ip = float(
                 row.get("projected_ip", row.get("projected_ip_mean", 50))
             )
-            p_stats[pid] = {
-                "ip": ip,
-                "runs": float(
+            s = {"ip": ip}
+            if _has_pit_counts:
+                bf = float(row.get("total_bf_mean", ip * 4.3))
+                s["bf"] = bf
+                s["h"] = float(row.get("total_h_mean", bf * 0.240))
+                s["hr"] = float(row.get("total_hr_mean", bf * 0.030))
+                s["bb"] = float(row.get("total_bb_mean", bf * 0.082))
+                s["hbp"] = float(row.get("total_hbp_mean", bf * 0.008))
+            else:
+                s["runs"] = float(
                     row.get("total_runs_mean", ip * _LG_RA_PER_9 / 9)
-                ),
-            }
+                )
+            p_stats[pid] = s
 
         # --- Replacement-level rates (from bench quality) ---
         bench_h = hitters.sort_values("value_score").head(
@@ -465,32 +478,79 @@ def _draw_team_profiles_for_sim(
             tot_h, tot_bb, tot_hbp, tot_hr, tot_tb, tot_pa,
         )
 
-        # --- Pitching: cascade IP, compute RA ---
+        # --- Pitching: cascade IP, compute RA via BaseRuns ---
+        # Use same BaseRuns estimator as offense so RS and RA are on
+        # the same scale. Falls back to total_runs_mean if counting
+        # stats are missing.
         adj_p = cascade_pitcher_ip(
             pc["p_starters"], pc["p_relievers"], sim_injuries,
         )
 
-        tot_runs_allowed, tot_ip = 0.0, 0.0
         p_stats = pc["p_stats"]
-        for _, row in adj_p.iterrows():
-            pid = int(row["player_id"])
-            adj_ip = float(row["adjusted_ip"])
-            if adj_ip <= 0:
-                continue
-            if row.get("is_replacement", False):
-                tot_runs_allowed += adj_ip * pc["repl_ra_per_9"] / 9
-                tot_ip += adj_ip
-            elif pid in p_stats:
-                s = p_stats[pid]
-                frac = adj_ip / max(s["ip"], 1)
-                tot_runs_allowed += s["runs"] * frac
-                tot_ip += adj_ip
+        _use_pit_br = any("bf" in s for s in p_stats.values())
 
-        if tot_ip > 0:
-            ip_scale = _TARGET_TEAM_IP / tot_ip
-            ra_season = tot_runs_allowed * ip_scale
+        if _use_pit_br:
+            # BaseRuns path: accumulate H/HR/BB/HBP/BF, then compute
+            tot_h, tot_hr, tot_bb, tot_hbp, tot_bf = (
+                0.0, 0.0, 0.0, 0.0, 0.0,
+            )
+            for _, row in adj_p.iterrows():
+                pid = int(row["player_id"])
+                adj_ip = float(row["adjusted_ip"])
+                if adj_ip <= 0:
+                    continue
+                if row.get("is_replacement", False):
+                    # Estimate replacement BF from IP (~4.3 BF/IP)
+                    repl_bf = adj_ip * 4.3
+                    tot_bf += repl_bf
+                    tot_h += repl_bf * 0.240
+                    tot_hr += repl_bf * 0.030
+                    tot_bb += repl_bf * 0.082
+                    tot_hbp += repl_bf * 0.008
+                elif pid in p_stats:
+                    s = p_stats[pid]
+                    frac = adj_ip / max(s["ip"], 1)
+                    tot_bf += s["bf"] * frac
+                    tot_h += s["h"] * frac
+                    tot_hr += s["hr"] * frac
+                    tot_bb += s["bb"] * frac
+                    tot_hbp += s["hbp"] * frac
+
+            if tot_bf > 0:
+                bf_scale = _TARGET_TEAM_PA / tot_bf
+                tot_h *= bf_scale
+                tot_hr *= bf_scale
+                tot_bb *= bf_scale
+                tot_hbp *= bf_scale
+                # Estimate TB: 65% singles, 25% doubles, 10% triples + 4*HR
+                non_hr_h = max(tot_h - tot_hr, 0)
+                tot_tb = non_hr_h * (0.65 + 2 * 0.25 + 3 * 0.10) + 4 * tot_hr
+                ra_season = _baseruns_from_counting(
+                    tot_h, tot_bb, tot_hbp, tot_hr, tot_tb, _TARGET_TEAM_PA,
+                )
+            else:
+                ra_season = _LG_RA_PER_9 * 162
         else:
-            ra_season = _LG_RA_PER_9 * 162
+            # Legacy path: use total_runs_mean directly
+            tot_runs_allowed, tot_ip = 0.0, 0.0
+            for _, row in adj_p.iterrows():
+                pid = int(row["player_id"])
+                adj_ip = float(row["adjusted_ip"])
+                if adj_ip <= 0:
+                    continue
+                if row.get("is_replacement", False):
+                    tot_runs_allowed += adj_ip * pc["repl_ra_per_9"] / 9
+                    tot_ip += adj_ip
+                elif pid in p_stats:
+                    s = p_stats[pid]
+                    frac = adj_ip / max(s["ip"], 1)
+                    tot_runs_allowed += s["runs"] * frac
+                    tot_ip += adj_ip
+            if tot_ip > 0:
+                ip_scale = _TARGET_TEAM_IP / tot_ip
+                ra_season = tot_runs_allowed * ip_scale
+            else:
+                ra_season = _LG_RA_PER_9 * 162
 
         profiles[tid] = {
             "rs_per_game": rs_season / 162,

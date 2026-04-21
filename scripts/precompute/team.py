@@ -620,8 +620,14 @@ def run_league_sim(
                     p_cols = ["pitcher_id", "role", "tdd_value_score", "age"]
                     if bf_col:
                         p_cols.append(bf_col)
+                    _p_merge_cols = ["pitcher_id", "total_runs_mean", "projected_ip_mean",
+                                     "total_h_mean", "total_hr_mean", "total_bb_mean",
+                                     "total_bf_mean"]
+                    if "total_hbp_mean" in t_pcs.columns:
+                        _p_merge_cols.append("total_hbp_mean")
+                    _p_merge_cols = [c for c in _p_merge_cols if c in t_pcs.columns]
                     p_m = t_pr[p_cols].merge(
-                        t_pcs[["pitcher_id", "total_runs_mean", "projected_ip_mean"]],
+                        t_pcs[_p_merge_cols],
                         on="pitcher_id", how="inner",
                     ).rename(columns={
                         "pitcher_id": "player_id",
