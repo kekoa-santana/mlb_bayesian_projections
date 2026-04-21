@@ -48,6 +48,8 @@ def blend_projected_wins(
     runs_allowed: float,
     prior_strength_games: float = DEFAULT_PRIOR_STRENGTH,
     record_weight: float = DEFAULT_RECORD_WEIGHT,
+    xrs_per_game: float | None = None,
+    xra_per_game: float | None = None,
 ) -> dict[str, float | None]:
     """Blend preseason projection with current-season record and run diff.
 
@@ -70,6 +72,10 @@ def blend_projected_wins(
     record_weight : float, default 0.40
         Blend weight on raw W-L evidence vs Pythagorean evidence.  The
         default leans on Pythag because it is less noisy at small n.
+    xrs_per_game, xra_per_game : float, optional
+        Statcast-based expected runs scored/allowed per game.  When
+        provided, used for the Pythagorean component instead of actual
+        runs (strips BABIP and sequencing noise).
 
     Returns
     -------
@@ -91,7 +97,13 @@ def blend_projected_wins(
         }
 
     record_pct = current_wins / games_played
-    pyt_pct = pythag_win_pct(runs_scored, runs_allowed)
+
+    # Prefer xRuns (Statcast contact quality) for Pythagorean when available
+    if xrs_per_game is not None and xra_per_game is not None:
+        pyt_pct = pythag_win_pct(xrs_per_game, xra_per_game)
+    else:
+        pyt_pct = pythag_win_pct(runs_scored, runs_allowed)
+
     observed_pct = record_weight * record_pct + (1.0 - record_weight) * pyt_pct
 
     posterior_pct = (
@@ -163,8 +175,11 @@ def apply_in_season_blend(
             w = int(rr["wins"])
             rs = float(rr["runs_scored"])
             ra = float(rr["runs_allowed"])
+            xrs = float(rr["xrs_per_game"]) if "xrs_per_game" in rec.columns and pd.notna(rr.get("xrs_per_game")) else None
+            xra = float(rr["xra_per_game"]) if "xra_per_game" in rec.columns and pd.notna(rr.get("xra_per_game")) else None
         else:
             gp, w, rs, ra = 0, 0, 0.0, 0.0
+            xrs, xra = None, None
 
         blend = blend_projected_wins(
             preseason_wins=preseason_w,
@@ -174,6 +189,8 @@ def apply_in_season_blend(
             runs_allowed=ra,
             prior_strength_games=prior_strength_games,
             record_weight=record_weight,
+            xrs_per_game=xrs,
+            xra_per_game=xra,
         )
         results.append({"games_played": gp, **blend})
 
@@ -186,6 +203,161 @@ def apply_in_season_blend(
     out["games_played"] = blend_df["games_played"].values
 
     return out
+
+
+def _baseruns(
+    pa: float, k: float, bb: float, hbp: float, hr: float,
+    xba_on_bip: float, xslg_on_bip: float, games: int,
+) -> float:
+    """Hybrid BaseRuns: K/BB/HR at face value, xBA/xSLG on BIP.
+
+    Returns expected runs per game.
+    """
+    # BIP = all batted balls including HR (Statcast xBA/xSLG covers HR events)
+    bip = pa - k - bb - hbp
+    if bip <= 0 or games <= 0:
+        return 0.0
+
+    # xBA and xSLG from Statcast already include HR outcomes on batted balls,
+    # so xH and xTB capture HR contribution without separate addition.
+    xH = xba_on_bip * bip
+    xTB = xslg_on_bip * bip
+
+    A = xH + bb + hbp - hr
+    B = (1.4 * xTB - 0.6 * xH - 3 * hr + 0.1 * (bb + hbp)) * 1.02
+    sf_est = pa * 0.008
+    C = (pa - bb - hbp - sf_est) - xH
+    D = hr
+
+    denom = max(B + C, 1.0)
+    xruns = A * B / denom + D
+    return float(xruns / games)
+
+
+def compute_team_xruns(season: int) -> pd.DataFrame:
+    """Compute team-level expected runs from Statcast contact quality.
+
+    Uses hybrid BaseRuns: K/BB/HR at face value (no contact component),
+    xBA/xSLG on balls in play from Statcast (strips BABIP/sequencing luck).
+
+    Parameters
+    ----------
+    season : int
+        MLB season year.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: team_id, xrs_per_game, xra_per_game.
+        Empty DataFrame if Statcast data is not available.
+    """
+    from src.data.db import read_sql
+
+    # Offense: team batting stats + BIP contact quality
+    offense = read_sql(
+        "SELECT fg.team_id, "
+        "  COUNT(DISTINCT fg.game_pk) AS games, "
+        "  SUM(fg.bat_pa) AS pa, "
+        "  SUM(fg.bat_k) AS k, "
+        "  SUM(fg.bat_bb) AS bb, "
+        "  SUM(COALESCE(fg.bat_hbp, 0)) AS hbp, "
+        "  SUM(fg.bat_hr) AS hr "
+        "FROM production.fact_player_game_mlb fg "
+        "JOIN production.dim_game dg ON fg.game_pk = dg.game_pk "
+        "WHERE dg.season = :season AND dg.game_type = 'R' "
+        "  AND fg.player_role = 'batter' "
+        "GROUP BY fg.team_id",
+        {"season": season},
+    )
+    if offense.empty:
+        return pd.DataFrame(columns=["team_id", "xrs_per_game", "xra_per_game"])
+
+    bip_offense = read_sql(
+        "SELECT fg.team_id, "
+        "  AVG(CASE WHEN sbb.xba::text != 'NaN' THEN sbb.xba END) AS xba_on_bip, "
+        "  AVG(CASE WHEN sbb.xslg::text != 'NaN' THEN sbb.xslg END) AS xslg_on_bip "
+        "FROM production.fact_pa fpa "
+        "JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk "
+        "JOIN production.sat_batted_balls sbb ON fpa.pa_id = sbb.pa_id "
+        "JOIN production.fact_player_game_mlb fg "
+        "  ON fpa.batter_id = fg.player_id AND fpa.game_pk = fg.game_pk "
+        "  AND fg.player_role = 'batter' "
+        "WHERE dg.season = :season AND dg.game_type = 'R' "
+        "GROUP BY fg.team_id",
+        {"season": season},
+    )
+
+    off = offense.merge(bip_offense, on="team_id", how="left")
+    # Fallback: if no Statcast BIP data, use league-average xBA/xSLG
+    lg_xba = bip_offense["xba_on_bip"].mean() if not bip_offense.empty else 0.328
+    lg_xslg = bip_offense["xslg_on_bip"].mean() if not bip_offense.empty else 0.540
+    off["xba_on_bip"] = off["xba_on_bip"].fillna(lg_xba)
+    off["xslg_on_bip"] = off["xslg_on_bip"].fillna(lg_xslg)
+
+    off["xrs_per_game"] = off.apply(
+        lambda r: _baseruns(
+            r["pa"], r["k"], r["bb"], r["hbp"], r["hr"],
+            r["xba_on_bip"], r["xslg_on_bip"], int(r["games"]),
+        ),
+        axis=1,
+    )
+
+    # Pitching: team pitching stats + BIP contact quality allowed
+    # pit_bf = batters faced (no pit_pa column), estimate HBP at 0.8% of BF
+    pitching = read_sql(
+        "SELECT fg.team_id, "
+        "  COUNT(DISTINCT fg.game_pk) AS games, "
+        "  SUM(fg.pit_bf) AS pa, "
+        "  SUM(fg.pit_k) AS k, "
+        "  SUM(fg.pit_bb) AS bb, "
+        "  SUM(fg.pit_bf) * 0.008 AS hbp, "
+        "  SUM(fg.pit_hr) AS hr "
+        "FROM production.fact_player_game_mlb fg "
+        "JOIN production.dim_game dg ON fg.game_pk = dg.game_pk "
+        "WHERE dg.season = :season AND dg.game_type = 'R' "
+        "  AND fg.player_role = 'pitcher' "
+        "GROUP BY fg.team_id",
+        {"season": season},
+    )
+
+    bip_pitching = read_sql(
+        "SELECT fg.team_id, "
+        "  AVG(CASE WHEN sbb.xba::text != 'NaN' THEN sbb.xba END) AS xba_on_bip, "
+        "  AVG(CASE WHEN sbb.xslg::text != 'NaN' THEN sbb.xslg END) AS xslg_on_bip "
+        "FROM production.fact_pa fpa "
+        "JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk "
+        "JOIN production.sat_batted_balls sbb ON fpa.pa_id = sbb.pa_id "
+        "JOIN production.fact_player_game_mlb fg "
+        "  ON fpa.pitcher_id = fg.player_id AND fpa.game_pk = fg.game_pk "
+        "  AND fg.player_role = 'pitcher' "
+        "WHERE dg.season = :season AND dg.game_type = 'R' "
+        "GROUP BY fg.team_id",
+        {"season": season},
+    )
+
+    pit = pitching.merge(bip_pitching, on="team_id", how="left")
+    lg_xba_p = bip_pitching["xba_on_bip"].mean() if not bip_pitching.empty else 0.328
+    lg_xslg_p = bip_pitching["xslg_on_bip"].mean() if not bip_pitching.empty else 0.540
+    pit["xba_on_bip"] = pit["xba_on_bip"].fillna(lg_xba_p)
+    pit["xslg_on_bip"] = pit["xslg_on_bip"].fillna(lg_xslg_p)
+
+    pit["xra_per_game"] = pit.apply(
+        lambda r: _baseruns(
+            r["pa"], r["k"], r["bb"], r["hbp"], r["hr"],
+            r["xba_on_bip"], r["xslg_on_bip"], int(r["games"]),
+        ),
+        axis=1,
+    )
+
+    result = off[["team_id", "xrs_per_game"]].merge(
+        pit[["team_id", "xra_per_game"]], on="team_id", how="outer",
+    )
+
+    logger.info(
+        "Team xRuns computed for %d teams: mean xRS=%.2f, mean xRA=%.2f",
+        len(result), result["xrs_per_game"].mean(), result["xra_per_game"].mean(),
+    )
+    return result
 
 
 def load_current_team_records(
@@ -252,5 +424,14 @@ def load_current_team_records(
         df[col] = df[col].astype(int)
     for col in ("runs_scored", "runs_allowed"):
         df[col] = df[col].astype(float)
+
+    # Merge Statcast-based xRuns for more stable Pythagorean estimates
+    try:
+        xruns = compute_team_xruns(season)
+        if not xruns.empty:
+            df = df.merge(xruns, on="team_id", how="left")
+            logger.info("Merged xRuns for %d teams", xruns["xrs_per_game"].notna().sum())
+    except Exception:
+        logger.warning("Failed to compute team xRuns for %d", season, exc_info=True)
 
     return df
