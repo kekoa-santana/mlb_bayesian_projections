@@ -27,6 +27,54 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Negative binomial dispersion parameter
+# Calibrated from 2024-2026 per-team runs: var/mean ~ 2.2
+# r = mu^2 / (var - mu).  At mu=4.5, var=10 -> r ~ 3.6.
+# ---------------------------------------------------------------------------
+NEGBIN_R_DEFAULT: float = 3.6
+
+
+# ---------------------------------------------------------------------------
+# NegBin resampling
+# ---------------------------------------------------------------------------
+
+def negbin_resample(
+    sim_runs: np.ndarray,
+    rng: np.random.Generator,
+    r: float = NEGBIN_R_DEFAULT,
+) -> np.ndarray:
+    """Replace sim run samples with negative-binomial draws at the same mean.
+
+    The PA-by-PA simulator correctly estimates E[runs|context] for each
+    game, but per-game variance can be miscalibrated (too narrow if the
+    sim doesn't capture all variance sources, or too wide in edge cases).
+    Resampling from NegBin(mu=sim_mean, r) produces a distribution whose
+    variance matches the empirically observed var/mean ~ 2.2 ratio in
+    actual MLB game data, regardless of the sim's internal variance.
+
+    Parameters
+    ----------
+    sim_runs : np.ndarray
+        Integer run totals from the simulator, shape ``(n_sims,)``.
+    rng : np.random.Generator
+        Random number generator.
+    r : float
+        NegBin dispersion parameter. Lower = more overdispersion.
+        Default calibrated from 2024-2026 MLB data.
+
+    Returns
+    -------
+    np.ndarray
+        Integer run samples drawn from NegBin(mu, r), shape ``(n_sims,)``.
+    """
+    mu = float(np.mean(sim_runs))
+    if mu < 0.01:
+        return sim_runs.copy()
+    # NumPy parameterizes NegBin as (n, p) where n=r, p=r/(r+mu)
+    p = r / (r + mu)
+    return rng.negative_binomial(r, p, size=len(sim_runs))
+
 
 # ---------------------------------------------------------------------------
 # CRPS

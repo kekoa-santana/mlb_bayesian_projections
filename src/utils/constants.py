@@ -263,15 +263,20 @@ CLIP_HI: float = 1 - 1e-6
 
 # ---------------------------------------------------------------------------
 # Game-sim league baselines (used for logit centering)
+# Updated 2026-04-22: blended 70% historical (2022-2025) + 30% April-debiased
+# 2026 YTD.  April BB% runs +0.5pp hot, HR% runs -0.3pp cold historically.
+# Raw 2026 YTD (26,906 BF): K=0.224, BB=0.099, HR=0.027
 # ---------------------------------------------------------------------------
-SIM_LEAGUE_K_RATE: float = 0.226
-SIM_LEAGUE_BB_RATE: float = 0.082
-SIM_LEAGUE_HR_RATE: float = 0.031
+SIM_LEAGUE_K_RATE: float = 0.224
+SIM_LEAGUE_BB_RATE: float = 0.086
+SIM_LEAGUE_HR_RATE: float = 0.030
 
 # ---------------------------------------------------------------------------
 # BABIP constants
+# Historical (2022-2025 pooled): 0.290.  Batter BABIP includes speed/LD%
+# component so slightly higher than pitcher (which regresses harder).
 # ---------------------------------------------------------------------------
-LEAGUE_BABIP_PITCHER: float = 0.292
+LEAGUE_BABIP_PITCHER: float = 0.295
 LEAGUE_BABIP_BATTER: float = 0.300
 
 # BABIP adjustment coefficients (LD% and sprint speed)
@@ -287,10 +292,12 @@ LEAGUE_HBP_RATE: float = 0.011
 
 # ---------------------------------------------------------------------------
 # Bullpen baseline rates (game sim defaults)
+# Updated 2026-04-22: blended historical (2022-2025) + April-debiased 2026.
+# Raw 2026 YTD reliever data (11,753 BF): K=0.226, BB=0.109, HR=0.026
 # ---------------------------------------------------------------------------
-BULLPEN_K_RATE: float = 0.253
-BULLPEN_BB_RATE: float = 0.084
-BULLPEN_HR_RATE: float = 0.024
+BULLPEN_K_RATE: float = 0.226
+BULLPEN_BB_RATE: float = 0.096
+BULLPEN_HR_RATE: float = 0.028
 
 # ---------------------------------------------------------------------------
 # Branding — The Data Diamond color palette

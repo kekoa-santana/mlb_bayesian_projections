@@ -68,3 +68,38 @@ def wind_category(game) -> str:
     if direction in ("in", "out", "cross", "none"):
         return direction
     return "unknown"
+
+
+def wind_speed_bucket(game) -> str:
+    """Return the wind speed bucket for a game row.
+
+    Parameters
+    ----------
+    game : dict-like
+        Game row with a ``weather_wind_speed`` field.
+
+    Returns
+    -------
+    str
+        One of "calm", "light", "moderate", "strong", or "unknown".
+        Cutoffs match the SQL in src/data/queries/environment.py:
+        calm <= 5, light <= 10, moderate <= 15, strong > 15.
+    """
+    speed = game.get("weather_wind_speed") if hasattr(game, "get") else None
+    if speed is None:
+        return "unknown"
+    if isinstance(speed, float) and (math.isnan(speed) or math.isinf(speed)):
+        return "unknown"
+    try:
+        s = float(speed)
+    except (TypeError, ValueError):
+        return "unknown"
+    if math.isnan(s):
+        return "unknown"
+    if s <= 5:
+        return "calm"
+    if s <= 10:
+        return "light"
+    if s <= 15:
+        return "moderate"
+    return "strong"

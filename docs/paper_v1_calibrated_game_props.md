@@ -1,6 +1,6 @@
 # Calibrated Game-Level Prop Probabilities for MLB: A Hierarchical Bayesian Approach
 
-**Koa Santana — The Data Diamond**
+**Kekoa Santana — The Data Diamond**
 
 _Draft v0.1 — April 2026_
 

@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.utils.math_helpers import safe_logit
+from src.utils.constants import SIM_LEAGUE_K_RATE, SIM_LEAGUE_BB_RATE, SIM_LEAGUE_HR_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,24 @@ def resample_posterior(
     if len(arr) == n_sims:
         return arr.copy()
     return rng.choice(arr, size=n_sims, replace=True)
+
+
+def resample_posterior_joint(
+    arrays: list[np.ndarray],
+    n_sims: int,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """Resample multiple aligned posterior arrays using shared indices.
+
+    Preserves the joint correlation between arrays by drawing one
+    index vector and applying it to all arrays. Use this for
+    correlated K/BB/HR posteriors from the logistic-normal sampler.
+    """
+    n = len(arrays[0])
+    if n == n_sims:
+        return [a.copy() for a in arrays]
+    idx = rng.integers(0, n, size=n_sims)
+    return [a[idx] for a in arrays]
 
 
 # ---------------------------------------------------------------------------
@@ -183,12 +202,46 @@ def pitcher_rate_to_lift_array(
     sample array, the samples are resampled to *n_sims* draws and each
     draw gets its own logit lift — propagating pitcher posterior
     uncertainty through every sim independently.
+
+    NOTE: this resamples independently. For correlated K/BB/HR posteriors,
+    use ``pitcher_rates_to_lift_arrays_joint`` instead to preserve pairing.
     """
     if np.ndim(rate) == 0:
         lift = float(safe_logit(float(rate)) - safe_logit(league_rate))
         return np.full(n_sims, lift)
     arr = resample_posterior(np.asarray(rate, dtype=np.float64), n_sims, rng)
     return safe_logit(arr) - safe_logit(league_rate)
+
+
+def pitcher_rates_to_lift_arrays_joint(
+    k_rate: float | np.ndarray,
+    bb_rate: float | np.ndarray,
+    hr_rate: float | np.ndarray,
+    n_sims: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert pitcher K/BB/HR rates to logit lifts, preserving joint correlation.
+
+    When all three rates are posterior arrays (from correlated logistic-normal
+    sampling), uses a shared index vector so the K-HR correlation is preserved
+    through the sim. Falls back to independent resampling for scalars.
+    """
+    all_arrays = (np.ndim(k_rate) >= 1 and np.ndim(bb_rate) >= 1 and np.ndim(hr_rate) >= 1)
+    if all_arrays:
+        k_arr = np.asarray(k_rate, dtype=np.float64)
+        bb_arr = np.asarray(bb_rate, dtype=np.float64)
+        hr_arr = np.asarray(hr_rate, dtype=np.float64)
+        resampled = resample_posterior_joint([k_arr, bb_arr, hr_arr], n_sims, rng)
+        k_lift = safe_logit(resampled[0]) - safe_logit(SIM_LEAGUE_K_RATE)
+        bb_lift = safe_logit(resampled[1]) - safe_logit(SIM_LEAGUE_BB_RATE)
+        hr_lift = safe_logit(resampled[2]) - safe_logit(SIM_LEAGUE_HR_RATE)
+        return k_lift, bb_lift, hr_lift
+    # Fallback: independent resampling (scalar or mixed inputs)
+    return (
+        pitcher_rate_to_lift_array(k_rate, SIM_LEAGUE_K_RATE, n_sims, rng),
+        pitcher_rate_to_lift_array(bb_rate, SIM_LEAGUE_BB_RATE, n_sims, rng),
+        pitcher_rate_to_lift_array(hr_rate, SIM_LEAGUE_HR_RATE, n_sims, rng),
+    )
 
 
 # ---------------------------------------------------------------------------

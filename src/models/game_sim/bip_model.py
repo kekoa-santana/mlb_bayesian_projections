@@ -17,10 +17,12 @@ from src.utils.constants import LEAGUE_BABIP_BATTER
 
 logger = logging.getLogger(__name__)
 
-# League-average BIP outcome splits (2022-2025)
+# League-average BIP outcome splits
 # Conditional on BIP (excludes K, BB, HBP, HR)
 # Derived from: field_out / (field_out + single + double + triple)
 # where field_out includes force_out, GIDP, FC, sac_fly, etc.
+# Historical BABIP (2022-2025): 0.290.  Out rate = 1 - BABIP = 0.710.
+# Backed off to 0.700 to allow sim to reach ~9.0 R/G with blended rates.
 _DEFAULT_BIP_PROBS = {
     "out": 0.700,
     "single": 0.222,
@@ -38,11 +40,8 @@ _SHRINKAGE_K = 500  # BIP needed for full weight on pitcher-specific BABIP
 # Coefficients for quality-metric BIP split prediction
 # Trained on 2021-2025 BIP data (337 year-pairs, walk-forward validated)
 # BABIP = f(exit_velo, launch_angle, gb_pct, sprint_speed)
-# Intercept re-centered (2026-04-14) so avg-quality batter
-# (EV=88, LA=12, GB=0.44, sprint=27) maps to pred_babip=0.300, matching the
-# league default out rate in _DEFAULT_BIP_PROBS. Previous intercept (0.21759)
-# produced pred_babip=0.280 → 0.720 out rate, biasing every lineup's BIP
-# outcomes ~2pp toward outs and pulling ~0.1 runs/game off sim totals.
+# Avg-quality batter (EV=88, LA=12, GB=0.44, sprint=27) maps to
+# pred_babip=0.300.
 _BABIP_COEFS = {
     "avg_ev": 0.00035,
     "avg_la": -0.00396,
@@ -316,7 +315,8 @@ class BIPOutcomeModel:
         """
         p = np.asarray(probs, dtype=np.float64).copy()
         # Apply pitcher BABIP adjustment by shifting hit mass
-        if abs(babip_adj) >= 0.001:
+        babip_adj = np.asarray(babip_adj)
+        if np.any(np.abs(babip_adj) >= 0.001):
             hit_p = p[:, 1:].sum(axis=1)
             # Avoid divide-by-zero on pathological rows
             safe_hit = np.where(hit_p > 1e-9, hit_p, 1e-9)

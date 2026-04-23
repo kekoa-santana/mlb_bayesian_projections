@@ -1,0 +1,246 @@
+PS C:\Users\kekoa\Documents\data_analytics\player_profiles> python scripts/precompute_dashboard_data.py --include 
+game_data,game_sim,confident_picks
+16:09:36 precompute                INFO    Selective run -- sections: bf_priors, catcher_framing, confident_picks, game_logs, game_sim_data, outs_priors, player_teams, umpire, weather
+16:09:36 precompute                INFO    FULL mode: draws=2000, tune=1000, chains=4, sim_seasons=10000
+16:09:36 precompute                INFO    ============================================================
+16:09:36 precompute                INFO    Pre-caching observed profiles for 2025...
+16:09:36 src.data.db               INFO    Loading cached hitter_observed_profile_2025.parquet
+16:09:36 precompute                INFO    Hitter observed profile: 583 rows
+16:09:36 src.data.db               INFO    Loading cached sprint_speed_2025.parquet
+16:09:36 precompute                INFO    Sprint speed: 395 rows
+16:09:36 src.data.db               INFO    Loading cached pitcher_observed_profile_2025.parquet
+16:09:36 precompute                INFO    Pitcher observed profile: 716 rows
+16:09:37 precompute.game_data      INFO    ============================================================
+16:09:37 precompute.game_data      INFO    Computing BF priors...
+16:09:37 src.data.queries.game     INFO    Fetching pitcher game logs for 2018
+16:09:37 src.data.db               INFO    Connected to mlb_fantasy on localhost:5433
+16:09:37 src.data.queries.game     INFO    Fetching pitcher game logs for 2019
+16:09:37 src.data.queries.game     INFO    Fetching pitcher game logs for 2020
+16:09:37 src.data.queries.game     INFO    Fetching pitcher game logs for 2021
+16:09:37 src.data.queries.game     INFO    Fetching pitcher game logs for 2022
+16:09:37 src.data.queries.game     INFO    Fetching pitcher game logs for 2023
+16:09:38 src.data.queries.game     INFO    Fetching pitcher game logs for 2024
+16:09:38 src.data.queries.game     INFO    Fetching pitcher game logs for 2025
+16:09:38 precompute.game_data      INFO    Computed P/PA for 905 pitchers (mean=3.89)
+16:09:38 src.models.bf_model       INFO    P/PA adjustment applied to 2573 pitchers (mean adj=0.02 BF, range=-0.61 to 0.86)
+16:09:38 src.models.bf_model       INFO    BF priors: 2573 pitcher-seasons, mean reliability=0.566
+16:09:38 precompute.game_data      INFO    Saved BF priors: 2573 pitcher-seasons
+16:09:38 precompute.game_data      INFO    Saved BF priors preseason snapshot
+16:09:38 precompute.game_data      INFO    ============================================================
+16:09:38 precompute.game_data      INFO    Computing outs priors...
+16:09:38 src.data.queries.game     INFO    Fetching pitcher game logs for 2018
+16:09:38 src.data.queries.game     INFO    Fetching pitcher game logs for 2019
+16:09:38 src.data.queries.game     INFO    Fetching pitcher game logs for 2020
+16:09:38 src.data.queries.game     INFO    Fetching pitcher game logs for 2021
+16:09:38 src.data.queries.game     INFO    Fetching pitcher game logs for 2022
+16:09:38 src.data.queries.game     INFO    Fetching pitcher game logs for 2023
+16:09:38 src.data.queries.game     INFO    Fetching pitcher game logs for 2024
+16:09:38 src.data.queries.game     INFO    Fetching pitcher game logs for 2025
+16:09:39 src.models.bf_model       INFO    Outs priors: 2573 pitcher-seasons, mean reliability=0.457
+16:09:39 precompute.game_data      INFO    Saved outs priors: 2573 pitcher-seasons
+16:09:39 precompute.game_data      INFO    Saved outs priors preseason snapshot
+16:09:39 precompute.game_data      INFO    ============================================================
+16:09:39 precompute.game_data      INFO    Computing umpire tendencies (K + BB + HR)...
+16:09:39 src.data.queries.environment INFO    Fetching umpire tendencies for seasons [2021, 2022, 2023, 2024, 2025] (min_games=30)
+16:09:40 src.data.queries.environment INFO    Umpire tendencies: 102 umpires, league K%=0.2258 BB%=0.0809 HR%=0.03074, K lift range=[-0.0454, 0.0524], BB lift range=[-0.1026, 0.0971], HR lift range=[-0.1064, 0.0839]
+16:09:40 precompute.game_data      INFO    Saved umpire tendencies: 102 umpires
+16:09:40 precompute.game_data      INFO    ============================================================
+16:09:40 precompute.game_data      INFO    Computing weather effects...
+16:09:40 src.data.queries.environment INFO    Fetching weather effects for seasons [2018, 2019, 2020, 2021, 2022, 
+2023, 2024, 2025]
+16:09:40 src.data.queries.environment INFO    Weather effects: 15 combinations, K mult range=[0.944, 1.048], HR mult range=[0.754, 1.174]
+16:09:40 precompute.game_data      INFO    Saved weather effects: 15 combinations
+16:09:40 precompute.game_data      INFO    ============================================================
+16:09:40 precompute.game_data      INFO    Computing catcher framing effects...
+16:09:40 precompute.game_data      WARNING Catcher framing failed for season 2018: 'int' object is not iterable   
+16:09:40 precompute.game_data      WARNING Catcher framing failed for season 2019: 'int' object is not iterable   
+16:09:40 precompute.game_data      WARNING Catcher framing failed for season 2020: 'int' object is not iterable   
+16:09:40 precompute.game_data      WARNING Catcher framing failed for season 2021: 'int' object is not iterable   
+16:09:40 precompute.game_data      WARNING Catcher framing failed for season 2022: 'int' object is not iterable   
+16:09:40 precompute.game_data      WARNING Catcher framing failed for season 2023: 'int' object is not iterable   
+16:09:40 precompute.game_data      WARNING Catcher framing failed for season 2024: 'int' object is not iterable   
+16:09:40 precompute.game_data      WARNING Catcher framing failed for season 2025: 'int' object is not iterable   
+16:09:40 precompute.game_data      WARNING No catcher framing data produced
+16:09:40 precompute.game_data      INFO    ============================================================
+16:09:40 precompute.game_data      INFO    Computing player-team mapping...
+16:09:40 src.data.queries.traditional INFO    Fetching player-team mapping for 2025
+16:09:40 precompute.game_data      INFO    Spring training override: 455 team changes, 2091 new players
+16:09:40 precompute.game_data      INFO    Saved player teams: 3561 players
+16:09:40 precompute.game_data      INFO    ============================================================
+16:09:40 precompute.game_data      INFO    Computing game browser data for 2025...
+16:09:40 src.data.queries.game     INFO    Fetching game lineups for 2025
+16:09:40 precompute.game_data      INFO    Saved game lineups: 43740 rows (2430 games)
+16:09:40 src.data.queries.game     INFO    Fetching game batter Ks for 2025
+16:09:40 precompute.game_data      INFO    Saved game batter Ks: 116388 rows
+16:09:40 src.data.queries.game     INFO    Fetching pitcher game logs for 2025
+16:09:41 precompute.game_data      INFO    Saved pitcher game logs: 20760 rows
+16:09:41 precompute.game_data      INFO    Saved game info: 2430 games
+16:09:41 precompute                INFO    Skipping backtest_summaries (not in --include list)
+16:09:41 precompute.game_sim       INFO    ============================================================
+16:09:41 precompute.game_sim       INFO    Generating game simulator data...
+16:09:41 precompute.game_sim       INFO    Generating synthetic hitter HR samples...
+16:09:41 src.data.db               INFO    Loading cached hitter_season_extended_2018.parquet
+16:09:41 src.data.db               INFO    Loading cached sprint_speed_2018.parquet
+16:09:41 src.data.db               INFO    Loading cached hitter_season_extended_2019.parquet
+16:09:41 src.data.db               INFO    Loading cached sprint_speed_2019.parquet
+16:09:41 src.data.db               INFO    Loading cached hitter_season_extended_2020.parquet
+16:09:41 src.data.db               INFO    Loading cached sprint_speed_2020.parquet
+16:09:41 src.data.db               INFO    Loading cached hitter_season_extended_2021.parquet
+16:09:41 src.data.db               INFO    Loading cached sprint_speed_2021.parquet
+16:09:41 src.data.db               INFO    Loading cached hitter_season_extended_2022.parquet
+16:09:41 src.data.db               INFO    Loading cached sprint_speed_2022.parquet
+16:09:41 src.data.db               INFO    Loading cached hitter_season_extended_2023.parquet
+16:09:41 src.data.db               INFO    Loading cached sprint_speed_2023.parquet
+16:09:41 src.data.db               INFO    Loading cached hitter_season_extended_2024.parquet
+16:09:41 src.data.db               INFO    Loading cached sprint_speed_2024.parquet
+16:09:41 src.data.db               INFO    Loading cached hitter_season_extended_2025.parquet
+16:09:41 src.data.db               INFO    Loading cached sprint_speed_2025.parquet
+16:09:41 src.data.feature_eng      INFO    Multi-season extended hitter data: 6283 player-seasons across [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+16:09:41 precompute.game_sim       INFO    Saved hitter HR Beta posterior samples for 537 batters
+16:09:41 precompute.game_sim       INFO    Training pitcher exit model...
+16:09:41 src.data.queries.simulator INFO    Fetching exit model training data for seasons [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+16:09:45 src.data.queries.simulator INFO    Fetching pitcher exit tendencies for seasons [2018, 2019, 2020, 2021, 
+2022, 2023, 2024, 2025]
+16:10:13 src.models.game_sim.exit_model INFO    Exit model trained: AUC=0.9426, accuracy=0.9600, n=779240 (4.4% positive)
+16:10:13 precompute.game_sim       INFO    Exit model: AUC=0.9426, n=779240
+16:10:13 src.models.game_sim.exit_model INFO    Exit model saved to C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard\exit_model.pkl
+16:10:13 precompute.game_sim       INFO    Saved exit model + tendencies
+16:10:13 src.models.game_sim.exit_model INFO    Exit model saved to C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard\snapshots\exit_model_preseason.pkl
+16:10:13 precompute.game_sim       INFO    Saved exit model preseason snapshot
+16:10:13 precompute.game_sim       INFO    Computing pitch count features...
+16:10:13 src.data.queries.simulator INFO    Fetching pitcher pitch count features for seasons [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+16:10:16 precompute.game_sim       INFO    Saved pitcher pitch count features: 6736 rows
+16:10:16 src.data.queries.simulator INFO    Fetching batter pitch count features for seasons [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+16:10:17 precompute.game_sim       INFO    Saved batter pitch count features: 6283 rows
+16:10:17 precompute.game_sim       INFO    Computing TTO adjustment profiles...
+16:10:17 src.data.queries.simulator INFO    Fetching TTO adjustment profiles for seasons [2018, 2019, 2020, 2021, 
+2022, 2023, 2024, 2025] (min_pa=30)
+16:10:18 precompute.game_sim       INFO    Saved TTO profiles: 4335 rows
+16:10:18 precompute.game_sim       INFO    Training game-level BB adjustment model...
+16:10:18 src.models.game_bb_adj    INFO    Fetching pitcher starts for seasons [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+16:10:19 src.models.game_bb_adj    INFO    Retrieved 33131 pitcher starts
+16:10:19 src.data.db               INFO    Loading cached pitcher_observed_profile_2018.parquet
+16:10:19 src.data.db               INFO    Loading cached pitcher_observed_profile_2019.parquet
+16:10:19 src.data.db               INFO    Loading cached pitcher_observed_profile_2020.parquet
+16:10:19 src.data.db               INFO    Loading cached pitcher_observed_profile_2021.parquet
+16:10:19 src.data.db               INFO    Loading cached pitcher_observed_profile_2022.parquet
+16:10:19 src.data.db               INFO    Loading cached pitcher_observed_profile_2023.parquet
+16:10:19 src.data.db               INFO    Loading cached pitcher_observed_profile_2024.parquet
+16:10:19 src.data.db               INFO    Loading cached pitcher_observed_profile_2025.parquet
+16:10:19 src.data.queries.environment INFO    Fetching umpire tendencies for seasons [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025] (min_games=30)
+16:10:21 src.data.queries.environment INFO    Umpire tendencies: 115 umpires, league K%=0.2264 BB%=0.0811 HR%=0.03161, K lift range=[-0.0456, 0.0578], BB lift range=[-0.0891, 0.0995], HR lift range=[-0.1222, 0.0832]
+16:10:21 src.models.game_bb_adj    INFO    Computing lineup avg BB rates for seasons [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+16:10:23 src.models.game_bb_adj    INFO    Built game BB feature matrix: 32945 rows (32945 with all features)
+16:10:23 src.models.game_bb_adj    INFO    Trained game BB XGBoost: n=32945, RMSE(logit)=0.9098, top features: lineup_avg_bb_rate=0.327, is_home=0.126, pitcher_bb_x_lineup_bb=0.110, pitcher_zone_x_umpire=0.085, pitcher_bb_x_umpire=0.084
+16:10:23 precompute.game_sim       INFO    Saved game BB adjustment model: n=32945, RMSE=0.9098
+16:10:23 precompute.game_sim       INFO    Computing team bullpen rates...
+16:10:23 src.data.queries.simulator INFO    Fetching team bullpen rates for seasons [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+16:10:23 precompute.game_sim       INFO    Saved team bullpen rates: 240 rows
+16:10:23 precompute.game_sim       INFO    Computing team bullpen tier profiles...
+16:10:23 src.data.queries.simulator INFO    Fetching reliever stats by team for seasons [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+16:10:23 src.data.queries.simulator INFO    Fetching reliever role history for seasons [2024, 2025] (min_games=1)
+16:10:24 src.models.reliever_roles INFO    Classified 491 relievers: {'MR': 318, 'SU': 129, 'CL': 44}
+16:10:24 src.models.game_sim.bullpen_model INFO    Built 30 team bullpen profiles for 2025. Avg high-lev K%=0.251 
+BB%=0.089, low-lev K%=0.206 BB%=0.094
+16:10:24 precompute.game_sim       INFO    Saved 30 team bullpen tier profiles
+16:10:24 precompute.game_sim       INFO    Computing batter BIP profiles...
+16:10:24 src.data.queries.hitter   INFO    Fetching batter BIP profile for seasons [2018, 2019, 2020, 2021, 2022, 
+2023, 2024, 2025]
+16:10:25 src.data.queries.traditional INFO    Fetching sprint speed for 2025
+16:10:25 precompute.game_sim       INFO    Saved batter BIP profiles: 554 batters. Mean p_out=0.704 p_single=0.224 p_double=0.065 p_triple=0.0067
+16:10:25 precompute.game_sim       INFO    Game simulator data complete.
+16:10:25 src.models.game_sim._sim_utils INFO    Loaded matchup shrinkage slopes: {'k': 0.7869923671829762, 'bb': 0.4, 'hr': 0.0}
+16:10:25 precompute.confident_picks INFO    ============================================================
+16:10:25 precompute.confident_picks INFO    Generating edge picks for 2026-04-22 + 2026-04-23...
+16:10:26 src.data.schedule         INFO    Weather attached: 15/15 with temp, 15/15 with direction
+16:10:26 src.data.schedule         INFO    Fetched 15 games for 2026-04-22
+16:10:26 src.data.schedule         INFO    Weather attached: 0/9 with temp, 9/9 with direction
+16:10:26 src.data.schedule         INFO    Fetched 9 games for 2026-04-23
+16:10:26 precompute.confident_picks INFO    Games found: 15 today + 9 tomorrow = 24
+16:10:31 precompute.confident_picks INFO    Fetched confirmed lineups for 30 team-games
+16:10:31 precompute.confident_picks INFO    Loading pre-computed sim inputs...
+16:10:31 src.models.game_sim.exit_model INFO    Exit model loaded from C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard\exit_model.pkl (type=gbm)
+16:10:31 precompute.confident_picks INFO    Loaded LD% BABIP adjustments for 757 batters
+16:10:31 src.data.queries.breakout INFO    Fetching rolling form for 46 pitchers
+16:10:31 src.data.queries.breakout INFO    Fetching rolling form for 270 batters
+16:10:32 src.data.queries.breakout INFO    Fetching rolling hard-hit% for 270 batters (window=15)
+16:10:33 precompute.confident_picks INFO    Rolling form lifts: 45 pitchers, 270 batters
+16:10:33 precompute.confident_picks INFO    Loaded sprint speed BABIP adjustments for 652 batters
+16:10:33 precompute.confident_picks INFO    Loaded park factor lifts for 32 venues
+16:10:33 precompute.confident_picks INFO    Loaded 102 umpire tendencies (K + BB lifts)
+16:10:33 precompute.confident_picks INFO    Loaded 15 weather effect combos
+16:10:33 precompute.confident_picks INFO    No catcher framing data — skipping framing adjustments
+16:10:33 src.data.db               INFO    Loading cached league_baselines_pooled_pitch_type_marcel_2020_2026.parquet
+16:10:33 precompute.confident_picks INFO    Loaded 30 team bullpen tier profiles
+16:10:33 precompute.confident_picks INFO    Loaded BIP profiles for 554 batters
+16:10:33 src.data.db               INFO    Loading cached season_totals_by_hand_2025.parquet
+16:10:33 precompute.confident_picks INFO    Loaded platoon splits: 1342 batter-hand rows
+16:10:33 precompute.confident_picks INFO    Built pitcher hand lookup: 870 pitchers
+16:12:00 precompute.confident_picks INFO    Saved 22 game-level predictions to game_predictions.parquet
+16:12:04 draftkings                INFO    Fetched 623 DK player props across 98 players
+16:12:04 precompute.confident_picks INFO    Saved 559 DK props (559 resolved to MLB IDs), history now 9901 rows
+16:12:04 prizepicks                INFO    Fetched 1720 Prize Picks props across 98 players
+16:12:04 precompute.confident_picks INFO    Saved 1698 PP props (1698 resolved to MLB IDs), history now 87504 rows16:12:04 precompute.confident_picks INFO    Vegas merge: 765 / 2969 with lines, 765 with edge
+16:12:04 precompute.confident_picks INFO    Market edge: 659 viable legs (model_prob > 53%)
+16:13:02 precompute.confident_picks INFO    Market edge: 55 parlays evaluated, 55 profitable (EV > $1)
+16:13:02 precompute.confident_picks INFO      prizepicks_power 5-pick: EV $17.32 | edge 1632.5% | kelly 3.0% | Shohei Ohtani K under 6.5, Shohei Ohtani K under 6.5, Shohei Ohtani H under 4.5, Shohei Ohtani H under 4.5, Edmundo Sosa BB under 0.5
+16:13:02 precompute.confident_picks INFO      prizepicks_power 5-pick: EV $17.22 | edge 1622.0% | kelly 3.0% | Shohei Ohtani K under 6.5, Shohei Ohtani K under 6.5, Shohei Ohtani H under 4.5, Shohei Ohtani H under 4.5, Shohei Ohtani BB under 1.5
+16:13:02 precompute.confident_picks INFO      prizepicks_power 5-pick: EV $17.22 | edge 1622.0% | kelly 3.0% | Shohei Ohtani K under 6.5, Shohei Ohtani K under 6.5, Shohei Ohtani H under 4.5, Shohei Ohtani H under 4.5, Shohei Ohtani BB under 1.5
+16:13:02 precompute.confident_picks INFO      prizepicks_power 5-pick: EV $17.22 | edge 1622.0% | kelly 3.0% | Shohei Ohtani K under 6.5, Shohei Ohtani K under 6.5, Shohei Ohtani H under 4.5, Shohei Ohtani BB under 1.5, Shohei Ohtani BB under 1.5
+16:13:02 precompute.confident_picks INFO      prizepicks_power 5-pick: EV $17.22 | edge 1622.0% | kelly 3.0% | Shohei Ohtani K under 6.5, Shohei Ohtani K under 6.5, Shohei Ohtani H under 4.5, Shohei Ohtani BB under 1.5, Shohei Ohtani BB under 1.5
+16:13:03 precompute.confident_picks INFO    Saved pitcher game sim samples: 220 arrays (+ dated archive)
+16:13:07 precompute.confident_picks INFO    Saved batter game sim samples: 1568 arrays (+ dated archive)
+C:\Users\kekoa\Documents\data_analytics\player_profiles\scripts\precompute\confident_picks.py:1400: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+  merged = pd.concat(
+16:13:14 precompute.confident_picks INFO    Backfilled results: 45884 rows with actuals
+16:13:14 precompute.confident_picks INFO    Saved 47929 prop projections (225 pitcher, 2744 batter) to game_props.parquet [45559 final, 1695 scheduled]
+16:13:14 precompute.confident_picks INFO      Pitcher K projections:
+16:13:14 precompute.confident_picks INFO        Matthew Boyd vs PHI: 6.8 K expected | Line 6.5 | P(over)=55%      
+16:13:14 precompute.confident_picks INFO        Logan Gilbert vs ATH: 6.7 K expected | Line 6.5 | P(over)=54%     
+16:13:14 precompute.confident_picks INFO        José Soriano vs TOR: 5.9 K expected | Line 5.5 | P(over)=57%      
+16:13:14 precompute.confident_picks INFO        Michael Wacha vs BAL: 5.8 K expected | Line 5.5 | P(over)=55%     
+16:13:14 precompute.confident_picks INFO        Jack Leiter vs PIT: 5.7 K expected | Line 5.5 | P(over)=53%       
+16:13:14 precompute.confident_picks INFO        Max Fried vs BOS: 5.5 K expected | Line 5.5 | P(over)=51%
+16:13:14 precompute.confident_picks INFO        Eric Lauer vs LAA: 5.5 K expected | Line 5.5 | P(over)=50%        
+16:13:14 precompute.confident_picks INFO        Ranger Suarez vs NYY: 5.3 K expected | Line 5.5 | P(over)=46%     
+16:13:14 precompute.confident_picks INFO        Tanner Bibee vs HOU: 5.2 K expected | Line 5.5 | P(over)=43%      
+16:13:14 precompute.confident_picks INFO        Braxton Ashcraft vs TEX: 5.2 K expected | Line 5.5 | P(over)=43%  
+16:13:14 precompute.confident_picks INFO        DL Hall vs DET: 5.2 K expected | Line 5.5 | P(over)=44%
+16:13:14 precompute.confident_picks INFO        Kyle Backhus vs CHC: 5.2 K expected | Line 5.5 | P(over)=44%      
+16:13:14 precompute.confident_picks INFO        Shohei Ohtani vs SF: 5.1 K expected | Line 5.5 | P(over)=43%      
+16:13:14 precompute.confident_picks INFO        Nick Martinez vs CIN: 5.0 K expected | Line 4.5 | P(over)=58%     
+16:13:14 precompute.confident_picks INFO        Clay Holmes vs MIN: 5.0 K expected | Line 4.5 | P(over)=58%       
+16:13:14 precompute.confident_picks INFO        Casey Mize vs MIL: 4.9 K expected | Line 4.5 | P(over)=57%        
+16:13:14 precompute.confident_picks INFO        Tyler Mahle vs LAD: 4.9 K expected | Line 4.5 | P(over)=58%       
+16:13:14 precompute.confident_picks INFO        Eduardo Rodriguez vs CWS: 4.8 K expected | Line 4.5 | P(over)=55% 
+16:13:14 precompute.confident_picks INFO        Walker Buehler vs COL: 4.8 K expected | Line 4.5 | P(over)=55%    
+16:13:14 precompute.confident_picks INFO        Janson Junk vs STL: 4.6 K expected | Line 4.5 | P(over)=51%       
+16:13:14 precompute.confident_picks INFO        Peter Lambert vs CLE: 4.5 K expected | Line 4.5 | P(over)=50%     
+16:13:14 precompute.confident_picks INFO        Aaron Civale vs SEA: 4.5 K expected | Line 4.5 | P(over)=49%      
+16:13:14 precompute.confident_picks INFO        Brandon Williamson vs TB: 4.1 K expected | Line 4.5 | P(over)=41% 
+16:13:14 precompute.confident_picks INFO        Chris Bassitt vs KC: 4.0 K expected | Line 3.5 | P(over)=58%      
+16:13:14 precompute.confident_picks INFO        Zack Littell vs ATL: 4.0 K expected | Line 3.5 | P(over)=57%      
+16:13:14 precompute.confident_picks INFO        Didier Fuentes vs WSH: 3.9 K expected | Line 3.5 | P(over)=55%    
+16:13:14 precompute.confident_picks INFO        Tomoyuki Sugano vs SD: 3.8 K expected | Line 3.5 | P(over)=54%    
+16:13:14 precompute.confident_picks INFO        Anthony Kay vs AZ: 3.7 K expected | Line 3.5 | P(over)=53%        
+16:13:14 precompute.confident_picks INFO        Kyle Leahy vs MIA: 3.5 K expected | Line 3.5 | P(over)=49%        
+16:13:14 precompute.confident_picks INFO        Jacob deGrom vs PIT: 7.7 K expected | Line 7.5 | P(over)=53%      
+16:13:14 precompute.confident_picks INFO        Tarik Skubal vs MIL: 6.7 K expected | Line 6.5 | P(over)=55%      
+16:13:14 precompute.confident_picks INFO        Cam Schlittler vs BOS: 6.4 K expected | Line 6.5 | P(over)=47%    
+16:13:14 precompute.confident_picks INFO        Cristopher Sánchez vs CHC: 6.3 K expected | Line 6.5 | P(over)=48%16:13:14 precompute.confident_picks INFO        Joe Ryan vs NYM: 6.3 K expected | Line 6.5 | P(over)=48%
+16:13:14 precompute.confident_picks INFO        Tyler Glasnow vs SF: 6.1 K expected | Line 6.5 | P(over)=46%      
+16:13:14 precompute.confident_picks INFO        Michael Soroka vs CWS: 5.9 K expected | Line 5.5 | P(over)=58%    
+16:13:14 precompute.confident_picks INFO        Matt Waldron vs COL: 5.3 K expected | Line 5.5 | P(over)=46%      
+16:13:14 precompute.confident_picks INFO        Logan Webb vs LAD: 5.2 K expected | Line 5.5 | P(over)=44%        
+16:13:14 precompute.confident_picks INFO        Edward Cabrera vs PHI: 5.2 K expected | Line 5.5 | P(over)=44%    
+16:13:14 precompute.confident_picks INFO        Bubba Chandler vs TEX: 5.0 K expected | Line 5.5 | P(over)=41%    
+16:13:14 precompute.confident_picks INFO        Christian Scott vs MIN: 4.4 K expected | Line 4.5 | P(over)=48%   
+16:13:14 precompute.confident_picks INFO        Brandon Sproat vs DET: 4.4 K expected | Line 4.5 | P(over)=48%    
+16:13:14 precompute.confident_picks INFO        Cade Cavalli vs ATL: 4.2 K expected | Line 4.5 | P(over)=43%      
+16:13:14 precompute.confident_picks INFO        Davis Martin vs AZ: 4.0 K expected | Line 3.5 | P(over)=59%       
+16:13:14 precompute.confident_picks INFO        Martín Pérez vs WSH: 3.4 K expected | Line 3.5 | P(over)=47%      
+16:13:14 precompute                INFO    ============================================================
+16:13:14 precompute                INFO    Dashboard pre-computation complete!
+16:13:14 precompute                INFO      Hitter projections:  578 players
+16:13:14 precompute                INFO      Pitcher projections: 723 players
+16:13:14 precompute                INFO      Output dir:          C:\Users\kekoa\Documents\data_analytics\tdd-dashboard\data\dashboard

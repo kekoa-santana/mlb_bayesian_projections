@@ -159,6 +159,39 @@ def run_bf_priors(
     save_dashboard_parquet(bf_priors, "bf_priors.parquet")
     logger.info("Saved BF priors: %d pitcher-seasons", len(bf_priors))
 
+    # Preseason snapshot for backtesting
+    snapshot_dir = DASHBOARD_DIR / "snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    bf_priors.to_parquet(snapshot_dir / "bf_priors_preseason.parquet", index=False)
+    logger.info("Saved BF priors preseason snapshot")
+
+
+def run_outs_priors(
+    *,
+    seasons: list[int] = SEASONS,
+) -> None:
+    """Compute outs priors (outs-anchored exit model)."""
+    from src.data.queries import get_pitcher_game_logs
+    from src.models.bf_model import compute_pitcher_outs_priors
+
+    logger.info("=" * 60)
+    logger.info("Computing outs priors...")
+    game_logs_list = []
+    for s in seasons:
+        gl = get_pitcher_game_logs(s)
+        game_logs_list.append(gl)
+    game_logs = pd.concat(game_logs_list, ignore_index=True)
+
+    outs_priors = compute_pitcher_outs_priors(game_logs)
+    save_dashboard_parquet(outs_priors, "outs_priors.parquet")
+    logger.info("Saved outs priors: %d pitcher-seasons", len(outs_priors))
+
+    # Preseason snapshot for backtesting
+    snapshot_dir = DASHBOARD_DIR / "snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    outs_priors.to_parquet(snapshot_dir / "outs_priors_preseason.parquet", index=False)
+    logger.info("Saved outs priors preseason snapshot")
+
 
 def run_umpire(
     *,
@@ -199,16 +232,12 @@ def run_catcher_framing(
 
     logger.info("=" * 60)
     logger.info("Computing catcher framing effects...")
-    frames = []
-    for s in seasons:
-        try:
-            df = get_catcher_framing_effects(s)
-            if not df.empty:
-                frames.append(df)
-        except Exception as e:
-            logger.warning("Catcher framing failed for season %d: %s", s, e)
-    if frames:
-        framing = pd.concat(frames, ignore_index=True)
+    try:
+        framing = get_catcher_framing_effects(seasons)
+    except Exception as e:
+        logger.warning("Catcher framing failed: %s", e)
+        framing = pd.DataFrame()
+    if not framing.empty:
         save_dashboard_parquet(framing, "catcher_framing.parquet")
         logger.info("Saved catcher framing: %d catcher-seasons", len(framing))
     else:

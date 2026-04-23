@@ -66,6 +66,15 @@ def run(
         exit_model.save(DASHBOARD_DIR / "exit_model.pkl")
         save_dashboard_parquet(exit_tendencies, "pitcher_exit_tendencies.parquet")
         logger.info("Saved exit model + tendencies")
+
+        # Preseason snapshot for backtesting
+        snapshot_dir = DASHBOARD_DIR / "snapshots"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        exit_model.save(snapshot_dir / "exit_model_preseason.pkl")
+        exit_tendencies.to_parquet(
+            snapshot_dir / "pitcher_exit_tendencies_preseason.parquet", index=False,
+        )
+        logger.info("Saved exit model preseason snapshot")
     except Exception:
         logger.exception("Failed to train exit model")
 

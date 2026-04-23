@@ -55,7 +55,7 @@ _SECTION_GROUPS: dict[str, list[str]] = {
     "rankings":    ["player_rankings", "breakouts"],
     "weekly_form": ["weekly_form"],
     "daily_standouts": ["daily_standouts"],
-    "game_data":   ["player_teams", "game_logs", "bf_priors", "umpire", "weather", "catcher_framing"],
+    "game_data":   ["player_teams", "game_logs", "bf_priors", "outs_priors", "umpire", "weather", "catcher_framing"],
     "traditional": ["trad_stats", "agg_eff"],
     "glicko":      ["player_glicko"],
     "historical":  ["historical_all"],
@@ -234,6 +234,12 @@ def main() -> None:
     # =================================================================
     if should_run("bf_priors"):
         game_data.run_bf_priors(seasons=SEASONS)
+
+    # =================================================================
+    # 4a-ii. Outs priors (outs-anchored exit model)
+    # =================================================================
+    if should_run("outs_priors"):
+        game_data.run_outs_priors(seasons=SEASONS)
 
     # =================================================================
     # 4b. Umpire K-rate tendencies

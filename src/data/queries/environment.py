@@ -1,10 +1,12 @@
-"""Park factors, umpire tendencies, weather effects, catcher framing, days rest."""
+"""Park factors, umpire tendencies, weather effects, catcher framing, days rest,
+rolling league baseline."""
 from __future__ import annotations
 
 import logging
 
 import numpy as np
 import pandas as pd
+from scipy.special import logit as _logit
 
 from src.data.db import read_sql
 
@@ -309,9 +311,9 @@ def get_weather_effects(
 ) -> pd.DataFrame:
     """Compute weather-adjusted K and HR rate multipliers.
 
-    Groups outdoor games by temperature bucket and wind category, computes
-    K-rate and HR-rate for each combination, and expresses as a multiplier
-    relative to the overall outdoor average.
+    Groups outdoor games by temperature bucket, wind category, and wind
+    speed bucket, computes K-rate and HR-rate for each combination, and
+    expresses as a multiplier relative to the overall outdoor average.
 
     Parameters
     ----------
@@ -321,8 +323,8 @@ def get_weather_effects(
     Returns
     -------
     pd.DataFrame
-        Columns: temp_bucket, wind_category, games, k_rate, hr_rate,
-        k_multiplier, hr_multiplier.
+        Columns: temp_bucket, wind_category, wind_speed_bucket, games,
+        k_rate, hr_rate, k_multiplier, hr_multiplier.
     """
     if seasons is None:
         seasons = list(range(2018, 2026))
@@ -351,6 +353,12 @@ def get_weather_effects(
             ELSE 'hot'
         END AS temp_bucket,
         dw.wind_category,
+        CASE
+            WHEN dw.wind_speed <= 5 THEN 'calm'
+            WHEN dw.wind_speed <= 10 THEN 'light'
+            WHEN dw.wind_speed <= 15 THEN 'moderate'
+            ELSE 'strong'
+        END AS wind_speed_bucket,
         COUNT(*) AS games,
         SUM(gs.pa) AS total_pa,
         SUM(gs.k) AS total_k,
@@ -358,9 +366,9 @@ def get_weather_effects(
     FROM game_stats gs
     JOIN production.dim_weather dw ON gs.game_pk = dw.game_pk
     WHERE NOT dw.is_dome
-    GROUP BY 1, dw.wind_category
-    HAVING COUNT(*) >= 50
-    ORDER BY 1, dw.wind_category
+    GROUP BY 1, dw.wind_category, 3
+    HAVING COUNT(*) >= 30
+    ORDER BY 1, dw.wind_category, 3
     """
     logger.info("Fetching weather effects for seasons %s", seasons)
     df = read_sql(query, {})
@@ -386,6 +394,105 @@ def get_weather_effects(
                 len(df),
                 df["k_multiplier"].min(), df["k_multiplier"].max(),
                 df["hr_multiplier"].min(), df["hr_multiplier"].max())
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Rolling league baseline (14-day trailing K%, BB%, HR%)
+# ---------------------------------------------------------------------------
+def get_rolling_league_baseline(
+    season: int | None = None,
+    window: int = 14,
+    game_date: str | None = None,
+) -> pd.DataFrame:
+    """Compute trailing league K%, BB%, HR% and logit offsets.
+
+    Uses the last ``window`` game-dates (not strict calendar days --
+    off-days are skipped) to compute league rates, then converts to
+    logit-scale offsets vs the static baselines in constants.py.
+
+    Parameters
+    ----------
+    season : int, optional
+        Season to query. Derived from ``game_date`` if not provided.
+    window : int
+        Number of trailing game-dates to include (default 14).
+    game_date : str, optional
+        Reference date (ISO format). Used to derive season if needed.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: game_date, rolling_pa, rolling_k_rate, rolling_bb_rate,
+        rolling_hr_rate, k_offset, bb_offset, hr_offset.
+    """
+    if season is None:
+        if game_date is not None:
+            season = int(game_date[:4])
+        else:
+            from datetime import date as _date
+            season = _date.today().year
+    from src.utils.constants import (
+        SIM_LEAGUE_K_RATE,
+        SIM_LEAGUE_BB_RATE,
+        SIM_LEAGUE_HR_RATE,
+    )
+
+    query = f"""
+    WITH daily AS (
+        SELECT
+            dg.game_date,
+            COUNT(*) AS pa,
+            SUM(CASE WHEN fpa.events IN ('strikeout','strikeout_double_play')
+                     THEN 1 ELSE 0 END) AS k,
+            SUM(CASE WHEN fpa.events IN ('walk','intent_walk')
+                     THEN 1 ELSE 0 END) AS bb,
+            SUM(CASE WHEN fpa.events = 'home_run'
+                     THEN 1 ELSE 0 END) AS hr
+        FROM production.fact_pa fpa
+        JOIN production.dim_game dg ON fpa.game_pk = dg.game_pk
+        WHERE dg.game_type = 'R'
+          AND dg.season = {int(season)}
+          AND fpa.events IS NOT NULL
+        GROUP BY dg.game_date
+    )
+    SELECT
+        game_date,
+        pa,
+        SUM(pa) OVER w AS rolling_pa,
+        SUM(k) OVER w AS rolling_k,
+        SUM(bb) OVER w AS rolling_bb,
+        SUM(hr) OVER w AS rolling_hr
+    FROM daily
+    WINDOW w AS (ORDER BY game_date
+                 ROWS BETWEEN {int(window) - 1} PRECEDING AND CURRENT ROW)
+    ORDER BY game_date
+    """
+    logger.info("Fetching rolling league baseline for %d (window=%d)", season, window)
+    df = read_sql(query, {})
+    if df.empty:
+        return df
+
+    df["rolling_k_rate"] = (df["rolling_k"] / df["rolling_pa"]).round(5)
+    df["rolling_bb_rate"] = (df["rolling_bb"] / df["rolling_pa"]).round(5)
+    df["rolling_hr_rate"] = (df["rolling_hr"] / df["rolling_pa"]).round(5)
+
+    base_k = _logit(SIM_LEAGUE_K_RATE)
+    base_bb = _logit(SIM_LEAGUE_BB_RATE)
+    base_hr = _logit(SIM_LEAGUE_HR_RATE)
+
+    df["k_offset"] = (_logit(np.clip(df["rolling_k_rate"], 0.01, 0.99)) - base_k).round(4)
+    df["bb_offset"] = (_logit(np.clip(df["rolling_bb_rate"], 0.01, 0.99)) - base_bb).round(4)
+    df["hr_offset"] = (_logit(np.clip(df["rolling_hr_rate"], 0.01, 0.99)) - base_hr).round(4)
+
+    df = df.drop(columns=["pa", "rolling_k", "rolling_bb", "rolling_hr"])
+    df["game_date"] = df["game_date"].astype(str)
+
+    logger.info(
+        "Rolling baseline: %d days, latest K_off=%.3f BB_off=%.3f HR_off=%.3f",
+        len(df),
+        df["k_offset"].iloc[-1], df["bb_offset"].iloc[-1], df["hr_offset"].iloc[-1],
+    )
     return df
 
 

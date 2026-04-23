@@ -261,6 +261,140 @@ def draw_bf_samples(
 
 
 # ---------------------------------------------------------------------------
+# Pitcher outs distribution model
+# ---------------------------------------------------------------------------
+# Managers think in innings (outs), not BF. An outs-anchored exit model
+# directly targets the decision managers make ("get me through 6" = 18 outs).
+# Outs priors use the same shrinkage framework as BF priors but aggregate
+# the `outs` column from pitcher game logs.
+
+# Population defaults (validated against 2022-2025 starter data, BF >= 9).
+# Game-weighted mean outs = 15.91; rounded to 16.0 for same upward-bias
+# logic as BF: blow-ups can pull outs below target but nothing inflates above.
+DEFAULT_POP_OUTS_MU = 16.0
+DEFAULT_POP_OUTS_WITHIN_STD = 3.5   # Mean within-pitcher game-to-game std
+DEFAULT_SHRINKAGE_K_OUTS = 8.0      # within_var / between_var ≈ 12.53 / 1.57
+
+
+def compute_pitcher_outs_priors(
+    game_logs: pd.DataFrame,
+    pop_mu: float = DEFAULT_POP_OUTS_MU,
+    pop_within_std: float = DEFAULT_POP_OUTS_WITHIN_STD,
+    shrinkage_k: float = DEFAULT_SHRINKAGE_K_OUTS,
+    min_starts: int = 5,
+) -> pd.DataFrame:
+    """Compute shrinkage-estimated outs priors per pitcher-season.
+
+    Parameters
+    ----------
+    game_logs : pd.DataFrame
+        Stacked game logs across seasons. Must have columns:
+        pitcher_id, season, outs, is_starter, batters_faced.
+    pop_mu : float
+        Population mean outs for starters.
+    pop_within_std : float
+        Population within-pitcher game-to-game std.
+    shrinkage_k : float
+        Shrinkage constant k = sigma^2 / tau^2.
+    min_starts : int
+        Pitchers below this get pure population prior.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (pitcher_id, season) with columns:
+        pitcher_id, season, n_starts, raw_mean_outs, raw_std_outs,
+        mu_outs, sigma_outs, reliability.
+    """
+    starters = game_logs[
+        (game_logs["is_starter"] == True)  # noqa: E712
+        & (game_logs["batters_faced"] >= 9)
+    ].copy()
+
+    if starters.empty:
+        logger.warning("No starter game logs found for outs priors")
+        return pd.DataFrame(columns=[
+            "pitcher_id", "season", "n_starts", "raw_mean_outs", "raw_std_outs",
+            "mu_outs", "sigma_outs", "reliability",
+        ])
+
+    agg = starters.groupby(["pitcher_id", "season"]).agg(
+        n_starts=("outs", "count"),
+        raw_mean_outs=("outs", "mean"),
+        raw_std_outs=("outs", "std"),
+    ).reset_index()
+
+    agg["raw_std_outs"] = agg["raw_std_outs"].fillna(pop_within_std)
+
+    # Shrinkage
+    agg["reliability"] = agg["n_starts"] / (agg["n_starts"] + shrinkage_k)
+    below_min = agg["n_starts"] < min_starts
+    agg.loc[below_min, "reliability"] = 0.0
+
+    agg["mu_outs"] = (
+        agg["reliability"] * agg["raw_mean_outs"]
+        + (1 - agg["reliability"]) * pop_mu
+    )
+    agg["sigma_outs"] = (
+        agg["reliability"] * agg["raw_std_outs"]
+        + (1 - agg["reliability"]) * pop_within_std
+    )
+
+    logger.info(
+        "Outs priors: %d pitcher-seasons, mean reliability=%.3f",
+        len(agg), agg["reliability"].mean(),
+    )
+    return agg
+
+
+def get_outs_distribution(
+    pitcher_id: int,
+    season: int,
+    outs_priors: pd.DataFrame,
+    pop_mu: float = DEFAULT_POP_OUTS_MU,
+    pop_within_std: float = DEFAULT_POP_OUTS_WITHIN_STD,
+) -> dict[str, Any]:
+    """Look up outs distribution parameters for a pitcher.
+
+    Parameters
+    ----------
+    pitcher_id : int
+        MLB pitcher ID.
+    season : int
+        Season to look up.
+    outs_priors : pd.DataFrame
+        Output of ``compute_pitcher_outs_priors``.
+    pop_mu : float
+        Fallback population mean.
+    pop_within_std : float
+        Fallback population std.
+
+    Returns
+    -------
+    dict
+        Keys: mu_outs, sigma_outs, reliability, dist_type.
+    """
+    mask = (outs_priors["pitcher_id"] == pitcher_id) & (outs_priors["season"] == season)
+    rows = outs_priors[mask]
+
+    if rows.empty:
+        return {
+            "mu_outs": pop_mu,
+            "sigma_outs": pop_within_std,
+            "reliability": 0.0,
+            "dist_type": "population_fallback",
+        }
+
+    row = rows.iloc[0]
+    return {
+        "mu_outs": float(row["mu_outs"]),
+        "sigma_outs": float(row["sigma_outs"]),
+        "reliability": float(row["reliability"]),
+        "dist_type": "shrinkage",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Batter PA distribution model
 # ---------------------------------------------------------------------------
 
