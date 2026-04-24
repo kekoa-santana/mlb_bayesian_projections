@@ -193,6 +193,35 @@ def run_outs_priors(
     logger.info("Saved outs priors preseason snapshot")
 
 
+def run_pitches_priors(
+    *,
+    seasons: list[int] = SEASONS,
+) -> None:
+    """Compute pitch count priors (pitch-count-anchored exit model)."""
+    from src.data.queries import get_pitcher_game_logs
+    from src.models.bf_model import compute_pitcher_pitches_priors
+
+    logger.info("=" * 60)
+    logger.info("Computing pitch count priors...")
+    game_logs_list = []
+    for s in seasons:
+        gl = get_pitcher_game_logs(s)
+        game_logs_list.append(gl)
+    game_logs = pd.concat(game_logs_list, ignore_index=True)
+
+    pitches_priors = compute_pitcher_pitches_priors(game_logs)
+    save_dashboard_parquet(pitches_priors, "pitches_priors.parquet")
+    logger.info("Saved pitches priors: %d pitcher-seasons", len(pitches_priors))
+
+    # Preseason snapshot
+    snapshot_dir = DASHBOARD_DIR / "snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    pitches_priors.to_parquet(
+        snapshot_dir / "pitches_priors_preseason.parquet", index=False
+    )
+    logger.info("Saved pitches priors preseason snapshot")
+
+
 def run_umpire(
     *,
     from_season: int = FROM_SEASON,

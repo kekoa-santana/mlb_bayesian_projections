@@ -19,14 +19,13 @@ logger = logging.getLogger(__name__)
 
 # League-average BIP outcome splits
 # Conditional on BIP (excludes K, BB, HBP, HR)
-# Derived from: field_out / (field_out + single + double + triple)
-# where field_out includes force_out, GIDP, FC, sac_fly, etc.
 # Historical BABIP (2022-2025): 0.290.  Out rate = 1 - BABIP = 0.710.
-# Backed off to 0.700 to allow sim to reach ~9.0 R/G with blended rates.
+# Regenerated per-batter profiles have mean p_out = 0.709.
+# Default used as fallback for batters without individual profiles.
 _DEFAULT_BIP_PROBS = {
-    "out": 0.700,
-    "single": 0.222,
-    "double": 0.065,
+    "out": 0.710,
+    "single": 0.215,
+    "double": 0.063,
     "triple": 0.005,
 }
 
@@ -39,15 +38,15 @@ _SHRINKAGE_K = 500  # BIP needed for full weight on pitcher-specific BABIP
 
 # Coefficients for quality-metric BIP split prediction
 # Trained on 2021-2025 BIP data (337 year-pairs, walk-forward validated)
-# BABIP = f(exit_velo, launch_angle, gb_pct, sprint_speed)
-# Avg-quality batter (EV=88, LA=12, GB=0.44, sprint=27) maps to
-# pred_babip=0.300.
+# then scaled ~2x to match actual BABIP differentiation (std 0.036 vs
+# original model std 0.017). Intercept recalculated so league-avg inputs
+# (EV=88, LA=12, GB=0.44, sprint=27) produce pred_babip=0.295.
 _BABIP_COEFS = {
-    "avg_ev": 0.00035,
-    "avg_la": -0.00396,
-    "gb_pct": -0.08537,
-    "sprint_speed": 0.00433,
-    "intercept": 0.23718,
+    "avg_ev": 0.00070,
+    "avg_la": -0.00790,
+    "gb_pct": -0.17000,
+    "sprint_speed": 0.00870,
+    "intercept": 0.16810,
 }
 
 # Per-hit-type share adjustments from quality metrics
@@ -64,7 +63,7 @@ def compute_player_bip_probs(
     sprint_speed: float = 27.0,
     observed_bip_splits: dict[str, float] | None = None,
     bip_count: int = 0,
-    shrinkage_k: int = 300,
+    shrinkage_k: int = 150,
 ) -> np.ndarray:
     """Compute personalized BIP outcome probabilities.
 
@@ -108,7 +107,7 @@ def compute_player_bip_probs(
         + _BABIP_COEFS["sprint_speed"] * sprint_speed
         + _BABIP_COEFS["intercept"]
     )
-    pred_babip = np.clip(pred_babip, 0.15, 0.45)
+    pred_babip = np.clip(pred_babip, 0.12, 0.55)
 
     # Adjust hit distribution based on player profile
     # High EV -> more extra-base hits (doubles especially)
@@ -227,7 +226,7 @@ class BIPOutcomeModel:
 
         # Shift hit probability (single + double + triple) by BABIP adj
         hit_prob = probs[1:].sum()
-        new_hit_prob = np.clip(hit_prob + babip_adj, 0.05, 0.50)
+        new_hit_prob = np.clip(hit_prob + babip_adj, 0.03, 0.55)
         scale = new_hit_prob / hit_prob if hit_prob > 0 else 1.0
 
         probs[1:] *= scale
@@ -269,7 +268,7 @@ class BIPOutcomeModel:
             if nonzero.any():
                 hit_p = p[nonzero, 1:].sum(axis=1)
                 safe_hit = np.where(hit_p > 1e-9, hit_p, 1e-9)
-                new_hit = np.clip(hit_p + babip_adj[nonzero], 0.05, 0.50)
+                new_hit = np.clip(hit_p + babip_adj[nonzero], 0.03, 0.55)
                 scale = new_hit / safe_hit
                 p[nonzero, 1:] = p[nonzero, 1:] * scale[:, None]
                 p[nonzero, 0] = 1.0 - p[nonzero, 1:].sum(axis=1)
@@ -320,7 +319,7 @@ class BIPOutcomeModel:
             hit_p = p[:, 1:].sum(axis=1)
             # Avoid divide-by-zero on pathological rows
             safe_hit = np.where(hit_p > 1e-9, hit_p, 1e-9)
-            new_hit = np.clip(hit_p + babip_adj, 0.05, 0.50)
+            new_hit = np.clip(hit_p + babip_adj, 0.03, 0.55)
             scale = new_hit / safe_hit
             p[:, 1:] = p[:, 1:] * scale[:, None]
             p[:, 0] = 1.0 - p[:, 1:].sum(axis=1)

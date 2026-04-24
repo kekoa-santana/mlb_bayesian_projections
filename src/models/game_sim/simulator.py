@@ -81,23 +81,75 @@ _POP_BF_MU = 22.4
 _POP_BF_STD = 1.8   # Between-pitcher std of mean BF (not within-game)
 _BF_LOGIT_SCALE = 0.25  # logit shift per z-score of pitcher BF mean (tuned from 0.35 to recenter BF bias)
 
-# ---- Outs-anchored exit model ----
-# Managers think in innings/outs, not BF. The exit decision fires at inning
-# boundaries (outs % 3 == 0) and checks outs >= target_outs.  Since the
-# check is exact at inning boundaries, there is no overshoot bias (unlike
-# BF, which had ~1.5 BF overshoot requiring an offset).
-_OUTS_ANCHOR_K = 3.0       # Steep sigmoid: 1 out past target → 95% exit
-_SIGMA_OUTS_CAP = 1.5      # Cap on target noise (same logic as BF cap)
-_OUTS_ANCHOR_OFFSET = 0.0  # No offset needed — outs align with inning boundaries
-_POP_OUTS_MU = 16.0        # Population mean outs for starters (2022-2025, BF >= 9)
+# ---- Pitch-count-anchored exit model (preferred) ----
+# Evaluated per PA with two components: boundary exits (empirical hazard
+# rates adjusted by pitch count) and mid-inning exits (trouble-driven).
+# Replaces the outs-anchored model which produced a 6 IP modal spike.
+
+# Empirical boundary hazard rates (2022-2025, 19K starts)
+# P(exit | reached this boundary), indexed by completed innings (1-8)
+_BOUNDARY_BASE_HAZARD = np.array([
+    0.003,   # 1 IP (3 outs)
+    0.010,   # 2 IP (6 outs)
+    0.032,   # 3 IP (9 outs)
+    0.084,   # 4 IP (12 outs)
+    0.273,   # 5 IP (15 outs)
+    0.555,   # 6 IP (18 outs)
+    0.763,   # 7 IP (21 outs)
+    0.667,   # 8 IP (24 outs)
+])
+
+# Pre-computed logits of boundary hazards (avoid recomputing per PA)
+_BOUNDARY_BASE_LOGIT = np.log(
+    _BOUNDARY_BASE_HAZARD / (1.0 - _BOUNDARY_BASE_HAZARD)
+)
+
+# Pitch count modifier: logit shift per std-dev of pitch deviation at boundaries
+_BOUNDARY_PITCH_SLOPE = 1.0
+
+# Mid-inning per-PA base hazard by inning (increases with innings)
+# These are per-PA rates; with ~3.5 PAs per inning, cumulative
+# mid-inning exit per inning is roughly 3.5x the per-PA rate.
+_MID_INNING_BASE_HAZARD = np.array([
+    0.001,   # inning 1
+    0.002,   # inning 2
+    0.003,   # inning 3
+    0.006,   # inning 4
+    0.010,   # inning 5
+    0.018,   # inning 6
+    0.028,   # inning 7
+    0.040,   # inning 8
+])
+_MID_INNING_BASE_LOGIT = np.log(
+    _MID_INNING_BASE_HAZARD / (1.0 - _MID_INNING_BASE_HAZARD)
+)
+
+# Mid-inning trouble multipliers (additive logit shifts)
+_MID_PITCH_SLOPE = 0.5          # per std-dev above target pitches
+_TROUBLE_RUNS_INNING_SLOPE = 0.25  # per run scored this inning
+_TROUBLE_RUNNERS_SLOPE = 0.15      # per runner on base
+
+# Hard caps
+_PITCH_HARD_CAP = 120   # Force exit above this
+_PITCH_SOFT_CAP = 110   # 90% exit probability above this
+
+# Mid-inning blowup: force exit if runs_this_inning >= threshold
+_BLOWUP_RUNS_THRESHOLD = 4
+
+# Population pitch count defaults (for pitchers without priors)
+_POP_PITCHES_MU = 86.9
+_POP_PITCHES_SIGMA = 12.1
+
+# ---- DEPRECATED: Outs-anchored exit constants (kept for backward compat) ----
+_OUTS_ANCHOR_K = 3.0
+_SIGMA_OUTS_CAP = 2.0
+_OUTS_ANCHOR_OFFSET = 0.0
+_POP_OUTS_MU = 16.0
 
 # ---- DEPRECATED: BF-anchored exit constants (kept for backward compat) ----
-_BF_ANCHOR_K = 0.3    # logit slope: gentle sigmoid (at 3.0 it was near-instant yank)
+_BF_ANCHOR_K = 0.3
 _SIGMA_BF_CAP = 1.5
 _BF_ANCHOR_OFFSET = 1.5
-
-# Mid-inning blowup threshold: yank pitcher if runs_this_inning >= this value
-_BLOWUP_RUNS_THRESHOLD = 4
 
 # Bullpen state adjustment parameters
 _BULLPEN_WORKLOAD_POP_MEAN = 5.0   # Mean relief IP over trailing 3 days
@@ -712,6 +764,8 @@ def simulate_game(
     sigma_bf: float | None = None,
     mu_outs: float | None = None,
     sigma_outs: float | None = None,
+    mu_pitches: float | None = None,
+    sigma_pitches: float | None = None,
     lineup_matchup_reliabilities: dict[str, np.ndarray] | None = None,
     bullpen_k_rate: float = BULLPEN_K_RATE,
     bullpen_bb_rate: float = BULLPEN_BB_RATE,
@@ -897,36 +951,34 @@ def simulate_game(
     # Active mask — simulations where pitcher is still in the game
     active = np.ones(n_sims, dtype=bool)
 
-    # BF-anchored exit: draw per-sim target BF from pitcher's BF prior.
-    # When mu_bf/sigma_bf are provided, the exit decision fires only at
-    # inning boundaries, anchored to this target. Mid-inning exits are
-    # limited to hard caps and blow-up conditions. This eliminates the
-    # per-PA K/BB/HR → game-state → exit-model feedback loop that made
-    # total BF sensitive to the posterior sample source.
-    # --- Outs-anchored exit (preferred) vs BF-anchored (deprecated) ---
-    # Priority: mu_outs > mu_bf > legacy per-PA exit model.
-    use_outs_anchor = mu_outs is not None and sigma_outs is not None
-    use_bf_anchor = (not use_outs_anchor) and mu_bf is not None and sigma_bf is not None
+    # --- Exit model priority ---
+    # Pitch-count-anchored (preferred) > outs-anchored > BF-anchored > legacy
+    use_pitches_anchor = mu_pitches is not None and sigma_pitches is not None
+    use_outs_anchor = (not use_pitches_anchor) and mu_outs is not None and sigma_outs is not None
+    use_bf_anchor = (not use_pitches_anchor and not use_outs_anchor) and mu_bf is not None and sigma_bf is not None
 
-    if use_outs_anchor:
+    target_pitches_arr = None
+    target_outs_arr = None
+    sigma_pitches_eff = _POP_PITCHES_SIGMA
+
+    if use_pitches_anchor:
+        sigma_pitches_eff = max(sigma_pitches, 4.0)
+        target_pitches_arr = rng.normal(
+            mu_pitches, sigma_pitches_eff, size=n_sims,
+        )
+        target_pitches_arr = np.clip(target_pitches_arr, 40, 130).astype(float)
+    elif use_outs_anchor:
         effective_sigma = min(max(sigma_outs, 0.5), _SIGMA_OUTS_CAP)
         target_outs_arr = rng.normal(
             mu_outs - _OUTS_ANCHOR_OFFSET, effective_sigma, size=n_sims,
         )
         target_outs_arr = np.clip(target_outs_arr, 3, 27).astype(float)
     elif use_bf_anchor:
-        # DEPRECATED: BF-anchored fallback for callers that haven't
-        # migrated to outs priors yet.
         effective_sigma = min(max(sigma_bf, 0.5), _SIGMA_BF_CAP)
         target_bf = rng.normal(
             mu_bf - _BF_ANCHOR_OFFSET, effective_sigma, size=n_sims,
         )
         target_bf = np.clip(target_bf, 9, 35).astype(float)
-        target_outs_arr = None
-    else:
-        # No priors at all — fall back to the legacy per-PA exit model.
-        # This preserves backward compatibility for callers that don't
-        # supply outs or BF priors (e.g., backtest scripts, season sim).
         target_outs_arr = None
 
     # --- Main simulation loop ---
@@ -1069,22 +1121,64 @@ def simulate_game(
         # --- 5. Exit check ---
         # Force exit on complete game (27 outs)
         force_exit = outs[active] >= 27
-        # Force exit on pitch count hard cap
-        force_exit |= pitches[active] >= 130
 
-        if use_outs_anchor:
-            # ---- OUTS-ANCHORED EXIT LOGIC ----
-            # Managers target innings (outs), not BF. Exit checks fire
-            # at inning boundaries where outs is always a multiple of 3,
-            # giving natural alignment with the target.
+        if use_pitches_anchor:
+            # ---- PITCH-COUNT-ANCHORED EXIT (per-PA evaluation) ----
+            # Two components: boundary exits (empirical hazard + pitch count)
+            # and mid-inning exits (trouble-driven).
 
-            # Mid-inning blow-up: yank pitcher if >= 4 runs this inning
+            # Force exits
+            force_exit |= pitches[active] >= _PITCH_HARD_CAP
             mid_inning_blowup = ~inning_over & (
                 runs_this_inning[active] >= _BLOWUP_RUNS_THRESHOLD
             )
             force_exit |= mid_inning_blowup
 
-            # Between-inning exit: only at inning boundaries
+            exit_prob = np.zeros(n_active)
+            not_forced = ~force_exit
+
+            # Pitch count z-score relative to target
+            z_pc = (
+                (pitches[active].astype(float) - target_pitches_arr[active])
+                / sigma_pitches_eff
+            )
+
+            # Component 1: Boundary exits
+            at_boundary = inning_over & (bf_count[active] >= 3) & not_forced
+            if at_boundary.any():
+                completed_ip = outs[active][at_boundary] // 3
+                inn_idx = np.clip(completed_ip - 1, 0, 7)
+                base_logit = _BOUNDARY_BASE_LOGIT[inn_idx]
+                adj_logit = base_logit + _BOUNDARY_PITCH_SLOPE * z_pc[at_boundary]
+                exit_prob[at_boundary] = expit(adj_logit)
+
+            # Component 2: Mid-inning exits
+            mid_inning = ~inning_over & not_forced & (bf_count[active] >= 3)
+            if mid_inning.any():
+                curr_inn = np.clip(inning[active][mid_inning] - 1, 0, 7)
+                base_logit = _MID_INNING_BASE_LOGIT[curr_inn]
+                adj_logit = base_logit.copy()
+                # Pitch count effect (only above target)
+                adj_logit += _MID_PITCH_SLOPE * np.maximum(z_pc[mid_inning], 0.0)
+                # Trouble: runs this inning
+                adj_logit += _TROUBLE_RUNS_INNING_SLOPE * runs_this_inning[active][mid_inning].astype(float)
+                # Trouble: runners on base
+                runners_on = (r1[active] + r2[active] + r3[active])[mid_inning].astype(float)
+                adj_logit += _TROUBLE_RUNNERS_SLOPE * runners_on
+                exit_prob[mid_inning] = expit(adj_logit)
+
+            # Soft cap: very high exit prob above _PITCH_SOFT_CAP
+            soft_mask = (pitches[active] >= _PITCH_SOFT_CAP) & not_forced
+            exit_prob[soft_mask] = np.maximum(exit_prob[soft_mask], 0.90)
+
+        elif use_outs_anchor:
+            # ---- DEPRECATED: OUTS-ANCHORED EXIT ----
+            force_exit |= pitches[active] >= 130
+            mid_inning_blowup = ~inning_over & (
+                runs_this_inning[active] >= _BLOWUP_RUNS_THRESHOLD
+            )
+            force_exit |= mid_inning_blowup
+
             exit_prob = np.zeros(n_active)
             at_boundary = inning_over & (bf_count[active] >= 3)
             at_boundary &= ~force_exit
@@ -1099,6 +1193,7 @@ def simulate_game(
 
         elif use_bf_anchor:
             # ---- DEPRECATED: BF-ANCHORED EXIT ----
+            force_exit |= pitches[active] >= 130
             mid_inning_blowup = ~inning_over & (
                 runs_this_inning[active] >= _BLOWUP_RUNS_THRESHOLD
             )
@@ -1117,18 +1212,7 @@ def simulate_game(
                 )
         else:
             # ---- DEPRECATED: Per-PA exit model (legacy) ----
-            # WARNING: This path evaluates exit probability after every
-            # PA, using game-state features (runners, recent_trouble)
-            # that are downstream of the K/BB/HR sample distribution.
-            # This creates a feedback loop: different K samples →
-            # different game states → different exit probabilities →
-            # different total BF. The resulting BF is NOT invariant to
-            # the posterior sample source. When K samples over-predict
-            # K rate, this path inflates BF by ~15-20%.
-            #
-            # Use BF-anchored exit (pass mu_bf/sigma_bf) instead.
-            # This path is kept only for backward compatibility with
-            # callers that do not yet supply BF priors.
+            force_exit |= pitches[active] >= 130
             current_tto = np.minimum(
                 bf_count[active] // BF_PER_TTO + 1, 3
             )
@@ -1225,6 +1309,8 @@ def predict_game(
     sigma_bf: float | None = None,
     mu_outs: float | None = None,
     sigma_outs: float | None = None,
+    mu_pitches: float | None = None,
+    sigma_pitches: float | None = None,
     lineup_bip_probs: np.ndarray | None = None,
     n_sims: int = 50_000,
     random_seed: int = 42,
@@ -1260,6 +1346,8 @@ def predict_game(
         sigma_bf=sigma_bf,
         mu_outs=mu_outs,
         sigma_outs=sigma_outs,
+        mu_pitches=mu_pitches,
+        sigma_pitches=sigma_pitches,
         manager_pull_tendency=manager_pull_tendency,
         bullpen_k_rate=bullpen_k_rate,
         bullpen_bb_rate=bullpen_bb_rate,

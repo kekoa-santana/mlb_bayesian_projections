@@ -280,7 +280,7 @@ LEAGUE_BABIP_PITCHER: float = 0.295
 LEAGUE_BABIP_BATTER: float = 0.300
 
 # BABIP adjustment coefficients (LD% and sprint speed)
-BABIP_LD_COEFF: float = 0.25       # logit-scale lift per unit LD% deviation
+BABIP_LD_COEFF: float = 0.60       # logit-scale lift per unit LD% deviation (boosted from 0.25)
 BABIP_LEAGUE_LD_RATE: float = 0.22  # league-average line-drive rate
 BABIP_LEAGUE_SPEED: float = 27.0    # league-average sprint speed (ft/s)
 BABIP_SPEED_COEFF: float = 0.010    # logit-scale lift per ft/s speed deviation

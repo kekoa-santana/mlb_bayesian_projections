@@ -273,7 +273,7 @@ def draw_bf_samples(
 # logic as BF: blow-ups can pull outs below target but nothing inflates above.
 DEFAULT_POP_OUTS_MU = 16.0
 DEFAULT_POP_OUTS_WITHIN_STD = 3.5   # Mean within-pitcher game-to-game std
-DEFAULT_SHRINKAGE_K_OUTS = 8.0      # within_var / between_var ≈ 12.53 / 1.57
+DEFAULT_SHRINKAGE_K_OUTS = 5.0      # within_var / between_var; lowered from 8.0 for wider mu_outs spread
 
 
 def compute_pitcher_outs_priors(
@@ -342,6 +342,84 @@ def compute_pitcher_outs_priors(
 
     logger.info(
         "Outs priors: %d pitcher-seasons, mean reliability=%.3f",
+        len(agg), agg["reliability"].mean(),
+    )
+    return agg
+
+
+# ---- Pitch count priors ----
+# Population defaults (validated against 2022-2025 starter data, BF >= 9).
+DEFAULT_POP_PITCHES_MU = 86.9       # Mean exit pitch count
+DEFAULT_POP_PITCHES_WITHIN_STD = 12.1  # Within-pitcher game-to-game std
+DEFAULT_SHRINKAGE_K_PITCHES = 2.67  # within_var / between_var = 12.1^2 / 7.4^2
+
+
+def compute_pitcher_pitches_priors(
+    game_logs: pd.DataFrame,
+    pop_mu: float = DEFAULT_POP_PITCHES_MU,
+    pop_within_std: float = DEFAULT_POP_PITCHES_WITHIN_STD,
+    shrinkage_k: float = DEFAULT_SHRINKAGE_K_PITCHES,
+    min_starts: int = 5,
+) -> pd.DataFrame:
+    """Compute shrinkage-estimated pitch count priors per pitcher-season.
+
+    Parameters
+    ----------
+    game_logs : pd.DataFrame
+        Stacked game logs across seasons. Must have columns:
+        pitcher_id, season, number_of_pitches, is_starter, batters_faced.
+    pop_mu : float
+        Population mean exit pitch count for starters.
+    pop_within_std : float
+        Population within-pitcher game-to-game std.
+    shrinkage_k : float
+        Shrinkage constant k = sigma^2 / tau^2.
+    min_starts : int
+        Pitchers below this get pure population prior.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (pitcher_id, season) with columns:
+        pitcher_id, season, n_starts, raw_mean_pitches, raw_std_pitches,
+        mu_pitches, sigma_pitches, reliability.
+    """
+    starters = game_logs[
+        (game_logs["is_starter"] == True)  # noqa: E712
+        & (game_logs["batters_faced"] >= 9)
+    ].copy()
+
+    if starters.empty:
+        logger.warning("No starter game logs found for pitches priors")
+        return pd.DataFrame(columns=[
+            "pitcher_id", "season", "n_starts", "raw_mean_pitches",
+            "raw_std_pitches", "mu_pitches", "sigma_pitches", "reliability",
+        ])
+
+    agg = starters.groupby(["pitcher_id", "season"]).agg(
+        n_starts=("number_of_pitches", "count"),
+        raw_mean_pitches=("number_of_pitches", "mean"),
+        raw_std_pitches=("number_of_pitches", "std"),
+    ).reset_index()
+
+    agg["raw_std_pitches"] = agg["raw_std_pitches"].fillna(pop_within_std)
+
+    # Shrinkage
+    agg["reliability"] = agg["n_starts"] / (agg["n_starts"] + shrinkage_k)
+    below_min = agg["n_starts"] < min_starts
+    agg.loc[below_min, "reliability"] = 0.0
+
+    agg["mu_pitches"] = (
+        agg["reliability"] * agg["raw_mean_pitches"]
+        + (1 - agg["reliability"]) * pop_mu
+    )
+    agg["sigma_pitches"] = (
+        agg["reliability"] * agg["raw_std_pitches"]
+        + (1 - agg["reliability"]) * pop_within_std
+    )
+
+    logger.info(
+        "Pitches priors: %d pitcher-seasons, mean reliability=%.3f",
         len(agg), agg["reliability"].mean(),
     )
     return agg

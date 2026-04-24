@@ -36,10 +36,9 @@ from src.utils.weather import parse_temp_bucket, wind_category, wind_speed_bucke
 logger = logging.getLogger("precompute.confident_picks")
 
 # Batter stats to project (HR excluded — too noisy at game level)
-# Lineup sim: stats that benefit from base-state tracking (R, RBI, HRR)
-# Per-batter sim: stats that only depend on batter hit types (TB)
-LINEUP_SIM_STATS = ("h", "k", "bb", "r", "rbi", "hrr")
-BATTER_SIM_STATS = ("tb",)
+# All stats use the lineup sim for consistent environment (park, weather, ump).
+LINEUP_SIM_STATS = ("h", "k", "bb", "r", "rbi", "hrr", "tb")
+BATTER_SIM_STATS: tuple[str, ...] = ()  # empty — all stats from lineup sim
 BATTER_STATS = LINEUP_SIM_STATS + BATTER_SIM_STATS
 
 
@@ -101,7 +100,6 @@ def run(
         simulate_lineup_game,
         simulate_full_game_both_teams,
     )
-    from src.models.game_sim.batter_simulator import simulate_batter_game
     from src.models.game_sim.tto_model import build_all_tto_lifts
     from src.models.game_sim.pitch_count_model import build_pitch_count_features
     from src.models.game_sim.form_model import (
@@ -229,9 +227,13 @@ def run(
     # BF priors (used for batter PA allocation in lineup sim)
     bf_priors = pd.read_parquet(DASHBOARD_DIR / "bf_priors.parquet")
 
-    # Outs priors (used for pitcher exit model)
+    # Outs priors (deprecated fallback for pitcher exit model)
     _outs_path = DASHBOARD_DIR / "outs_priors.parquet"
     outs_priors = pd.read_parquet(_outs_path) if _outs_path.exists() else pd.DataFrame()
+
+    # Pitch count priors (preferred exit model)
+    _pitches_path = DASHBOARD_DIR / "pitches_priors.parquet"
+    pitches_priors = pd.read_parquet(_pitches_path) if _pitches_path.exists() else pd.DataFrame()
 
     # Roster + lineup priors for projected lineups (roster also used for name lookups)
     try:
@@ -328,7 +330,7 @@ def run(
             "No batter_sprint_speed.parquet found; speed BABIP adjustments disabled"
         )
 
-    # Park factor lifts (K and HR only; H/BB skipped due to model H bias)
+    # Park factor lifts (K, BB, HR logit lifts + hitter BABIP adjustment)
     park_lift_lookup: dict[int, dict[str, float]] = {}
     try:
         pf_lifts = pd.read_parquet(DASHBOARD_DIR / "park_factor_lifts.parquet")
@@ -337,6 +339,7 @@ def run(
                 "k_lift": float(pr["k_lift"]),
                 "bb_lift": float(pr.get("bb_lift", 0.0)),
                 "hr_lift": float(pr["hr_lift"]),
+                "h_babip_adj": float(pr.get("h_babip_adj", 0.0)),
             }
         logger.info("Loaded park factor lifts for %d venues", len(park_lift_lookup))
     except (FileNotFoundError, KeyError):
@@ -622,12 +625,13 @@ def run(
         ump_bb_lift += rolling_bb_offset
         wx_hr_lift += rolling_hr_offset
 
-        # Park factor lifts (K and HR only)
+        # Park factor lifts (K, BB, HR logit lifts + hitter BABIP adj)
         venue_id = game.get("venue_id")
         park_lifts = park_lift_lookup.get(int(venue_id), {}) if pd.notna(venue_id) else {}
         park_k_lift = park_lifts.get("k_lift", 0.0)
         park_bb_lift = park_lifts.get("bb_lift", 0.0)
         park_hr_lift = park_lifts.get("hr_lift", 0.0)
+        park_h_babip_adj = park_lifts.get("h_babip_adj", 0.0)
 
         # --- PITCHER SIMS (both starters) ---
         for side in ("home", "away"):
@@ -729,7 +733,21 @@ def run(
             # Pitcher team ID (needed for bullpen + catcher lookups)
             pitcher_team_id = int(game.get(team_col, 0)) if pd.notna(game.get(team_col)) else 0
 
-            # Outs prior for outs-anchored exit (preferred)
+            # Pitch count priors (preferred exit model)
+            mu_pitches_val: float | None = None
+            sigma_pitches_val: float | None = None
+            if not pitches_priors.empty:
+                _pc_row = pitches_priors[pitches_priors["pitcher_id"] == pitcher_id]
+                if len(_pc_row) > 0:
+                    _pc_latest = _pc_row.sort_values("season").iloc[-1]
+                    mu_pitches_val = float(_pc_latest["mu_pitches"])
+                    sigma_pitches_val = float(_pc_latest["sigma_pitches"])
+            # Fallback: use avg_pitches from exit tendencies
+            if mu_pitches_val is None:
+                mu_pitches_val = avg_pitches  # already loaded above
+                sigma_pitches_val = 12.1  # population within-pitcher std
+
+            # Outs prior (deprecated fallback)
             mu_outs_val: float | None = None
             sigma_outs_val: float | None = None
             if not outs_priors.empty:
@@ -796,6 +814,10 @@ def run(
                     game_context=GameContext(
                         umpire_k_lift=ump_k_lift + platoon_k_lift,
                         umpire_bb_lift=ump_bb_lift + platoon_bb_lift,
+                        park_k_lift=park_k_lift,
+                        park_bb_lift=park_bb_lift,
+                        park_hr_lift=park_hr_lift,
+                        park_h_babip_adj=park_h_babip_adj,
                         weather_k_lift=wx_k_lift,
                         weather_hr_lift=wx_hr_lift,
                         catcher_k_lift=catcher_k_lift,
@@ -805,6 +827,8 @@ def run(
                     sigma_bf=sigma_bf_val,
                     mu_outs=mu_outs_val,
                     sigma_outs=sigma_outs_val,
+                    mu_pitches=mu_pitches_val,
+                    sigma_pitches=sigma_pitches_val,
                     manager_pull_tendency=team_avg_p,
                     bullpen_profile=team_bullpen_profile,
                     lineup_bip_probs=lineup_bip_probs_arr,
@@ -1034,6 +1058,7 @@ def run(
                     park_k_lift=park_k_lift,
                     park_bb_lift=park_bb_lift,
                     park_hr_lift=park_hr_lift,
+                    park_h_babip_adj=park_h_babip_adj,
                     weather_k_lift=wx_k_lift,
                     weather_hr_lift=wx_hr_lift,
                     form_k_lifts=lineup_form_k,
@@ -1068,71 +1093,13 @@ def run(
                     "hrr": batter_arrays["hrr_samples"],
                 }
 
-                # Per-batter sim for TB (uses calibrated PA model,
-                # avoids the lineup sim's PA inflation that biases TB)
-                bid_str = str(batter_id)
-                try:
-                    # Batter form lifts (K%, BB%, HR momentum)
-                    bat_form = batter_form_lifts.get(
-                        batter_id, BatterFormLifts(),
-                    )
-                    batter_sim = simulate_batter_game(
-                        batter_k_rate_samples=hitter_k_npz[bid_str],
-                        batter_bb_rate_samples=hitter_bb_npz[bid_str],
-                        batter_hr_rate_samples=hitter_hr_npz[bid_str],
-                        batting_order=batting_order,
-                        starter_k_rate=starter_k,
-                        starter_bb_rate=starter_bb,
-                        starter_hr_rate=starter_hr,
-                        starter_bf_mu=bf_mu,
-                        starter_bf_sigma=bf_sigma,
-                        matchup_k_lift=float(
-                            batter_matchup_lifts["k"][slot_idx]
-                        ),
-                        matchup_bb_lift=float(
-                            batter_matchup_lifts["bb"][slot_idx]
-                        ),
-                        matchup_hr_lift=float(
-                            batter_matchup_lifts["hr"][slot_idx]
-                        ),
-                        bullpen_k_rate=bp_k,
-                        bullpen_bb_rate=bp_bb,
-                        bullpen_hr_rate=bp_hr,
-                        batter_babip_adj=ld_babip_lookup.get(batter_id, 0.0),
-                        umpire_k_lift=ump_k_lift,
-                        umpire_bb_lift=ump_bb_lift,
-                        weather_k_lift=wx_k_lift,
-                        form_k_lift=bat_form.k_lift,
-                        form_bb_lift=bat_form.bb_lift,
-                        form_hr_lift=bat_form.hr_lift + bat_form.hh_lift,
-                        batter_bip_probs=batter_bip_lookup.get(batter_id),
-                        n_sims=n_sims,
-                        random_seed=(
-                            42 + game_pk % 10000 + batter_id % 1000
-                        ),
-                    )
-                    batter_summary = batter_sim.summary()
-                except Exception:
-                    batter_summary = None
-
                 for stat_key in BATTER_STATS:
-                    # TB uses per-batter sim; all others use lineup sim
-                    if stat_key in BATTER_SIM_STATS:
-                        if batter_summary is None:
-                            continue
-                        expected = batter_summary[stat_key]["mean"]
-                        std = batter_summary[stat_key]["std"]
-                        all_lines = [x + 0.5 for x in range(25)]
-                        over_df = batter_sim.over_probs(
-                            stat_key, all_lines,
-                        )
-                    else:
-                        expected = lineup_summary[stat_key]["mean"]
-                        std = lineup_summary[stat_key]["std"]
-                        all_lines = [x + 0.5 for x in range(25)]
-                        over_df = lineup_sim.batter_over_probs(
-                            slot_idx, stat_key, all_lines,
-                        )
+                    expected = lineup_summary[stat_key]["mean"]
+                    std = lineup_summary[stat_key]["std"]
+                    all_lines = [x + 0.5 for x in range(25)]
+                    over_df = lineup_sim.batter_over_probs(
+                        slot_idx, stat_key, all_lines,
+                    )
 
                     default_line = max(np.floor(expected) + 0.5, 0.5)
                     p_over_map = dict(
@@ -1246,6 +1213,7 @@ def run(
                     park_k_lift=park_k_lift,
                     park_bb_lift=park_bb_lift,
                     park_hr_lift=park_hr_lift,
+                    park_h_babip_adj=park_h_babip_adj,
                     weather_k_lift=wx_k_lift,
                     weather_hr_lift=wx_hr_lift,
                     # Form lifts
