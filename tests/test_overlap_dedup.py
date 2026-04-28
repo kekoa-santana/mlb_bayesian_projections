@@ -50,7 +50,7 @@ class TestWeatherHelpers:
     def test_callers_use_shared_module(self) -> None:
         """Caller files import from src.utils.weather (verified via source)."""
         import pathlib
-        root = pathlib.Path("C:/Users/kekoa/Documents/data_analytics/player_profiles")
+        root = pathlib.Path(__file__).resolve().parent.parent
         for fpath in [
             root / "scripts" / "update_in_season.py",
             root / "scripts" / "precompute" / "confident_picks.py",
@@ -97,9 +97,10 @@ class TestPrecomputeGating:
     """Backtest summaries should be gated behind should_run()."""
 
     def test_backtest_summaries_gated(self) -> None:
+        import pathlib
         source_path = (
-            "C:/Users/kekoa/Documents/data_analytics/player_profiles/"
-            "scripts/precompute_dashboard_data.py"
+            pathlib.Path(__file__).resolve().parent.parent
+            / "scripts" / "precompute_dashboard_data.py"
         )
         with open(source_path) as f:
             source = f.read()
