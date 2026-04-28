@@ -641,3 +641,142 @@ def draw_pa_samples(
         bf_max=pa_max,
         rng=rng,
     )
+
+
+# ---- Reliever-as-starter detection ----
+# Population defaults for relievers (validated from 2022-2025 data).
+RP_POP_OUTS = 4.0       # ~1.3 innings per appearance
+RP_POP_PITCHES = 22.0   # ~4 P/PA × 5.3 BF
+RP_POP_BF = 5.3
+RP_SIGMA_OUTS = 1.5     # tight — relievers are consistent in workload
+RP_SIGMA_PITCHES = 5.0
+RP_SIGMA_BF = 1.5
+
+
+def compute_reliever_flags(
+    from_season: int = 2022,
+    start_pct_threshold: float = 0.25,
+    min_apps: int = 15,
+) -> set[int]:
+    """Return pitcher IDs who are primarily relievers.
+
+    Queries the database for career appearance history since
+    ``from_season``.  A pitcher is flagged as a reliever if they have
+    at least ``min_apps`` total appearances and fewer than
+    ``start_pct_threshold`` fraction of those are starts.
+
+    Parameters
+    ----------
+    from_season : int
+        Earliest season to include in the career lookback.
+    start_pct_threshold : float
+        Maximum start fraction to be classified as a reliever.
+    min_apps : int
+        Minimum total appearances required.
+
+    Returns
+    -------
+    set[int]
+        Pitcher IDs classified as primary relievers.
+    """
+    from src.data.db import read_sql
+
+    df = read_sql("""
+        SELECT b.pitcher_id,
+               SUM(CASE WHEN b.is_starter THEN 1 ELSE 0 END) AS starts,
+               COUNT(*) AS total_apps
+        FROM staging.pitching_boxscores b
+        JOIN production.dim_game g ON b.game_pk = g.game_pk
+        WHERE g.season >= :from_season AND g.game_type = 'R'
+        GROUP BY b.pitcher_id
+    """, params={"from_season": from_season})
+
+    if df.empty:
+        logger.warning("No pitching boxscores found for reliever detection")
+        return set()
+
+    df["start_pct"] = df["starts"] / df["total_apps"]
+    relievers = df[
+        (df["total_apps"] >= min_apps)
+        & (df["start_pct"] < start_pct_threshold)
+    ]
+    rp_ids = set(relievers["pitcher_id"].astype(int).tolist())
+    logger.info(
+        "Reliever detection: %d relievers identified (threshold=%.0f%%, min_apps=%d)",
+        len(rp_ids), start_pct_threshold * 100, min_apps,
+    )
+    return rp_ids
+
+
+def compute_reliever_workload(
+    reliever_ids: set[int],
+    from_season: int = 2022,
+    min_relief_apps: int = 10,
+) -> dict[int, dict[str, float]]:
+    """Compute per-reliever workload priors from their relief appearances.
+
+    Parameters
+    ----------
+    reliever_ids : set[int]
+        Pitcher IDs to compute workloads for.
+    from_season : int
+        Earliest season to include.
+    min_relief_apps : int
+        Minimum relief appearances to use pitcher-specific data;
+        below this, population defaults are used.
+
+    Returns
+    -------
+    dict[int, dict[str, float]]
+        ``{pitcher_id: {"mu_outs", "sigma_outs", "mu_pitches",
+        "sigma_pitches", "mu_bf", "sigma_bf"}}``.
+    """
+    if not reliever_ids:
+        return {}
+
+    from src.data.db import read_sql
+
+    # Build a safe IN clause
+    id_list = ",".join(str(int(pid)) for pid in reliever_ids)
+    df = read_sql(f"""
+        SELECT b.pitcher_id, b.outs, b.batters_faced, b.number_of_pitches
+        FROM staging.pitching_boxscores b
+        JOIN production.dim_game g ON b.game_pk = g.game_pk
+        WHERE g.season >= :from_season
+          AND g.game_type = 'R'
+          AND NOT b.is_starter
+          AND b.pitcher_id IN ({id_list})
+    """, params={"from_season": from_season})
+
+    result: dict[int, dict[str, float]] = {}
+    pop_defaults = {
+        "mu_outs": RP_POP_OUTS,
+        "sigma_outs": RP_SIGMA_OUTS,
+        "mu_pitches": RP_POP_PITCHES,
+        "sigma_pitches": RP_SIGMA_PITCHES,
+        "mu_bf": RP_POP_BF,
+        "sigma_bf": RP_SIGMA_BF,
+    }
+
+    for pid in reliever_ids:
+        subset = df[df["pitcher_id"] == pid]
+        if len(subset) >= min_relief_apps:
+            result[pid] = {
+                "mu_outs": float(subset["outs"].mean()),
+                "sigma_outs": max(float(subset["outs"].std()), 0.5),
+                "mu_pitches": float(
+                    subset["number_of_pitches"].dropna().mean()
+                ) if subset["number_of_pitches"].notna().sum() >= min_relief_apps else RP_POP_PITCHES,
+                "sigma_pitches": RP_SIGMA_PITCHES,
+                "mu_bf": float(subset["batters_faced"].mean()),
+                "sigma_bf": max(float(subset["batters_faced"].std()), 0.5),
+            }
+        else:
+            result[pid] = dict(pop_defaults)
+
+    logger.info(
+        "Reliever workload: %d pitchers (%d with pitcher-specific data)",
+        len(result),
+        sum(1 for pid in result if result[pid]["mu_outs"] != RP_POP_OUTS),
+    )
+    return result

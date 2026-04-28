@@ -966,7 +966,7 @@ def simulate_game(
         target_pitches_arr = rng.normal(
             mu_pitches, sigma_pitches_eff, size=n_sims,
         )
-        target_pitches_arr = np.clip(target_pitches_arr, 40, 130).astype(float)
+        target_pitches_arr = np.clip(target_pitches_arr, 10, 130).astype(float)
     elif use_outs_anchor:
         effective_sigma = min(max(sigma_outs, 0.5), _SIGMA_OUTS_CAP)
         target_outs_arr = rng.normal(

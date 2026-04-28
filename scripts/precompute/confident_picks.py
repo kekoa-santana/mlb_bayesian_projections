@@ -183,7 +183,11 @@ def run(
         PitcherFormLifts,
     )
     from src.models.matchup import score_matchup_for_stat
-    from src.models.bf_model import compute_pitcher_bf_priors
+    from src.models.bf_model import (
+        compute_pitcher_bf_priors,
+        compute_reliever_flags,
+        compute_reliever_workload,
+    )
 
     if game_date is None:
         game_date = date.today().isoformat()
@@ -307,6 +311,12 @@ def run(
     # Pitch count priors (preferred exit model)
     _pitches_path = DASHBOARD_DIR / "pitches_priors.parquet"
     pitches_priors = pd.read_parquet(_pitches_path) if _pitches_path.exists() else pd.DataFrame()
+
+    # Reliever detection — identify pitchers who are primarily relievers
+    # so we don't project them for a full starter workload when they
+    # appear as the listed "starter" in opener/bullpen games.
+    reliever_ids = compute_reliever_flags(from_season=2022)
+    reliever_workload = compute_reliever_workload(reliever_ids, from_season=2022)
 
     # Roster + lineup priors for projected lineups (roster also used for name lookups)
     try:
@@ -842,6 +852,35 @@ def run(
             else:
                 mu_bf_val = None
                 sigma_bf_val = None
+
+            # Reliever-as-starter override: if this pitcher is primarily
+            # a reliever AND has no starter-specific priors (i.e., would
+            # fall through to population defaults), use their reliever
+            # workload history instead.  Pitchers who have converted to
+            # starting (and have pitches_priors or bf_priors rows) keep
+            # their starter priors — those reflect actual starter workload.
+            has_starter_priors = (
+                (not pitches_priors.empty and len(pitches_priors[pitches_priors["pitcher_id"] == pitcher_id]) > 0)
+                or (not bf_priors.empty and len(bf_priors[bf_priors["pitcher_id"] == pitcher_id]) > 0)
+            )
+            is_rp_start = pitcher_id in reliever_ids and not has_starter_priors
+            if is_rp_start:
+                rp_work = reliever_workload.get(pitcher_id, {})
+                mu_pitches_val = rp_work.get("mu_pitches", 22.0)
+                sigma_pitches_val = rp_work.get("sigma_pitches", 5.0)
+                mu_outs_val = rp_work.get("mu_outs", 4.0)
+                sigma_outs_val = rp_work.get("sigma_outs", 1.5)
+                mu_bf_val = rp_work.get("mu_bf", 5.3)
+                sigma_bf_val = rp_work.get("sigma_bf", 1.5)
+                logger.info(
+                    "RP-as-starter: %d (%s) — using reliever priors "
+                    "(mu_pitches=%.0f, mu_outs=%.1f, mu_bf=%.1f)",
+                    pitcher_id,
+                    game.get(pname_col, "?"),
+                    mu_pitches_val,
+                    mu_outs_val,
+                    mu_bf_val,
+                )
 
             # Catcher framing lift (pitcher's own team's catcher)
             catcher_k_lift = 0.0
