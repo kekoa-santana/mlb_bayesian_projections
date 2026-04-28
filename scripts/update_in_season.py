@@ -115,10 +115,23 @@ def load_hitter_preseason_samples(stat_name: str) -> dict[str, np.ndarray]:
     return {k: data[k] for k in data.files}
 
 
-def get_observed_hitter_totals() -> pd.DataFrame:
-    """Query 2026 hitter season totals from the database."""
+def get_observed_hitter_totals(
+    up_to_date: str | None = None,
+) -> pd.DataFrame:
+    """Query 2026 hitter season totals from the database.
+
+    Parameters
+    ----------
+    up_to_date : str or None
+        If provided (``'YYYY-MM-DD'``), only include games on or before
+        this date.  ``None`` returns all 2026 regular-season data.
+    """
     from src.data.db import read_sql
-    df = read_sql("""
+    date_filter = "AND dg.game_date::date <= :up_to_date" if up_to_date else ""
+    params: dict = {"season": SEASON}
+    if up_to_date:
+        params["up_to_date"] = up_to_date
+    df = read_sql(f"""
         SELECT
             fp.batter_id,
             COUNT(DISTINCT fp.pa_id) AS pa,
@@ -127,18 +140,31 @@ def get_observed_hitter_totals() -> pd.DataFrame:
             SUM(CASE WHEN fp.events = 'home_run' THEN 1 ELSE 0 END) AS hr
         FROM production.fact_pa fp
         JOIN production.dim_game dg ON fp.game_pk = dg.game_pk
-        WHERE dg.season = :season AND dg.game_type = 'R'
+        WHERE dg.season = :season AND dg.game_type = 'R' {date_filter}
         GROUP BY fp.batter_id
         HAVING COUNT(DISTINCT fp.pa_id) >= 1
-    """, {"season": SEASON})
-    logger.info("Observed 2026 hitter totals: %d batters", len(df))
+    """, params)
+    logger.info("Observed 2026 hitter totals: %d batters (up_to=%s)", len(df), up_to_date or "all")
     return df
 
 
-def get_observed_pitcher_totals() -> pd.DataFrame:
-    """Query 2026 pitcher season totals from the database."""
+def get_observed_pitcher_totals(
+    up_to_date: str | None = None,
+) -> pd.DataFrame:
+    """Query 2026 pitcher season totals from the database.
+
+    Parameters
+    ----------
+    up_to_date : str or None
+        If provided (``'YYYY-MM-DD'``), only include games on or before
+        this date.  ``None`` returns all 2026 regular-season data.
+    """
     from src.data.db import read_sql
-    df = read_sql("""
+    date_filter = "AND dg.game_date::date <= :up_to_date" if up_to_date else ""
+    params: dict = {"season": SEASON}
+    if up_to_date:
+        params["up_to_date"] = up_to_date
+    df = read_sql(f"""
         SELECT
             pb.pitcher_id,
             SUM(pb.batters_faced) AS batters_faced,
@@ -149,11 +175,11 @@ def get_observed_pitcher_totals() -> pd.DataFrame:
             SUM(CASE WHEN pb.is_starter THEN 1 ELSE 0 END) AS games_started
         FROM staging.pitching_boxscores pb
         JOIN production.dim_game dg ON pb.game_pk = dg.game_pk
-        WHERE dg.season = :season AND dg.game_type = 'R'
+        WHERE dg.season = :season AND dg.game_type = 'R' {date_filter}
         GROUP BY pb.pitcher_id
         HAVING SUM(pb.batters_faced) >= 1
-    """, {"season": SEASON})
-    logger.info("Observed 2026 pitcher totals: %d pitchers", len(df))
+    """, params)
+    logger.info("Observed 2026 pitcher totals: %d pitchers (up_to=%s)", len(df), up_to_date or "all")
     return df
 
 

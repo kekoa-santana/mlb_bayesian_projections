@@ -17,7 +17,7 @@ bullpen rates, etc.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import numpy as np
@@ -69,6 +69,80 @@ class _TeamSimContext:
     form_k: np.ndarray                    # (9,)
     form_bb: np.ndarray                   # (9,)
     form_hr: np.ndarray                   # (9,)
+    # Metadata for batter pick extraction
+    valid_slots: dict[int, tuple[int, int]] = field(default_factory=dict)
+    team_abbr: str = ""
+    opp_abbr: str = ""
+
+
+def _extract_batter_picks(
+    lineup_result,
+    ctx: _TeamSimContext,
+    game_pk: int,
+    game_dt: str,
+    roster: pd.DataFrame,
+    player_posteriors: dict,
+) -> list[dict]:
+    """Extract per-batter prop rows from a LineupSimulationResult.
+
+    Works with results from either ``simulate_lineup_game`` or from
+    ``FullGameSimulationResult.away`` / ``.home``.
+    """
+    picks: list[dict] = []
+    for slot_idx, (batter_id, batting_order) in ctx.valid_slots.items():
+        lineup_summary = lineup_result.batter_summary(slot_idx)
+        batter_name = _lookup_name(roster, batter_id)
+
+        batter_arrays = lineup_result.batter_result(slot_idx)
+        player_posteriors[(game_pk, batter_id)] = {
+            "h": batter_arrays["h_samples"],
+            "k": batter_arrays["k_samples"],
+            "bb": batter_arrays["bb_samples"],
+            "hr": batter_arrays["hr_samples"],
+            "r": batter_arrays["r_samples"],
+            "rbi": batter_arrays["rbi_samples"],
+            "tb": batter_arrays["tb_samples"],
+            "hrr": batter_arrays["hrr_samples"],
+        }
+
+        for stat_key in BATTER_STATS:
+            expected = lineup_summary[stat_key]["mean"]
+            std = lineup_summary[stat_key]["std"]
+            all_lines = [x + 0.5 for x in range(25)]
+            over_df = lineup_result.batter_over_probs(
+                slot_idx, stat_key, all_lines,
+            )
+
+            default_line = max(np.floor(expected) + 0.5, 0.5)
+            p_over_map = dict(
+                zip(over_df["line"], over_df["p_over"])
+            )
+
+            p_over_cols = {}
+            for lv in [x + 0.5 for x in range(25)]:
+                p_over_cols[f"p_over_{lv:.1f}"] = round(
+                    p_over_map.get(lv, 0), 3
+                )
+
+            picks.append({
+                "game_date": game_dt,
+                "game_pk": game_pk,
+                "player_id": batter_id,
+                "player_name": batter_name,
+                "player_type": "batter",
+                "team": ctx.team_abbr,
+                "opponent": ctx.opp_abbr,
+                "batting_order": batting_order,
+                "stat": stat_key.upper(),
+                "expected": round(expected, 2),
+                "std": round(std, 2),
+                "line": default_line,
+                "p_over": round(
+                    p_over_map.get(default_line, 0), 3
+                ),
+                **p_over_cols,
+            })
+    return picks
 
 
 def run(
@@ -110,7 +184,6 @@ def run(
     )
     from src.models.matchup import score_matchup_for_stat
     from src.models.bf_model import compute_pitcher_bf_priors
-    from src.models.game_predictions import NEGBIN_R_DEFAULT
 
     if game_date is None:
         game_date = date.today().isoformat()
@@ -577,6 +650,8 @@ def run(
     pitcher_picks = []
     batter_picks = []
     game_predictions: list[dict] = []
+    # Raw sim arrays for Vegas blend (game_pk → (home_runs, away_runs))
+    _sim_arrays: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     # Raw posterior distributions per player-game for Layer 4 market edge.
     # Keyed by (game_pk, player_id) → {stat: np.ndarray of MC draws}
     player_posteriors: dict[tuple[int, int], dict[str, np.ndarray]] = {}
@@ -893,7 +968,10 @@ def run(
                 "dk_q90": round(dk["q90"], 1),
                 "espn_mean": round(espn["mean"], 1),
                 "espn_median": round(espn["median"], 1),
-                "expected_ip": float(np.mean(sim.outs_samples)) / 3.0,
+                "expected_ip": float(
+                    round(np.mean(sim.outs_samples)) // 3
+                    + (round(np.mean(sim.outs_samples)) % 3) / 10.0
+                ),
                 "expected_pitches": round(summary["pitch_count"]["mean"], 0),
                 "expected_bf": round(summary["bf"]["mean"], 1),
             }
@@ -1034,105 +1112,7 @@ def run(
                 lineup_form_bb[order_idx] = bf.bb_lift
                 lineup_form_hr[order_idx] = bf.hr_lift + bf.hh_lift
 
-            # Run lineup simulation (single call for all 9 batters)
-            try:
-                lineup_sim = simulate_lineup_game(
-                    batter_k_rate_samples=lineup_k_samples,
-                    batter_bb_rate_samples=lineup_bb_samples,
-                    batter_hr_rate_samples=lineup_hr_samples,
-                    starter_k_rate=starter_k,
-                    starter_bb_rate=starter_bb,
-                    starter_hr_rate=starter_hr,
-                    starter_bf_mu=bf_mu,
-                    starter_bf_sigma=bf_sigma,
-                    matchup_k_lifts=batter_matchup_lifts["k"],
-                    matchup_bb_lifts=batter_matchup_lifts["bb"],
-                    matchup_hr_lifts=batter_matchup_lifts["hr"],
-                    bullpen_k_rate=bp_k,
-                    bullpen_bb_rate=bp_bb,
-                    bullpen_hr_rate=bp_hr,
-                    batter_babip_adjs=lineup_babip_adjs,
-                    batter_bip_probs=lineup_bip_probs_arr,
-                    umpire_k_lift=ump_k_lift,
-                    umpire_bb_lift=ump_bb_lift,
-                    park_k_lift=park_k_lift,
-                    park_bb_lift=park_bb_lift,
-                    park_hr_lift=park_hr_lift,
-                    park_h_babip_adj=park_h_babip_adj,
-                    weather_k_lift=wx_k_lift,
-                    weather_hr_lift=wx_hr_lift,
-                    form_k_lifts=lineup_form_k,
-                    form_bb_lifts=lineup_form_bb,
-                    form_hr_lifts=lineup_form_hr,
-                    n_sims=n_sims,
-                    random_seed=42 + game_pk % 10000,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Lineup sim failed: game %d %s: %s",
-                    game_pk, side, e,
-                )
-                continue
-
-            # Extract per-batter results for valid slots
-            game_dt = game.get("game_date", game_date)
-            for slot_idx, (batter_id, batting_order) in valid_slots.items():
-                lineup_summary = lineup_sim.batter_summary(slot_idx)
-                batter_name = _lookup_name(roster, batter_id)
-
-                # Stash batter posteriors for Layer 4 edge analysis
-                batter_arrays = lineup_sim.batter_result(slot_idx)
-                player_posteriors[(game_pk, batter_id)] = {
-                    "h": batter_arrays["h_samples"],
-                    "k": batter_arrays["k_samples"],
-                    "bb": batter_arrays["bb_samples"],
-                    "hr": batter_arrays["hr_samples"],
-                    "r": batter_arrays["r_samples"],
-                    "rbi": batter_arrays["rbi_samples"],
-                    "tb": batter_arrays["tb_samples"],
-                    "hrr": batter_arrays["hrr_samples"],
-                }
-
-                for stat_key in BATTER_STATS:
-                    expected = lineup_summary[stat_key]["mean"]
-                    std = lineup_summary[stat_key]["std"]
-                    all_lines = [x + 0.5 for x in range(25)]
-                    over_df = lineup_sim.batter_over_probs(
-                        slot_idx, stat_key, all_lines,
-                    )
-
-                    default_line = max(np.floor(expected) + 0.5, 0.5)
-                    p_over_map = dict(
-                        zip(over_df["line"], over_df["p_over"])
-                    )
-
-                    # Store P(over) at standard lines 0.5-10.5
-                    p_over_cols = {}
-                    for lv in [x + 0.5 for x in range(25)]:
-                        p_over_cols[f"p_over_{lv:.1f}"] = round(
-                            p_over_map.get(lv, 0), 3
-                        )
-
-                    batter_picks.append({
-                        "game_date": game_dt,
-                        "game_pk": game_pk,
-                        "player_id": batter_id,
-                        "player_name": batter_name,
-                        "player_type": "batter",
-                        "team": team_abbr,
-                        "opponent": opp_abbr,
-                        "batting_order": batting_order,
-                        "stat": stat_key.upper(),
-                        "expected": round(expected, 2),
-                        "std": round(std, 2),
-                        "line": default_line,
-                        "p_over": round(
-                            p_over_map.get(default_line, 0), 3
-                        ),
-                        **p_over_cols,
-                    })
-
-            # Stash per-side context for full-game sim
+            # Stash per-side context (sim runs later in full-game sim)
             side_contexts[side] = _TeamSimContext(
                 lineup_k_samples=lineup_k_samples,
                 lineup_bb_samples=lineup_bb_samples,
@@ -1152,9 +1132,13 @@ def run(
                 form_k=lineup_form_k,
                 form_bb=lineup_form_bb,
                 form_hr=lineup_form_hr,
+                valid_slots=valid_slots,
+                team_abbr=team_abbr,
+                opp_abbr=opp_abbr,
             )
 
-        # --- FULL-GAME SIM (moneyline / spread / over-under) ---
+        # --- FULL-GAME SIM (batter props + moneyline / spread / over-under) ---
+        _ran_full_game = False
         if (
             run_full_game_sim
             and "home" in side_contexts
@@ -1231,20 +1215,30 @@ def run(
                 away_abbr = game.get("away_abbr", "")
                 game_dt = game.get("game_date", game_date)
 
-                # NegBin resample with optional game-level model blend.
-                # If the game-level model is available, blend its mu with
-                # the PA-by-PA sim mean (50/50) for a more robust estimate,
-                # then draw NegBin samples at the blended mean.
-                nb_rng = np.random.default_rng(42 + game_pk % 10000 + 9999)
-                sim_mu_home = float(np.mean(fg_result.home_runs))
-                sim_mu_away = float(np.mean(fg_result.away_runs))
+                _ran_full_game = True
 
+                # --- Extract batter props from full-game sim ---
+                # fg_result.away / .home are LineupSimulationResult objects
+                # with per-batter (9, n_sims) arrays including walk-off effects.
+                batter_picks.extend(_extract_batter_picks(
+                    fg_result.away, a, game_pk, game_dt,
+                    roster, player_posteriors,
+                ))
+                batter_picks.extend(_extract_batter_picks(
+                    fg_result.home, h, game_pk, game_dt,
+                    roster, player_posteriors,
+                ))
+
+                # --- Game-level predictions from raw sim draws ---
+                home_runs = fg_result.home_runs.astype(float)
+                away_runs = fg_result.away_runs.astype(float)
+                sim_mu_home = float(np.mean(home_runs))
+                sim_mu_away = float(np.mean(away_runs))
+
+                # Optional game-level model blend via multiplicative shift
                 if game_level_model is not None:
-                    # Build features for game-level model
                     home_team_id = int(game.get("home_team_id", 0))
                     away_team_id = int(game.get("away_team_id", 0))
-                    # h.starter_k = away starter (what home batters face)
-                    # a.starter_k = home starter (what away batters face)
                     glm_features = pd.DataFrame([{
                         "starter_k_pct_home": float(np.mean(a.starter_k)),
                         "starter_bb_pct_home": float(np.mean(a.starter_bb)),
@@ -1264,13 +1258,15 @@ def run(
                         glm_pred = game_level_model.predict_game(glm_features)
                         glm_mu_home = float(glm_pred["mu_home"].iloc[0])
                         glm_mu_away = float(glm_pred["mu_away"].iloc[0])
-                        # Blend: 50% sim + 50% game-level model
                         mu_home = 0.5 * sim_mu_home + 0.5 * glm_mu_home
                         mu_away = 0.5 * sim_mu_away + 0.5 * glm_mu_away
+                        # Multiplicative shift to blend game-level model
+                        scale_h = mu_home / max(sim_mu_home, 0.1)
+                        scale_a = mu_away / max(sim_mu_away, 0.1)
+                        home_runs = np.maximum(np.round(home_runs * scale_h), 0)
+                        away_runs = np.maximum(np.round(away_runs * scale_a), 0)
                     except Exception:
-                        mu_home, mu_away = sim_mu_home, sim_mu_away
-                else:
-                    mu_home, mu_away = sim_mu_home, sim_mu_away
+                        pass  # keep raw sim draws
 
                 # LightGBM PA model: predict avg K/BB/HR for each side
                 lgbm_k_home = lgbm_k_away = np.nan
@@ -1280,15 +1276,14 @@ def run(
                         away_team_id = int(game.get("away_team_id", 0))
                         game_temp = float(game.get("weather_temp") or 72)
                         game_prf = park_run_factor_lookup.get(int(venue_id), 1.0) if pd.notna(venue_id) else 1.0
-                        # Home batting vs away pitcher
                         lgbm_home = pd.DataFrame([{
                             "pitcher_k_pct": float(np.mean(h.starter_k)),
                             "pitcher_bb_pct": float(np.mean(h.starter_bb)),
                             "pitcher_hr_pct": float(np.mean(h.starter_hr)),
-                            "batter_k_pct": 0.224,  # league avg placeholder
+                            "batter_k_pct": 0.224,
                             "batter_bb_pct": 0.083,
                             "batter_hr_pct": 0.030,
-                            "platoon": 0.5,  # avg matchup
+                            "platoon": 0.5,
                             "times_through_order": 2,
                             "outs_when_up": 1,
                             "inning": 4,
@@ -1298,7 +1293,6 @@ def run(
                             "is_dome": 1.0 if is_indoor else 0.0,
                         }])
                         lgbm_away = lgbm_home.copy()
-                        # Away batting vs home pitcher
                         lgbm_away["pitcher_k_pct"] = float(np.mean(a.starter_k))
                         lgbm_away["pitcher_bb_pct"] = float(np.mean(a.starter_bb))
                         lgbm_away["pitcher_hr_pct"] = float(np.mean(a.starter_hr))
@@ -1309,37 +1303,25 @@ def run(
                     except Exception:
                         pass
 
-                r = NEGBIN_R_DEFAULT
-                p_h = r / (r + max(mu_home, 0.1))
-                p_a = r / (r + max(mu_away, 0.1))
-                home_runs_nb = nb_rng.negative_binomial(r, p_h, size=n_sims)
-                away_runs_nb = nb_rng.negative_binomial(r, p_a, size=n_sims)
+                # Derive all game surfaces from sim draws directly
+                total_runs = home_runs + away_runs
+                margin = home_runs - away_runs
 
-                total_runs = (
-                    home_runs_nb.astype(float)
-                    + away_runs_nb.astype(float)
-                )
-                margin = (
-                    home_runs_nb.astype(float)
-                    - away_runs_nb.astype(float)
-                )
-
-                # Recompute win prob from NegBin samples
-                home_wins_nb = np.sum(margin > 0)
-                away_wins_nb = np.sum(margin < 0)
-                draws_nb = np.sum(margin == 0)
-                n_nb = len(margin)
-                nb_home_win_prob = (home_wins_nb + 0.5 * draws_nb) / n_nb
+                home_wins = np.sum(margin > 0)
+                away_wins = np.sum(margin < 0)
+                draws = np.sum(margin == 0)
+                n_total = len(margin)
+                home_win_prob = (home_wins + 0.5 * draws) / n_total
 
                 fg_rec: dict = {
                     "game_date": game_dt,
                     "game_pk": game_pk,
                     "home_abbr": home_abbr,
                     "away_abbr": away_abbr,
-                    "home_win_prob": round(float(nb_home_win_prob), 4),
-                    "away_win_prob": round(1.0 - float(nb_home_win_prob), 4),
-                    "home_runs_mean": round(float(np.mean(home_runs_nb)), 2),
-                    "away_runs_mean": round(float(np.mean(away_runs_nb)), 2),
+                    "home_win_prob": round(float(home_win_prob), 4),
+                    "away_win_prob": round(1.0 - float(home_win_prob), 4),
+                    "home_runs_mean": round(float(np.mean(home_runs)), 2),
+                    "away_runs_mean": round(float(np.mean(away_runs)), 2),
                     "total_runs_mean": round(float(np.mean(total_runs)), 2),
                     "total_runs_std": round(float(np.std(total_runs)), 2),
                     "home_margin_mean": round(float(np.mean(margin)), 2),
@@ -1349,32 +1331,144 @@ def run(
                     "lgbm_k_away": round(lgbm_k_away, 4) if not np.isnan(lgbm_k_away) else None,
                 }
 
-                # O/U probs at standard lines
                 for line in [5.5, 6.5, 7.5, 8.5, 9.5, 10.5]:
                     fg_rec[f"p_over_{line:.1f}"] = round(
                         float(np.mean(total_runs > line)), 4,
                     )
 
-                # Spread probs at standard lines
                 for line in [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5]:
                     fg_rec[f"p_home_cover_{line:+.1f}"] = round(
                         float(np.mean(margin > line)), 4,
                     )
 
                 game_predictions.append(fg_rec)
+                # Stash raw sim arrays for Vegas blend
+                _sim_arrays[game_pk] = (home_runs.copy(), away_runs.copy())
             except Exception as e:
                 logger.warning(
-                    "Full-game sim failed: game %d: %s", game_pk, e,
+                    "Full-game sim failed: game %d: %s — falling back to "
+                    "independent lineup sims for batter props", game_pk, e,
                 )
+                # Fallback: run independent lineup sims for batter props only
+                for side in ("away", "home"):
+                    ctx = side_contexts.get(side)
+                    if ctx is None or not ctx.valid_slots:
+                        continue
+                    try:
+                        fallback_sim = simulate_lineup_game(
+                            batter_k_rate_samples=ctx.lineup_k_samples,
+                            batter_bb_rate_samples=ctx.lineup_bb_samples,
+                            batter_hr_rate_samples=ctx.lineup_hr_samples,
+                            starter_k_rate=ctx.starter_k,
+                            starter_bb_rate=ctx.starter_bb,
+                            starter_hr_rate=ctx.starter_hr,
+                            starter_bf_mu=ctx.bf_mu,
+                            starter_bf_sigma=ctx.bf_sigma,
+                            matchup_k_lifts=ctx.matchup_lifts["k"],
+                            matchup_bb_lifts=ctx.matchup_lifts["bb"],
+                            matchup_hr_lifts=ctx.matchup_lifts["hr"],
+                            bullpen_k_rate=ctx.bp_k,
+                            bullpen_bb_rate=ctx.bp_bb,
+                            bullpen_hr_rate=ctx.bp_hr,
+                            batter_babip_adjs=ctx.babip_adjs,
+                            batter_bip_probs=ctx.bip_probs,
+                            umpire_k_lift=ump_k_lift,
+                            umpire_bb_lift=ump_bb_lift,
+                            park_k_lift=park_k_lift,
+                            park_bb_lift=park_bb_lift,
+                            park_hr_lift=park_hr_lift,
+                            park_h_babip_adj=park_h_babip_adj,
+                            weather_k_lift=wx_k_lift,
+                            weather_hr_lift=wx_hr_lift,
+                            form_k_lifts=ctx.form_k,
+                            form_bb_lifts=ctx.form_bb,
+                            form_hr_lifts=ctx.form_hr,
+                            n_sims=n_sims,
+                            random_seed=42 + game_pk % 10000,
+                        )
+                        game_dt = game.get("game_date", game_date)
+                        batter_picks.extend(_extract_batter_picks(
+                            fallback_sim, ctx, game_pk, game_dt,
+                            roster, player_posteriors,
+                        ))
+                    except Exception as e2:
+                        logger.warning(
+                            "Fallback lineup sim also failed: game %d %s: %s",
+                            game_pk, side, e2,
+                        )
+
+        # If full-game sim was skipped (disabled or missing side), run
+        # independent lineup sims for batter props only.
+        if not _ran_full_game and side_contexts:
+            for side, ctx in side_contexts.items():
+                if not ctx.valid_slots:
+                    continue
+                try:
+                    fallback_sim = simulate_lineup_game(
+                        batter_k_rate_samples=ctx.lineup_k_samples,
+                        batter_bb_rate_samples=ctx.lineup_bb_samples,
+                        batter_hr_rate_samples=ctx.lineup_hr_samples,
+                        starter_k_rate=ctx.starter_k,
+                        starter_bb_rate=ctx.starter_bb,
+                        starter_hr_rate=ctx.starter_hr,
+                        starter_bf_mu=ctx.bf_mu,
+                        starter_bf_sigma=ctx.bf_sigma,
+                        matchup_k_lifts=ctx.matchup_lifts["k"],
+                        matchup_bb_lifts=ctx.matchup_lifts["bb"],
+                        matchup_hr_lifts=ctx.matchup_lifts["hr"],
+                        bullpen_k_rate=ctx.bp_k,
+                        bullpen_bb_rate=ctx.bp_bb,
+                        bullpen_hr_rate=ctx.bp_hr,
+                        batter_babip_adjs=ctx.babip_adjs,
+                        batter_bip_probs=ctx.bip_probs,
+                        umpire_k_lift=ump_k_lift,
+                        umpire_bb_lift=ump_bb_lift,
+                        park_k_lift=park_k_lift,
+                        park_bb_lift=park_bb_lift,
+                        park_hr_lift=park_hr_lift,
+                        park_h_babip_adj=park_h_babip_adj,
+                        weather_k_lift=wx_k_lift,
+                        weather_hr_lift=wx_hr_lift,
+                        form_k_lifts=ctx.form_k,
+                        form_bb_lifts=ctx.form_bb,
+                        form_hr_lifts=ctx.form_hr,
+                        n_sims=n_sims,
+                        random_seed=42 + game_pk % 10000,
+                    )
+                    game_dt = game.get("game_date", game_date)
+                    batter_picks.extend(_extract_batter_picks(
+                        fallback_sim, ctx, game_pk, game_dt,
+                        roster, player_posteriors,
+                    ))
+                except Exception as e:
+                    logger.warning(
+                        "Independent lineup sim failed: game %d %s: %s",
+                        game_pk, side, e,
+                    )
 
     # --- Vegas calibration anchor: blend sim predictions with market lines ---
     if game_predictions:
         game_preds_df = pd.DataFrame(game_predictions)
-        game_preds_df = _blend_with_vegas(game_preds_df, game_date)
+        game_preds_df = _blend_with_vegas(game_preds_df, game_date, _sim_arrays)
         save_dashboard_parquet(game_preds_df, "game_predictions.parquet")
+        # Append to history — never drop previous snapshots for the same
+        # game_date so that re-runs don't clobber earlier predictions.
+        _gp_hist_path = DASHBOARD_DIR / "game_predictions_history.parquet"
+        _gp_snap = game_preds_df.copy()
+        _gp_snap["snapshot_ts"] = pd.Timestamp.now().isoformat()
+        if _gp_hist_path.exists():
+            _gp_hist = pd.read_parquet(_gp_hist_path)
+            if "snapshot_ts" not in _gp_hist.columns:
+                _gp_hist["snapshot_ts"] = None
+            _gp_hist_df = pd.concat([_gp_hist, _gp_snap], ignore_index=True)
+        else:
+            _gp_hist_df = _gp_snap
+        _gp_hist_df.to_parquet(_gp_hist_path, index=False)
         logger.info(
-            "Saved %d game-level predictions to game_predictions.parquet",
-            len(game_preds_df),
+            "Saved %d game-level predictions to game_predictions.parquet "
+            "(history: %d rows, %d snapshots)",
+            len(game_preds_df), len(_gp_hist_df),
+            _gp_hist_df["snapshot_ts"].nunique(),
         )
 
     # --- Combine new predictions ---
@@ -1790,22 +1884,24 @@ def _fetch_book_props(
             dk_df = dk_df[dk_df["player_id"].notna()].copy()
             dk_df["player_id"] = dk_df["player_id"].astype(int)
             dk_df["game_date"] = game_date
+            dk_df["snapshot_ts"] = pd.Timestamp.now().isoformat()
             save_dashboard_parquet(dk_df, "dk_props.parquet")
-            # Append to history
+            # Append to history — keep all snapshots (lines move intraday)
             _dk_hist_path = DASHBOARD_DIR / "dk_props_history.parquet"
             if _dk_hist_path.exists():
                 _dk_hist = pd.read_parquet(_dk_hist_path)
-                # Drop any existing rows for this date to avoid duplicates
-                _dk_hist = _dk_hist[_dk_hist["game_date"] != game_date]
-                dk_df = pd.concat([_dk_hist, dk_df], ignore_index=True)
-            dk_df.to_parquet(_dk_hist_path, index=False)
-            # Re-filter to today only for return value
-            dk_resolved = dk_df[dk_df["game_date"] == game_date].copy()
+                if "snapshot_ts" not in _dk_hist.columns:
+                    _dk_hist["snapshot_ts"] = None
+                dk_hist_df = pd.concat([_dk_hist, dk_df], ignore_index=True)
+            else:
+                dk_hist_df = dk_df.copy()
+            dk_hist_df.to_parquet(_dk_hist_path, index=False)
+            dk_resolved = dk_df.copy()
             logger.info(
                 "Saved %d DK props (%d resolved to MLB IDs), "
-                "history now %d rows",
+                "history now %d rows (%d snapshots)",
                 len(dk_resolved), dk_resolved["player_id"].notna().sum(),
-                len(dk_df),
+                len(dk_hist_df), dk_hist_df["snapshot_ts"].nunique(),
             )
         else:
             logger.info("No DK props available")
@@ -1829,20 +1925,24 @@ def _fetch_book_props(
             pp_df = pp_df[pp_df["player_id"].notna()].copy()
             pp_df["player_id"] = pp_df["player_id"].astype(int)
             pp_df["game_date"] = game_date
+            pp_df["snapshot_ts"] = pd.Timestamp.now().isoformat()
             save_dashboard_parquet(pp_df, "pp_props.parquet")
-            # Append to history
+            # Append to history — keep all snapshots (lines move intraday)
             _pp_hist_path = DASHBOARD_DIR / "pp_props_history.parquet"
             if _pp_hist_path.exists():
                 _pp_hist = pd.read_parquet(_pp_hist_path)
-                _pp_hist = _pp_hist[_pp_hist["game_date"] != game_date]
-                pp_df = pd.concat([_pp_hist, pp_df], ignore_index=True)
-            pp_df.to_parquet(_pp_hist_path, index=False)
-            pp_resolved = pp_df[pp_df["game_date"] == game_date].copy()
+                if "snapshot_ts" not in _pp_hist.columns:
+                    _pp_hist["snapshot_ts"] = None
+                pp_hist_df = pd.concat([_pp_hist, pp_df], ignore_index=True)
+            else:
+                pp_hist_df = pp_df.copy()
+            pp_hist_df.to_parquet(_pp_hist_path, index=False)
+            pp_resolved = pp_df.copy()
             logger.info(
                 "Saved %d PP props (%d resolved to MLB IDs), "
-                "history now %d rows",
+                "history now %d rows (%d snapshots)",
                 len(pp_resolved), pp_resolved["player_id"].notna().sum(),
-                len(pp_df),
+                len(pp_hist_df), pp_hist_df["snapshot_ts"].nunique(),
             )
         else:
             logger.info("No Prize Picks props available")
@@ -2176,19 +2276,24 @@ def _parse_odds_teams(description: str) -> tuple[str, str] | None:
 def _blend_with_vegas(
     game_preds_df: pd.DataFrame,
     game_date: str,
+    sim_arrays: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> pd.DataFrame:
     """Blend sim predictions with Vegas lines for calibration.
 
     Loads game_odds_daily.parquet (or falls back to history), joins
     on (game_date, away_abbr, home_abbr), and blends total and ML.
 
-    All probability surfaces (O/U, spread, ML) are derived from a
-    single NegBin draw at the blended total, with the home/away split
-    adjusted by the de-vigged Vegas ML. This keeps everything coherent.
+    When ``sim_arrays`` is provided (game_pk → (home_runs, away_runs)),
+    probability surfaces are derived by multiplicatively scaling the
+    raw sim draws to the blended target means — preserving the sim's
+    joint correlation structure.  Falls back to NegBin resample for
+    games not in ``sim_arrays``.
 
     Adds columns: vegas_total_line, vegas_home_ml_fair,
     sim_total_raw, sim_home_wp_raw (pre-blend values for tracking).
     """
+    if sim_arrays is None:
+        sim_arrays = {}
     odds_path = DASHBOARD_DIR / "game_odds_daily.parquet"
     history_path = DASHBOARD_DIR / "game_odds_history.parquet"
 
@@ -2329,10 +2434,6 @@ def _blend_with_vegas(
     df["sim_home_wp_raw"] = df["home_win_prob"]
 
     # Blend: use Vegas ML to shift home/away run split, Vegas total
-    # to anchor the total. All surfaces (O/U, spread, ML) are then
-    # derived from a single NegBin draw for coherence.
-    from src.models.game_predictions import NEGBIN_R_DEFAULT
-
     has_total = df["vegas_total_line"].notna()
     has_ml = df["vegas_home_ml_fair"].notna() if "vegas_home_ml_fair" in df.columns else pd.Series(False, index=df.index)
     has_any = has_total | has_ml
@@ -2340,9 +2441,9 @@ def _blend_with_vegas(
     if has_any.any():
         w_t = _VEGAS_TOTAL_WEIGHT
         w_m = _VEGAS_ML_WEIGHT
-        r = NEGBIN_R_DEFAULT
 
         for idx in df.index[has_any]:
+            game_pk = int(df.loc[idx, "game_pk"])
             sim_home = df.loc[idx, "home_runs_mean"]
             sim_away = df.loc[idx, "away_runs_mean"]
             sim_total = sim_home + sim_away
@@ -2362,7 +2463,6 @@ def _blend_with_vegas(
 
             vegas_ml_fair = df.loc[idx, "vegas_home_ml_fair"] if "vegas_home_ml_fair" in df.columns else np.nan
             if pd.notna(vegas_ml_fair):
-                # Vegas ML implies a home share of scoring; blend with sim
                 blended_home_share = (1 - w_m) * sim_home_share + w_m * vegas_ml_fair
             else:
                 blended_home_share = sim_home_share
@@ -2371,39 +2471,51 @@ def _blend_with_vegas(
             mu_home = mu_total * blended_home_share
             mu_away = mu_total * (1 - blended_home_share)
 
-            # Draw NegBin samples -- all surfaces derived from this
-            rng = np.random.default_rng(42 + int(df.loc[idx, "game_pk"]) % 10000)
-            p_h = r / (r + max(mu_home, 0.1))
-            p_a = r / (r + max(mu_away, 0.1))
-            nb_home = rng.negative_binomial(r, p_h, size=10000)
-            nb_away = rng.negative_binomial(r, p_a, size=10000)
-            nb_total = nb_home.astype(float) + nb_away.astype(float)
-            nb_margin = nb_home.astype(float) - nb_away.astype(float)
+            if game_pk in sim_arrays:
+                # Multiplicative scaling preserves joint correlation
+                home_raw, away_raw = sim_arrays[game_pk]
+                raw_mu_h = np.mean(home_raw)
+                raw_mu_a = np.mean(away_raw)
+                scale_h = mu_home / max(raw_mu_h, 0.1)
+                scale_a = mu_away / max(raw_mu_a, 0.1)
+                blend_home = np.maximum(np.round(home_raw * scale_h), 0)
+                blend_away = np.maximum(np.round(away_raw * scale_a), 0)
+            else:
+                # Fallback: NegBin resample for games without sim arrays
+                from src.models.game_predictions import NEGBIN_R_DEFAULT
+                r = NEGBIN_R_DEFAULT
+                rng = np.random.default_rng(42 + game_pk % 10000)
+                p_h = r / (r + max(mu_home, 0.1))
+                p_a = r / (r + max(mu_away, 0.1))
+                blend_home = rng.negative_binomial(r, p_h, size=10000).astype(float)
+                blend_away = rng.negative_binomial(r, p_a, size=10000).astype(float)
+
+            blend_total = blend_home + blend_away
+            blend_margin = blend_home - blend_away
 
             df.loc[idx, "home_runs_mean"] = round(mu_home, 2)
             df.loc[idx, "away_runs_mean"] = round(mu_away, 2)
             df.loc[idx, "total_runs_mean"] = round(mu_total, 2)
-            df.loc[idx, "total_runs_std"] = round(float(np.std(nb_total)), 2)
-            df.loc[idx, "home_margin_mean"] = round(float(np.mean(nb_margin)), 2)
+            df.loc[idx, "total_runs_std"] = round(float(np.std(blend_total)), 2)
+            df.loc[idx, "home_margin_mean"] = round(float(np.mean(blend_margin)), 2)
 
-            # Win prob from the same draws (coherent with spread)
-            home_wins = np.sum(nb_margin > 0)
-            away_wins = np.sum(nb_margin < 0)
-            draws = np.sum(nb_margin == 0)
-            n_nb = len(nb_margin)
-            wp = (home_wins + 0.5 * draws) / n_nb
+            home_wins = np.sum(blend_margin > 0)
+            away_wins = np.sum(blend_margin < 0)
+            draws = np.sum(blend_margin == 0)
+            n_draws = len(blend_margin)
+            wp = (home_wins + 0.5 * draws) / n_draws
             df.loc[idx, "home_win_prob"] = round(float(wp), 4)
             df.loc[idx, "away_win_prob"] = round(1.0 - float(wp), 4)
 
             for line in [5.5, 6.5, 7.5, 8.5, 9.5, 10.5]:
                 col = f"p_over_{line:.1f}"
                 if col in df.columns:
-                    df.loc[idx, col] = round(float(np.mean(nb_total > line)), 4)
+                    df.loc[idx, col] = round(float(np.mean(blend_total > line)), 4)
 
             for line in [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5]:
                 col = f"p_home_cover_{line:+.1f}"
                 if col in df.columns:
-                    df.loc[idx, col] = round(float(np.mean(nb_margin > line)), 4)
+                    df.loc[idx, col] = round(float(np.mean(blend_margin > line)), 4)
 
     n_total = has_total.sum()
     n_ml = has_ml.sum()
