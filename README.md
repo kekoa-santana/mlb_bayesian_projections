@@ -270,7 +270,7 @@ player_profiles/                          # Projection engine only
 ### Installation
 ```bash
 # Clone this repo
-git clone https://github.com/TheDataDiamond/player_profiles
+git clone https://github.com/kekoa-santana/mlb_bayesian_projections.git
 cd player_profiles
 
 # Install dependencies
